@@ -179,7 +179,10 @@ ApplicationWindow {
                     }
                     onDropped: function(drop) {
                         if (drop.urls.length > 0) {
-                            mapViewport.requestLoad(drop.urls[0].toString())
+                            // Keep the QUrl intact so requestLoad can use
+                            // toLocalFile() on Windows instead of passing a
+                            // file:/// URI to the Go/GDAL boundary.
+                            mapViewport.requestLoad(drop.urls[0])
                             drop.acceptProposedAction()
                         }
                     }
@@ -187,7 +190,14 @@ ApplicationWindow {
 
                 function requestLoad(url) {
                     var path = (url && url.toLocalFile) ? url.toLocalFile() : String(url)
-                    if (path.indexOf("file://") === 0) path = decodeURIComponent(path.substring(7))
+                    if (path.indexOf("file://") === 0) {
+                        path = decodeURIComponent(path.substring(7))
+                        // file:///C:/... becomes /C:/... after removing the
+                        // URI prefix; remove that extra slash on Windows.
+                        if (path.length >= 3 && path[0] === "/" && path[2] === ":") {
+                            path = path.substring(1)
+                        }
+                    }
                     mapCanvas.loadPath = path
                     mapCanvas.loadGeneration += 1
                 }

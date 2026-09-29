@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$env:CGO_ENABLED = '1'
 
 function Invoke-Checked {
     param(

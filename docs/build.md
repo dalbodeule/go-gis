@@ -88,7 +88,7 @@ projinfo --version
 geos-config --version
 pkg-config --modversion gdal
 pkg-config --modversion proj
-pkg-config --modversion geos_c
+pkg-config --modversion geos
 ```
 
 Apple Silicon의 기본 Homebrew prefix는 보통 `/opt/homebrew`, Intel Mac은 `/usr/local`입니다. `brew --prefix` 결과를 사용하므로 경로를 직접 하드코딩하지 않습니다.
@@ -183,7 +183,7 @@ projinfo --version
 geos-config --version
 pkg-config --modversion gdal
 pkg-config --modversion proj
-pkg-config --modversion geos_c
+pkg-config --modversion geos
 ```
 
 ### Fedora/RHEL 계열
@@ -247,7 +247,7 @@ gdalinfo --version
 projinfo --version
 pkg-config --modversion gdal
 pkg-config --modversion proj
-pkg-config --modversion geos_c
+pkg-config --modversion geos
 ```
 
 OSGeo4W 또는 별도 설치 경로가 `pkg-config`에 자동으로 등록되지 않으면 `PKG_CONFIG_PATH`에 `lib\pkgconfig` 경로를 추가합니다. 경로는 설치한 prefix에 맞게 바꿉니다.
@@ -281,7 +281,7 @@ projinfo --version
 geos-config --version
 pkg-config --modversion gdal
 pkg-config --modversion proj
-pkg-config --modversion geos_c
+pkg-config --modversion geos
 go test ./...
 go vet ./...
 ```

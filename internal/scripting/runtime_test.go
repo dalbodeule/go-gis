@@ -28,7 +28,10 @@ func TestRuntimeChangesPropertyAndExports(t *testing.T) {
 	runtime := NewRuntime(service, dxf.Exporter{})
 	defer runtime.Close()
 	destination := filepath.Join(t.TempDir(), "roads.dxf")
-	script := `local layers = gogis.layers(); assert(layers[1] == "roads"); gogis.set_property("roads", 1, "name", "한글 도로"); gogis.export_dxf("` + destination + `", "roads", "ares-cp949")`
+	// Lua treats backslashes in string literals as escape characters. Use
+	// slash-separated paths so the generated script works on Windows too.
+	luaDestination := filepath.ToSlash(destination)
+	script := `local layers = gogis.layers(); assert(layers[1] == "roads"); gogis.set_property("roads", 1, "name", "한글 도로"); gogis.export_dxf("` + luaDestination + `", "roads", "ares-cp949")`
 	if err := runtime.Run(context.Background(), script); err != nil {
 		t.Fatal(err)
 	}
