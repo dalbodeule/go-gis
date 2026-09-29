@@ -15,6 +15,23 @@
 - GEOS 및 개발 헤더
 - `pkg-config` 또는 각 라이브러리의 include/library 경로 설정
 
+## 빌드 스크립트와 산출물
+
+모든 로컬 빌드 산출물은 저장소 루트의 `build/` 폴더에 둡니다. `build/`는
+생성 디렉터리이므로 Git에서 추적하지 않습니다.
+
+```sh
+./scripts/build.sh cli       # build/gis-cli
+./scripts/build.sh native    # build/gis-cli-native
+./scripts/build.sh desktop   # build/gogis-desktop
+./scripts/build.sh all       # cli + desktop
+./scripts/build.sh clean     # build/ 제거
+```
+
+`desktop` 대상은 Qt 6의 C++17 요구사항을 위해 `CGO_CXXFLAGS`에
+`-std=c++17`을 자동으로 추가합니다. 호출자가 이미 `-std=c++17` 또는
+`-std=gnu++17`을 지정한 경우 기존 값을 유지합니다.
+
 Go 바인딩은 다음 모듈을 사용합니다.
 
 ```text
@@ -63,6 +80,24 @@ go test ./...
 go vet ./...
 go build -o bin/gis-cli ./cmd/gis-cli
 ```
+
+## Qt Quick desktop prototype
+
+The Milestone B shell is optional and uses Qt 6 Quick/QML through MIQT. It is
+guarded by the `qt` build tag, so the standard CLI and test commands do not
+need Qt. Install Qt 6 development components for Core, Gui, Quick, Qml, and
+QuickControls2, then make sure the Qt `pkg-config` files and a CGO-compatible
+C/C++ compiler are visible in the same shell.
+
+```sh
+CGO_CXXFLAGS=-std=c++17 go run -tags qt ./cmd/gis-desktop
+```
+
+The first prototype renders the desktop shell and keeps the map canvas as an
+explicit hand-off point for the custom scene-graph item. The UI-neutral chunk
+scheduler is tested by the normal Go test suite. A Qt build cannot be verified
+on a machine without the Qt development installation; in that case use
+`go test ./...` to verify the scheduler and the rest of the repository.
 
 실행 시 PROJ grid/resource data를 찾지 못하면 다음을 확인합니다.
 

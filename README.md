@@ -6,6 +6,11 @@
 
 운영체제별 Go·CGO·GDAL/PROJ/GEOS 설치와 빌드는 [빌드 가이드](docs/build.md)를 참고합니다.
 
+빌드 산출물은 저장소의 `build/` 폴더에 생성합니다. 공통 빌드 스크립트는
+`scripts/build.sh`입니다.
+
+마일스톤 B의 UI·부분 렌더링 후보와 벤치마크 기준은 [UI 렌더링 결정 기록](docs/decisions/0002-milestone-b-ui-rendering.md)에 정리되어 있습니다.
+
 ## 선택한 기술 스택
 
 - Go: GIS 도메인 모델, 공용 명령/API, CLI, 작업 취소·진행률 제어
@@ -24,6 +29,12 @@
 ```sh
 go run ./cmd/gis-cli --help
 go test ./...
+
+# 기본 CLI 빌드: build/gis-cli
+./scripts/build.sh cli
+
+# Qt Quick 데스크톱 빌드: build/gogis-desktop
+./scripts/build.sh desktop
 ```
 
 현재 CLI는 프로젝트 뼈대 확인용 `--help`와 버전 출력을 제공합니다. 실제 SHP → PROJ → DXF 수직 관통 경로는 마일스톤 A에서 추가합니다.

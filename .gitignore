@@ -1,5 +1,6 @@
 # Go build and test artifacts
 /bin/
+/build/
 /dist/
 /coverage.out
 /coverage.html

@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/airbusgeo/godal v0.0.18
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/mappu/miqt v0.14.0
 	github.com/twpayne/go-geos v0.23.0
 	github.com/twpayne/go-proj/v11 v11.1.0
 	github.com/yuin/gopher-lua v1.1.2
