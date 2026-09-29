@@ -60,14 +60,47 @@ Wails는 빠른 화면 구성과 Go↔웹 기술 결합에는 매력적이다. �
 
 - `internal/render.Scheduler`: 청크 캐시, viewport generation, 취소, 오래된
   결과 폐기를 UI 툴킷과 독립적으로 처리한다.
+- `internal/render.BatchStore`: 현재 generation에 해당하는 vertex batch만
+  적용하고 늦게 도착한 결과는 기존 화면을 유지한 채 폐기한다.
+- `internal/render.ChunkPlanner`: viewport extent와 look-ahead margin으로
+  필요한 청크 키만 계산하고 zoom bucket을 함께 지정한다.
+- `internal/render.LayerVisibility`: 레이어 트리의 가시성 상태를 UI와
+  독립적으로 보관하고 숨김·미등록 레이어의 chunk 요청을 제거한다.
+- QML 레이어 체크박스는 `MapCanvas.visible`을 변경하고, Qt 브리지가 이를
+  Go에 전달한다. 숨겨진 레이어는 새 요청을 만들지 않으며 기존 batch도
+  제거한다.
+- 지도 클릭은 현재 데모 피처 선택 상태를 갱신하고 속성 패널에 레이어·피처·
+  편집 가능 상태를 표시한다. 실제 geometry hit-test와 core feature ID
+  연결을 위해 `internal/render.HitTest`가 line feature의 closest segment와
+  tolerance를 계산하며, `ScreenPointToWorld`/`HitTestScreen`이 Qt 화면 좌표와
+  world 좌표 및 픽셀 tolerance를 변환한다. QML 클릭은 native bridge의
+  generation/좌표 snapshot을 거쳐 Go에서 hit-test되고 선택 결과가 다시
+  QML 속성 패널로 전달된다.
 - `cmd/gis-desktop/qml/Main.qml`: 레이어 목록·지도 캔버스·속성 패널의 Qt
   Quick 셸을 제공한다.
 - `cmd/gis-desktop/main_qt.go`: QML을 embed하고 MIQT의
   `QQmlApplicationEngine`으로 로드한다. `qt` build tag가 없으면 컴파일되지
   않는다.
+- `ui/qt/native`: MIQT에 없는 `QQuickItem`/`QSGGeometryNode` 경계를 Qt C++로
+  얇게 감싸고 `GoGIS.MapCanvas` QML 타입으로 등록한다. 현재는 연결 검증용
+  polyline을 그리고, Go 스케줄러가 만든 정규화 XY vertex batch를 C ABI로
+  복사해 `QSGGeometryNode`에 공급한다.
+- `Main.qml`의 지도 입력은 드래그 패닝과 휠 줌을 처리하며, 각 입력을
+  viewport generation으로 증가시킨다. `MapCanvas.itemChange`가 이를 감지해
+  C ABI polling 경계로 넘기고, Go가 `Scheduler.AdvanceGeneration` 및
+  `BatchStore.BeginGeneration`을 호출한다.
+- 새 viewport 요청이 시작되면 이전 chunk request context를 취소하고 최신
+  generation 요청만 비동기로 적용한다. 취소를 무시하는 네이티브/외부 작업도
+  `BatchStore`의 generation 검사에서 최종적으로 화면 반영이 차단된다.
+- 하나의 visible extent 요청 안에서는 최대 4개 청크를 병렬 생성해 느린
+  청크 하나가 전체 첫 표시를 막지 않도록 한다.
+- `Scheduler.Stats()`로 요청 수, 실제 생성 수, cache hit, stale 폐기,
+  취소 요청을 수집해 성능 기준을 정량화한다. planner/cache benchmark는
+  `go test -bench ./internal/render`로 실행한다.
 
-다음 구현 단계는 `QQuickItem` 기반 custom scene-graph item을 추가해
-`Scheduler`의 immutable vertex batch를 `QSGGeometryNode`에 연결하는 것이다.
+다음 구현 단계는 실제 데이터셋의 attribute table과 진행률·취소 읽기 모델을
+현재 데모 편집 흐름에 연결하고, ARES Commander를 포함한 외부 포맷 호환성을
+실제 샘플로 검증하는 것이다.
 
 ## 반드시 수행할 수직 벤치마크
 

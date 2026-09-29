@@ -49,8 +49,19 @@ func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, e
 	result := core.Layer{Name: layer.Name(), Editable: true}
 	if spatialRef := layer.SpatialRef(); spatialRef != nil {
 		defer spatialRef.Close()
-		if authority := spatialRef.AuthorityCode("EPSG"); authority != "" {
-			result.CRS.AuthorityCode = "EPSG:" + authority
+		authorityName := spatialRef.AuthorityName("")
+		authorityCode := spatialRef.AuthorityCode("")
+		if authorityCode == "" {
+			// Some drivers omit the authority node until GDAL identifies it.
+			_ = spatialRef.AutoIdentifyEPSG()
+			authorityName = spatialRef.AuthorityName("")
+			authorityCode = spatialRef.AuthorityCode("")
+		}
+		if authorityCode != "" {
+			if authorityName == "" {
+				authorityName = "EPSG"
+			}
+			result.CRS.AuthorityCode = authorityName + ":" + authorityCode
 		}
 	}
 

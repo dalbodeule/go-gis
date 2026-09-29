@@ -1,0 +1,70 @@
+package render
+
+import "testing"
+
+func TestHitTestReturnsClosestLineFeature(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "roads", FeatureID: 10, Vertices: []Point{{X: 0, Y: 0}, {X: 10, Y: 0}}},
+		{Layer: "roads", FeatureID: 20, Vertices: []Point{{X: 0, Y: 3}, {X: 10, Y: 3}}},
+	}
+	result, ok := HitTest(features, Point{X: 4, Y: 0.2}, 0.5)
+	if !ok || result.FeatureID != 10 || result.Layer != "roads" {
+		t.Fatalf("hit = %#v, ok = %v", result, ok)
+	}
+	if result.Distance < 0.19 || result.Distance > 0.21 {
+		t.Fatalf("distance = %f, want 0.2", result.Distance)
+	}
+}
+
+func TestHitTestRejectsOutsideToleranceAndHandlesPoints(t *testing.T) {
+	features := []HitFeature{{Layer: "labels", FeatureID: 7, Vertices: []Point{{X: 2, Y: 2}}}}
+	if _, ok := HitTest(features, Point{X: 2.5, Y: 2}, 0.25); ok {
+		t.Fatal("hit outside tolerance")
+	}
+	if result, ok := HitTest(features, Point{X: 2.1, Y: 2}, 0.25); !ok || result.FeatureID != 7 {
+		t.Fatalf("point hit = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestHitTestRejectsDegenerateInput(t *testing.T) {
+	if _, ok := HitTest(nil, Point{}, 1); ok {
+		t.Fatal("empty feature list reported a hit")
+	}
+	if _, ok := HitTest([]HitFeature{{Vertices: []Point{{X: 0, Y: 0}}}}, Point{}, -1); ok {
+		t.Fatal("negative tolerance reported a hit")
+	}
+}
+
+func TestScreenPointToWorldUsesCenteredViewportAndInvertsY(t *testing.T) {
+	viewport := Viewport{Center: Point{X: 10, Y: 20}, Zoom: 2}
+	world, ok := ScreenPointToWorld(Point{X: 100, Y: 50}, viewport, 200, 100)
+	if !ok {
+		t.Fatal("screen point was rejected")
+	}
+	if world != (Point{X: 10, Y: 20}) {
+		t.Fatalf("center world = %#v, want (10,20)", world)
+	}
+
+	world, ok = ScreenPointToWorld(Point{X: 120, Y: 40}, viewport, 200, 100)
+	if !ok || world.X <= 10 || world.Y <= 20 {
+		t.Fatalf("offset world = %#v, ok = %v", world, ok)
+	}
+}
+
+func TestHitTestScreenUsesPixelTolerance(t *testing.T) {
+	viewport := Viewport{Center: Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	features := []HitFeature{{Layer: "roads", FeatureID: 42, Vertices: []Point{{X: 0.4, Y: 0.5}, {X: 0.6, Y: 0.5}}}}
+	result, ok := HitTestScreen(features, Point{X: 100, Y: 101}, viewport, 200, 200, 2)
+	if !ok || result.FeatureID != 42 {
+		t.Fatalf("screen hit = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestScreenPointToWorldRejectsInvalidViewport(t *testing.T) {
+	if _, ok := ScreenPointToWorld(Point{}, Viewport{Zoom: 0}, 100, 100); ok {
+		t.Fatal("invalid zoom was accepted")
+	}
+	if _, ok := HitTestScreen(nil, Point{}, Viewport{Zoom: 1}, 0, 100, 2); ok {
+		t.Fatal("invalid dimensions were accepted")
+	}
+}

@@ -9,8 +9,14 @@ The current prototype has two deliberate boundaries:
 - `internal/render` owns viewport-independent chunk scheduling, generation
   invalidation, stale-result rejection, and cache reuse.
 - `cmd/gis-desktop/qml/Main.qml` owns the initial desktop layout. The map
-  placeholder is the future insertion point for a custom `QQuickItem` whose
-  scene-graph node will consume immutable chunk vertex batches.
+  canvas is backed by a custom `QQuickItem`/`QSGGeometryNode` bridge in
+  `ui/qt/native`. The prototype now passes a scheduler-produced normalized XY
+  vertex batch from Go into that node. Dragging pans the canvas and the mouse
+  wheel changes zoom while incrementing the QML viewport generation. The Qt
+  bridge now exposes that generation to Go, which advances the scheduler and
+  batch store before requesting the next canvas update. Older requests are
+  cancelled when a new viewport arrives, and `ChunkPlanner` limits each request
+  to the visible chunks plus look-ahead margin.
 
 ## Local build
 

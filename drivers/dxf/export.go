@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"gogis/internal/core"
+	"golang.org/x/text/encoding/korean"
 )
 
 // Profile controls the deliberately explicit DXF header choices.
@@ -23,6 +24,11 @@ type Profile struct {
 // ARESUTF8 is an experimental profile. ARES compatibility and Korean font
 // rendering still require verification with the target application.
 var ARESUTF8 = Profile{ACADVersion: "AC1015", CodePage: "UTF-8", TextHeight: 1}
+
+// ARESCP949 is the legacy Korean code-page profile. ARES/CAD compatibility
+// still needs validation in the target application, but the byte encoding and
+// declared DXF header are now deterministic.
+var ARESCP949 = Profile{ACADVersion: "AC1015", CodePage: "ANSI_949", TextHeight: 1}
 
 // Exporter writes a small, inspectable ASCII DXF subset without hiding header
 // or encoding decisions behind a third-party library.
@@ -39,8 +45,15 @@ func (e Exporter) Export(ctx context.Context, destination string, layer core.Lay
 	if configuration.ACADVersion == "" {
 		configuration = ARESUTF8
 	}
-	if profile != "" && profile != "ares-utf8" {
+	switch profile {
+	case "", "ares-utf8":
+	case "ares-cp949":
+		configuration = ARESCP949
+	default:
 		return fmt.Errorf("unsupported DXF profile %q", profile)
+	}
+	if _, err := encodeText("", configuration.CodePage); err != nil {
+		return err
 	}
 	file, err := os.Create(destination)
 	if err != nil {
@@ -49,8 +62,17 @@ func (e Exporter) Export(ctx context.Context, destination string, layer core.Lay
 	defer file.Close()
 	writer := bufio.NewWriter(file)
 	write := func(code int, value string) error {
-		_, err := fmt.Fprintf(writer, "%d\n%s\n", code, value)
-		return err
+		encoded, err := encodeText(value, configuration.CodePage)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(writer, "%d\n", code); err != nil {
+			return err
+		}
+		if _, err := writer.Write(encoded); err != nil {
+			return err
+		}
+		return writer.WriteByte('\n')
 	}
 	if err := writeHeader(write, configuration); err != nil {
 		return err
@@ -79,6 +101,21 @@ func (e Exporter) Export(ctx context.Context, destination string, layer core.Lay
 		return err
 	}
 	return writer.Flush()
+}
+
+func encodeText(value, codePage string) ([]byte, error) {
+	switch strings.ToUpper(strings.TrimSpace(codePage)) {
+	case "UTF-8", "UTF8":
+		return []byte(value), nil
+	case "CP949", "ANSI_949", "EUC-KR":
+		encoded, err := korean.EUCKR.NewEncoder().Bytes([]byte(value))
+		if err != nil {
+			return nil, fmt.Errorf("encode DXF text as CP949: %w", err)
+		}
+		return encoded, nil
+	default:
+		return nil, fmt.Errorf("unsupported DXF code page %q", codePage)
+	}
 }
 
 func writeHeader(write func(int, string) error, profile Profile) error {

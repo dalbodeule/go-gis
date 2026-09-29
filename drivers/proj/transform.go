@@ -32,10 +32,6 @@ func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("create PROJ transformation: %w", err)
 	}
-	pj, err = pj.NormalizeForVisualization()
-	if err != nil {
-		return core.Layer{}, fmt.Errorf("normalize PROJ axis order: %w", err)
-	}
 
 	result := layer.Clone()
 	result.CRS = target
@@ -47,7 +43,7 @@ func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer
 		if !ok {
 			return core.Layer{}, fmt.Errorf("feature %d geometry is not core.WKTGeometry", result.Features[i].ID)
 		}
-		wkt, err := transformXY(geometry.WKT, pj)
+		wkt, err := transformXY(geometry.WKT, pj, source, target)
 		if err != nil {
 			return core.Layer{}, fmt.Errorf("feature %d: %w", result.Features[i].ID, err)
 		}
@@ -56,7 +52,11 @@ func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer
 	return result, nil
 }
 
-func transformXY(wkt string, pj *projlib.PJ) (string, error) {
+// transformXY keeps the core WKT contract in XY order while using PROJ's
+// native axis order at the C boundary. EPSG:4326 is latitude/longitude in
+// PROJ's native order; the projected Korean CRSs used by the MVP are already
+// consumed and returned as easting/northing.
+func transformXY(wkt string, pj *projlib.PJ, source, target core.CRS) (string, error) {
 	numbers := numberPattern.FindAllStringIndex(wkt, -1)
 	if len(numbers)%2 != 0 {
 		return "", fmt.Errorf("WKT must contain XY coordinate pairs")
@@ -71,7 +71,7 @@ func transformXY(wkt string, pj *projlib.PJ) (string, error) {
 			return "", err
 		}
 		if i%2 == 0 {
-			coord := projlib.NewCoord(value, 0, 0, 0)
+			x := value
 			if i+1 >= len(numbers) {
 				return "", fmt.Errorf("missing y coordinate")
 			}
@@ -80,17 +80,28 @@ func transformXY(wkt string, pj *projlib.PJ) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			coord[1] = y
+			coord := projlib.NewCoord(x, y, 0, 0)
+			if isLatitudeLongitudeCRS(source) {
+				coord[0], coord[1] = coord[1], coord[0]
+			}
 			transformed, err := pj.Forward(coord)
 			if err != nil {
 				return "", err
 			}
-			builder.WriteString(strconv.FormatFloat(transformed.X(), 'g', -1, 64))
+			outputX, outputY := transformed.X(), transformed.Y()
+			if isLatitudeLongitudeCRS(target) {
+				outputX, outputY = outputY, outputX
+			}
+			builder.WriteString(strconv.FormatFloat(outputX, 'g', -1, 64))
 			builder.WriteString(wkt[span[1]:ySpan[0]])
-			builder.WriteString(strconv.FormatFloat(transformed.Y(), 'g', -1, 64))
+			builder.WriteString(strconv.FormatFloat(outputY, 'g', -1, 64))
 			last = ySpan[1]
 		}
 	}
 	builder.WriteString(wkt[last:])
 	return builder.String(), nil
+}
+
+func isLatitudeLongitudeCRS(crs core.CRS) bool {
+	return strings.EqualFold(strings.TrimSpace(crs.AuthorityCode), "EPSG:4326")
 }

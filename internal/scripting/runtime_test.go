@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"gogis/drivers/dxf"
 	"gogis/internal/commands"
@@ -39,5 +40,48 @@ func TestRuntimeChangesPropertyAndExports(t *testing.T) {
 	}
 	if len(contents) == 0 {
 		t.Fatal("DXF output is empty")
+	}
+}
+
+func TestRuntimeSandboxBlocksHostCapabilities(t *testing.T) {
+	service := commands.NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
+	runtime := NewRuntime(service, nil)
+	defer runtime.Close()
+	for _, expression := range []string{
+		`assert(io == nil)`,
+		`assert(os == nil)`,
+		`assert(package == nil)`,
+		`assert(debug == nil)`,
+		`assert(require == nil)`,
+		`assert(dofile == nil)`,
+		`assert(loadfile == nil)`,
+		`assert(loadstring == nil)`,
+	} {
+		if err := runtime.Run(context.Background(), expression); err != nil {
+			t.Fatalf("sandbox expression %q failed: %v", expression, err)
+		}
+	}
+	if err := runtime.Run(context.Background(), `assert(string.upper("gogis") == "GOGIS"); assert(math.floor(2.9) == 2)`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeCancellationStopsLongScript(t *testing.T) {
+	service := commands.NewProjectService("demo", core.CRS{})
+	runtime := NewRuntime(service, nil)
+	defer runtime.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runtime.Run(ctx, `while true do end`)
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("long script completed without cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("long script did not stop after cancellation")
 	}
 }

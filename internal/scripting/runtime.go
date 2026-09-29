@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"gogis/internal/commands"
 	"gogis/internal/core"
@@ -22,11 +23,27 @@ type Runtime struct {
 	state    *lua.LState
 	service  *commands.ProjectService
 	exporter Exporter
+	mu       sync.Mutex
 }
 
 // NewRuntime creates a runtime with the minimum public API.
 func NewRuntime(service *commands.ProjectService, exporter Exporter) *Runtime {
-	runtime := &Runtime{state: lua.NewState(), service: service, exporter: exporter}
+	state := lua.NewState(lua.Options{SkipOpenLibs: true})
+	// Explicit allow-list: scripts get language helpers and deterministic
+	// string/math/table operations, but no filesystem, process, module, debug,
+	// coroutine, or channel capabilities.
+	for _, open := range []func(*lua.LState) int{lua.OpenBase, lua.OpenTable, lua.OpenString, lua.OpenMath} {
+		if results := open(state); results > 0 {
+			state.Pop(results)
+		}
+	}
+	for _, name := range []string{
+		"dofile", "loadfile", "load", "loadstring", "require", "module",
+		"print", "collectgarbage", "newproxy",
+	} {
+		state.SetGlobal(name, lua.LNil)
+	}
+	runtime := &Runtime{state: state, service: service, exporter: exporter}
 	runtime.state.SetGlobal("gogis", runtime.state.SetFuncs(runtime.state.NewTable(), map[string]lua.LGFunction{
 		"layers":       runtime.layers,
 		"set_property": runtime.setProperty,
@@ -36,13 +53,21 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter) *Runtime {
 }
 
 // Close releases the Lua state.
-func (r *Runtime) Close() { r.state.Close() }
+func (r *Runtime) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.Close()
+}
 
 // Run executes a script with a cancellation check before entry.
 func (r *Runtime) Run(ctx context.Context, script string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.SetContext(ctx)
+	defer r.state.RemoveContext()
 	return r.state.DoString(script)
 }
 

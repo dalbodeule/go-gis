@@ -37,7 +37,25 @@ go test ./...
 ./scripts/build.sh desktop
 ```
 
-현재 CLI는 프로젝트 뼈대 확인용 `--help`와 버전 출력을 제공합니다. 실제 SHP → PROJ → DXF 수직 관통 경로는 마일스톤 A에서 추가합니다.
+네이티브 GIS 드라이버를 포함한 CLI는 다음과 같이 빌드합니다.
+
+```sh
+./scripts/build.sh native
+```
+
+`convert`는 SHP 또는 GeoPackage 벡터 레이어를 읽어 DXF로 내보냅니다. 필요하면 입력 CRS를 덮어쓰고 출력 CRS로 좌표를 변환할 수 있습니다.
+
+```sh
+./build/gis-cli convert \
+  --input data/roads.gpkg \
+  --layer roads \
+  --output build/roads.dxf \
+  --source-crs EPSG:4326 \
+  --target-crs EPSG:5179 \
+  --profile ares-utf8
+```
+
+DXF 프로파일은 `ares-utf8`과 `ares-cp949`를 지원합니다. 실제 ARES Commander 호환성은 별도 외부 검증이 필요합니다.
 
 ## 작업 규칙
 
