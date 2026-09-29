@@ -24,9 +24,30 @@
 ./scripts/build.sh cli       # build/gis-cli
 ./scripts/build.sh native    # build/gis-cli-native
 ./scripts/build.sh desktop   # build/gogis-desktop
+./scripts/build.sh all-native # build/gis-cli-native + build/gogis-desktop-native
 ./scripts/build.sh all       # cli + desktop
 ./scripts/build.sh clean     # build/ 제거
 ```
+
+커밋 전 전체 검증은 다음 명령으로 실행합니다. 일반/native 테스트와 race
+검사, `go vet`, native 산출물 빌드, patch whitespace 검사를 순서대로 수행합니다.
+
+```sh
+./scripts/verify.sh
+```
+
+Windows PowerShell에서는 같은 portable 검증을 다음처럼 실행할 수 있습니다.
+`-Native`와 `-Qt`는 해당 SDK와 native 라이브러리가 설치된 경우에만 추가합니다.
+
+```powershell
+.\scripts\verify.ps1
+.\scripts\verify.ps1 -Native -Qt
+```
+
+GitHub Actions는 Windows에서 PowerShell portable CLI 빌드와 portable Go 테스트·vet을 수행하고, Linux/macOS
+에서는 GDAL·PROJ·GEOS native 테스트와 native race 테스트를 추가로 수행합니다.
+Qt 데스크톱 패키징은 각 OS의 Qt 배포 방식 차이 때문에 CI native GIS job과
+분리하며, Qt가 설치된 개발 환경에서 `scripts/verify.sh`가 수행합니다.
 
 `desktop` 대상은 Qt 6의 C++17 요구사항을 위해 `CGO_CXXFLAGS`에
 `-std=c++17`을 자동으로 추가합니다. 호출자가 이미 `-std=c++17` 또는
@@ -91,6 +112,41 @@ C/C++ compiler are visible in the same shell.
 
 ```sh
 CGO_CXXFLAGS=-std=c++17 go run -tags qt ./cmd/gis-desktop
+```
+
+저장소 빌드 스크립트는 데모 UI와 native 데이터 UI를 구분합니다.
+
+```sh
+./scripts/build.sh desktop
+./scripts/build.sh desktop-native
+./build/gogis-desktop-native --input testdata/sample.geojson --layer sample \
+  --source-crs EPSG:4326 --target-crs EPSG:5179 \
+  --save build/sample-edited.gpkg
+```
+
+`desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
+실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면
+dataset의 모든 layer를 로드합니다. `--save`를 지정하면 편집 Commit 결과를
+새 GeoPackage/SHP로 저장하며, 다중 layer dataset에서는 현재 선택된 layer가
+저장됩니다.
+
+`--source-crs`는 입력 dataset의 CRS 메타데이터가 없거나 잘못 기록된 경우
+모든 입력 layer에 적용하는 명시적 override입니다. `--target-crs`는 표시용
+공통 CRS이며, 각 layer의 CRS가 다르면 PROJ로 변환합니다. CRS를 알 수 없는
+layer를 변환 대상에 포함할 때는 `--source-crs`를 지정해야 합니다.
+
+DXF exporter의 구조 검증은 GDAL DXF driver로도 수행할 수 있습니다. 예를
+들어 샘플 GeoJSON을 변환한 뒤 GDAL이 DXF를 다시 읽고 geometry 수와 extent를
+인식하는지 확인합니다. 이 검사는 ARES Commander의 실제 화면·한글 글꼴
+호환성을 대체하지 않으며, ARES 검증은 대상 앱에서 별도로 수행해야 합니다.
+
+```sh
+go run -tags native ./cmd/gis-cli convert \
+  --input testdata/sample.geojson \
+  --output /tmp/gogis-check.dxf \
+  --source-crs EPSG:4326 --target-crs EPSG:4326 \
+  --profile ares-utf8
+ogrinfo -ro -al -so /tmp/gogis-check.dxf
 ```
 
 The first prototype renders the desktop shell and keeps the map canvas as an
@@ -161,6 +217,21 @@ export GDAL_DATA=/usr/share/gdal
 ## Windows
 
 Windows는 Go, CGO 컴파일러, GIS 네이티브 라이브러리의 ABI가 모두 일치해야 합니다. macOS/Linux에서 만든 바이너리에 Windows DLL을 나중에 복사하는 방식은 지원하지 않습니다.
+
+PowerShell에서는 저장소의 Windows 전용 스크립트를 사용합니다. 산출물은
+`build\`에 생성됩니다.
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\build.ps1 cli
+.\scripts\build.ps1 native
+.\scripts\build.ps1 desktop
+.\scripts\build.ps1 all-native
+.\scripts\build.ps1 clean
+```
+
+`native`, `desktop-native`, `all-native`는 아래 native GIS/Qt 의존성과 CGO
+툴체인이 설치된 Windows 환경에서만 실행할 수 있습니다.
 
 ### 권장 개발 셸
 

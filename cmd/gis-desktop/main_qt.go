@@ -15,6 +15,7 @@ import (
 	"github.com/mappu/miqt/qt6/qml"
 	"gogis/internal/commands"
 	"gogis/internal/core"
+	"gogis/internal/presentation"
 	"gogis/internal/render"
 	"gogis/ui/qt/native"
 )
@@ -27,7 +28,7 @@ var mainQML []byte
 
 func main() {
 	qt.NewQApplication(os.Args)
-	runtime := loadDemoChunk()
+	runtime := loadRuntime(os.Args)
 	native.RegisterMapCanvas()
 	engine := qml.NewQQmlApplicationEngine()
 	engine.LoadData(mainQML)
@@ -44,7 +45,10 @@ type demoRuntime struct {
 	mu         sync.Mutex
 	cancel     context.CancelFunc
 	features   []render.HitFeature
+	hitIndex   render.HitIndex
 	service    *commands.ProjectService
+	dataMode   bool
+	persist    func(context.Context, string) error
 	selected   render.HitResult
 	hasSelect  bool
 }
@@ -59,13 +63,41 @@ func loadDemoChunk() *demoRuntime {
 	runtime.builder = demoChunkBuilder(runtime.planner.ChunkSize)
 	runtime.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1})
 	runtime.service = newDemoService(runtime.features)
+	runtime.publishLayerTree()
 	runtime.publishAttributes("roads")
 	return runtime
 }
 
-type attributeRow struct {
-	FeatureID uint64 `json:"featureId"`
-	Name      string `json:"name"`
+type attributePayload struct {
+	Columns []string              `json:"columns"`
+	Rows    []attributePayloadRow `json:"rows"`
+}
+
+type attributePayloadRow struct {
+	FeatureID uint64         `json:"featureId"`
+	Values    map[string]any `json:"values"`
+}
+
+type layerTreePayloadRow struct {
+	Name string `json:"name"`
+}
+
+func (r *demoRuntime) publishLayerTree() {
+	if r.service == nil {
+		native.SetLayerTreePayload("[]")
+		return
+	}
+	tree := presentation.LayerTree(r.service.Project())
+	rows := make([]layerTreePayloadRow, len(tree))
+	for index, item := range tree {
+		rows[index] = layerTreePayloadRow{Name: item.Name}
+	}
+	payload, err := json.Marshal(rows)
+	if err != nil {
+		native.SetLayerTreePayload("[]")
+		return
+	}
+	native.SetLayerTreePayload(string(payload))
 }
 
 func (r *demoRuntime) publishAttributes(layerName string) {
@@ -73,17 +105,23 @@ func (r *demoRuntime) publishAttributes(layerName string) {
 		native.SetAttributePayload("[]")
 		return
 	}
-	rows := []attributeRow{}
+	payloadModel := attributePayload{}
 	for _, layer := range r.service.Project().Layers {
 		if layer.Name != layerName {
 			continue
 		}
-		for _, feature := range layer.Features {
-			name, _ := feature.Properties["name"].(string)
-			rows = append(rows, attributeRow{FeatureID: feature.ID, Name: name})
+		table := presentation.AttributeTable(layer)
+		payloadModel.Columns = make([]string, len(table.Columns))
+		for i, column := range table.Columns {
+			payloadModel.Columns[i] = column.Name
 		}
+		payloadModel.Rows = make([]attributePayloadRow, len(table.Rows))
+		for i, row := range table.Rows {
+			payloadModel.Rows[i] = attributePayloadRow{FeatureID: row.FeatureID, Values: row.Values}
+		}
+		break
 	}
-	payload, err := json.Marshal(rows)
+	payload, err := json.Marshal(payloadModel)
 	if err != nil {
 		native.SetAttributePayload("[]")
 		return
@@ -116,21 +154,30 @@ func newDemoService(features []render.HitFeature) *commands.ProjectService {
 
 func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	var keys []render.ChunkKey
-	for _, layer := range r.visibility.VisibleLayers() {
-		keys = append(keys, r.planner.VisibleKeys(viewport, layer)...)
+	if r.dataMode {
+		for _, layer := range r.visibility.VisibleLayers() {
+			keys = append(keys, r.planner.VisibleKeys(viewport, layer)...)
+		}
+	} else {
+		for _, layer := range r.visibility.VisibleLayers() {
+			keys = append(keys, r.planner.VisibleKeys(viewport, layer)...)
+		}
 	}
 	keys = r.visibility.FilterChunkKeys(keys)
 	generation := r.scheduler.Generation()
 	r.batchStore.BeginGeneration(generation, keys...)
 	r.mu.Lock()
-	r.features = demoFeatures(keys, r.planner.ChunkSize)
+	if !r.dataMode {
+		r.features = demoFeatures(keys, r.planner.ChunkSize)
+		r.hitIndex = render.NewHitIndex(r.features, 0.01)
+	}
 	r.mu.Unlock()
 	if len(keys) == 0 {
 		native.SetRenderStatus("No visible layers")
 		r.batchStore.Clear()
 		native.SetVertices(nil)
 		native.RequestCanvasUpdate()
-		native.SetSelection("", "", "No feature selected")
+		native.SetSelection("", "", "", "No feature selected")
 		return
 	}
 
@@ -143,19 +190,19 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	if previousCancel != nil {
 		previousCancel()
 	}
-	setStatus := func(status string) {
+	setProgress := func(progress presentation.RenderProgress) {
 		if r.scheduler.Generation() == requestGeneration {
-			native.SetRenderStatus(status)
+			native.SetRenderStatus(progress.Message())
 		}
 	}
-	setStatus(fmt.Sprintf("Loading 0/%d chunks", len(keys)))
+	setProgress(presentation.RenderProgress{Phase: "Loading", Total: len(keys), Cancellable: true})
 
 	go func() {
 		results := r.scheduler.Request(requestContext, keys, r.builder)
 		completed := 0
 		for result := range results {
 			completed++
-			setStatus(fmt.Sprintf("Loading %d/%d chunks", completed, len(keys)))
+			setProgress(presentation.RenderProgress{Phase: "Loading", Completed: completed, Total: len(keys), Cancellable: true})
 			if !r.batchStore.Apply(result) {
 				continue
 			}
@@ -165,9 +212,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			}
 		}
 		if requestContext.Err() != nil {
-			setStatus("Render cancelled")
+			setProgress(presentation.RenderProgress{Phase: "Render cancelled"})
 		} else {
-			setStatus(fmt.Sprintf("Ready · %d chunks", completed))
+			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(keys)})
 		}
 	}()
 }
@@ -201,12 +248,19 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 	r.mu.Lock()
 	features := append([]render.HitFeature(nil), r.features...)
 	r.mu.Unlock()
-	result, ok := render.HitTestScreen(features, render.Point{X: click.X, Y: click.Y}, worldViewport, width, height, 8)
+	r.mu.Lock()
+	hitIndex := r.hitIndex
+	r.mu.Unlock()
+	visible := make(map[string]bool)
+	for _, layer := range r.visibility.VisibleLayers() {
+		visible[layer] = true
+	}
+	result, ok := hitIndex.HitTestScreenVisible(render.Point{X: click.X, Y: click.Y}, worldViewport, width, height, 8, visible)
 	if !ok {
 		r.mu.Lock()
 		r.hasSelect = false
 		r.mu.Unlock()
-		native.SetSelection("", "", "No feature selected")
+		native.SetSelection("", "", "", "No feature selected")
 		native.SetAttributePayload("[]")
 		return
 	}
@@ -216,7 +270,7 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 	r.hasSelect = true
 	r.mu.Unlock()
 	r.publishAttributes(result.Layer)
-	native.SetSelection(result.Layer, fmt.Sprintf("%s segment #%d", result.Layer, result.FeatureID), "Selected for inspection")
+	native.SetSelection(result.Layer, fmt.Sprintf("%s segment #%d", result.Layer, result.FeatureID), r.featureName(result.Layer, result.FeatureID), "Selected for inspection")
 }
 
 func (r *demoRuntime) ensureFeature(result render.HitResult, features []render.HitFeature) {
@@ -258,27 +312,53 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		return
 	}
 	if event.Action == "rollback" {
-		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), "Edit cancelled")
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit cancelled")
 		return
 	}
 	if event.Action != "commit" || r.service == nil {
 		return
 	}
 	if err := r.service.BeginEdit(); err != nil {
-		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), "Edit failed")
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit failed")
 		return
 	}
 	if err := r.service.SetFeatureProperty(selected.Layer, selected.FeatureID, "name", event.Value); err != nil {
 		_ = r.service.Rollback()
-		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), "Edit failed")
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit failed")
 		return
 	}
 	if err := r.service.Commit(); err != nil {
-		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), "Edit failed")
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit failed")
 		return
 	}
 	r.publishAttributes(selected.Layer)
-	native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), "Property saved")
+	if r.persist != nil {
+		if err := r.persist(context.Background(), selected.Layer); err != nil {
+			native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, fmt.Sprintf("Saved in memory; disk save failed: %v", err))
+			return
+		}
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, "Property saved to disk")
+		return
+	}
+	native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, "Property saved in memory")
+}
+
+func (r *demoRuntime) featureName(layerName string, featureID uint64) string {
+	if r.service != nil {
+		for _, layer := range r.service.Project().Layers {
+			if layer.Name != layerName {
+				continue
+			}
+			for _, feature := range layer.Features {
+				if feature.ID == featureID {
+					if name, ok := feature.Properties["name"].(string); ok {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (r *demoRuntime) cancelCurrentRender() {
@@ -309,8 +389,22 @@ func startViewportSync(runtime *demoRuntime) {
 	lastClickGeneration := native.ClickGeneration()
 	lastEditGeneration := native.EditGeneration()
 	lastCancelGeneration := native.CancelGeneration()
+	lastActiveLayerGeneration := native.ActiveLayerGeneration()
+	lastLoadGeneration := native.LoadGeneration()
 	go func() {
 		for range time.NewTicker(16 * time.Millisecond).C {
+			loadGeneration := native.LoadGeneration()
+			if loadGeneration != lastLoadGeneration {
+				lastLoadGeneration = loadGeneration
+				path := native.CurrentLoadPath()
+				if path == "" {
+					native.SetRenderStatus("Open cancelled")
+				} else if next, err := loadDataRuntime(path, "", "", "", ""); err != nil {
+					native.SetRenderStatus("Open failed: " + err.Error())
+				} else {
+					runtime.replaceWith(next)
+				}
+			}
 			qtGeneration := native.ViewportGeneration()
 			layerVisibilityGeneration := native.LayerVisibilityGeneration()
 			viewport := native.CurrentViewport()
@@ -354,6 +448,13 @@ func startViewportSync(runtime *demoRuntime) {
 			if cancelGeneration != lastCancelGeneration {
 				lastCancelGeneration = cancelGeneration
 				runtime.cancelCurrentRender()
+			}
+			activeLayerGeneration := native.ActiveLayerGeneration()
+			if activeLayerGeneration != lastActiveLayerGeneration {
+				lastActiveLayerGeneration = activeLayerGeneration
+				if layer := native.CurrentActiveLayer(); layer != "" {
+					runtime.publishAttributes(layer)
+				}
 			}
 		}
 	}()

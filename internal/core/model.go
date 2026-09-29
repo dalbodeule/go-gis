@@ -31,17 +31,33 @@ type Field struct {
 	Type FieldType
 }
 
+// Label describes a CAD-ready text annotation without coupling the core to a
+// particular export format.
+type Label struct {
+	Text     string
+	X        float64
+	Y        float64
+	Rotation float64
+	Height   float64
+	Style    string
+}
+
 // Feature is a vector feature with an application-level identifier.
 type Feature struct {
 	ID         uint64
 	Geometry   Geometry
 	Properties map[string]any
+	Label      *Label
 }
 
 // Clone returns a detached copy suitable for edit snapshots.
 func (f Feature) Clone() Feature {
 	clone := f
 	clone.Properties = maps.Clone(f.Properties)
+	if f.Label != nil {
+		label := *f.Label
+		clone.Label = &label
+	}
 	if f.Geometry != nil {
 		clone.Geometry = f.Geometry.Clone()
 	}

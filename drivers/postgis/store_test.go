@@ -43,6 +43,9 @@ func TestPostGISQueriesUseQuotedTableAndStableOrdering(t *testing.T) {
 	if got := readLayerQuery(`gis.roads`); got != `SELECT id, ST_AsText(geom), ST_SRID(geom), properties FROM "gis"."roads" ORDER BY id` {
 		t.Fatalf("read query = %s", got)
 	}
+	if got := clearLayerQuery(`gis.roads`); got != `DELETE FROM "gis"."roads"` {
+		t.Fatalf("clear query = %s", got)
+	}
 }
 
 func TestInferFieldsSortsNamesAndMapsJSONTypes(t *testing.T) {

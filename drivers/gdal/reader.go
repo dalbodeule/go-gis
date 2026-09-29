@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"gogis/drivers"
 	"gogis/internal/core"
 
 	"github.com/airbusgeo/godal"
@@ -16,6 +17,9 @@ import (
 // Reader opens vector layers through GDAL/OGR. It supports any installed GDAL
 // vector driver, including SHP and GeoPackage.
 type Reader struct{}
+
+var _ drivers.LayerReader = Reader{}
+var _ drivers.LayerCollectionReader = Reader{}
 
 // Open reads a layer into the core snapshot model. Feature IDs are assigned
 // in read order because the current core model intentionally does not expose
@@ -46,6 +50,38 @@ func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, e
 		layer = layers[0]
 	}
 
+	return readLayer(ctx, layer)
+}
+
+// OpenAll reads every vector layer in a dataset as detached core snapshots.
+// It is used by the desktop project loader so a multi-layer GeoPackage can be
+// displayed without reopening the dataset per layer.
+func (Reader) OpenAll(ctx context.Context, source string) ([]core.Layer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	godal.RegisterAll()
+	dataset, err := godal.Open(source)
+	if err != nil {
+		return nil, fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	layers := dataset.Layers()
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("dataset %q contains no vector layers", source)
+	}
+	result := make([]core.Layer, 0, len(layers))
+	for _, layer := range layers {
+		loaded, err := readLayer(ctx, layer)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, loaded)
+	}
+	return result, nil
+}
+
+func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
 	result := core.Layer{Name: layer.Name(), Editable: true}
 	if spatialRef := layer.SpatialRef(); spatialRef != nil {
 		defer spatialRef.Close()

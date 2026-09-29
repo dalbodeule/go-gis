@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -35,6 +36,8 @@ var ARESCP949 = Profile{ACADVersion: "AC1015", CodePage: "ANSI_949", TextHeight:
 type Exporter struct {
 	Profile Profile
 }
+
+var numberPattern = regexp.MustCompile(`[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?`)
 
 // Export writes Point, LineString, Polygon and a property-driven TEXT label.
 func (e Exporter) Export(ctx context.Context, destination string, layer core.Layer, profile string) error {
@@ -88,8 +91,16 @@ func (e Exporter) Export(ctx context.Context, destination string, layer core.Lay
 		if err := writeWKT(write, geometry.WKT, layer.Name); err != nil {
 			return fmt.Errorf("feature %d: %w", feature.ID, err)
 		}
-		if label, ok := feature.Properties["label"].(string); ok && label != "" {
-			if err := writeText(write, label, configuration.TextHeight); err != nil {
+		if feature.Label != nil && feature.Label.Text != "" {
+			label := *feature.Label
+			if label.Height <= 0 {
+				label.Height = configuration.TextHeight
+			}
+			if err := writeText(write, label); err != nil {
+				return err
+			}
+		} else if label, ok := feature.Properties["label"].(string); ok && label != "" {
+			if err := writeText(write, core.Label{Text: label, Height: configuration.TextHeight}); err != nil {
 				return err
 			}
 		}
@@ -144,6 +155,9 @@ func writeHeader(write func(int, string) error, profile Profile) error {
 
 func writeWKT(write func(int, string) error, wkt, layer string) error {
 	upper := strings.ToUpper(strings.TrimSpace(wkt))
+	if strings.HasSuffix(upper, " EMPTY") || upper == "EMPTY" {
+		return nil
+	}
 	if strings.HasPrefix(upper, "POINT") {
 		values, err := numbers(wkt)
 		if err != nil || len(values) < 2 {
@@ -151,52 +165,93 @@ func writeWKT(write func(int, string) error, wkt, layer string) error {
 		}
 		return entity(write, "POINT", layer, values[0], values[1], 0, 0)
 	}
+	if strings.HasPrefix(upper, "MULTIPOINT") {
+		groups, err := geometryGroups(wkt)
+		if err != nil {
+			return fmt.Errorf("invalid MULTIPOINT WKT")
+		}
+		if len(groups) == 0 {
+			values, numberErr := numbers(wkt)
+			if numberErr != nil || len(values) == 0 || len(values)%2 != 0 {
+				return fmt.Errorf("invalid MULTIPOINT WKT")
+			}
+			for index := 0; index < len(values); index += 2 {
+				if err := entity(write, "POINT", layer, values[index], values[index+1], 0, 0); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, group := range groups {
+			values, err := numbers(group)
+			if err != nil || len(values) < 2 {
+				return fmt.Errorf("invalid MULTIPOINT component")
+			}
+			if err := entity(write, "POINT", layer, values[0], values[1], 0, 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if strings.HasPrefix(upper, "LINESTRING") {
 		values, err := numbers(wkt)
 		if err != nil || len(values) < 4 || len(values)%2 != 0 {
 			return fmt.Errorf("invalid LINESTRING WKT")
 		}
-		if err := write(0, "LWPOLYLINE"); err != nil {
-			return err
-		}
-		if err := write(8, layer); err != nil {
-			return err
-		}
-		if err := write(90, strconv.Itoa(len(values)/2)); err != nil {
-			return err
-		}
-		for i := 0; i < len(values); i += 2 {
-			if err := write(10, format(values[i])); err != nil {
-				return err
-			}
-			if err := write(20, format(values[i+1])); err != nil {
-				return err
-			}
-		}
-		return nil
+		return writePolyline(write, layer, values, false)
 	}
 	if strings.HasPrefix(upper, "POLYGON") {
 		values, err := numbers(wkt)
 		if err != nil || len(values) < 6 || len(values)%2 != 0 {
 			return fmt.Errorf("invalid POLYGON WKT")
 		}
-		if err := write(0, "LWPOLYLINE"); err != nil {
-			return err
+		return writePolyline(write, layer, values, true)
+	}
+	if strings.HasPrefix(upper, "MULTILINESTRING") {
+		groups, err := geometryGroups(wkt)
+		if err != nil || len(groups) == 0 {
+			return fmt.Errorf("invalid MULTILINESTRING WKT")
 		}
-		if err := write(8, layer); err != nil {
-			return err
-		}
-		if err := write(90, strconv.Itoa(len(values)/2)); err != nil {
-			return err
-		}
-		if err := write(70, "1"); err != nil {
-			return err
-		}
-		for i := 0; i < len(values); i += 2 {
-			if err := write(10, format(values[i])); err != nil {
+		for _, group := range groups {
+			values, err := numbers(group)
+			if err != nil || len(values) < 4 || len(values)%2 != 0 {
+				return fmt.Errorf("invalid MULTILINESTRING component")
+			}
+			if err := writePolyline(write, layer, values, false); err != nil {
 				return err
 			}
-			if err := write(20, format(values[i+1])); err != nil {
+		}
+		return nil
+	}
+	if strings.HasPrefix(upper, "MULTIPOLYGON") {
+		polygons, err := geometryGroups(wkt)
+		if err != nil || len(polygons) == 0 {
+			return fmt.Errorf("invalid MULTIPOLYGON WKT")
+		}
+		for _, polygon := range polygons {
+			rings, err := geometryGroups(polygon)
+			if err != nil || len(rings) == 0 {
+				return fmt.Errorf("invalid MULTIPOLYGON component")
+			}
+			for _, ring := range rings {
+				values, err := numbers(ring)
+				if err != nil || len(values) < 6 || len(values)%2 != 0 {
+					return fmt.Errorf("invalid MULTIPOLYGON ring")
+				}
+				if err := writePolyline(write, layer, values, true); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if strings.HasPrefix(upper, "GEOMETRYCOLLECTION") {
+		components, err := geometryComponents(wkt)
+		if err != nil || len(components) == 0 {
+			return fmt.Errorf("invalid GEOMETRYCOLLECTION WKT")
+		}
+		for _, component := range components {
+			if err := writeWKT(write, component, layer); err != nil {
 				return err
 			}
 		}
@@ -205,23 +260,138 @@ func writeWKT(write func(int, string) error, wkt, layer string) error {
 	return fmt.Errorf("unsupported geometry type")
 }
 
-func writeText(write func(int, string) error, label string, height float64) error {
+func writePolyline(write func(int, string) error, layer string, values []float64, closed bool) error {
+	if err := write(0, "LWPOLYLINE"); err != nil {
+		return err
+	}
+	if err := write(8, layer); err != nil {
+		return err
+	}
+	if err := write(90, strconv.Itoa(len(values)/2)); err != nil {
+		return err
+	}
+	if closed {
+		if err := write(70, "1"); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < len(values); i += 2 {
+		if err := write(10, format(values[i])); err != nil {
+			return err
+		}
+		if err := write(20, format(values[i+1])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// geometryGroups returns the immediate parenthesized components inside a
+// WKT geometry's outer group. It preserves nesting so MULTIPOLYGON rings can
+// be handled without turning separate parts into one connected line.
+func geometryGroups(wkt string) ([]string, error) {
+	start := strings.IndexByte(wkt, '(')
+	if start < 0 {
+		return nil, fmt.Errorf("geometry has no coordinate group")
+	}
+	content := wkt[start:]
+	if len(content) < 2 || content[0] != '(' || content[len(content)-1] != ')' {
+		return nil, fmt.Errorf("geometry has unbalanced parentheses")
+	}
+	content = content[1 : len(content)-1]
+	groups := make([]string, 0)
+	depth, groupStart := 0, -1
+	for index, character := range content {
+		switch character {
+		case '(':
+			if depth == 0 {
+				groupStart = index
+			}
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return nil, fmt.Errorf("geometry has unbalanced parentheses")
+			}
+			if depth == 0 && groupStart >= 0 {
+				groups = append(groups, content[groupStart:index+1])
+				groupStart = -1
+			}
+		}
+	}
+	if depth != 0 {
+		return nil, fmt.Errorf("geometry has unbalanced parentheses")
+	}
+	return groups, nil
+}
+
+func geometryComponents(wkt string) ([]string, error) {
+	start := strings.IndexByte(wkt, '(')
+	if start < 0 {
+		return nil, fmt.Errorf("geometry has no component group")
+	}
+	content := wkt[start:]
+	if len(content) < 2 || content[0] != '(' || content[len(content)-1] != ')' {
+		return nil, fmt.Errorf("geometry has unbalanced parentheses")
+	}
+	content = content[1 : len(content)-1]
+	components := make([]string, 0)
+	depth, componentStart := 0, 0
+	for index, character := range content {
+		switch character {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return nil, fmt.Errorf("geometry has unbalanced parentheses")
+			}
+		case ',':
+			if depth == 0 {
+				component := strings.TrimSpace(content[componentStart:index])
+				if component != "" {
+					components = append(components, component)
+				}
+				componentStart = index + 1
+			}
+		}
+	}
+	if depth != 0 {
+		return nil, fmt.Errorf("geometry has unbalanced parentheses")
+	}
+	if component := strings.TrimSpace(content[componentStart:]); component != "" {
+		components = append(components, component)
+	}
+	return components, nil
+}
+
+func writeText(write func(int, string) error, label core.Label) error {
 	if err := write(0, "TEXT"); err != nil {
 		return err
 	}
 	if err := write(8, "LABEL"); err != nil {
 		return err
 	}
-	if err := write(10, "0"); err != nil {
+	if err := write(10, format(label.X)); err != nil {
 		return err
 	}
-	if err := write(20, "0"); err != nil {
+	if err := write(20, format(label.Y)); err != nil {
 		return err
 	}
-	if err := write(40, format(height)); err != nil {
+	if err := write(40, format(label.Height)); err != nil {
 		return err
 	}
-	return write(1, label)
+	if label.Rotation != 0 {
+		if err := write(50, format(label.Rotation)); err != nil {
+			return err
+		}
+	}
+	if label.Style != "" {
+		if err := write(7, label.Style); err != nil {
+			return err
+		}
+	}
+	return write(1, label.Text)
 }
 
 func entity(write func(int, string) error, kind, layer string, x, y, x2, y2 float64) error {
@@ -248,9 +418,7 @@ func entity(write func(int, string) error, kind, layer string, x, y, x2, y2 floa
 
 func numbers(wkt string) ([]float64, error) {
 	var result []float64
-	for _, token := range strings.FieldsFunc(wkt, func(r rune) bool {
-		return !(r == '-' || r == '+' || r == '.' || r >= '0' && r <= '9' || r == 'e' || r == 'E')
-	}) {
+	for _, token := range numberPattern.FindAllString(wkt, -1) {
 		value, err := strconv.ParseFloat(token, 64)
 		if err != nil {
 			return nil, err

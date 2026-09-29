@@ -23,11 +23,14 @@ type Runtime struct {
 	state    *lua.LState
 	service  *commands.ProjectService
 	exporter Exporter
+	spatial  commands.SpatialOperator
 	mu       sync.Mutex
+	runCtx   context.Context
 }
 
-// NewRuntime creates a runtime with the minimum public API.
-func NewRuntime(service *commands.ProjectService, exporter Exporter) *Runtime {
+// NewRuntime creates a runtime with the minimum public API. An optional
+// spatial operator enables the shared GEOS-backed spatial command in Lua.
+func NewRuntime(service *commands.ProjectService, exporter Exporter, spatial ...commands.SpatialOperator) *Runtime {
 	state := lua.NewState(lua.Options{SkipOpenLibs: true})
 	// Explicit allow-list: scripts get language helpers and deterministic
 	// string/math/table operations, but no filesystem, process, module, debug,
@@ -43,13 +46,71 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter) *Runtime {
 	} {
 		state.SetGlobal(name, lua.LNil)
 	}
-	runtime := &Runtime{state: state, service: service, exporter: exporter}
+	var spatialOperator commands.SpatialOperator
+	if len(spatial) > 0 {
+		spatialOperator = spatial[0]
+	}
+	runtime := &Runtime{state: state, service: service, exporter: exporter, spatial: spatialOperator}
 	runtime.state.SetGlobal("gogis", runtime.state.SetFuncs(runtime.state.NewTable(), map[string]lua.LGFunction{
 		"layers":       runtime.layers,
 		"set_property": runtime.setProperty,
 		"export_dxf":   runtime.exportDXF,
+		"spatial":      runtime.spatialOperation,
+		"filter":       runtime.filter,
+		"label":        runtime.label,
 	}))
 	return runtime
+}
+
+func (r *Runtime) filter(state *lua.LState) int {
+	source := state.CheckString(1)
+	field := state.CheckString(2)
+	expected := state.CheckString(3)
+	result := state.CheckString(4)
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := r.service.FilterProjectLayer(ctx, source, field, expected, result); err != nil {
+		state.RaiseError("filter: %v", err)
+	}
+	return 0
+}
+
+func (r *Runtime) label(state *lua.LState) int {
+	source := state.CheckString(1)
+	field := state.CheckString(2)
+	result := state.CheckString(3)
+	height := float64(state.OptNumber(4, 1))
+	style := state.OptString(5, "")
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := r.service.LabelProjectLayer(ctx, source, field, result, height, style); err != nil {
+		state.RaiseError("label: %v", err)
+	}
+	return 0
+}
+
+func (r *Runtime) spatialOperation(state *lua.LState) int {
+	if r.spatial == nil {
+		state.RaiseError("spatial operator is not configured")
+		return 0
+	}
+	operation := state.CheckString(1)
+	left := state.CheckString(2)
+	right := state.OptString(3, "")
+	result := state.CheckString(4)
+	distance := state.OptNumber(5, 0)
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := r.service.ApplySpatialOperation(ctx, r.spatial, operation, left, right, result, float64(distance)); err != nil {
+		state.RaiseError("spatial operation: %v", err)
+	}
+	return 0
 }
 
 // Close releases the Lua state.
@@ -66,6 +127,8 @@ func (r *Runtime) Run(ctx context.Context, script string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.runCtx = ctx
+	defer func() { r.runCtx = nil }()
 	r.state.SetContext(ctx)
 	defer r.state.RemoveContext()
 	return r.state.DoString(script)
@@ -108,9 +171,14 @@ func (r *Runtime) exportDXF(state *lua.LState) int {
 	}
 	destination := state.CheckString(1)
 	layerName := state.CheckString(2)
+	profile := state.OptString(3, "ares-utf8")
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, layer := range r.service.Project().Layers {
 		if layer.Name == layerName {
-			if err := r.exporter.Export(context.Background(), destination, layer, "ares-utf8"); err != nil {
+			if err := r.exporter.Export(ctx, destination, layer, profile); err != nil {
 				state.RaiseError("export DXF: %v", err)
 			}
 			return 0

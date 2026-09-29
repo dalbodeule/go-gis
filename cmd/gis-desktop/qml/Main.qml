@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Qt.labs.platform as Platform
 import GoGIS 1.0
 
 ApplicationWindow {
@@ -20,6 +21,10 @@ ApplicationWindow {
             Label { text: "GoGIS"; font.bold: true; font.pixelSize: 18 }
             Label { text: "Milestone B / Qt Quick"; color: "#65717d" }
             Item { Layout.fillWidth: true }
+            Button {
+                text: "Open file"
+                onClicked: fileDialog.open()
+            }
             Label { text: "QSGGeometryNode: active demo batch"; color: "#65717d" }
         }
     }
@@ -52,6 +57,7 @@ ApplicationWindow {
                             layerModel.setProperty(index, "layerVisible", checked)
                             mapViewport.syncLayerVisibility()
                         }
+                        onClicked: mapViewport.selectLayer(name)
                     }
                 }
             }
@@ -60,7 +66,13 @@ ApplicationWindow {
         Frame {
             SplitView.fillWidth: true
             SplitView.fillHeight: true
-            background: Rectangle { color: "#dfe5ea"; radius: 4 }
+            background: null
+            Rectangle {
+                anchors.fill: parent
+                z: -1
+                color: "#dfe5ea"
+                radius: 4
+            }
             Item {
                 id: mapViewport
                 anchors.fill: parent
@@ -73,9 +85,35 @@ ApplicationWindow {
                 property string selectedStatus: "No feature selected"
                 property string editorValue: ""
                 property string attributePayloadSeen: ""
+                property string layerTreePayloadSeen: ""
+                property string activeLayer: ""
+                property var attributeColumns: []
                 property string renderStatus: "Ready"
 
                 ListModel { id: attributeModel }
+
+                function formatAttributeValues(values) {
+                    var parts = []
+                    for (var i = 0; i < attributeColumns.length; ++i) {
+                        var key = attributeColumns[i]
+                        var value = values[key]
+                        parts.push(key + "=" + (value === undefined || value === null ? "" : String(value)))
+                    }
+                    return parts.join(" · ")
+                }
+
+                function anyLayerVisible() {
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        if (layerModel.get(i).layerVisible) return true
+                    }
+                    return false
+                }
+
+                function selectLayer(name) {
+                    activeLayer = name
+                    mapCanvas.activeLayer = name
+                    mapCanvas.activeLayerGeneration += 1
+                }
 
                 function syncLayerVisibility() {
                     var visibility = {}
@@ -93,27 +131,66 @@ ApplicationWindow {
                     property real clickX: 0
                     property real clickY: 0
                     property int clickGeneration: 0
-                    property string selectionLayer: ""
-                    property string selectionFeature: ""
-                    property string selectionStatus: "No feature selected"
+                property string selectionLayer: ""
+                property string selectionFeature: ""
+                property string selectionValue: ""
+                property string selectionStatus: "No feature selected"
                     property string layerVisibilityPayload: "{}"
                     property int layerVisibilityGeneration: 0
                     property string editAction: ""
                     property string editValue: ""
                     property int editGeneration: 0
                     property string attributePayload: "[]"
+                    property string layerTreePayload: "[]"
+                    property string activeLayer: ""
+                    property int activeLayerGeneration: 0
                     property string renderStatus: "Ready"
                     property int cancelGeneration: 0
+                    property string loadPath: ""
+                    property int loadGeneration: 0
                     x: mapViewport.panX
                     y: mapViewport.panY
                     scale: mapViewport.mapZoom
                     transformOrigin: Item.Center
-                    visible: layerModel.get(0).layerVisible ||
-                             layerModel.get(1).layerVisible ||
-                             layerModel.get(2).layerVisible
+                    visible: mapViewport.anyLayerVisible()
                 }
 
                 Component.onCompleted: mapViewport.syncLayerVisibility()
+
+                DropArea {
+                    anchors.fill: parent
+                    z: 10
+                    keys: ["text/uri-list"]
+                    Rectangle {
+                        anchors.fill: parent
+                        visible: parent.containsDrag
+                        color: "#337ab7"
+                        opacity: 0.16
+                        border.color: "#2b6cb0"
+                        border.width: 2
+                        radius: 4
+                    }
+                    Label {
+                        anchors.centerIn: parent
+                        visible: parent.containsDrag
+                        text: "Drop SHP, GeoPackage, or GeoJSON"
+                        color: "#1f4e79"
+                        font.bold: true
+                    }
+                    onDropped: function(drop) {
+                        if (drop.urls.length > 0) {
+                            mapViewport.requestLoad(drop.urls[0].toString())
+                            drop.acceptProposedAction()
+                        }
+                    }
+                }
+
+                function requestLoad(url) {
+                    var path = (url && url.toLocalFile) ? url.toLocalFile() : String(url)
+                    if (path.indexOf("file://") === 0) path = decodeURIComponent(path.substring(7))
+                    mapCanvas.loadPath = path
+                    mapCanvas.loadGeneration += 1
+                }
 
                 MouseArea {
                     id: mapMouseArea
@@ -153,15 +230,27 @@ ApplicationWindow {
                     running: true
                     onTriggered: {
                         if (mapViewport.selectedFeature !== mapCanvas.selectionFeature) {
-                            mapViewport.editorValue = mapCanvas.selectionFeature
+                            mapViewport.editorValue = mapCanvas.selectionValue
                         }
                         if (mapCanvas.attributePayload !== mapViewport.attributePayloadSeen) {
                             mapViewport.attributePayloadSeen = mapCanvas.attributePayload
                             attributeModel.clear()
-                            var rows = JSON.parse(mapCanvas.attributePayload)
+                            var table = JSON.parse(mapCanvas.attributePayload)
+                            mapViewport.attributeColumns = table.columns || []
+                            var rows = table.rows || []
                             for (var i = 0; i < rows.length; ++i) {
                                 attributeModel.append(rows[i])
                             }
+                        }
+                        if (mapCanvas.layerTreePayload !== mapViewport.layerTreePayloadSeen) {
+                            mapViewport.layerTreePayloadSeen = mapCanvas.layerTreePayload
+                            var layers = JSON.parse(mapCanvas.layerTreePayload)
+                            layerModel.clear()
+                            for (var layerIndex = 0; layerIndex < layers.length; ++layerIndex) {
+                                layerModel.append({name: layers[layerIndex].name, layerVisible: true})
+                            }
+                            if (layers.length > 0) mapViewport.selectLayer(layers[0].name)
+                            mapViewport.syncLayerVisibility()
                         }
                         mapViewport.renderStatus = mapCanvas.renderStatus
                         mapViewport.selectedLayer = mapCanvas.selectionLayer
@@ -215,7 +304,7 @@ ApplicationWindow {
                             mapCanvas.editAction = "rollback"
                             mapCanvas.editValue = ""
                             mapCanvas.editGeneration += 1
-                            mapViewport.editorValue = mapCanvas.selectionFeature
+                            mapViewport.editorValue = mapCanvas.selectionValue
                         }
                     }
                 }
@@ -244,7 +333,11 @@ ApplicationWindow {
                         width: ListView.view.width
                         spacing: 6
                         Label { text: String(featureId); Layout.preferredWidth: 92; elide: Text.ElideRight }
-                        Label { text: name; Layout.fillWidth: true; elide: Text.ElideRight }
+                        Label {
+                            text: mapViewport.formatAttributeValues(values)
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                        }
                     }
                 }
                 Item { Layout.fillHeight: true }
@@ -265,12 +358,20 @@ ApplicationWindow {
             }
             Item { Layout.fillWidth: true }
             Label {
-                text: "Roads visible: " + layerModel.get(0).layerVisible +
+                text: "Layers: " + layerModel.count +
                       " / generation " +
                       (mapViewport ? mapViewport.viewportGeneration : 0) +
                       " / zoom " + (mapViewport ? mapViewport.mapZoom.toFixed(2) : "1.00")
                 color: "#65717d"
             }
         }
+    }
+
+    Platform.FileDialog {
+        id: fileDialog
+        title: "Open vector layer"
+        fileMode: Platform.FileDialog.OpenFile
+        nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json)", "All files (*)"]
+        onAccepted: mapViewport.requestLoad(file)
     }
 }

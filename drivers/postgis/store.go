@@ -103,7 +103,8 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 	return layer, nil
 }
 
-// SaveLayer creates the minimal table schema and writes a layer atomically.
+// SaveLayer creates the minimal table schema and atomically replaces the
+// configured table snapshot with the supplied layer.
 func (s *Store) SaveLayer(ctx context.Context, layer core.Layer) error {
 	tx, err := s.begin(ctx)
 	if err != nil {
@@ -111,6 +112,9 @@ func (s *Store) SaveLayer(ctx context.Context, layer core.Layer) error {
 	}
 	defer tx.Rollback(ctx)
 	if err := tx.EnsureSchema(ctx); err != nil {
+		return err
+	}
+	if err := tx.ClearLayer(ctx); err != nil {
 		return err
 	}
 	if err := tx.WriteLayer(ctx, layer); err != nil {
@@ -130,6 +134,16 @@ type Transaction struct {
 func (t *Transaction) EnsureSchema(ctx context.Context) error {
 	if _, err := t.tx.ExecContext(ctx, schemaQuery(t.table)); err != nil {
 		return fmt.Errorf("create PostGIS schema for %s: %w", t.table, err)
+	}
+	return nil
+}
+
+// ClearLayer removes the previous snapshot inside the active transaction.
+// SaveLayer therefore behaves as an atomic replacement rather than appending
+// rows to an existing table.
+func (t *Transaction) ClearLayer(ctx context.Context) error {
+	if _, err := t.tx.ExecContext(ctx, clearLayerQuery(t.table)); err != nil {
+		return fmt.Errorf("clear PostGIS layer %s: %w", t.table, err)
 	}
 	return nil
 }
@@ -197,6 +211,10 @@ func schemaQuery(table string) string {
 
 func readLayerQuery(table string) string {
 	return fmt.Sprintf("SELECT id, ST_AsText(geom), ST_SRID(geom), properties FROM %s ORDER BY id", quoteIdentifier(table))
+}
+
+func clearLayerQuery(table string) string {
+	return fmt.Sprintf("DELETE FROM %s", quoteIdentifier(table))
 }
 
 func tableName(table string) string {

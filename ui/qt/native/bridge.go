@@ -92,15 +92,17 @@ func CurrentClick() CanvasClick {
 	return CanvasClick{X: float64(x), Y: float64(y)}
 }
 
-// SetSelection publishes the latest Go-side selection to QML properties.
-func SetSelection(layer, feature, status string) {
+// SetSelection publishes selection identity, editable value, and status to QML.
+func SetSelection(layer, feature, value, status string) {
 	cLayer := C.CString(layer)
 	cFeature := C.CString(feature)
+	cValue := C.CString(value)
 	cStatus := C.CString(status)
 	defer C.free(unsafe.Pointer(cLayer))
 	defer C.free(unsafe.Pointer(cFeature))
+	defer C.free(unsafe.Pointer(cValue))
 	defer C.free(unsafe.Pointer(cStatus))
-	C.gogis_set_selection(cLayer, cFeature, cStatus)
+	C.gogis_set_selection(cLayer, cFeature, cValue, cStatus)
 }
 
 // LayerVisibilityGeneration returns the latest QML layer-state generation.
@@ -147,6 +149,25 @@ func SetAttributePayload(payload string) {
 	C.gogis_set_attribute_payload(cPayload)
 }
 
+// SetLayerTreePayload publishes the current Go-side layer tree to QML.
+func SetLayerTreePayload(payload string) {
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_layer_tree_payload(cPayload)
+}
+
+// ActiveLayerGeneration returns the latest QML layer selection generation.
+func ActiveLayerGeneration() uint64 {
+	return uint64(C.gogis_active_layer_generation())
+}
+
+// CurrentActiveLayer returns the latest selected layer name.
+func CurrentActiveLayer() string {
+	buffer := make([]C.char, 4096)
+	C.gogis_active_layer((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}
+
 // SetRenderStatus publishes a short render progress message to QML.
 func SetRenderStatus(status string) {
 	cStatus := C.CString(status)
@@ -157,4 +178,16 @@ func SetRenderStatus(status string) {
 // CancelGeneration returns the latest user cancellation request.
 func CancelGeneration() uint64 {
 	return uint64(C.gogis_cancel_generation())
+}
+
+// LoadGeneration returns the latest QML file-open request generation.
+func LoadGeneration() uint64 {
+	return uint64(C.gogis_load_generation())
+}
+
+// CurrentLoadPath returns the latest file path requested by QML.
+func CurrentLoadPath() string {
+	buffer := make([]C.char, 16384)
+	C.gogis_load_path((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }

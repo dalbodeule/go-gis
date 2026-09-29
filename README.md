@@ -24,6 +24,45 @@
 
 네이티브 의존성은 Go 코어에 직접 섞지 않고 `drivers/` 경계에 둡니다. 바인딩 모듈은 `go.mod`에 등록되어 있지만 실제 CGO import 경계는 `native` build tag 아래에 있으므로, 기본 CLI 빌드는 네이티브 GIS 설치 없이도 가능합니다. 운영체제별 설치와 네이티브 빌드는 [빌드 가이드](docs/build.md)를 따릅니다.
 
+레이블은 `internal/core.Label`로 위치(X/Y), 회전, 높이, 문자 스타일을 표현하며 DXF TEXT로 내보냅니다. 포맷별 문자 인코딩과 ARES Commander 호환성은 별도 샘플 검증이 필요합니다.
+
+공간 연산은 `internal/commands.ApplySpatialOperation`을 통해 `intersect`,
+`union`, `difference`, `buffer`를 공통 dispatch하며, `ProjectService`에 결과
+레이어를 원자적으로 추가할 수 있습니다. 실제 GEOS 구현은 `native` 빌드에서
+`drivers/geos`를 주입합니다. 이 공용 경계에서 binary operation의 CRS 일치도
+검사하므로 CLI·GUI·Lua가 서로 다른 CRS를 조용히 연산하지 않습니다.
+
+Lua에서는 `gogis.spatial("buffer", "roads", "", "roads_buffer", 10)`처럼
+동일한 공간 연산 명령을 호출할 수 있습니다.
+
+속성 필터는 CLI에서 다음과 같이 실행합니다. 값 비교는 문자열·불리언·숫자
+필드를 지원하며, 일치하는 feature만 결과 레이어로 복사합니다.
+
+```sh
+./build/gis-cli filter \
+  --input data/roads.gpkg \
+  --layer roads \
+  --field kind \
+  --value road \
+  --output build/roads-only.gpkg
+```
+
+속성값을 geometry 대표 위치의 DXF TEXT 레이블로 생성할 수도 있습니다.
+
+```sh
+./build/gis-cli label \
+  --input data/roads.gpkg \
+  --layer roads \
+  --field name \
+  --height 2.5 \
+  --style Korean \
+  --output build/roads-labeled.dxf
+```
+
+동일 스키마 레이어 병합은 `commands.MergeLayers`를 사용합니다. CRS·필드
+스키마가 다르거나 feature ID가 중복되면 명확한 오류를 반환하며, 프로젝트에
+결과를 추가할 때는 편집 트랜잭션으로 원자적으로 커밋됩니다.
+
 ## 시작하기
 
 ```sh
@@ -41,6 +80,8 @@ go test ./...
 
 ```sh
 ./scripts/build.sh native
+# native CLI + native Qt desktop를 함께 빌드하려면
+./scripts/build.sh all-native
 ```
 
 `convert`는 SHP 또는 GeoPackage 벡터 레이어를 읽어 DXF로 내보냅니다. 필요하면 입력 CRS를 덮어쓰고 출력 CRS로 좌표를 변환할 수 있습니다.
@@ -55,8 +96,41 @@ go test ./...
   --profile ares-utf8
 ```
 
-DXF 프로파일은 `ares-utf8`과 `ares-cp949`를 지원합니다. 실제 ARES Commander 호환성은 별도 외부 검증이 필요합니다.
+DXF 프로파일은 `ares-utf8`과 `ares-cp949`를 지원합니다. 자동 사전 검증과
+ARES Commander 수동 검증 절차는 [ARES 검증 문서](docs/verification/ares-commander.md)에
+정리되어 있으며, 실제 앱 검증 전에는 두 프로파일 모두 실험적으로 취급합니다.
+MVP 요구사항별 자동·수동 검증 범위는 [MVP 체크리스트](docs/verification/mvp-checklist.md)에
+정리되어 있습니다.
+
+공간 연산은 native CLI에서 다음과 같이 실행합니다. `buffer`는 `--distance`를
+사용하고, 이외의 연산은 `--right-input`을 추가로 지정합니다. 출력 확장자는
+`.dxf`, `.gpkg`, `.shp` 중 하나여야 합니다. GEOS 결과가
+`MULTILINESTRING` 또는 `MULTIPOLYGON`이어도 DXF exporter가 각 component를
+별도 polyline entity로 기록하며, `MULTIPOINT`와 `GEOMETRYCOLLECTION`의
+지원 geometry도 개별 entity로 분해해 기록합니다.
+
+```sh
+./build/gis-cli spatial \
+  --operation buffer \
+  --input data/points.gpkg \
+  --layer points \
+  --output build/points-buffer.dxf \
+  --distance 10
+```
+
+여러 입력을 병합하려면 `--input`을 반복하고, 레이어 이름을 지정할 때는
+입력 순서와 같은 순서로 `--layer`를 반복합니다. 병합 CLI는 데이터셋별로
+읽기 순서로 부여된 ID를 전체 결과에서 유일하도록 재부여합니다.
+
+```sh
+./build/gis-cli merge \
+  --input data/roads-a.gpkg --layer roads \
+  --input data/roads-b.gpkg --layer roads \
+  --output build/roads-merged.gpkg
+```
 
 ## 작업 규칙
 
 기본 규칙은 [agents.md](agents.md)를 따릅니다. 특히 Codex나 자동화 도구는 커밋을 만들지 않으며, 모든 커밋은 사용자가 직접 주도해야 합니다. 커밋이 필요할 때는 사용자의 로컬 Git에 설정된 기본 GPG 키로 서명해야 합니다.
+
+현재 변경 묶음의 검토·검증·사용자 커밋 절차는 [커밋 준비 기록](docs/commit-prep.md)에 정리되어 있습니다.

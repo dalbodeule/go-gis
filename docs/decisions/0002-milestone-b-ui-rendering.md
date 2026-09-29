@@ -97,10 +97,36 @@ Wails는 빠른 화면 구성과 Go↔웹 기술 결합에는 매력적이다. �
 - `Scheduler.Stats()`로 요청 수, 실제 생성 수, cache hit, stale 폐기,
   취소 요청을 수집해 성능 기준을 정량화한다. planner/cache benchmark는
   `go test -bench ./internal/render`로 실행한다.
+- `internal/presentation.AttributeTableModel`이 레이어 필드와 feature 값을
+  UI 중립 read model로 고정한다. Qt adapter는 특정 `name` 필드에 의존하지
+  않고 모든 명시·추론 컬럼을 표시하며, `RenderProgress`가 로딩/완료/취소
+  상태 문자열을 동일한 형식으로 제공한다.
+- QML layer delegate의 선택과 가시성은 별도 상태로 전달된다. 선택된 layer는
+  native bridge를 통해 Go attribute read model을 갱신하고, 체크 상태는
+  render visibility만 변경한다.
+- `internal/render.LayerSource`는 normalized geometry를 0.25 world-unit
+  grid cell에 분배한다. native data mode는 `ChunkPlanner`의 visible keys만
+  요청하므로 전체 layer batch를 매 viewport 변경마다 복제하지 않는다.
+- MultiLineString·MultiPolygon·GeometryCollection의 disjoint part는
+  `HitFeature.Parts`로 보존해 render chunk와 hit-test가 서로 다른 component를
+  가상의 선으로 연결하지 않는다.
+- 선택 경로는 `internal/render.HitIndex`의 immutable uniform grid를 사용한다.
+  native normalized data에서는 0.01 world-unit 셀을 사용해 클릭 tolerance 주변
+  후보만 검사하며, geometry가 바뀌면 새 index를 만들어 교체한다. UI thread에서
+  원본 feature 전체를 선형 순회하지 않으며, 숨긴 레이어는 후보 단계에서
+  제외한다.
 
-다음 구현 단계는 실제 데이터셋의 attribute table과 진행률·취소 읽기 모델을
-현재 데모 편집 흐름에 연결하고, ARES Commander를 포함한 외부 포맷 호환성을
-실제 샘플로 검증하는 것이다.
+- `scripts/build.sh desktop-native`로 만든 바이너리에 `--input ...`을
+  전달하면 GDAL layer를 `internal/render.LayerSource`로 정규화하고, 실제
+  layer 이름·속성 table·선택 feature를 동적 QML layer tree에 전달한다.
+  여러 layer는 첫 번째 유효 CRS를 표시 CRS로 삼고 PROJ로 변환한 다음,
+  dataset 전체의 공통 extent를 기준으로 정규화하여 서로 다른 원본 좌표
+  범위가 화면에서 잘못 겹치지 않게 한다. CRS가 없는 layer가 유효 CRS
+  layer와 섞이면 로딩을 중단하고 오류를 보고한다. 기본 `desktop` target은
+  외부 GIS 런타임 없이 데모 source를 유지한다.
+
+다음 구현 단계는 대용량 multi-layer fixture의 성능 측정과 ARES Commander를
+포함한 외부 포맷 호환성 검증이다.
 
 ## 반드시 수행할 수직 벤치마크
 
@@ -112,6 +138,27 @@ Wails는 빠른 화면 구성과 Go↔웹 기술 결합에는 매력적이다. �
 - 합격 기준 초안: 연속 패닝 중 UI thread block 16ms 초과 없음, stale 작업이 화면을 덮어쓰지 않음, 100만 feature 전체 geometry를 매 프레임 직렬화하지 않음
 
 최종 UI 확정은 이 수치와 Windows/macOS/Linux 실제 빌드 결과를 근거로 별도 ADR에서 결정한다.
+
+현재 재현 가능한 기준 benchmark는 `go test -bench ./internal/render`의
+`BenchmarkLayerSource100KLines`와 `BenchmarkLayerSource100KChunkBuild`이다.
+이는 실제 파일 I/O가 아닌 geometry 정규화·immutable batch 생성 비용을
+측정하므로, 이후 GDAL 화면 영역 조회 benchmark와 별도로 비교한다.
+규모별 정규화와 multi-layer batch 비용은 다음 benchmark로 재현한다.
+
+```sh
+go test -run '^$' -bench 'BenchmarkLayerSourceScale|BenchmarkMultiLayerChunkBuild' \
+  -benchtime=1x -benchmem ./internal/render
+```
+
+Apple M3에서 `-benchtime=200ms`로 측정한 정규화 비용은 10K 약 3.56ms,
+100K 약 34.1ms, 1M 약 360ms였고, 4개 layer의 chunk build는 약 9.4µs였다.
+이 수치는
+합성 WKT 입력 기준이며 GDAL I/O와 화면 영역 질의 비용은 포함하지 않는다.
+100K line source에서 선택 benchmark도 제공한다. Apple M3 기준 `-benchtime=200ms`
+로 `BenchmarkHitTestLinear100K`는 약 0.89ms, `BenchmarkHitTestIndexed100K`는
+약 0.0014ms(약 2.5KB 할당)였으며, 두 경로의 결과 동등성은 단위 테스트로
+검증한다. 측정 환경은 macOS Darwin/arm64, Apple M3이며, 실행 시점의 CPU
+부하와 Go 버전에 따라 값은 변할 수 있다.
 
 ## 참고 문서
 

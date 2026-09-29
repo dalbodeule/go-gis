@@ -34,7 +34,7 @@ void gogis_canvas_click(double* x, double* y);
 
 // Publishes selection state for the QML properties on MapCanvas.
 void gogis_set_selection(const char* layer, const char* feature,
-                         const char* status);
+                         const char* value, const char* status);
 
 // Reads the latest JSON layer visibility payload observed on the GUI thread.
 unsigned long long gogis_layer_visibility_generation(void);
@@ -47,11 +47,22 @@ void gogis_edit_event(char* action, int action_length, char* value, int value_le
 // Publishes a JSON attribute-row payload for the QML table.
 void gogis_set_attribute_payload(const char* payload);
 
+// Publishes a JSON layer-tree payload for the QML layer model.
+void gogis_set_layer_tree_payload(const char* payload);
+
+// Reads the latest QML-selected layer name.
+unsigned long long gogis_active_layer_generation(void);
+void gogis_active_layer(char* buffer, int buffer_length);
+
 // Publishes the current Go-side render request status to QML.
 void gogis_set_render_status(const char* status);
 
 // Returns the latest user-requested render cancellation generation.
 unsigned long long gogis_cancel_generation(void);
+
+// Reads a file-open request emitted by QML.
+unsigned long long gogis_load_generation(void);
+void gogis_load_path(char* buffer, int buffer_length);
 
 #ifdef __cplusplus
 }

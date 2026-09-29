@@ -9,7 +9,17 @@ GoGIS의 Lua runtime은 내부 Go 포인터나 UI 객체를 노출하지 않고,
 - `table`, `string`, `math` 표준 라이브러리
 - `gogis.layers()`
 - `gogis.set_property(layer, featureID, field, value)`
-- `gogis.export_dxf(destination, layer)`
+- `gogis.export_dxf(destination, layer[, profile])`. `profile`은 `ares-utf8`
+  (기본값) 또는 `ares-cp949`이며, 호출 중인 Go `context.Context`가 exporter에
+  전달되어 취소가 포맷 출력까지 전파된다.
+- `gogis.spatial(operation, left, right, result[, distance])`. `operation`은
+  `intersect`, `union`, `difference`, `buffer` 중 하나이며, 내부적으로
+  `commands.ApplySpatialOperation`과 동일한 dispatch를 사용한다. `buffer`는
+  `right`를 비워 두고 `distance`를 사용한다.
+- `gogis.filter(layer, field, value, result)`는 속성값이 일치하는 feature만
+  복사한 결과 레이어를 생성한다.
+- `gogis.label(layer, field, result[, height, style])`는 속성값으로 라벨을
+  생성하고 geometry 대표 위치에 배치한다.
 
 ## 차단 범위
 

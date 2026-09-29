@@ -1,0 +1,72 @@
+name: GoGIS verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    name: Go checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run portable tests
+        run: go test ./...
+
+      - name: Run portable vet
+        run: go vet ./...
+
+      - name: Build portable CLI with PowerShell script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\verify.ps1 -SkipRace
+
+  native-unix:
+    name: Native GIS checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install GIS libraries on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev libproj-dev libgeos-dev pkg-config
+
+      - name: Install GIS libraries on macOS
+        if: runner.os == 'macOS'
+        run: brew install gdal proj geos
+
+      - name: Run native tests
+        run: go test -tags native ./...
+
+      - name: Run native race tests
+        run: go test -race -tags native ./...
+
+      - name: Build native CLI
+        run: go build -tags native -o build/gis-cli-native ./cmd/gis-cli

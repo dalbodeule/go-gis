@@ -14,7 +14,11 @@ Targets:
   cli       Build the default GoGIS CLI (default)
   native    Build the CLI with GDAL/PROJ/GEOS native drivers
   desktop   Build the Qt Quick desktop prototype
+  desktop-native
+            Build the Qt Quick desktop with GDAL/PROJ/GEOS input support
   all       Build cli and desktop
+  all-native
+            Build native CLI and native Qt Quick desktop
   clean     Remove generated files under build/
 EOF
 }
@@ -50,6 +54,20 @@ build_desktop() {
 			"${ROOT_DIR}/cmd/gis-desktop"
 }
 
+build_desktop_native() {
+	mkdir -p "${BUILD_DIR}"
+	local cgo_cxxflags="${CGO_CXXFLAGS:-}"
+	case " ${cgo_cxxflags} " in
+		*" -std=c++17 "*|*" -std=gnu++17 "*) ;;
+		*) cgo_cxxflags="${cgo_cxxflags} -std=c++17" ;;
+	esac
+	CGO_CXXFLAGS="${cgo_cxxflags# }" \
+		GOCACHE="${GOCACHE_DIR}" \
+		go build -tags "qt native" \
+			-o "${BUILD_DIR}/gogis-desktop-native" \
+			"${ROOT_DIR}/cmd/gis-desktop"
+}
+
 target="${1:-cli}"
 case "${target}" in
 	cli)
@@ -61,9 +79,16 @@ case "${target}" in
 	desktop)
 		build_desktop
 		;;
+	desktop-native)
+		build_desktop_native
+		;;
 	all)
 		build_cli
 		build_desktop
+		;;
+	all-native)
+		build_native
+		build_desktop_native
 		;;
 	clean)
 	rm -rf "${BUILD_DIR}"

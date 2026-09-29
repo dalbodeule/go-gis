@@ -60,6 +60,46 @@ func TestHitTestScreenUsesPixelTolerance(t *testing.T) {
 	}
 }
 
+func TestHitIndexMatchesLinearHitTest(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "roads", FeatureID: 10, Vertices: []Point{{X: 0, Y: 0}, {X: 1, Y: 0}}},
+		{Layer: "roads", FeatureID: 20, Vertices: []Point{{X: 0, Y: 0.4}, {X: 1, Y: 0.4}}},
+		{Layer: "labels", FeatureID: 30, Vertices: []Point{{X: 0.9, Y: 0.9}}},
+	}
+	index := NewHitIndex(features, 0.25)
+	linear, linearOK := HitTest(features, Point{X: 0.6, Y: 0.03}, 0.1)
+	indexed, indexedOK := index.HitTest(Point{X: 0.6, Y: 0.03}, 0.1)
+	if linearOK != indexedOK || linear != indexed {
+		t.Fatalf("linear = %#v/%v, indexed = %#v/%v", linear, linearOK, indexed, indexedOK)
+	}
+	if _, ok := index.HitTest(Point{X: 0.6, Y: 0.2}, 0.05); ok {
+		t.Fatal("indexed hit outside tolerance")
+	}
+}
+
+func TestHitIndexScreenUsesPixelTolerance(t *testing.T) {
+	features := []HitFeature{{Layer: "roads", FeatureID: 42, Vertices: []Point{{X: 0.4, Y: 0.5}, {X: 0.6, Y: 0.5}}}}
+	index := NewHitIndex(features, 0.25)
+	result, ok := index.HitTestScreen(Point{X: 100, Y: 101}, Viewport{Center: Point{X: 0.5, Y: 0.5}, Zoom: 1}, 200, 200, 2)
+	if !ok || result.FeatureID != 42 {
+		t.Fatalf("indexed screen hit = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestHitIndexHonorsLayerVisibility(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "hidden", FeatureID: 1, Vertices: []Point{{X: 0, Y: 0}, {X: 1, Y: 0}}},
+		{Layer: "visible", FeatureID: 2, Vertices: []Point{{X: 0, Y: 0.5}, {X: 1, Y: 0.5}}},
+	}
+	index := NewHitIndex(features, 0.25)
+	if result, ok := index.HitTestVisible(Point{X: 0.5, Y: 0}, 0.1, map[string]bool{"visible": true}); ok || result.FeatureID != 0 {
+		t.Fatalf("hidden layer was selectable: %#v, ok = %v", result, ok)
+	}
+	if result, ok := index.HitTestVisible(Point{X: 0.5, Y: 0}, 0.1, map[string]bool{"hidden": true}); !ok || result.FeatureID != 1 {
+		t.Fatalf("visible hidden-layer hit = %#v, ok = %v", result, ok)
+	}
+}
+
 func TestScreenPointToWorldRejectsInvalidViewport(t *testing.T) {
 	if _, ok := ScreenPointToWorld(Point{}, Viewport{Zoom: 0}, 100, 100); ok {
 		t.Fatal("invalid zoom was accepted")

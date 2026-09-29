@@ -12,6 +12,12 @@ type LayerReader interface {
 	Open(ctx context.Context, source string, layerName string) (core.Layer, error)
 }
 
+// LayerCollectionReader loads every vector layer in one dataset. A caller can
+// still use LayerReader when it wants one explicitly named layer.
+type LayerCollectionReader interface {
+	OpenAll(ctx context.Context, source string) ([]core.Layer, error)
+}
+
 // LayerWriter persists a vector layer to a file or database.
 type LayerWriter interface {
 	Write(ctx context.Context, destination string, layer core.Layer) error

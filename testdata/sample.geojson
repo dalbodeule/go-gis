@@ -1,0 +1,16 @@
+{
+  "type": "FeatureCollection",
+  "name": "sample",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "한글 도로", "kind": "road"},
+      "geometry": {"type": "LineString", "coordinates": [[126.9, 37.4], [127.1, 37.5]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "한글 건물", "kind": "building"},
+      "geometry": {"type": "Polygon", "coordinates": [[[127.0, 37.45], [127.02, 37.45], [127.02, 37.47], [127.0, 37.47], [127.0, 37.45]]]}
+    }
+  ]
+}

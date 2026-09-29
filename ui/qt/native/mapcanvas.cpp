@@ -39,13 +39,23 @@ std::atomic<unsigned long long> g_edit_generation{0};
 std::mutex g_attribute_mutex;
 std::string g_attribute_payload;
 std::atomic<unsigned long long> g_attribute_generation{0};
+std::mutex g_layer_tree_mutex;
+std::string g_layer_tree_payload;
+std::atomic<unsigned long long> g_layer_tree_generation{0};
+std::mutex g_active_layer_mutex;
+std::string g_active_layer;
+std::atomic<unsigned long long> g_active_layer_generation{0};
 std::mutex g_render_status_mutex;
 std::string g_render_status;
 std::atomic<unsigned long long> g_render_status_generation{0};
 std::atomic<unsigned long long> g_cancel_generation{0};
+std::mutex g_load_mutex;
+std::string g_load_path;
+std::atomic<unsigned long long> g_load_generation{0};
 std::mutex g_selection_mutex;
 std::string g_selection_layer;
 std::string g_selection_feature;
+std::string g_selection_value;
 std::string g_selection_status;
 std::atomic<unsigned long long> g_selection_generation{0};
 std::mutex g_canvas_mutex;
@@ -110,6 +120,7 @@ public:
                 std::lock_guard<std::mutex> lock(g_selection_mutex);
                 setProperty("selectionLayer", QString::fromStdString(g_selection_layer));
                 setProperty("selectionFeature", QString::fromStdString(g_selection_feature));
+                setProperty("selectionValue", QString::fromStdString(g_selection_value));
                 setProperty("selectionStatus", QString::fromStdString(g_selection_status));
                 selection_generation_ = selection_generation;
             }
@@ -119,6 +130,13 @@ public:
                 std::lock_guard<std::mutex> lock(g_attribute_mutex);
                 setProperty("attributePayload", QString::fromStdString(g_attribute_payload));
                 attribute_generation_ = attribute_generation;
+            }
+
+            const auto layer_tree_generation = g_layer_tree_generation.load(std::memory_order_relaxed);
+            if (layer_tree_generation != layer_tree_generation_) {
+                std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
+                setProperty("layerTreePayload", QString::fromStdString(g_layer_tree_payload));
+                layer_tree_generation_ = layer_tree_generation;
             }
 
             const auto render_status_generation = g_render_status_generation.load(std::memory_order_relaxed);
@@ -131,6 +149,20 @@ public:
             const auto cancel_generation = property("cancelGeneration").toULongLong();
             if (cancel_generation != g_cancel_generation.load(std::memory_order_relaxed)) {
                 g_cancel_generation.store(cancel_generation, std::memory_order_relaxed);
+            }
+
+            const auto load_generation = property("loadGeneration").toULongLong();
+            if (load_generation != g_load_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_load_mutex);
+                g_load_path = property("loadPath").toString().toStdString();
+                g_load_generation.store(load_generation, std::memory_order_relaxed);
+            }
+
+            const auto active_layer_generation = property("activeLayerGeneration").toULongLong();
+            if (active_layer_generation != g_active_layer_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_active_layer_mutex);
+                g_active_layer = property("activeLayer").toString().toStdString();
+                g_active_layer_generation.store(active_layer_generation, std::memory_order_relaxed);
             }
         });
         click_timer_.start();
@@ -194,6 +226,7 @@ private:
     QTimer click_timer_;
     unsigned long long selection_generation_ = 0;
     unsigned long long attribute_generation_ = 0;
+    unsigned long long layer_tree_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
 };
 
@@ -262,11 +295,12 @@ extern "C" void gogis_canvas_click(double* x, double* y) {
 }
 
 extern "C" void gogis_set_selection(const char* layer, const char* feature,
-                                      const char* status) {
+                                      const char* value, const char* status) {
     {
         std::lock_guard<std::mutex> lock(g_selection_mutex);
         g_selection_layer = layer != nullptr ? layer : "";
         g_selection_feature = feature != nullptr ? feature : "";
+        g_selection_value = value != nullptr ? value : "";
         g_selection_status = status != nullptr ? status : "";
     }
     g_selection_generation.fetch_add(1, std::memory_order_relaxed);
@@ -312,6 +346,28 @@ extern "C" void gogis_set_attribute_payload(const char* payload) {
     g_attribute_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" void gogis_set_layer_tree_payload(const char* payload) {
+    {
+        std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
+        g_layer_tree_payload = payload != nullptr ? payload : "[]";
+    }
+    g_layer_tree_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" unsigned long long gogis_active_layer_generation(void) {
+    return g_active_layer_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_active_layer(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_active_layer_mutex);
+    const auto copy_length = std::min<size_t>(g_active_layer.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_active_layer.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
 extern "C" void gogis_set_render_status(const char* status) {
     {
         std::lock_guard<std::mutex> lock(g_render_status_mutex);
@@ -322,4 +378,18 @@ extern "C" void gogis_set_render_status(const char* status) {
 
 extern "C" unsigned long long gogis_cancel_generation(void) {
     return g_cancel_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" unsigned long long gogis_load_generation(void) {
+    return g_load_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_load_path(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_load_mutex);
+    const auto copy_length = std::min<size_t>(g_load_path.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_load_path.data(), copy_length);
+    buffer[copy_length] = '\0';
 }
