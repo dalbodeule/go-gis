@@ -11,12 +11,18 @@ Go를 주 언어로 사용한다. `internal/core`는 `Project`, `Layer`, `Featur
 
 ### GIS 엔진과 데이터 접근
 
-- GDAL/OGR: SHP, GeoPackage 등 벡터 I/O
-- PROJ: CRS 식별 및 좌표 변환
-- GEOS: 기본 공간 연산
+- GDAL/OGR: SHP, GeoPackage 등 벡터 I/O — `github.com/airbusgeo/godal`
+- PROJ: CRS 식별 및 좌표 변환 — `github.com/twpayne/go-proj/v11`
+- GEOS: 기본 공간 연산 — `github.com/twpayne/go-geos`
 - PostgreSQL/PostGIS: 트랜잭션 기반 DB I/O
 
 각 라이브러리는 `drivers/` 아래 어댑터로 감싼다. 초기에는 네이티브 런타임 배포와 CGO 동시성 규칙을 기술 검증에서 확인하며, 코어 패키지가 특정 바인딩 타입을 직접 노출하지 않도록 한다.
+
+검토 기준일: 2026-09-29.
+
+- `godal`은 GDAL 3.0 이상을 요구하고, CGO 호출 횟수를 줄이는 Go API를 제공한다. 다만 upstream README가 벡터와 공간참조 영역은 아직 완성도가 낮고 API가 호환성 깨지는 방향으로 바뀔 수 있다고 명시하므로, SHP/GPKG 경로를 먼저 작은 어댑터와 샘플로 고정한다.
+- `go-proj/v11`은 PROJ 9.4 이상을 요구하며 대량 좌표 변환, 오류 처리, 자동 C 메모리 관리를 제공한다. EPSG:5179/5186/4326 변환은 축 순서와 grid 데이터 여부를 별도 회귀 테스트로 고정한다.
+- `go-geos`는 GEOS의 thread-safe 재진입 API를 사용하고 GeoJSON/WKB/WKT 및 `database/sql` 연동을 제공한다. 장시간 실행 앱에서 C heap 압력이 Go runtime에 직접 보이지 않는다는 upstream 경고가 있으므로, 작업 단위별 context와 명시적 geometry 수명 관리를 적용한다.
 
 ### 사용자 인터페이스와 자동화
 
@@ -26,7 +32,7 @@ CLI는 Go 명령으로 먼저 제공하고, Lua는 UI 스레드나 내부 포인
 
 ### DXF
 
-DXF 출력은 최소 엔티티부터 구현하거나 기존 라이브러리를 비교 검증한다. UTF-8 또는 CP949를 선결정하지 않고 `$DWGCODEPAGE`, font override, DXF 버전과 함께 ARES Commander 2027 샘플 검증으로 결정한다.
+`github.com/yofu/dxf`는 MIT 라이선스의 ASCII DXF 라이브러리지만 AC1015(AutoCAD 2000)만 지원한다. 기본 엔티티 생성의 참고 구현으로는 유용하나, ARES Commander 2027 한글 검증에 필요한 DXF 버전·`$DWGCODEPAGE`·UTF-8/CP949 조합을 충분히 제어할 수 있다는 증거가 없어 핵심 exporter로 채택하지 않는다. GoGIS는 필요한 엔티티와 인코딩을 직접 제어하는 `drivers/dxf` 어댑터를 우선 구현하고, `yofu/dxf`는 비교용 fixture 생성에만 사용할 수 있다.
 
 ## 선택 이유
 
@@ -41,3 +47,10 @@ DXF 출력은 최소 엔티티부터 구현하거나 기존 라이브러리를 �
 - PostGIS 드라이버와 인증 방식
 
 이 항목들은 마일스톤 A의 프로토타입과 실제 샘플 검증 이후 별도 ADR로 확정한다.
+
+## 참고한 upstream 문서
+
+- [godal README](https://github.com/airbusgeo/godal)
+- [go-proj README](https://github.com/twpayne/go-proj)
+- [go-geos README](https://github.com/twpayne/go-geos)
+- [yofu/dxf README](https://github.com/yofu/dxf)

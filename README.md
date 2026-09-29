@@ -4,6 +4,8 @@
 
 현재 저장소는 구현 착수를 위한 최소 뼈대입니다. 전체 목표와 MVP 범위는 [desktop-gis-codex-brief.md](desktop-gis-codex-brief.md), 기술 선택과 보류된 결정은 [기술 스택 결정 기록](docs/decisions/0001-tech-stack.md)에서 확인할 수 있습니다.
 
+운영체제별 Go·CGO·GDAL/PROJ/GEOS 설치와 빌드는 [빌드 가이드](docs/build.md)를 참고합니다.
+
 ## 선택한 기술 스택
 
 - Go: GIS 도메인 모델, 공용 명령/API, CLI, 작업 취소·진행률 제어
@@ -15,7 +17,7 @@
 - GUI: Qt 바인딩과 Wails+WebGL/WebGPU를 수직 프로토타입으로 비교한 뒤 결정
 - Lua: 안전한 공개 명령 API 위에 최소 스크립팅 계층으로 추가
 
-네이티브 의존성은 Go 코어에 직접 섞지 않고 `drivers/` 경계에 둡니다. 초기 빌드에는 외부 의존성을 넣지 않아 CLI 뼈대가 어떤 개발 환경에서도 컴파일되도록 했습니다.
+네이티브 의존성은 Go 코어에 직접 섞지 않고 `drivers/` 경계에 둡니다. 바인딩 모듈은 `go.mod`에 등록되어 있지만 실제 CGO import 경계는 `native` build tag 아래에 있으므로, 기본 CLI 빌드는 네이티브 GIS 설치 없이도 가능합니다. 운영체제별 설치와 네이티브 빌드는 [빌드 가이드](docs/build.md)를 따릅니다.
 
 ## 시작하기
 
