@@ -1,0 +1,17 @@
+# Go build and test artifacts
+/bin/
+/dist/
+/coverage.out
+/coverage.html
+
+# Local tooling and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local GIS data and generated exports
+/testdata/local/
+*.gpkg-journal
+*.gpkg-wal
+*.gpkg-shm
+*.dxf
