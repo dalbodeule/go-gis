@@ -19,6 +19,7 @@ type LayerSource struct {
 	Features  []HitFeature
 	Builder   ChunkBuilder
 	ChunkSize float64
+	Extent    [4]float64
 }
 
 // parsedFeaturePoints keeps the common single-part representation flat. A
@@ -40,6 +41,8 @@ func NewLayerSource(layer core.Layer) (LayerSource, error) {
 	if err != nil {
 		return LayerSource{}, err
 	}
+	bounds := paddedDegenerateExtent([4]float64{minX, minY, maxX, maxY}, layer.CRS.AuthorityCode)
+	minX, minY, maxX, maxY = bounds[0], bounds[1], bounds[2], bounds[3]
 	return newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, nil), nil
 }
 
@@ -100,6 +103,15 @@ func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64) (map[s
 	if bounds != nil {
 		minX, minY, maxX, maxY = bounds[0], bounds[1], bounds[2], bounds[3]
 	}
+	crsCode := ""
+	for _, layer := range layers {
+		if layer.CRS.AuthorityCode != "" {
+			crsCode = layer.CRS.AuthorityCode
+			break
+		}
+	}
+	extent := paddedDegenerateExtent([4]float64{minX, minY, maxX, maxY}, crsCode)
+	minX, minY, maxX, maxY = extent[0], extent[1], extent[2], extent[3]
 	sources := make(map[string]LayerSource, len(layers))
 	featureCount := 0
 	for _, layer := range layers {
@@ -109,10 +121,40 @@ func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64) (map[s
 	featureOffset := 0
 	for index, layer := range layers {
 		featureEnd := featureOffset + len(layer.Features)
-		sources[layer.Name] = newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, features[featureOffset:featureEnd:featureEnd])
+		source := newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, features[featureOffset:featureEnd:featureEnd])
+		source.Extent = [4]float64{minX, minY, maxX, maxY}
+		sources[layer.Name] = source
 		featureOffset = featureEnd
 	}
 	return sources, features, nil
+}
+
+// paddedDegenerateExtent gives point-only and axis-aligned datasets a usable
+// coordinate window. Without a non-zero span the UI cannot derive coordinates
+// or scale, and normalized point coordinates collapse to an edge of the canvas.
+func paddedDegenerateExtent(bounds [4]float64, authorityCode string) [4]float64 {
+	spanX, spanY := bounds[2]-bounds[0], bounds[3]-bounds[1]
+	if spanX > 0 && spanY > 0 {
+		return bounds
+	}
+	padding := 0.5
+	switch strings.ToUpper(strings.TrimSpace(authorityCode)) {
+	case "EPSG:4326":
+		padding = 0.005
+	case "EPSG:3857", "EPSG:5179", "EPSG:5186":
+		padding = 10
+	}
+	if spanX == 0 {
+		xPadding := math.Max(padding, spanY*0.05)
+		bounds[0] -= xPadding
+		bounds[2] += xPadding
+	}
+	if spanY == 0 {
+		yPadding := math.Max(padding, spanX*0.05)
+		bounds[1] -= yPadding
+		bounds[3] += yPadding
+	}
+	return bounds
 }
 
 func parseLayerPoints(layer core.Layer) ([]parsedFeaturePoints, []bool, float64, float64, float64, float64, error) {
@@ -948,6 +990,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 	return LayerSource{
 		Features:  features,
 		ChunkSize: chunkSize,
+		Extent:    [4]float64{minX, minY, maxX, maxY},
 		Builder: func(ctx context.Context, key ChunkKey) (Chunk, error) {
 			if err := ctx.Err(); err != nil {
 				return Chunk{}, err

@@ -63,10 +63,16 @@ std::atomic<unsigned long long> g_active_layer_generation{0};
 std::mutex g_render_status_mutex;
 std::string g_render_status;
 std::atomic<unsigned long long> g_render_status_generation{0};
+std::mutex g_map_metadata_mutex;
+std::string g_map_metadata_payload;
+std::atomic<unsigned long long> g_map_metadata_generation{0};
 std::atomic<unsigned long long> g_cancel_generation{0};
 std::mutex g_load_mutex;
 std::string g_load_path;
 std::atomic<unsigned long long> g_load_generation{0};
+std::mutex g_save_mutex;
+std::string g_save_path;
+std::atomic<unsigned long long> g_save_generation{0};
 std::mutex g_selection_mutex;
 std::string g_selection_layer;
 std::string g_selection_feature;
@@ -200,6 +206,14 @@ public:
                 render_status_generation_ = render_status_generation;
             }
 
+            const auto map_metadata_generation = g_map_metadata_generation.load(std::memory_order_relaxed);
+            if (map_metadata_generation != map_metadata_generation_) {
+                std::lock_guard<std::mutex> lock(g_map_metadata_mutex);
+                setProperty("mapMetadataPayload", QString::fromStdString(g_map_metadata_payload));
+                setProperty("mapMetadataGeneration", QVariant::fromValue<qulonglong>(map_metadata_generation));
+                map_metadata_generation_ = map_metadata_generation;
+            }
+
             const auto cancel_generation = property("cancelGeneration").toULongLong();
             if (cancel_generation != g_cancel_generation.load(std::memory_order_relaxed)) {
                 g_cancel_generation.store(cancel_generation, std::memory_order_relaxed);
@@ -210,6 +224,13 @@ public:
                 std::lock_guard<std::mutex> lock(g_load_mutex);
                 g_load_path = property("loadPath").toString().toStdString();
                 g_load_generation.store(load_generation, std::memory_order_relaxed);
+            }
+
+            const auto save_generation = property("saveGeneration").toULongLong();
+            if (save_generation != g_save_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_save_mutex);
+                g_save_path = property("savePath").toString().toStdString();
+                g_save_generation.store(save_generation, std::memory_order_relaxed);
             }
 
             const auto active_layer_generation = property("activeLayerGeneration").toULongLong();
@@ -305,6 +326,7 @@ private:
     unsigned long long attribute_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
+    unsigned long long map_metadata_generation_ = 0;
     unsigned long long rendered_generation_ = 0;
     size_t rendered_vertex_count_ = 0;
     int rendered_stage_ = 0;
@@ -500,6 +522,12 @@ extern "C" void gogis_set_render_status(const char* status) {
     g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" void gogis_set_map_metadata(const char* payload) {
+    std::lock_guard<std::mutex> lock(g_map_metadata_mutex);
+    g_map_metadata_payload = payload == nullptr ? "{}" : payload;
+    g_map_metadata_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
 extern "C" unsigned long long gogis_cancel_generation(void) {
     return g_cancel_generation.load(std::memory_order_relaxed);
 }
@@ -515,5 +543,19 @@ extern "C" void gogis_load_path(char* buffer, int buffer_length) {
     std::lock_guard<std::mutex> lock(g_load_mutex);
     const auto copy_length = std::min<size_t>(g_load_path.size(), static_cast<size_t>(buffer_length - 1));
     std::memcpy(buffer, g_load_path.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
+extern "C" unsigned long long gogis_save_generation(void) {
+    return g_save_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_save_path(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_save_mutex);
+    const auto copy_length = std::min<size_t>(g_save_path.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_save_path.data(), copy_length);
     buffer[copy_length] = '\0';
 }

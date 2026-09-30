@@ -11,6 +11,7 @@ package native
 import "C"
 
 import (
+	"encoding/json"
 	"unsafe"
 
 	"gogis/internal/render"
@@ -193,19 +194,47 @@ func SetRenderStatus(status string) {
 	C.gogis_set_render_status(cStatus)
 }
 
+// SetMapMetadata publishes the current full data extent in display CRS order.
+func SetMapMetadata(crs string, extent [4]float64) {
+	payload, err := json.Marshal(struct {
+		CRS    string     `json:"crs"`
+		Bounds [4]float64 `json:"bounds"`
+	}{CRS: crs, Bounds: extent})
+	if err != nil {
+		return
+	}
+	cPayload := C.CString(string(payload))
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_map_metadata(cPayload)
+}
+
 // CancelGeneration returns the latest user cancellation request.
 func CancelGeneration() uint64 {
 	return uint64(C.gogis_cancel_generation())
 }
 
-// LoadGeneration returns the latest QML file-open request generation.
+// LoadGeneration returns the latest QML vector-file selection generation.
 func LoadGeneration() uint64 {
 	return uint64(C.gogis_load_generation())
 }
 
-// CurrentLoadPath returns the latest file path requested by QML.
-func CurrentLoadPath() string {
-	buffer := make([]C.char, 16384)
+// CurrentLoadPaths decodes the local paths selected in QML.
+func CurrentLoadPaths() ([]string, error) {
+	buffer := make([]C.char, 262144)
 	C.gogis_load_path((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	var paths []string
+	err := json.Unmarshal([]byte(C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))), &paths)
+	return paths, err
+}
+
+// SaveGeneration returns the latest QML GeoPackage save request generation.
+func SaveGeneration() uint64 {
+	return uint64(C.gogis_save_generation())
+}
+
+// CurrentSavePath returns the local destination path requested by QML.
+func CurrentSavePath() string {
+	buffer := make([]C.char, 4096)
+	C.gogis_save_path((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }

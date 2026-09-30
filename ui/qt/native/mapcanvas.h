@@ -73,12 +73,19 @@ void gogis_active_layer(char* buffer, int buffer_length);
 // Publishes the current Go-side render request status to QML.
 void gogis_set_render_status(const char* status);
 
+// Publishes the current map coordinate bounds and display CRS to QML.
+void gogis_set_map_metadata(const char* payload);
+
 // Returns the latest user-requested render cancellation generation.
 unsigned long long gogis_cancel_generation(void);
 
-// Reads a file-open request emitted by QML.
+// Reads the JSON array of local file paths emitted by the QML file picker.
 unsigned long long gogis_load_generation(void);
 void gogis_load_path(char* buffer, int buffer_length);
+
+// Reads a GeoPackage save request emitted by QML.
+unsigned long long gogis_save_generation(void);
+void gogis_save_path(char* buffer, int buffer_length);
 
 #ifdef __cplusplus
 }

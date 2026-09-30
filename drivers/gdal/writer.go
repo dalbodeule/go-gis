@@ -22,45 +22,119 @@ type Writer struct{}
 
 var shapefileConfigMu sync.Mutex
 
-// Write creates a new vector dataset and writes the layer schema, attributes,
-// and WKT geometries. Existing destinations are intentionally rejected by the
-// native driver rather than being silently replaced.
-func (Writer) Write(ctx context.Context, destination string, layer core.Layer) error {
+// Write creates a single-layer vector dataset.
+func (writer Writer) Write(ctx context.Context, destination string, layer core.Layer) error {
+	if strings.EqualFold(filepath.Ext(destination), ".gpkg") {
+		if _, err := os.Stat(destination); err == nil {
+			existing, err := (Reader{}).OpenAll(ctx, destination)
+			if err != nil {
+				return fmt.Errorf("read existing GeoPackage layers: %w", err)
+			}
+			layers := make([]core.Layer, 0, len(existing)+1)
+			for _, current := range existing {
+				if current.Name != layer.Name {
+					layers = append(layers, current)
+				}
+			}
+			layers = append(layers, layer)
+			return writer.WriteLayers(ctx, destination, layers)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect destination %q: %w", destination, err)
+		}
+	}
+	return writer.WriteLayers(ctx, destination, []core.Layer{layer})
+}
+
+// WriteLayers persists all project layers. GeoPackage supports multiple layers;
+// Shapefile output intentionally accepts exactly one.
+func (Writer) WriteLayers(ctx context.Context, destination string, layers []core.Layer) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if layer.Name == "" {
-		return fmt.Errorf("layer name is required")
+	if len(layers) == 0 {
+		return fmt.Errorf("at least one layer is required")
 	}
-	if len(layer.Features) == 0 {
-		return fmt.Errorf("layer %q has no features to infer geometry type", layer.Name)
-	}
-
 	registerDrivers()
 	driver, err := driverForDestination(destination)
 	if err != nil {
 		return err
 	}
-	geometryType, err := ogrGeometryType(layer.Features[0])
-	if err != nil {
-		return err
+	if driver == godal.Shapefile && len(layers) != 1 {
+		return fmt.Errorf("Shapefile output supports one layer; use .gpkg for multiple layers")
 	}
-	for _, feature := range layer.Features[1:] {
-		other, err := ogrGeometryType(feature)
+	for _, layer := range layers {
+		if layer.Name == "" {
+			return fmt.Errorf("layer name is required")
+		}
+		if len(layer.Features) == 0 {
+			return fmt.Errorf("layer %q has no features to infer geometry type", layer.Name)
+		}
+		geometryType, err := ogrGeometryType(layer.Features[0])
 		if err != nil {
 			return err
 		}
-		if other != geometryType {
-			return fmt.Errorf("feature %d geometry type %v conflicts with %v", feature.ID, other, geometryType)
+		for _, feature := range layer.Features[1:] {
+			other, err := ogrGeometryType(feature)
+			if err != nil {
+				return err
+			}
+			if other != geometryType {
+				return fmt.Errorf("feature %d geometry type %v conflicts with %v in layer %q", feature.ID, other, geometryType, layer.Name)
+			}
 		}
 	}
+	if driver == godal.GeoPackage {
+		if _, err := os.Stat(destination); err == nil {
+			return replaceGeoPackage(ctx, destination, layers)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect destination %q: %w", destination, err)
+		}
+	}
+	return writeNewDataset(ctx, destination, driver, layers)
+}
 
+func replaceGeoPackage(ctx context.Context, destination string, layers []core.Layer) error {
+	directory := filepath.Dir(destination)
+	temporaryDirectory, err := os.MkdirTemp(directory, ".gogis-save-*")
+	if err != nil {
+		return fmt.Errorf("create temporary save directory: %w", err)
+	}
+	defer os.RemoveAll(temporaryDirectory)
+	temporaryPath := filepath.Join(temporaryDirectory, filepath.Base(destination))
+	if err := writeNewDataset(ctx, temporaryPath, godal.GeoPackage, layers); err != nil {
+		return err
+	}
+	backupFile, err := os.CreateTemp(directory, ".gogis-backup-*")
+	if err != nil {
+		return fmt.Errorf("reserve destination backup: %w", err)
+	}
+	backupPath := backupFile.Name()
+	if err := backupFile.Close(); err != nil {
+		_ = os.Remove(backupPath)
+		return fmt.Errorf("close destination backup: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return fmt.Errorf("prepare destination backup path: %w", err)
+	}
+	if err := os.Rename(destination, backupPath); err != nil {
+		return fmt.Errorf("preserve previous destination: %w", err)
+	}
+	if err := os.Rename(temporaryPath, destination); err != nil {
+		if restoreErr := os.Rename(backupPath, destination); restoreErr != nil {
+			return fmt.Errorf("replace destination: %w; previous file remains at %q: %v", err, backupPath, restoreErr)
+		}
+		return fmt.Errorf("replace destination: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return fmt.Errorf("saved %q but could not remove backup %q: %w", destination, backupPath, err)
+	}
+	return nil
+}
+
+func writeNewDataset(ctx context.Context, destination string, driver godal.DriverName, layers []core.Layer) error {
 	if driver == godal.Shapefile {
 		shapefileConfigMu.Lock()
 		defer shapefileConfigMu.Unlock()
-		// GDAL reads SHAPE_ENCODING while the layer writes DBF values. godal's
-		// per-call config scope ends after CreateVector, so keep the process
-		// option active for layer creation and feature writes as well.
 		previous, hadPrevious := os.LookupEnv("SHAPE_ENCODING")
 		if err := os.Setenv("SHAPE_ENCODING", "UTF-8"); err != nil {
 			return fmt.Errorf("set SHAPE_ENCODING: %w", err)
@@ -83,7 +157,29 @@ func (Writer) Write(ctx context.Context, destination string, layer core.Layer) e
 			_ = dataset.Close()
 		}
 	}()
+	for _, layer := range layers {
+		if err := writeLayer(ctx, dataset, layer); err != nil {
+			return err
+		}
+	}
+	if err := dataset.Close(); err != nil {
+		return fmt.Errorf("close dataset %q: %w", destination, err)
+	}
+	closed = true
+	if driver == godal.Shapefile {
+		codePagePath := strings.TrimSuffix(destination, filepath.Ext(destination)) + ".cpg"
+		if err := os.WriteFile(codePagePath, []byte("UTF-8\n"), 0o600); err != nil {
+			return fmt.Errorf("write shapefile code-page file: %w", err)
+		}
+	}
+	return nil
+}
 
+func writeLayer(ctx context.Context, dataset *godal.Dataset, layer core.Layer) error {
+	geometryType, err := ogrGeometryType(layer.Features[0])
+	if err != nil {
+		return err
+	}
 	var spatialRef *godal.SpatialRef
 	if layer.CRS.AuthorityCode != "" {
 		spatialRef, err = godal.NewSpatialRef(layer.CRS.AuthorityCode)
@@ -92,15 +188,14 @@ func (Writer) Write(ctx context.Context, destination string, layer core.Layer) e
 		}
 		defer spatialRef.Close()
 	}
-	fieldDefinitions, err := fieldDefinitions(layer.Fields)
+	fieldDefs, err := fieldDefinitions(layer.Fields)
 	if err != nil {
 		return err
 	}
-	outputLayer, err := dataset.CreateLayer(layer.Name, spatialRef, geometryType, fieldDefinitions...)
+	outputLayer, err := dataset.CreateLayer(layer.Name, spatialRef, geometryType, fieldDefs...)
 	if err != nil {
 		return fmt.Errorf("create layer %q: %w", layer.Name, err)
 	}
-
 	for _, feature := range layer.Features {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -123,17 +218,6 @@ func (Writer) Write(ctx context.Context, destination string, layer core.Layer) e
 			return fmt.Errorf("write feature %d: %w", feature.ID, err)
 		}
 		ogrFeature.Close()
-	}
-	if err := dataset.Close(); err != nil {
-		return fmt.Errorf("close dataset %q: %w", destination, err)
-	}
-	closed = true
-	if driver == godal.Shapefile {
-		// The DBF encoding is carried by a sidecar code-page file so readers do
-		// not need a process-global SHAPE_ENCODING setting.
-		if err := os.WriteFile(strings.TrimSuffix(destination, filepath.Ext(destination))+".cpg", []byte("UTF-8\n"), 0o600); err != nil {
-			return fmt.Errorf("write shapefile code-page file: %w", err)
-		}
 	}
 	return nil
 }

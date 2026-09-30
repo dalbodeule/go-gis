@@ -191,6 +191,52 @@ func (w *recordingLayerWriter) Write(_ context.Context, destination string, laye
 	return nil
 }
 
+type recordingLayerCollectionWriter struct {
+	destination string
+	layers      []core.Layer
+}
+
+func (w *recordingLayerCollectionWriter) Write(_ context.Context, destination string, layer core.Layer) error {
+	w.destination = destination
+	w.layers = []core.Layer{layer}
+	return nil
+}
+
+func (w *recordingLayerCollectionWriter) WriteLayers(_ context.Context, destination string, layers []core.Layer) error {
+	w.destination = destination
+	w.layers = layers
+	return nil
+}
+
+func TestProjectSaveAllLayersUsesCollectionWriterAndDetachedSnapshot(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"roads", "buildings"} {
+		if err := service.AddLayer(core.Layer{
+			Name:     name,
+			Features: []core.Feature{{ID: 1, Properties: map[string]any{"name": name}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writer := &recordingLayerCollectionWriter{}
+	if err := service.SaveAllLayers(context.Background(), writer, "all.gpkg"); err != nil {
+		t.Fatal(err)
+	}
+	if writer.destination != "all.gpkg" || len(writer.layers) != 2 {
+		t.Fatalf("write request destination=%q layers=%d", writer.destination, len(writer.layers))
+	}
+	writer.layers[0].Features[0].Properties["name"] = "mutated"
+	if got := service.Project().Layers[0].Features[0].Properties["name"]; got != "roads" {
+		t.Fatalf("writer mutated project snapshot: %v", got)
+	}
+}
+
 func TestProjectSaveLayerUsesCommittedClone(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
 	layer := core.Layer{

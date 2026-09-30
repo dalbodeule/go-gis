@@ -115,7 +115,13 @@ func TestNewLayerSourceSupportsPointsAndCancellation(t *testing.T) {
 	if source.Features[0].Parts != nil {
 		t.Fatalf("point source retained unnecessary parts wrapper: %#v", source.Features[0].Parts)
 	}
-	chunk, err := source.Builder(context.Background(), ChunkKey{})
+	if got := source.Features[0].Vertices[0]; got != (Point{X: 0.5, Y: 0.5}) {
+		t.Fatalf("point was not centered in padded extent: %v", got)
+	}
+	if source.Extent != [4]float64{4.5, 4.5, 5.5, 5.5} {
+		t.Fatalf("point extent = %v", source.Extent)
+	}
+	chunk, err := source.Builder(context.Background(), ChunkKey{X: 2, Y: 2})
 	if err != nil || len(chunk.Vertices) != 4 {
 		t.Fatalf("unexpected point chunk: %#v, %v", chunk, err)
 	}
@@ -123,6 +129,22 @@ func TestNewLayerSourceSupportsPointsAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := source.Builder(ctx, ChunkKey{}); err == nil {
 		t.Fatal("expected canceled source build")
+	}
+}
+
+func TestNewLayerSourcePadsGeographicPointForCoordinateAndScale(t *testing.T) {
+	source, err := NewLayerSource(core.Layer{
+		Name: "points", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Extent != [4]float64{126.995, 36.995, 127.005, 37.005} {
+		t.Fatalf("geographic point extent = %v", source.Extent)
+	}
+	if source.Features[0].Vertices[0] != (Point{X: 0.5, Y: 0.5}) {
+		t.Fatalf("geographic point position = %v", source.Features[0].Vertices[0])
 	}
 }
 
@@ -135,11 +157,11 @@ func TestNewLayerSourceClipsPointMarkerAtChunkBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	left, err := source.Builder(context.Background(), ChunkKey{Layer: "points", X: 0, Y: 0})
+	left, err := source.Builder(context.Background(), ChunkKey{Layer: "points", X: 0, Y: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := source.Builder(context.Background(), ChunkKey{Layer: "points", X: 1, Y: 0})
+	right, err := source.Builder(context.Background(), ChunkKey{Layer: "points", X: 1, Y: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

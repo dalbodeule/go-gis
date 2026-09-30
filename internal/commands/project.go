@@ -34,6 +34,11 @@ type LayerWriter interface {
 	Write(ctx context.Context, destination string, layer core.Layer) error
 }
 
+// LayerCollectionWriter persists a project as one multi-layer dataset.
+type LayerCollectionWriter interface {
+	WriteLayers(ctx context.Context, destination string, layers []core.Layer) error
+}
+
 // NewProjectService creates a service with an empty project.
 func NewProjectService(name string, crs core.CRS) *ProjectService {
 	project := core.Project{Name: name, CRS: crs}
@@ -368,4 +373,23 @@ func (s *ProjectService) SaveLayer(ctx context.Context, writer LayerWriter, dest
 		}
 	}
 	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
+}
+
+// SaveAllLayers persists a project as a dataset. Writers without collection
+// support can still save a single-layer project.
+func (s *ProjectService) SaveAllLayers(ctx context.Context, writer LayerWriter, destination string) error {
+	if writer == nil {
+		return errors.New("layer writer is required")
+	}
+	project := s.Project()
+	if len(project.Layers) == 0 {
+		return ErrNoLayers
+	}
+	if collectionWriter, ok := writer.(LayerCollectionWriter); ok {
+		return collectionWriter.WriteLayers(ctx, destination, project.Layers)
+	}
+	if len(project.Layers) != 1 {
+		return errors.New("writer does not support multi-layer datasets")
+	}
+	return writer.Write(ctx, destination, project.Layers[0])
 }

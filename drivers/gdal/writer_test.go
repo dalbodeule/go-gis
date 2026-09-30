@@ -53,6 +53,58 @@ func TestWriterRoundTripsGeoPackage(t *testing.T) {
 	assertRoundTrip(t, got)
 }
 
+func TestWriterRoundTripsAndReplacesAllGeoPackageLayers(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "project.gpkg")
+	writer := Writer{}
+	if err := writer.Write(context.Background(), destination, writableLayer()); err != nil {
+		t.Fatal(err)
+	}
+	buildings := writableLayer()
+	buildings.Name = "buildings"
+	buildings.Features[0].Properties["name"] = "한옥"
+	if err := writer.WriteLayers(context.Background(), destination, []core.Layer{writableLayer(), buildings}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"roads", "buildings"} {
+		got, err := (Reader{}).Open(context.Background(), destination, name)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		if len(got.Features) != 1 {
+			t.Fatalf("layer %s features = %d", name, len(got.Features))
+		}
+	}
+}
+
+func TestWriterSingleLayerUpdatePreservesOtherGeoPackageLayers(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "project.gpkg")
+	writer := Writer{}
+	roads := writableLayer()
+	buildings := writableLayer()
+	buildings.Name = "buildings"
+	if err := writer.WriteLayers(context.Background(), destination, []core.Layer{roads, buildings}); err != nil {
+		t.Fatal(err)
+	}
+	roads.Features[0].Properties["name"] = "updated road"
+	if err := writer.Write(context.Background(), destination, roads); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"roads", "buildings"} {
+		if _, err := (Reader{}).Open(context.Background(), destination, name); err != nil {
+			t.Fatalf("layer %s was not preserved: %v", name, err)
+		}
+	}
+}
+
+func TestWriterRejectsMultipleShapefileLayers(t *testing.T) {
+	layers := []core.Layer{writableLayer(), writableLayer()}
+	layers[1].Name = "buildings"
+	err := (Writer{}).WriteLayers(context.Background(), filepath.Join(t.TempDir(), "project.shp"), layers)
+	if err == nil {
+		t.Fatal("multi-layer Shapefile output was accepted")
+	}
+}
+
 func TestWriterRoundTripsShapefile(t *testing.T) {
 	destination := filepath.Join(t.TempDir(), "roads.shp")
 	want := writableLayer()

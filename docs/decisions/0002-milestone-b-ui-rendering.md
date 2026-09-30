@@ -125,6 +125,29 @@ Wails는 빠른 화면 구성과 Go↔웹 기술 결합에는 매력적이다. �
   layer와 섞이면 로딩을 중단하고 오류를 보고한다. 기본 `desktop` target은
   외부 GIS 런타임 없이 데모 source를 유지한다.
 
+## 다중 레이어 저장과 지도 상태 표시
+
+- `Add vector files`는 여러 SHP/GeoPackage/GeoJSON 파일을 한 번에 선택하거나
+  파일을 지도에 끌어 놓아 기존 프로젝트에 레이어로 추가한다. GeoPackage를
+  layer 선택 없이 열면 그 안의 모든 layer를 공통 extent/CRS로 정렬한다.
+  읽기 전용 모드에서도 기존 원본과 신규 파일을 geometry-only로 다시 구성하고,
+  레이어별 GDAL attribute session을 유지해 속성 전체를 메모리에 복제하지 않는다.
+  우측 속성 영역은 layer별 탭을 제공하고, 선택된 탭의 속성 페이지를 보여준다.
+- `Save GeoPackage`는 프로젝트의 모든 layer를 하나의 GeoPackage로 기록한다.
+  GeoPackage 교체는 같은 디렉터리에 임시 파일을 완성한 뒤 기존 파일을 백업하고
+  교체하므로, 기록 도중 실패해도 원본을 보존한다. 일반 단일-layer `Write`는
+  기존 GeoPackage의 다른 layer를 유지하며, `WriteLayers`는 명시적으로 전체
+  collection을 교체한다. SHP는 한 파일당 한 layer만 지원한다.
+- 지도 캔버스는 viewport 안에서 clip하고, 하단 상태줄은 커서 좌표와 근사 축척을
+  표시한다. X/Y 입력과 Go 버튼으로 현재 지도 extent 내의 좌표를 중심에 둔다.
+  축척은 96 DPI 및 projected CRS의 meter 단위를 가정하므로 정확한 출력 축척이
+  아닌 화면 참고값으로 표시한다.
+- 단일 점·수직선·수평선의 0폭 extent는 좌표/축척 산출과 point normalization을
+  위해 확장한다. EPSG:4326은 축당 최소 0.005도, 알려진 projected EPSG는 10 map
+  units를 사용하고, 다른 CRS는 0.5 map units를 fallback으로 쓴다.
+- ARES Commander 실제 앱 호환성은 외부 앱이 필요한 별도 Milestone A 검증으로
+  남는다.
+
 다음 구현 단계는 대용량 multi-layer fixture의 성능 측정과 ARES Commander를
 포함한 외부 포맷 호환성 검증이다.
 

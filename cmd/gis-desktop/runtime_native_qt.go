@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -17,6 +18,11 @@ import (
 	"gogis/internal/render"
 	"gogis/ui/qt/native"
 )
+
+type readOnlyLayerBinding struct {
+	session    *gdal.AttributeSession
+	sourceName string
+}
 
 func loadRuntime(args []string) *demoRuntime {
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
@@ -30,6 +36,7 @@ func loadRuntime(args []string) *demoRuntime {
 		return loadDemoChunk()
 	}
 	runtime.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1})
+	native.SetMapMetadata(runtime.mapCRS, runtime.mapExtent)
 	runtime.publishLayerTree()
 	if names := runtime.service.LayerNames(); len(names) > 0 {
 		runtime.publishAttributes(names[0])
@@ -144,6 +151,10 @@ func loadDataRuntimeModeContextWithPreview(ctx context.Context, input, layerName
 	if err != nil {
 		return nil, err
 	}
+	if readOnly {
+		runtime.readOnlySources = []vectorSourceSpec{{Path: input, LayerName: layerName, SourceCRS: sourceCRS}}
+		runtime.readOnlyDisplayCRS = runtime.mapCRS
+	}
 	keepAttributeSession = attributeSession != nil
 	return runtime, nil
 }
@@ -223,7 +234,102 @@ func tryReadOnlyPreview(ctx context.Context, session *gdal.AttributeSession, lay
 	// replaces the preview. No attribute lookups are issued against it yet.
 	preview.attributePageReader = nil
 	preview.attributeFeatureReader = nil
+	preview.readOnlySources = []vectorSourceSpec{{Path: input, LayerName: layerName, SourceCRS: sourceCRS}}
+	preview.readOnlyDisplayCRS = preview.mapCRS
 	onPreview(preview)
+}
+
+func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, displayCRS string) (*demoRuntime, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("at least one vector source is required")
+	}
+	sessions := make([]*gdal.AttributeSession, 0, len(sources))
+	closeSessions := func() {
+		for _, session := range sessions {
+			_ = session.Close()
+		}
+	}
+	loaded := false
+	defer func() {
+		if !loaded {
+			closeSessions()
+		}
+	}()
+	layers := make([]core.Layer, 0, len(sources))
+	bindings := make(map[string]readOnlyLayerBinding)
+	usedNames := make(map[string]bool)
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		session, err := gdal.OpenAttributeSession(source.Path)
+		if err != nil {
+			return nil, fmt.Errorf("open %q: %w", source.Path, err)
+		}
+		sessions = append(sessions, session)
+		var opened []core.Layer
+		if source.LayerName == "" {
+			opened, err = session.OpenAllGeometryOnly(ctx)
+		} else {
+			var layer core.Layer
+			layer, err = session.OpenGeometryOnly(ctx, source.LayerName)
+			if err == nil {
+				opened = []core.Layer{layer}
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read geometry from %q: %w", source.Path, err)
+		}
+		if len(opened) == 0 {
+			return nil, fmt.Errorf("%q contains no vector layers", source.Path)
+		}
+		for _, layer := range opened {
+			sourceLayerName := layer.Name
+			if source.SourceCRS != "" {
+				layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
+			}
+			layer.Name = uniqueImportedLayerName(layer.Name, source.Path, usedNames)
+			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: sourceLayerName}
+			layers = append(layers, layer)
+		}
+	}
+	runtime, err := buildDataRuntime(ctx, layers, "", "", displayCRS, "", true, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	runtime.attributePageReader = func(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
+		binding, ok := bindings[layerName]
+		if !ok {
+			return core.Layer{}, 0, fmt.Errorf("layer %q not found", layerName)
+		}
+		return binding.session.OpenAttributePage(ctx, binding.sourceName, offset, limit)
+	}
+	runtime.attributeFeatureReader = func(ctx context.Context, layerName string, featureID uint64) (core.Feature, error) {
+		binding, ok := bindings[layerName]
+		if !ok {
+			return core.Feature{}, fmt.Errorf("layer %q not found", layerName)
+		}
+		return binding.session.OpenFeature(ctx, binding.sourceName, featureID)
+	}
+	runtime.closeAttributeSource = closeSessions
+	runtime.readOnlySources = append([]vectorSourceSpec(nil), sources...)
+	runtime.readOnlyDisplayCRS = runtime.mapCRS
+	loaded = true
+	return runtime, nil
+}
+
+func uniqueImportedLayerName(original, sourcePath string, used map[string]bool) string {
+	name := original
+	if used[strings.ToLower(name)] {
+		stem := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
+		name = stem + "_" + original
+	}
+	candidate := name
+	for suffix := 2; used[strings.ToLower(candidate)]; suffix++ {
+		candidate = fmt.Sprintf("%s_%d", name, suffix)
+	}
+	used[strings.ToLower(candidate)] = true
+	return candidate
 }
 
 func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS, targetCRS, savePath string, readOnly bool, attributeSession *gdal.AttributeSession, bounds *[4]float64) (*demoRuntime, error) {
@@ -261,6 +367,12 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 	if len(layers) > 0 {
 		planner.ChunkSize = sources[layers[0].Name].ChunkSize
 	}
+	mapExtent := [4]float64{0, 0, 1, 1}
+	mapCRS := ""
+	if len(layers) > 0 {
+		mapExtent = sources[layers[0].Name].Extent
+		mapCRS = layers[0].CRS.AuthorityCode
+	}
 	serviceLayers := layers
 	if readOnly {
 		// Geometry and WKB are already owned by render sources. Keeping a second
@@ -271,15 +383,18 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 	}
 	loadedService := newLoadedProjectService(serviceLayers)
 	runtime := &demoRuntime{
-		scheduler:     render.NewScheduler(),
-		batchStore:    render.NewBatchStore(),
-		planner:       planner,
-		visibility:    render.NewLayerVisibility(layerNames...),
-		visibleLayers: visibleLayers,
-		features:      features,
-		service:       loadedService,
-		dataMode:      true,
-		readOnly:      readOnly,
+		scheduler:       render.NewScheduler(),
+		batchStore:      render.NewBatchStore(),
+		planner:         planner,
+		visibility:      render.NewLayerVisibility(layerNames...),
+		visibleLayers:   visibleLayers,
+		features:        features,
+		service:         loadedService,
+		dataMode:        true,
+		readOnly:        readOnly,
+		mapExtent:       mapExtent,
+		mapCRS:          mapCRS,
+		saveDestination: savePath,
 	}
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
 		source, ok := sources[key.Layer]
@@ -289,10 +404,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		return source.Builder(ctx, key)
 	}
 	if savePath != "" {
-		writer := gdal.Writer{}
-		runtime.persist = func(ctx context.Context, layerName string) error {
-			return runtime.service.SaveLayer(ctx, writer, savePath, layerName)
-		}
+		configureRuntimePersistence(runtime, savePath)
 	}
 	if attributeSession != nil {
 		runtime.attributePageReader = func(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
@@ -317,12 +429,183 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 	return runtime, nil
 }
 
+func configureRuntimePersistence(runtime *demoRuntime, destination string) {
+	writer := gdal.Writer{}
+	service := runtime.service
+	runtime.saveDestination = destination
+	runtime.persist = func(ctx context.Context, layerName string) error {
+		if strings.EqualFold(filepath.Ext(destination), ".gpkg") {
+			return service.SaveAllLayers(ctx, writer, destination)
+		}
+		if len(service.LayerNames()) > 1 {
+			return fmt.Errorf("cannot persist multiple layers to Shapefile; save the project as GeoPackage")
+		}
+		return service.SaveLayer(ctx, writer, destination, layerName)
+	}
+}
+
+func loadDataRuntimeFiles(ctx context.Context, paths []string, baseLayers []core.Layer, saveDestination string) (*demoRuntime, error) {
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("at least one vector file is required")
+	}
+	layers := make([]core.Layer, 0, len(baseLayers)+len(paths))
+	usedNames := make(map[string]bool, len(baseLayers)+len(paths))
+	for _, layer := range baseLayers {
+		layers = append(layers, layer)
+		usedNames[strings.ToLower(layer.Name)] = true
+	}
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		opened, err := (gdal.Reader{}).OpenAll(ctx, path)
+		if err != nil {
+			return nil, fmt.Errorf("open %q: %w", path, err)
+		}
+		if len(opened) == 0 {
+			return nil, fmt.Errorf("%q contains no vector layers", path)
+		}
+		for _, layer := range opened {
+			layer.Name = uniqueImportedLayerName(layer.Name, path, usedNames)
+			layers = append(layers, layer)
+		}
+	}
+	runtime, err := buildDataRuntime(ctx, layers, "", "", "", "", false, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	runtime.attributePageReader = func(_ context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
+		page, total, ok := runtime.service.LayerAttributePageOwned(layerName, offset, limit)
+		if !ok {
+			return core.Layer{}, 0, fmt.Errorf("layer %q not found", layerName)
+		}
+		return page, total, nil
+	}
+	if saveDestination != "" {
+		configureRuntimePersistence(runtime, saveDestination)
+	}
+	return runtime, nil
+}
+
 func layerMetadataOnly(layers []core.Layer) []core.Layer {
 	metadata := make([]core.Layer, len(layers))
 	for index, layer := range layers {
 		metadata[index] = core.Layer{Name: layer.Name, CRS: layer.CRS}
 	}
 	return metadata
+}
+
+func (r *demoRuntime) saveDataset(destination string) {
+	if destination == "" {
+		native.SetRenderStatus("Save cancelled")
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(destination), ".gpkg") {
+		native.SetRenderStatus("Save failed: choose a .gpkg destination")
+		return
+	}
+	r.mu.Lock()
+	service, readOnly := r.service, r.readOnly
+	r.mu.Unlock()
+	if readOnly {
+		native.SetRenderStatus("Save failed: read-only dataset is not editable")
+		return
+	}
+	if service == nil {
+		native.SetRenderStatus("Save failed: no project is loaded")
+		return
+	}
+	native.SetRenderStatus("Saving " + destination)
+	writer := gdal.Writer{}
+	if err := service.SaveAllLayers(context.Background(), writer, destination); err != nil {
+		native.SetRenderStatus("Save failed: " + err.Error())
+		return
+	}
+	r.mu.Lock()
+	r.persist = func(ctx context.Context, layerName string) error {
+		if strings.EqualFold(filepath.Ext(destination), ".gpkg") {
+			return service.SaveAllLayers(ctx, writer, destination)
+		}
+		return service.SaveLayer(ctx, writer, destination, layerName)
+	}
+	r.saveDestination = destination
+	r.mu.Unlock()
+	native.SetRenderStatus("Saved " + destination)
+}
+
+func (r *demoRuntime) startDataLoadPaths(paths []string) {
+	r.mu.Lock()
+	service := r.service
+	appendLayers := r.dataMode && service != nil
+	readOnly := r.readOnly
+	saveDestination := r.saveDestination
+	readOnlySources := append([]vectorSourceSpec(nil), r.readOnlySources...)
+	displayCRS := r.readOnlyDisplayCRS
+	previousVisibility := make(map[string]bool)
+	if appendLayers {
+		previousVisibility = make(map[string]bool, len(r.visibleLayers))
+		for name, visible := range r.visibleLayers {
+			previousVisibility[name] = visible
+		}
+	}
+	r.mu.Unlock()
+	var baseLayers []core.Layer
+	if appendLayers && !readOnly {
+		baseLayers = service.Project().Layers
+	}
+	if appendLayers && readOnly && len(readOnlySources) == 0 {
+		native.SetRenderStatus("Cannot add files until the read-only source is ready")
+		return
+	}
+	if readOnly {
+		for _, path := range paths {
+			readOnlySources = append(readOnlySources, vectorSourceSpec{Path: path})
+		}
+	}
+	loadContext, cancel := context.WithCancel(context.Background())
+	r.mu.Lock()
+	previousCancel := r.loadCancel
+	r.loadCancel = cancel
+	r.loadGeneration++
+	generation := r.loadGeneration
+	r.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
+	native.BeginLoadTrace()
+	native.SetRenderStatus(fmt.Sprintf("Loading %d vector file(s)", len(paths)))
+	go func() {
+		var next *demoRuntime
+		var err error
+		if readOnly {
+			next, err = loadReadOnlyDataRuntime(loadContext, readOnlySources, displayCRS)
+		} else {
+			next, err = loadDataRuntimeFiles(loadContext, paths, baseLayers, saveDestination)
+		}
+		r.mu.Lock()
+		current := generation == r.loadGeneration
+		if current {
+			r.loadCancel = nil
+		}
+		r.mu.Unlock()
+		if !current {
+			if next != nil && next.closeAttributeSource != nil {
+				next.closeAttributeSource()
+			}
+			return
+		}
+		if err != nil {
+			native.SetRenderStatus("Open failed: " + err.Error())
+			return
+		}
+		for name, visible := range previousVisibility {
+			if _, exists := next.visibleLayers[name]; exists {
+				next.visibleLayers[name] = visible
+				next.visibility.Set(name, visible)
+			}
+		}
+		r.replaceWithLoaded(next, generation)
+	}()
 }
 
 func (r *demoRuntime) replaceWith(next *demoRuntime) {
@@ -363,6 +646,12 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.dataMode = next.dataMode
 	r.readOnly = next.readOnly
 	r.previewLoading = preview
+	r.mapExtent = next.mapExtent
+	r.mapCRS = next.mapCRS
+	r.saveDestination = next.saveDestination
+	r.readOnlySources = next.readOnlySources
+	r.readOnlyDisplayCRS = next.readOnlyDisplayCRS
+	mapExtent, mapCRS := r.mapExtent, r.mapCRS
 	r.persist = next.persist
 	r.attributePageReader = next.attributePageReader
 	r.attributeFeatureReader = next.attributeFeatureReader
@@ -399,6 +688,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 		previousAttributeCloser()
 	}
 	native.SetSelection("", "", "", "Loaded")
+	native.SetMapMetadata(mapCRS, mapExtent)
 	r.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1})
 	r.publishLayerTree()
 	if preview {

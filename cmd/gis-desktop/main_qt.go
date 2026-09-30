@@ -59,6 +59,11 @@ type demoRuntime struct {
 	dataMode                    bool
 	readOnly                    bool
 	previewLoading              bool
+	saveDestination             string
+	readOnlySources             []vectorSourceSpec
+	readOnlyDisplayCRS          string
+	mapExtent                   [4]float64
+	mapCRS                      string
 	persist                     func(context.Context, string) error
 	attributePageReader         func(context.Context, string, int, int) (core.Layer, int, error)
 	attributeFeatureReader      func(context.Context, string, uint64) (core.Feature, error)
@@ -79,6 +84,12 @@ type demoRuntime struct {
 	hasSelect                   bool
 	selectionGeneration         uint64
 	selectionCancel             context.CancelFunc
+}
+
+type vectorSourceSpec struct {
+	Path      string
+	LayerName string
+	SourceCRS string
 }
 
 func loadDemoChunk() *demoRuntime {
@@ -118,7 +129,8 @@ type attributePageKey struct {
 }
 
 type layerTreePayloadRow struct {
-	Name string `json:"name"`
+	Name    string `json:"name"`
+	Visible bool   `json:"visible"`
 }
 
 func (r *demoRuntime) publishLayerTree() {
@@ -129,7 +141,11 @@ func (r *demoRuntime) publishLayerTree() {
 	names := r.service.LayerNames()
 	rows := make([]layerTreePayloadRow, len(names))
 	for index, name := range names {
-		rows[index] = layerTreePayloadRow{Name: name}
+		visible := true
+		if state, exists := r.visibleLayers[name]; exists {
+			visible = state
+		}
+		rows[index] = layerTreePayloadRow{Name: name, Visible: visible}
 	}
 	payload, err := json.Marshal(rows)
 	if err != nil {
@@ -732,16 +748,24 @@ func startViewportSync(runtime *demoRuntime) {
 	lastActiveLayerGeneration := native.ActiveLayerGeneration()
 	lastAttributePageGeneration := native.AttributePageGeneration()
 	lastLoadGeneration := native.LoadGeneration()
+	lastSaveGeneration := native.SaveGeneration()
 	go func() {
 		for range time.NewTicker(16 * time.Millisecond).C {
+			saveGeneration := native.SaveGeneration()
+			if saveGeneration != lastSaveGeneration {
+				lastSaveGeneration = saveGeneration
+				runtime.saveDataset(native.CurrentSavePath())
+			}
 			loadGeneration := native.LoadGeneration()
 			if loadGeneration != lastLoadGeneration {
 				lastLoadGeneration = loadGeneration
-				path := native.CurrentLoadPath()
-				if path == "" {
+				paths, err := native.CurrentLoadPaths()
+				if err != nil {
+					native.SetRenderStatus("Open failed: invalid file selection")
+				} else if len(paths) == 0 {
 					native.SetRenderStatus("Open cancelled")
 				} else {
-					runtime.startDataLoad(path, "", "", "", "", false)
+					runtime.startDataLoadPaths(paths)
 				}
 			}
 			qtGeneration := native.ViewportGeneration()

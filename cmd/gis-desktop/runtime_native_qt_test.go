@@ -56,6 +56,19 @@ func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 	if err := dataset.Close(); err != nil {
 		t.Fatal(err)
 	}
+	allLayers, err := loadDataRuntimeModeContext(context.Background(), path, "", "", "", "", false)
+	if err != nil {
+		t.Fatalf("load every dataset layer: %v", err)
+	}
+	if names := allLayers.service.LayerNames(); len(names) != 2 || names[0] != "first" || names[1] != "selected" {
+		t.Fatalf("all layer names = %v", names)
+	}
+	if len(allLayers.features) != 2 {
+		t.Fatalf("all layer feature count = %d, want 2", len(allLayers.features))
+	}
+	if allLayers.mapExtent != [4]float64{126.995, 36.995, 127.005, 37.005} {
+		t.Fatalf("common map extent = %v", allLayers.mapExtent)
+	}
 	for _, readOnly := range []bool{true, false} {
 		runtime, err := loadDataRuntimeModeContext(context.Background(), path, "selected", "", "", "", readOnly)
 		if err != nil {
@@ -70,6 +83,79 @@ func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 		if runtime.closeAttributeSource != nil {
 			runtime.closeAttributeSource()
 		}
+	}
+}
+
+func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
+	root := t.TempDir()
+	firstDirectory := filepath.Join(root, "first")
+	secondDirectory := filepath.Join(root, "second")
+	for _, directory := range []string{firstDirectory, secondDirectory} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPath := filepath.Join(firstDirectory, "roads.shp")
+	secondPath := filepath.Join(secondDirectory, "roads.shp")
+	firstLayer := core.Layer{
+		Name:   "roads",
+		CRS:    core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields: []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{
+			ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"},
+			Properties: map[string]any{"name": "first"},
+		}},
+	}
+	secondLayer := firstLayer.Clone()
+	secondLayer.Features[0].Geometry = core.WKTGeometry{WKT: "POINT (128 38)"}
+	secondLayer.Features[0].Properties["name"] = "second"
+	for _, item := range []struct {
+		path  string
+		layer core.Layer
+	}{{firstPath, firstLayer}, {secondPath, secondLayer}} {
+		if err := (gdal.Writer{}).Write(context.Background(), item.path, item.layer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := loadDataRuntimeFiles(context.Background(), []string{firstPath}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	added, err := loadDataRuntimeFiles(context.Background(), []string{secondPath}, first.service.Project().Layers, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := added.service.LayerNames(); len(names) != 2 || names[0] != "roads" || names[1] != "roads_roads" {
+		t.Fatalf("combined layer names = %v", names)
+	}
+	if len(added.features) != 2 {
+		t.Fatalf("combined feature count = %d, want 2", len(added.features))
+	}
+	if added.mapExtent != [4]float64{127, 37, 128, 38} {
+		t.Fatalf("combined extent = %v", added.mapExtent)
+	}
+	page, total, err := added.attributePageReader(context.Background(), "roads_roads", 0, 10)
+	if err != nil || total != 1 || page.Features[0].Properties["name"] != "second" {
+		t.Fatalf("added layer attributes page=%#v total=%d err=%v", page, total, err)
+	}
+	readOnlyFirst, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: firstPath}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnlyFirst.closeAttributeSource()
+	readOnlyAdded, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{
+		{Path: firstPath}, {Path: secondPath},
+	}, readOnlyFirst.mapCRS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnlyAdded.closeAttributeSource()
+	if !readOnlyAdded.readOnly || len(readOnlyAdded.features) != 2 {
+		t.Fatalf("read-only combined runtime mode=%t features=%d", readOnlyAdded.readOnly, len(readOnlyAdded.features))
+	}
+	page, total, err = readOnlyAdded.attributePageReader(context.Background(), "roads_roads", 0, 10)
+	if err != nil || total != 1 || page.Features[0].Properties["name"] != "second" {
+		t.Fatalf("read-only added layer page=%#v total=%d err=%v", page, total, err)
 	}
 }
 

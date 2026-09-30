@@ -44,4 +44,9 @@ table·선택 경로는 `desktop-native` target과 `testdata/sample.geojson`으�
 구성한다. `--save`를 지정한 native UI에서는 편집 Commit의
 결과를 새 GeoPackage/SHP로 저장할 수 있다.
 
+Milestone B UI는 GeoPackage의 모든 layer를 탭별 속성 패널로 노출하고,
+`Save GeoPackage`로 전체 layer를 한 파일에 저장한다. SHP 저장은 단일 layer만
+허용한다. 저장·클리핑·좌표/근사 축척 표시의 구현 및 자동 검증 상태는
+`docs/decisions/0002-milestone-b-ui-rendering.md`와 MVP checklist를 참조한다.
+
 네이티브 드라이버는 OS별 런타임 배포와 라이선스 조사를 마친 뒤 `drivers/interfaces.go`의 경계에 연결한다. 현재 테스트는 외부 의존성 없이 실행된다.
