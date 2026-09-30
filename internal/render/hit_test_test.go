@@ -77,6 +77,60 @@ func TestHitIndexMatchesLinearHitTest(t *testing.T) {
 	}
 }
 
+func TestHitIndexDensePathMatchesLinearHitTest(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "roads", FeatureID: 10, Vertices: []Point{{X: 0, Y: 0}, {X: 1, Y: 0}}},
+		{Layer: "roads", FeatureID: 20, Vertices: []Point{{X: 0, Y: 0.4}, {X: 1, Y: 0.4}}},
+		{Layer: "labels", FeatureID: 30, Vertices: []Point{{X: 0.9, Y: 0.9}}},
+	}
+	index := NewHitIndex(features, 0.25)
+	point := Point{X: 0.6, Y: 0.2}
+	linear, linearOK := HitTest(features, point, 0.5)
+	indexed, indexedOK := index.HitTest(point, 0.5)
+	if linearOK != indexedOK || linear != indexed {
+		t.Fatalf("linear = %#v/%v, indexed = %#v/%v", linear, linearOK, indexed, indexedOK)
+	}
+}
+
+func TestHitIndexLongSegmentUsesTraversedCells(t *testing.T) {
+	features := []HitFeature{{
+		Layer:     "roads",
+		FeatureID: 1,
+		Vertices:  []Point{{X: 0, Y: 0}, {X: 1, Y: 1}},
+	}}
+	index := NewHitIndex(features, 0.1)
+	if len(index.cells) >= 121 {
+		t.Fatalf("long segment indexed %d cells, want fewer than bounding box", len(index.cells))
+	}
+	if result, ok := index.HitTest(Point{X: 0.5, Y: 0.5}, 0.02); !ok || result.FeatureID != 1 {
+		t.Fatalf("long segment hit = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestHitIndexAxisAlignedSegmentsUseAllCrossedCells(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "roads", FeatureID: 1, Vertices: []Point{{X: 0.01, Y: 0.25}, {X: 0.99, Y: 0.25}}},
+		{Layer: "roads", FeatureID: 2, Vertices: []Point{{X: 0.5, Y: 0.01}, {X: 0.5, Y: 0.99}}},
+	}
+	index := NewHitIndex(features, 0.1)
+	if result, ok := index.HitTest(Point{X: 0.75, Y: 0.25}, 0.02); !ok || result.FeatureID != 1 {
+		t.Fatalf("horizontal segment hit = %#v, ok = %v", result, ok)
+	}
+	if result, ok := index.HitTest(Point{X: 0.5, Y: 0.75}, 0.02); !ok || result.FeatureID != 2 {
+		t.Fatalf("vertical segment hit = %#v, ok = %v", result, ok)
+	}
+	longIndex := NewHitIndex([]HitFeature{{
+		Layer: "roads", FeatureID: 3,
+		Vertices: []Point{{X: 0, Y: 0.5}, {X: 1, Y: 0.5}},
+	}}, 0.01)
+	if len(longIndex.spans) != 1 || len(longIndex.cells) != 0 {
+		t.Fatalf("long horizontal index = spans=%d cells=%d", len(longIndex.spans), len(longIndex.cells))
+	}
+	if result, ok := longIndex.HitTest(Point{X: 0.5, Y: 0.5}, 0.02); !ok || result.FeatureID != 3 {
+		t.Fatalf("long horizontal span hit = %#v, ok = %v", result, ok)
+	}
+}
+
 func TestHitIndexScreenUsesPixelTolerance(t *testing.T) {
 	features := []HitFeature{{Layer: "roads", FeatureID: 42, Vertices: []Point{{X: 0.4, Y: 0.5}, {X: 0.6, Y: 0.5}}}}
 	index := NewHitIndex(features, 0.25)

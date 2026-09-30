@@ -28,29 +28,56 @@ var mainQML []byte
 
 func main() {
 	qt.NewQApplication(os.Args)
-	runtime := loadRuntime(os.Args)
+	// Keep the event loop responsive while GDAL opens and snapshots a large
+	// dataset. The demo runtime is a lightweight first frame and is replaced
+	// by the native loader after QML is ready.
+	runtime := loadDemoChunk()
 	native.RegisterMapCanvas()
 	engine := qml.NewQQmlApplicationEngine()
 	engine.LoadData(mainQML)
 	startViewportSync(runtime)
+	startInitialDataLoad(runtime, os.Args)
 	qt.QApplication_Exec()
 }
 
 type demoRuntime struct {
-	scheduler  *render.Scheduler
-	batchStore *render.BatchStore
-	planner    render.ChunkPlanner
-	visibility *render.LayerVisibility
-	builder    render.ChunkBuilder
-	mu         sync.Mutex
-	cancel     context.CancelFunc
-	features   []render.HitFeature
-	hitIndex   render.HitIndex
-	service    *commands.ProjectService
-	dataMode   bool
-	persist    func(context.Context, string) error
-	selected   render.HitResult
-	hasSelect  bool
+	scheduler                   *render.Scheduler
+	batchStore                  *render.BatchStore
+	planner                     render.ChunkPlanner
+	visibility                  *render.LayerVisibility
+	visibleLayers               map[string]bool
+	builder                     render.ChunkBuilder
+	mu                          sync.Mutex
+	cancel                      context.CancelFunc
+	loadCancel                  context.CancelFunc
+	loadGeneration              uint64
+	features                    []render.HitFeature
+	hitIndex                    render.HitIndex
+	hitIndexReady               bool
+	service                     *commands.ProjectService
+	dataMode                    bool
+	readOnly                    bool
+	previewLoading              bool
+	persist                     func(context.Context, string) error
+	attributePageReader         func(context.Context, string, int, int) (core.Layer, int, error)
+	attributeFeatureReader      func(context.Context, string, uint64) (core.Feature, error)
+	closeAttributeSource        func()
+	attributeLayer              string
+	attributePage               int
+	attributeReady              bool
+	attributeCache              map[attributePageKey]string
+	attributeCacheOrder         []attributePageKey
+	attributeGeneration         uint64
+	attributeDispatchGeneration uint64
+	attributeCancel             context.CancelFunc
+	featureNameCacheLayer       string
+	featureNameCacheID          uint64
+	featureNameCacheValue       string
+	featureNameCacheReady       bool
+	selected                    render.HitResult
+	hasSelect                   bool
+	selectionGeneration         uint64
+	selectionCancel             context.CancelFunc
 }
 
 func loadDemoChunk() *demoRuntime {
@@ -59,6 +86,9 @@ func loadDemoChunk() *demoRuntime {
 		batchStore: render.NewBatchStore(),
 		planner:    render.NewChunkPlanner(),
 		visibility: render.NewLayerVisibility("roads", "buildings", "labels"),
+		visibleLayers: map[string]bool{
+			"roads": true, "buildings": true, "labels": true,
+		},
 	}
 	runtime.builder = demoChunkBuilder(runtime.planner.ChunkSize)
 	runtime.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1})
@@ -69,13 +99,21 @@ func loadDemoChunk() *demoRuntime {
 }
 
 type attributePayload struct {
-	Columns []string              `json:"columns"`
-	Rows    []attributePayloadRow `json:"rows"`
+	Columns  []string              `json:"columns"`
+	Rows     []attributePayloadRow `json:"rows"`
+	Page     int                   `json:"page"`
+	PageSize int                   `json:"pageSize"`
+	Total    int                   `json:"total"`
 }
 
 type attributePayloadRow struct {
 	FeatureID uint64         `json:"featureId"`
 	Values    map[string]any `json:"values"`
+}
+
+type attributePageKey struct {
+	layer string
+	page  int
 }
 
 type layerTreePayloadRow struct {
@@ -87,10 +125,10 @@ func (r *demoRuntime) publishLayerTree() {
 		native.SetLayerTreePayload("[]")
 		return
 	}
-	tree := presentation.LayerTree(r.service.Project())
-	rows := make([]layerTreePayloadRow, len(tree))
-	for index, item := range tree {
-		rows[index] = layerTreePayloadRow{Name: item.Name}
+	names := r.service.LayerNames()
+	rows := make([]layerTreePayloadRow, len(names))
+	for index, name := range names {
+		rows[index] = layerTreePayloadRow{Name: name}
 	}
 	payload, err := json.Marshal(rows)
 	if err != nil {
@@ -101,16 +139,90 @@ func (r *demoRuntime) publishLayerTree() {
 }
 
 func (r *demoRuntime) publishAttributes(layerName string) {
-	if r.service == nil {
-		native.SetAttributePayload("[]")
+	r.publishAttributesPage(layerName, 0)
+}
+
+const attributePageSize = 200
+
+func (r *demoRuntime) publishAttributesPage(layerName string, page int) {
+	r.mu.Lock()
+	dispatch := r.nextAttributeDispatchLocked()
+	r.mu.Unlock()
+	r.publishAttributesPageDispatched(layerName, page, dispatch)
+}
+
+func (r *demoRuntime) publishAttributesPageAsync(layerName string, page int) {
+	r.mu.Lock()
+	dispatch := r.nextAttributeDispatchLocked()
+	r.mu.Unlock()
+	go r.publishAttributesPageDispatched(layerName, page, dispatch)
+}
+
+func (r *demoRuntime) nextAttributeDispatchLocked() uint64 {
+	r.attributeDispatchGeneration++
+	r.attributeGeneration++
+	if r.attributeCancel != nil {
+		r.attributeCancel()
+		r.attributeCancel = nil
+	}
+	return r.attributeDispatchGeneration
+}
+
+func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int, dispatch uint64) {
+	if page < 0 {
+		page = 0
+	}
+	r.mu.Lock()
+	if dispatch != r.attributeDispatchGeneration {
+		r.mu.Unlock()
 		return
 	}
+	if r.attributeReady && r.attributeLayer == layerName && r.attributePage == page {
+		r.mu.Unlock()
+		return
+	}
+	r.attributeGeneration++
+	generation := r.attributeGeneration
+	if r.attributeCancel != nil {
+		r.attributeCancel()
+		r.attributeCancel = nil
+	}
+	key := attributePageKey{layer: layerName, page: page}
+	if payload, ok := r.attributeCache[key]; ok {
+		native.SetAttributePayload(payload)
+		r.attributeLayer = layerName
+		r.attributePage = page
+		r.attributeReady = true
+		r.mu.Unlock()
+		return
+	}
+	if r.service == nil {
+		native.SetAttributePayload("[]")
+		r.attributeLayer = layerName
+		r.attributePage = page
+		r.attributeReady = true
+		r.mu.Unlock()
+		return
+	}
+	service := r.service
+	reader := r.attributePageReader
+	requestContext, cancel := context.WithCancel(context.Background())
+	r.attributeCancel = cancel
+	r.mu.Unlock()
+	defer cancel()
 	payloadModel := attributePayload{}
-	for _, layer := range r.service.Project().Layers {
-		if layer.Name != layerName {
-			continue
-		}
-		table := presentation.AttributeTable(layer)
+	var layer core.Layer
+	var total int
+	var ok bool
+	var pageErr error
+	if reader != nil {
+		layer, total, pageErr = reader(requestContext, layerName, page*attributePageSize, attributePageSize)
+		ok = pageErr == nil
+	} else {
+		layer, total, ok = service.LayerAttributePageOwned(layerName, page*attributePageSize, attributePageSize)
+	}
+	if ok {
+		table := presentation.AttributeTableOwned(layer)
 		payloadModel.Columns = make([]string, len(table.Columns))
 		for i, column := range table.Columns {
 			payloadModel.Columns[i] = column.Name
@@ -119,14 +231,64 @@ func (r *demoRuntime) publishAttributes(layerName string) {
 		for i, row := range table.Rows {
 			payloadModel.Rows[i] = attributePayloadRow{FeatureID: row.FeatureID, Values: row.Values}
 		}
-		break
+		payloadModel.Page = page
+		payloadModel.PageSize = attributePageSize
+		payloadModel.Total = total
 	}
-	payload, err := json.Marshal(payloadModel)
-	if err != nil {
+	payload, marshalErr := json.Marshal(payloadModel)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.attributeGeneration || r.service != service {
+		return
+	}
+	r.attributeCancel = nil
+	if pageErr != nil {
+		if requestContext.Err() == nil {
+			native.SetRenderStatus("Attribute page failed: " + pageErr.Error())
+		}
+		return
+	}
+	if marshalErr != nil {
 		native.SetAttributePayload("[]")
+		r.attributeLayer = layerName
+		r.attributePage = page
+		r.attributeReady = true
 		return
 	}
 	native.SetAttributePayload(string(payload))
+	r.cacheAttributePayload(key, string(payload))
+	r.attributeLayer = layerName
+	r.attributePage = page
+	r.attributeReady = true
+}
+
+func (r *demoRuntime) republishAttributesAsync(layerName string) {
+	r.mu.Lock()
+	r.attributeReady = false
+	r.attributeCache = nil
+	r.attributeCacheOrder = nil
+	dispatch := r.nextAttributeDispatchLocked()
+	r.mu.Unlock()
+	go r.publishAttributesPageDispatched(layerName, 0, dispatch)
+}
+
+const attributePayloadCacheLimit = 8
+
+func (r *demoRuntime) cacheAttributePayload(key attributePageKey, payload string) {
+	if r.attributeCache == nil {
+		r.attributeCache = make(map[attributePageKey]string)
+	}
+	if _, exists := r.attributeCache[key]; exists {
+		return
+	}
+	r.attributeCache[key] = payload
+	r.attributeCacheOrder = append(r.attributeCacheOrder, key)
+	if len(r.attributeCacheOrder) <= attributePayloadCacheLimit {
+		return
+	}
+	oldest := r.attributeCacheOrder[0]
+	delete(r.attributeCache, oldest)
+	r.attributeCacheOrder = r.attributeCacheOrder[1:]
 }
 
 func newDemoService(features []render.HitFeature) *commands.ProjectService {
@@ -153,70 +315,115 @@ func newDemoService(features []render.HitFeature) *commands.ProjectService {
 }
 
 func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
-	var keys []render.ChunkKey
-	if r.dataMode {
-		for _, layer := range r.visibility.VisibleLayers() {
-			keys = append(keys, r.planner.VisibleKeys(viewport, layer)...)
-		}
-	} else {
-		for _, layer := range r.visibility.VisibleLayers() {
-			keys = append(keys, r.planner.VisibleKeys(viewport, layer)...)
-		}
-	}
-	keys = r.visibility.FilterChunkKeys(keys)
-	generation := r.scheduler.Generation()
-	r.batchStore.BeginGeneration(generation, keys...)
 	r.mu.Lock()
+	scheduler := r.scheduler
+	batchStore := r.batchStore
+	builder := r.builder
+	planner := r.planner
+	visibility := r.visibility
+	r.mu.Unlock()
+	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)
+	keys := keyBuffer.Keys
+	for _, layer := range visibility.VisibleLayers() {
+		keys = planner.VisibleKeysInto(keys, viewport, layer)
+	}
+	keys = visibility.FilterChunkKeysInPlace(keys)
+	generation := scheduler.Generation()
+	batchStore.BeginGeneration(generation, keys...)
+	r.mu.Lock()
+	previousCancel := r.cancel
+	r.cancel = nil
 	if !r.dataMode {
-		r.features = demoFeatures(keys, r.planner.ChunkSize)
-		r.hitIndex = render.NewHitIndex(r.features, 0.01)
+		r.features = demoFeatures(keys, planner.ChunkSize)
+		r.hitIndex = render.HitIndex{}
+		r.hitIndexReady = false
 	}
 	r.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 	if len(keys) == 0 {
 		native.SetRenderStatus("No visible layers")
-		r.batchStore.Clear()
+		batchStore.Clear()
 		native.SetVertices(nil)
 		native.RequestCanvasUpdate()
 		native.SetSelection("", "", "", "No feature selected")
+		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		return
 	}
 
 	requestContext, cancel := context.WithCancel(ctx)
 	requestGeneration := generation
 	r.mu.Lock()
-	previousCancel := r.cancel
 	r.cancel = cancel
 	r.mu.Unlock()
-	if previousCancel != nil {
-		previousCancel()
-	}
-	setProgress := func(progress presentation.RenderProgress) {
-		if r.scheduler.Generation() == requestGeneration {
+	lastProgress := time.Time{}
+	setProgress := func(progress presentation.RenderProgress, force bool) {
+		now := time.Now()
+		if !force && !lastProgress.IsZero() && now.Sub(lastProgress) < 16*time.Millisecond {
+			return
+		}
+		r.mu.Lock()
+		current := r.scheduler == scheduler && scheduler.Generation() == requestGeneration
+		preview := r.previewLoading
+		loading := r.loadCancel != nil
+		r.mu.Unlock()
+		if !current || (loading && !preview) {
+			return
+		}
+		if preview {
+			native.SetRenderStatus("Preview displayed; loading full data")
+		} else {
 			native.SetRenderStatus(progress.Message())
 		}
+		lastProgress = now
 	}
-	setProgress(presentation.RenderProgress{Phase: "Loading", Total: len(keys), Cancellable: true})
+	setProgress(presentation.RenderProgress{Phase: "Loading", Total: len(keys), Cancellable: true}, true)
 
-	go func() {
-		results := r.scheduler.Request(requestContext, keys, r.builder)
+	go func(requestKeys []render.ChunkKey, keyBuffer *render.ChunkKeyBuffer, scheduler *render.Scheduler) {
+		defer scheduler.ReleaseChunkKeyBuffer(keyBuffer)
+		results := scheduler.RequestUnique(requestContext, requestKeys, builder)
 		completed := 0
+		lastPublish := time.Now()
+		var publishScratch []render.Vertex
+		dirty := true // BeginGeneration may have removed now-hidden chunks.
+		publishBatch := func() {
+			if !dirty || requestContext.Err() != nil {
+				return
+			}
+			r.mu.Lock()
+			if r.scheduler != scheduler {
+				r.mu.Unlock()
+				return
+			}
+			currentGeneration, vertices := batchStore.CurrentInto(publishScratch)
+			publishScratch = vertices
+			if currentGeneration == requestGeneration && requestContext.Err() == nil {
+				native.SetVertices(publishScratch)
+				native.RequestCanvasUpdate()
+				dirty = false
+				lastPublish = time.Now()
+			}
+			r.mu.Unlock()
+		}
 		for result := range results {
 			completed++
-			setProgress(presentation.RenderProgress{Phase: "Loading", Completed: completed, Total: len(keys), Cancellable: true})
-			if !r.batchStore.Apply(result) {
+			setProgress(presentation.RenderProgress{Phase: "Loading", Completed: completed, Total: len(requestKeys), Cancellable: true}, completed == len(requestKeys))
+			if !batchStore.ApplyImmutable(result) {
 				continue
 			}
-			if _, vertices := r.batchStore.Current(); len(vertices) > 0 {
-				native.SetVertices(vertices)
-				native.RequestCanvasUpdate()
+			dirty = true
+			if time.Since(lastPublish) >= 16*time.Millisecond {
+				publishBatch()
 			}
 		}
+		publishBatch()
 		if requestContext.Err() != nil {
-			setProgress(presentation.RenderProgress{Phase: "Render cancelled"})
+			setProgress(presentation.RenderProgress{Phase: "Render cancelled"}, true)
 		} else {
-			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(keys)})
+			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(requestKeys)}, true)
 		}
-	}()
+	}(keys, keyBuffer, scheduler)
 }
 
 func demoFeatures(keys []render.ChunkKey, chunkSize float64) []render.HitFeature {
@@ -246,60 +453,130 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 		Zoom: viewport.Zoom,
 	}
 	r.mu.Lock()
-	features := append([]render.HitFeature(nil), r.features...)
-	r.mu.Unlock()
-	r.mu.Lock()
-	hitIndex := r.hitIndex
-	r.mu.Unlock()
-	visible := make(map[string]bool)
-	for _, layer := range r.visibility.VisibleLayers() {
-		visible[layer] = true
+	// refresh replaces the feature slice instead of mutating it in place, so
+	// the snapshot remains valid after releasing the runtime mutex. Avoid a
+	// full feature-array copy on every click.
+	features := r.features
+	if !r.hitIndexReady {
+		r.hitIndex = render.NewHitIndex(features, 0.01)
+		r.hitIndexReady = true
 	}
-	result, ok := hitIndex.HitTestScreenVisible(render.Point{X: click.X, Y: click.Y}, worldViewport, width, height, 8, visible)
+	hitIndex := r.hitIndex
+	visibleLayers := r.visibleLayers
+	serviceSnapshot := r.service
+	readOnlySnapshot := r.readOnly
+	r.mu.Unlock()
+	result, ok := hitIndex.HitTestScreenVisible(render.Point{X: click.X, Y: click.Y}, worldViewport, width, height, 8, visibleLayers)
 	if !ok {
 		r.mu.Lock()
+		if r.service != serviceSnapshot {
+			r.mu.Unlock()
+			return
+		}
 		r.hasSelect = false
+		r.selectionGeneration++
+		r.nextAttributeDispatchLocked()
+		r.attributeReady = false
+		if r.selectionCancel != nil {
+			r.selectionCancel()
+			r.selectionCancel = nil
+		}
 		r.mu.Unlock()
 		native.SetSelection("", "", "", "No feature selected")
 		native.SetAttributePayload("[]")
 		return
 	}
-	r.ensureFeature(result, features)
+	ensureFeature(serviceSnapshot, readOnlySnapshot, result, features)
+	label := fmt.Sprintf("%s segment #%d", result.Layer, result.FeatureID)
 	r.mu.Lock()
-	r.selected = result
-	r.hasSelect = true
-	r.mu.Unlock()
-	r.publishAttributes(result.Layer)
-	native.SetSelection(result.Layer, fmt.Sprintf("%s segment #%d", result.Layer, result.FeatureID), r.featureName(result.Layer, result.FeatureID), "Selected for inspection")
-}
-
-func (r *demoRuntime) ensureFeature(result render.HitResult, features []render.HitFeature) {
-	if r.service == nil {
+	if r.service != serviceSnapshot {
+		r.mu.Unlock()
 		return
 	}
-	for _, layer := range r.service.Project().Layers {
-		if layer.Name != result.Layer {
-			continue
+	r.selected = result
+	r.hasSelect = true
+	r.selectionGeneration++
+	generation := r.selectionGeneration
+	if r.selectionCancel != nil {
+		r.selectionCancel()
+		r.selectionCancel = nil
+	}
+	readOnly := r.readOnly
+	reader := r.attributeFeatureReader
+	service := r.service
+	cachedName := ""
+	cached := readOnly && r.featureNameCacheReady && r.featureNameCacheLayer == result.Layer && r.featureNameCacheID == result.FeatureID
+	if cached {
+		cachedName = r.featureNameCacheValue
+	}
+	var lookupContext context.Context
+	if readOnly && reader != nil && !cached {
+		var cancel context.CancelFunc
+		lookupContext, cancel = context.WithCancel(context.Background())
+		r.selectionCancel = cancel
+	}
+	if readOnly {
+		native.SetSelection(result.Layer, label, cachedName, "Selected for inspection")
+	}
+	r.mu.Unlock()
+	r.publishAttributesPageAsync(result.Layer, 0)
+	if readOnly {
+		if lookupContext != nil {
+			go r.finishReadOnlySelectionName(lookupContext, generation, service, reader, result, label)
 		}
-		for _, feature := range layer.Features {
-			if feature.ID == result.FeatureID {
-				return
-			}
-		}
+		return
+	}
+	name := r.featureName(result.Layer, result.FeatureID)
+	r.mu.Lock()
+	if generation == r.selectionGeneration && r.service == serviceSnapshot && r.hasSelect {
+		native.SetSelection(result.Layer, label, name, "Selected for inspection")
+	}
+	r.mu.Unlock()
+}
+
+func (r *demoRuntime) finishReadOnlySelectionName(ctx context.Context, generation uint64, service *commands.ProjectService, reader func(context.Context, string, uint64) (core.Feature, error), selected render.HitResult, label string) {
+	feature, err := reader(ctx, selected.Layer, selected.FeatureID)
+	if ctx.Err() != nil {
+		return
+	}
+	name, _ := feature.Properties["name"].(string)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation != r.selectionGeneration || r.service != service || !r.hasSelect || r.selected.Layer != selected.Layer || r.selected.FeatureID != selected.FeatureID {
+		return
+	}
+	r.selectionCancel = nil
+	if err != nil {
+		native.SetSelection(selected.Layer, label, "", "Selected; name lookup failed")
+		return
+	}
+	r.featureNameCacheLayer = selected.Layer
+	r.featureNameCacheID = selected.FeatureID
+	r.featureNameCacheValue = name
+	r.featureNameCacheReady = true
+	native.SetSelection(selected.Layer, label, name, "Selected for inspection")
+}
+
+func ensureFeature(service *commands.ProjectService, readOnly bool, result render.HitResult, features []render.HitFeature) {
+	if service == nil || readOnly {
+		return
+	}
+	if service.HasFeature(result.Layer, result.FeatureID) {
+		return
 	}
 	for _, feature := range features {
 		if feature.Layer != result.Layer || feature.FeatureID != result.FeatureID || len(feature.Vertices) < 2 {
 			continue
 		}
 		wkt := fmt.Sprintf("LINESTRING (%g %g, %g %g)", feature.Vertices[0].X, feature.Vertices[0].Y, feature.Vertices[1].X, feature.Vertices[1].Y)
-		if err := r.service.BeginEdit(); err != nil {
+		if err := service.BeginEdit(); err != nil {
 			return
 		}
-		if err := r.service.AddFeature(result.Layer, core.Feature{ID: result.FeatureID, Geometry: core.WKTGeometry{WKT: wkt}, Properties: map[string]any{"name": fmt.Sprintf("%s feature #%d", result.Layer, result.FeatureID)}}); err != nil {
-			_ = r.service.Rollback()
+		if err := service.AddFeature(result.Layer, core.Feature{ID: result.FeatureID, Geometry: core.WKTGeometry{WKT: wkt}, Properties: map[string]any{"name": fmt.Sprintf("%s feature #%d", result.Layer, result.FeatureID)}}); err != nil {
+			_ = service.Rollback()
 			return
 		}
-		_ = r.service.Commit()
+		_ = service.Commit()
 		return
 	}
 }
@@ -307,8 +584,19 @@ func (r *demoRuntime) ensureFeature(result render.HitResult, features []render.H
 func (r *demoRuntime) edit(event native.EditEvent) {
 	r.mu.Lock()
 	selected, ok := r.selected, r.hasSelect
+	readOnly := r.readOnly
 	r.mu.Unlock()
 	if !ok {
+		return
+	}
+	if readOnly {
+		r.mu.Lock()
+		name := ""
+		if r.featureNameCacheReady && r.featureNameCacheLayer == selected.Layer && r.featureNameCacheID == selected.FeatureID {
+			name = r.featureNameCacheValue
+		}
+		r.mu.Unlock()
+		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), name, "Read-only mode")
 		return
 	}
 	if event.Action == "rollback" {
@@ -331,7 +619,7 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit failed")
 		return
 	}
-	r.publishAttributes(selected.Layer)
+	r.republishAttributesAsync(selected.Layer)
 	if r.persist != nil {
 		if err := r.persist(context.Background(), selected.Layer); err != nil {
 			native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, fmt.Sprintf("Saved in memory; disk save failed: %v", err))
@@ -344,18 +632,37 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 }
 
 func (r *demoRuntime) featureName(layerName string, featureID uint64) string {
-	if r.service != nil {
-		for _, layer := range r.service.Project().Layers {
-			if layer.Name != layerName {
-				continue
+	r.mu.Lock()
+	service := r.service
+	readOnly := r.readOnly
+	reader := r.attributeFeatureReader
+	cached := readOnly && r.featureNameCacheReady && r.featureNameCacheLayer == layerName && r.featureNameCacheID == featureID
+	cachedName := r.featureNameCacheValue
+	r.mu.Unlock()
+	if service != nil {
+		if value, ok := service.FeatureProperty(layerName, featureID, "name"); ok {
+			if name, ok := value.(string); ok {
+				return name
 			}
-			for _, feature := range layer.Features {
-				if feature.ID == featureID {
-					if name, ok := feature.Properties["name"].(string); ok {
-						return name
-					}
+		}
+	}
+	if cached {
+		return cachedName
+	}
+	if reader != nil {
+		if feature, err := reader(context.Background(), layerName, featureID); err == nil {
+			name, _ := feature.Properties["name"].(string)
+			if readOnly {
+				r.mu.Lock()
+				if r.service == service && r.readOnly {
+					r.featureNameCacheLayer = layerName
+					r.featureNameCacheID = featureID
+					r.featureNameCacheValue = name
+					r.featureNameCacheReady = true
 				}
+				r.mu.Unlock()
 			}
+			return name
 		}
 	}
 	return ""
@@ -390,6 +697,7 @@ func startViewportSync(runtime *demoRuntime) {
 	lastEditGeneration := native.EditGeneration()
 	lastCancelGeneration := native.CancelGeneration()
 	lastActiveLayerGeneration := native.ActiveLayerGeneration()
+	lastAttributePageGeneration := native.AttributePageGeneration()
 	lastLoadGeneration := native.LoadGeneration()
 	go func() {
 		for range time.NewTicker(16 * time.Millisecond).C {
@@ -399,10 +707,8 @@ func startViewportSync(runtime *demoRuntime) {
 				path := native.CurrentLoadPath()
 				if path == "" {
 					native.SetRenderStatus("Open cancelled")
-				} else if next, err := loadDataRuntime(path, "", "", "", ""); err != nil {
-					native.SetRenderStatus("Open failed: " + err.Error())
 				} else {
-					runtime.replaceWith(next)
+					runtime.startDataLoad(path, "", "", "", "", false)
 				}
 			}
 			qtGeneration := native.ViewportGeneration()
@@ -453,7 +759,14 @@ func startViewportSync(runtime *demoRuntime) {
 			if activeLayerGeneration != lastActiveLayerGeneration {
 				lastActiveLayerGeneration = activeLayerGeneration
 				if layer := native.CurrentActiveLayer(); layer != "" {
-					runtime.publishAttributes(layer)
+					runtime.publishAttributesPageAsync(layer, 0)
+				}
+			}
+			attributePageGeneration := native.AttributePageGeneration()
+			if attributePageGeneration != lastAttributePageGeneration {
+				lastAttributePageGeneration = attributePageGeneration
+				if layer := native.CurrentActiveLayer(); layer != "" {
+					runtime.publishAttributesPageAsync(layer, native.CurrentAttributePage())
 				}
 			}
 		}
@@ -467,7 +780,11 @@ func applyLayerVisibility(runtime *demoRuntime, payload string) {
 	}
 	for layer, visible := range visibility {
 		if runtime.visibility.IsVisible(layer) != visible {
-			runtime.visibility.Set(layer, visible)
+			if runtime.visibility.Set(layer, visible) {
+				runtime.mu.Lock()
+				runtime.visibleLayers[layer] = visible
+				runtime.mu.Unlock()
+			}
 		}
 	}
 }

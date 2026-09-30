@@ -61,22 +61,21 @@ func (s *ProjectService) ApplySpatialOperation(ctx context.Context, operator Spa
 	if resultName == "" {
 		return errors.New("result layer name is required")
 	}
-	project := s.Project()
-	var left, right core.Layer
-	var foundLeft, foundRight bool
-	for _, layer := range project.Layers {
-		if layer.Name == leftName {
-			left, foundLeft = layer, true
-		}
-		if layer.Name == rightName {
-			right, foundRight = layer, true
-		}
-	}
+	left, foundLeft := s.Layer(leftName)
 	if !foundLeft {
 		return fmt.Errorf("%w: %s", ErrLayerMissing, leftName)
 	}
-	if operation != "buffer" && !foundRight {
-		return fmt.Errorf("%w: %s", ErrLayerMissing, rightName)
+	var right core.Layer
+	if operation != "buffer" {
+		if rightName == leftName {
+			right = left
+		} else {
+			var foundRight bool
+			right, foundRight = s.Layer(rightName)
+			if !foundRight {
+				return fmt.Errorf("%w: %s", ErrLayerMissing, rightName)
+			}
+		}
 	}
 	result, err := ApplySpatialOperation(ctx, operator, operation, left, right, distance)
 	if err != nil {

@@ -70,6 +70,16 @@ func (s *LayerVisibility) VisibleLayers() []string {
 func (s *LayerVisibility) FilterChunkKeys(keys []ChunkKey) []ChunkKey {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	allVisible := true
+	for _, key := range keys {
+		if !s.visible[key.Layer] {
+			allVisible = false
+			break
+		}
+	}
+	if allVisible {
+		return keys
+	}
 	filtered := make([]ChunkKey, 0, len(keys))
 	for _, key := range keys {
 		if s.visible[key.Layer] {
@@ -77,4 +87,27 @@ func (s *LayerVisibility) FilterChunkKeys(keys []ChunkKey) []ChunkKey {
 		}
 	}
 	return filtered
+}
+
+// FilterChunkKeysInPlace removes hidden or unknown layers from keys by
+// reusing its backing array. Callers must not need the original ordering slice
+// after this call; render refresh paths use it for exactly that ownership
+// boundary and avoid an allocation during layer toggles.
+func (s *LayerVisibility) FilterChunkKeysInPlace(keys []ChunkKey) []ChunkKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for index, key := range keys {
+		if s.visible[key.Layer] {
+			continue
+		}
+		write := index
+		for _, remaining := range keys[index:] {
+			if s.visible[remaining.Layer] {
+				keys[write] = remaining
+				write++
+			}
+		}
+		return keys[:write]
+	}
+	return keys
 }

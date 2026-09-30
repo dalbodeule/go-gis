@@ -5,6 +5,7 @@ package gdal
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -19,7 +20,13 @@ import (
 type Reader struct{}
 
 var _ drivers.LayerReader = Reader{}
+var _ drivers.GeometryOnlyReader = Reader{}
+var _ drivers.FeatureReader = Reader{}
+var _ drivers.AttributePageReader = Reader{}
 var _ drivers.LayerCollectionReader = Reader{}
+var _ drivers.GeometryOnlyCollectionReader = Reader{}
+var _ drivers.LayerWindowReader = Reader{}
+var _ drivers.GeometryOnlyWindowReader = Reader{}
 
 // Open reads a layer into the core snapshot model. Feature IDs are assigned
 // in read order because the current core model intentionally does not expose
@@ -28,7 +35,7 @@ func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, e
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
-	godal.RegisterAll()
+	registerDrivers()
 	dataset, err := godal.Open(source)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
@@ -53,42 +60,356 @@ func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, e
 	return readLayer(ctx, layer)
 }
 
-// OpenAll reads every vector layer in a dataset as detached core snapshots.
-// It is used by the desktop project loader so a multi-layer GeoPackage can be
-// displayed without reopening the dataset per layer.
-func (Reader) OpenAll(ctx context.Context, source string) ([]core.Layer, error) {
+// OpenGeometryOnly reads layer identity, CRS, feature IDs, and geometry while
+// skipping attribute maps. Render pipelines can use this path when properties
+// are fetched separately on demand.
+func (Reader) OpenGeometryOnly(ctx context.Context, source, layerName string) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return core.Layer{}, err
 	}
-	godal.RegisterAll()
+	registerDrivers()
 	dataset, err := godal.Open(source)
 	if err != nil {
-		return nil, fmt.Errorf("open %q: %w", source, err)
+		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
 	}
 	defer dataset.Close()
-	layers := dataset.Layers()
-	if len(layers) == 0 {
-		return nil, fmt.Errorf("dataset %q contains no vector layers", source)
-	}
-	result := make([]core.Layer, 0, len(layers))
-	for _, layer := range layers {
-		loaded, err := readLayer(ctx, layer)
-		if err != nil {
-			return nil, err
+
+	var layer godal.Layer
+	if layerName != "" {
+		candidate := dataset.LayerByName(layerName)
+		if candidate == nil {
+			return core.Layer{}, fmt.Errorf("layer %q not found in %q", layerName, source)
 		}
-		result = append(result, loaded)
+		layer = *candidate
+	} else {
+		layers := dataset.Layers()
+		if len(layers) == 0 {
+			return core.Layer{}, fmt.Errorf("dataset %q contains no vector layers", source)
+		}
+		layer = layers[0]
+	}
+	return readLayerOptions(ctx, layer, false)
+}
+
+// OpenFeature reads one feature by the sequential application ID assigned by
+// this reader. It avoids materializing properties for preceding features;
+// the underlying driver still scans until the requested ordinal is reached.
+func (Reader) OpenFeature(ctx context.Context, source, layerName string, featureID uint64) (core.Feature, error) {
+	if featureID == 0 {
+		return core.Feature{}, fmt.Errorf("feature ID must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return core.Feature{}, err
+	}
+	registerDrivers()
+	dataset, err := godal.Open(source)
+	if err != nil {
+		return core.Feature{}, fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	return openFeatureDataset(ctx, dataset, source, layerName, featureID)
+}
+
+func openFeatureDataset(ctx context.Context, dataset *godal.Dataset, source, layerName string, featureID uint64) (core.Feature, error) {
+	layer, err := selectLayer(dataset, source, layerName)
+	if err != nil {
+		return core.Feature{}, err
+	}
+	result, _, err := openFeatureLayer(ctx, layer, featureID, 1, true)
+	return result, err
+}
+
+func openFeatureLayer(ctx context.Context, layer godal.Layer, featureID, nextID uint64, reset bool) (core.Feature, uint64, error) {
+	if reset {
+		layer.ResetReading()
+		nextID = 1
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return core.Feature{}, nextID, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		if nextID != featureID {
+			feature.Close()
+			nextID++
+			continue
+		}
+		result, err := readFeature(feature, nextID, true)
+		feature.Close()
+		if err != nil {
+			return core.Feature{}, nextID, fmt.Errorf("read feature %d: %w", nextID, err)
+		}
+		return result, nextID + 1, nil
+	}
+	return core.Feature{}, nextID, fmt.Errorf("feature %d not found in layer %q", featureID, layer.Name())
+}
+
+// OpenAttributePage reads only one property page. It scans preceding features
+// to preserve the reader's sequential IDs but does not decode their fields or
+// geometries.
+func (Reader) OpenAttributePage(ctx context.Context, source, layerName string, offset, limit int) (core.Layer, int, error) {
+	if offset < 0 || limit <= 0 {
+		return core.Layer{}, 0, fmt.Errorf("invalid attribute page: offset=%d limit=%d", offset, limit)
+	}
+	if err := ctx.Err(); err != nil {
+		return core.Layer{}, 0, err
+	}
+	registerDrivers()
+	dataset, err := godal.Open(source)
+	if err != nil {
+		return core.Layer{}, 0, fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	return openAttributePageDataset(ctx, dataset, source, layerName, offset, limit)
+}
+
+func openAttributePageDataset(ctx context.Context, dataset *godal.Dataset, source, layerName string, offset, limit int) (core.Layer, int, error) {
+	layer, err := selectLayer(dataset, source, layerName)
+	if err != nil {
+		return core.Layer{}, 0, err
+	}
+	total, countErr := layer.FeatureCount()
+	if countErr != nil {
+		total = -1
+	}
+	query := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d", quoteSQLIdentifier(layer.Name()), limit, offset)
+	if resultSet, sqlErr := dataset.ExecuteSQL(query, godal.OGRSQLDialect()); sqlErr == nil && resultSet != nil {
+		defer resultSet.Close()
+		result, resultErr := readAttributePageLayer(ctx, resultSet.Layer, offset, limit)
+		if resultErr != nil {
+			return core.Layer{}, 0, resultErr
+		}
+		if total < 0 {
+			total = offset + len(result.Features)
+		}
+		return result, total, nil
+	}
+	result := core.Layer{
+		Name:     layer.Name(),
+		Editable: true,
+		Features: make([]core.Feature, 0, limit),
+	}
+	layer.ResetReading()
+	var ordinal int
+	for {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, 0, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		if ordinal < offset {
+			feature.Close()
+			ordinal++
+			continue
+		}
+		if ordinal >= offset+limit {
+			feature.Close()
+			break
+		}
+		fields := feature.Fields()
+		if len(result.Fields) == 0 {
+			result.Fields = fieldSchema(fields)
+		}
+		properties := make(map[string]any, len(fields))
+		for name, field := range fields {
+			properties[name] = fieldValue(field)
+		}
+		result.Features = append(result.Features, core.Feature{ID: uint64(ordinal + 1), Properties: properties})
+		feature.Close()
+		ordinal++
+	}
+	if total < 0 {
+		total = ordinal
+	}
+	return result, total, nil
+}
+
+func readAttributePageLayer(ctx context.Context, layer godal.Layer, offset, limit int) (core.Layer, error) {
+	result := core.Layer{
+		Name:     layer.Name(),
+		Editable: true,
+		Features: make([]core.Feature, 0, limit),
+	}
+	layer.ResetReading()
+	for index := 0; index < limit; index++ {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		fields := feature.Fields()
+		if len(result.Fields) == 0 {
+			result.Fields = fieldSchema(fields)
+		}
+		properties := make(map[string]any, len(fields))
+		for name, field := range fields {
+			properties[name] = fieldValue(field)
+		}
+		result.Features = append(result.Features, core.Feature{ID: uint64(offset + index + 1), Properties: properties})
+		feature.Close()
 	}
 	return result, nil
 }
 
-func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
-	result := core.Layer{Name: layer.Name(), Editable: true}
+func readAttributePageLayerCursor(ctx context.Context, layer godal.Layer, offset, limit int, nextID uint64, reset bool, schema []core.Field) (core.Layer, uint64, error) {
+	result := core.Layer{
+		Name:     layer.Name(),
+		Editable: true,
+		Features: make([]core.Feature, 0, limit),
+	}
+	if reset {
+		layer.ResetReading()
+		nextID = 1
+	}
+	for nextID < uint64(offset)+1 {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, nextID, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			return result, nextID, nil
+		}
+		feature.Close()
+		nextID++
+	}
+	for index := 0; index < limit; index++ {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, nextID, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		fields := feature.Fields()
+		if len(result.Fields) == 0 {
+			if len(schema) > 0 {
+				result.Fields = append(result.Fields, schema...)
+			} else {
+				result.Fields = fieldSchema(fields)
+			}
+
+		}
+		properties := make(map[string]any, len(fields))
+		for name, field := range fields {
+			properties[name] = fieldValue(field)
+		}
+		result.Features = append(result.Features, core.Feature{ID: nextID, Properties: properties})
+		feature.Close()
+		nextID++
+	}
+	return result, nextID, nil
+}
+
+func selectLayer(dataset *godal.Dataset, source, layerName string) (godal.Layer, error) {
+	if layerName != "" {
+		candidate := dataset.LayerByName(layerName)
+		if candidate == nil {
+			return godal.Layer{}, fmt.Errorf("layer %q not found in %q", layerName, source)
+		}
+		return *candidate, nil
+	}
+	layers := dataset.Layers()
+	if len(layers) == 0 {
+		return godal.Layer{}, fmt.Errorf("dataset %q contains no vector layers", source)
+	}
+	return layers[0], nil
+}
+
+// OpenWindow reads only features intersecting bounds, which is useful for
+// viewport-driven loading of large vector layers. Bounds are minX, minY,
+// maxX, maxY in the source layer's CRS.
+func (Reader) OpenWindow(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
+	return (Reader{}).openWindow(ctx, source, layerName, bounds, true)
+}
+
+// OpenWindowGeometryOnly reads only features intersecting bounds and skips
+// properties. It is intended for viewport renderers that load attributes on
+// demand through OpenFeature or OpenAttributePage.
+func (Reader) OpenWindowGeometryOnly(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
+	return (Reader{}).openWindow(ctx, source, layerName, bounds, false)
+}
+
+func (Reader) openWindow(ctx context.Context, source, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	if err := ctx.Err(); err != nil {
+		return core.Layer{}, err
+	}
+	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+		return core.Layer{}, fmt.Errorf("invalid spatial window: [%v %v %v %v]", bounds[0], bounds[1], bounds[2], bounds[3])
+	}
+	registerDrivers()
+	dataset, err := godal.Open(source)
+	if err != nil {
+		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	return openWindowDataset(ctx, dataset, source, layerName, bounds, includeProperties)
+}
+
+func openWindowDataset(ctx context.Context, dataset *godal.Dataset, source, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	layer, err := selectLayer(dataset, source, layerName)
+	if err != nil {
+		return core.Layer{}, err
+	}
+	return openWindowLayer(ctx, dataset, source, layer, layerName, bounds, includeProperties)
+}
+
+func openWindowLayer(ctx context.Context, dataset *godal.Dataset, source string, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	if layerName == "" {
+		layerName = layer.Name()
+	}
+	// GeoJSON is commonly backed by a streaming parser. For this driver,
+	// OGRSQL result-set creation can cost more than scanning the source once
+	// and asking GDAL for each feature envelope. Keep the SQL path for indexed
+	// formats such as SHP and GeoPackage.
+	if isJSONVectorSource(source) {
+		return readWindowLayer(ctx, layer, layerName, bounds, includeProperties)
+	}
+
+	filterWKT := fmt.Sprintf("POLYGON ((%[1]g %[2]g, %[3]g %[2]g, %[3]g %[4]g, %[1]g %[4]g, %[1]g %[2]g))", bounds[0], bounds[1], bounds[2], bounds[3])
+	filter, err := godal.NewGeometryFromWKT(filterWKT, nil)
+	if err != nil {
+		return core.Layer{}, fmt.Errorf("create spatial window: %w", err)
+	}
+	defer filter.Close()
+	resultSet, err := dataset.ExecuteSQL("SELECT * FROM "+quoteSQLIdentifier(layerName), godal.SpatialFilter(filter))
+	if err != nil {
+		return core.Layer{}, fmt.Errorf("apply spatial window to layer %q: %w", layerName, err)
+	}
+	if resultSet == nil {
+		return core.Layer{Name: layerName, Editable: true}, nil
+	}
+	defer resultSet.Close()
+	result, err := readLayerOptions(ctx, resultSet.Layer, includeProperties)
+	if err != nil {
+		return core.Layer{}, err
+	}
+	result.Name = layerName
+	return result, nil
+}
+
+func isJSONVectorSource(source string) bool {
+	switch strings.ToLower(filepath.Ext(source)) {
+	case ".geojson", ".json":
+		return true
+	default:
+		return false
+	}
+}
+
+func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	result := core.Layer{Name: layerName, Editable: true}
 	if spatialRef := layer.SpatialRef(); spatialRef != nil {
 		defer spatialRef.Close()
 		authorityName := spatialRef.AuthorityName("")
 		authorityCode := spatialRef.AuthorityCode("")
 		if authorityCode == "" {
-			// Some drivers omit the authority node until GDAL identifies it.
 			_ = spatialRef.AutoIdentifyEPSG()
 			authorityName = spatialRef.AuthorityName("")
 			authorityCode = spatialRef.AuthorityCode("")
@@ -114,25 +435,130 @@ func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
 		var featureErr error
 		func() {
 			defer feature.Close()
-			fields := feature.Fields()
-			if len(result.Fields) == 0 {
-				result.Fields = fieldSchema(fields)
-			}
-			properties := make(map[string]any, len(fields))
-			for name, field := range fields {
-				properties[name] = fieldValue(field)
-			}
 			geometry := feature.Geometry()
 			if geometry == nil {
+				nextID++
 				return
 			}
 			defer geometry.Close()
-			wkt, wktErr := geometry.WKT()
-			if wktErr != nil {
-				featureErr = wktErr
+			envelope, err := geometry.Bounds()
+			if err != nil {
+				featureErr = err
 				return
 			}
-			result.Features = append(result.Features, core.Feature{ID: nextID, Geometry: core.WKTGeometry{WKT: wkt}, Properties: properties})
+			if envelope[2] < bounds[0] || envelope[0] > bounds[2] ||
+				envelope[3] < bounds[1] || envelope[1] > bounds[3] {
+				nextID++
+				return
+			}
+			var fields map[string]godal.Field
+			if includeProperties {
+				fields = feature.Fields()
+				if len(result.Fields) == 0 {
+					result.Fields = fieldSchema(fields)
+				}
+			}
+			loaded, readErr := readFeatureFieldsWithGeometry(feature, nextID, fields, geometry)
+			if readErr != nil {
+				featureErr = readErr
+				return
+			}
+			result.Features = append(result.Features, loaded)
+			nextID++
+		}()
+		if featureErr != nil {
+			return core.Layer{}, fmt.Errorf("read feature %d: %w", nextID, featureErr)
+		}
+	}
+	return result, nil
+}
+
+func quoteSQLIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// OpenAll reads every vector layer in a dataset as detached core snapshots.
+// It is used by the desktop project loader so a multi-layer GeoPackage can be
+// displayed without reopening the dataset per layer.
+func (Reader) OpenAll(ctx context.Context, source string) ([]core.Layer, error) {
+	return (Reader{}).openAll(ctx, source, true)
+}
+
+// OpenAllGeometryOnly reads all layers and geometry while skipping properties.
+// It is intended for read-only render pipelines; callers that edit or save
+// must use OpenAll so source attributes remain available.
+func (Reader) OpenAllGeometryOnly(ctx context.Context, source string) ([]core.Layer, error) {
+	return (Reader{}).openAll(ctx, source, false)
+}
+
+func (Reader) openAll(ctx context.Context, source string, includeProperties bool) ([]core.Layer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	registerDrivers()
+	dataset, err := godal.Open(source)
+	if err != nil {
+		return nil, fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	return openAllDataset(ctx, dataset, source, includeProperties)
+}
+
+func openAllDataset(ctx context.Context, dataset *godal.Dataset, source string, includeProperties bool) ([]core.Layer, error) {
+	layers := dataset.Layers()
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("dataset %q contains no vector layers", source)
+	}
+	result := make([]core.Layer, 0, len(layers))
+	for _, layer := range layers {
+		loaded, err := readLayerOptions(ctx, layer, includeProperties)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, loaded)
+	}
+	return result, nil
+}
+
+func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
+	return readLayerOptions(ctx, layer, true)
+}
+
+func readLayerOptions(ctx context.Context, layer godal.Layer, includeProperties bool) (core.Layer, error) {
+	result := readLayerHeader(layer)
+	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
+	// feature slice up front. Some streaming or filtered drivers cannot provide
+	// an exact count, so failure is intentionally ignored.
+	if count, countErr := layer.FeatureCount(); countErr == nil && count > 0 {
+		result.Features = make([]core.Feature, 0, count)
+	}
+
+	layer.ResetReading()
+	var nextID uint64 = 1
+	for {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		var featureErr error
+		func() {
+			defer feature.Close()
+			var fields map[string]godal.Field
+			if includeProperties && len(result.Fields) == 0 {
+				fields = feature.Fields()
+				result.Fields = fieldSchema(fields)
+			} else if includeProperties {
+				fields = feature.Fields()
+			}
+			loaded, err := readFeatureFields(feature, nextID, fields)
+			if err != nil {
+				featureErr = err
+				return
+			}
+			result.Features = append(result.Features, loaded)
 			nextID++
 		}()
 		if featureErr != nil {
@@ -140,6 +566,63 @@ func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
 		}
 	}
 	return result, nil
+}
+
+func readLayerHeader(layer godal.Layer) core.Layer {
+	result := core.Layer{Name: layer.Name(), Editable: true}
+	if spatialRef := layer.SpatialRef(); spatialRef != nil {
+		defer spatialRef.Close()
+		authorityName := spatialRef.AuthorityName("")
+		authorityCode := spatialRef.AuthorityCode("")
+		if authorityCode == "" {
+			// Some drivers omit the authority node until GDAL identifies it.
+			_ = spatialRef.AutoIdentifyEPSG()
+			authorityName = spatialRef.AuthorityName("")
+			authorityCode = spatialRef.AuthorityCode("")
+		}
+		if authorityCode != "" {
+			if authorityName == "" {
+				authorityName = "EPSG"
+			}
+			result.CRS.AuthorityCode = authorityName + ":" + authorityCode
+		}
+	}
+	return result
+}
+
+func readFeature(feature *godal.Feature, id uint64, includeProperties bool) (core.Feature, error) {
+	var fields map[string]godal.Field
+	if includeProperties {
+		fields = feature.Fields()
+	}
+	return readFeatureFields(feature, id, fields)
+}
+
+func readFeatureFields(feature *godal.Feature, id uint64, fields map[string]godal.Field) (core.Feature, error) {
+	geometry := feature.Geometry()
+	if geometry == nil {
+		return readFeatureFieldsWithGeometry(feature, id, fields, nil)
+	}
+	defer geometry.Close()
+	return readFeatureFieldsWithGeometry(feature, id, fields, geometry)
+}
+
+func readFeatureFieldsWithGeometry(feature *godal.Feature, id uint64, fields map[string]godal.Field, geometry *godal.Geometry) (core.Feature, error) {
+	var properties map[string]any
+	if fields != nil {
+		properties = make(map[string]any, len(fields))
+		for name, field := range fields {
+			properties[name] = fieldValue(field)
+		}
+	}
+	if geometry == nil {
+		return core.Feature{ID: id, Properties: properties}, nil
+	}
+	wkb, err := geometry.WKB()
+	if err != nil {
+		return core.Feature{}, err
+	}
+	return core.Feature{ID: id, Geometry: core.WKBGeometry{WKB: wkb}, Properties: properties}, nil
 }
 
 func fieldSchema(fields map[string]godal.Field) []core.Field {

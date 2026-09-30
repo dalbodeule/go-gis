@@ -4,15 +4,18 @@ package native
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/airbusgeo/godal"
 	"github.com/twpayne/go-geos"
 	proj "github.com/twpayne/go-proj/v11"
 )
 
+var gdalRegisterOnce sync.Once
+
 // RegisterGDAL initializes GDAL's driver registry for a native build.
 func RegisterGDAL() {
-	godal.RegisterAll()
+	gdalRegisterOnce.Do(godal.RegisterAll)
 }
 
 // NewTransformer creates a PROJ CRS-to-CRS transformation.

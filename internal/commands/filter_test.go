@@ -52,3 +52,30 @@ func TestFilterLayerValidatesFieldAndCancellation(t *testing.T) {
 		t.Fatalf("cancel error = %v", err)
 	}
 }
+
+func TestFilterProjectLayerDoesNotShareSourceFeatures(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{
+		Name: "roads",
+		Features: []core.Feature{
+			{ID: 1, Properties: map[string]any{"kind": "road"}},
+			{ID: 2, Properties: map[string]any{"kind": "building"}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FilterProjectLayer(context.Background(), "roads", "kind", "road", "filtered"); err != nil {
+		t.Fatal(err)
+	}
+	service.project.Layers[0].Features[0].Properties["kind"] = "source-mutated"
+	filtered, ok := service.Layer("filtered")
+	if !ok || filtered.Features[0].Properties["kind"] != "road" {
+		t.Fatal("filtered layer shares feature data with its source")
+	}
+}

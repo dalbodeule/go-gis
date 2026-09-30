@@ -42,3 +42,20 @@ func TestChunkPlannerTracksNegativePan(t *testing.T) {
 		}
 	}
 }
+
+func TestChunkPlannerVisibleKeysIntoReusesDestination(t *testing.T) {
+	planner := ChunkPlanner{ChunkSize: 1, Margin: 0}
+	viewport := Viewport{Center: Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	dst := make([]ChunkKey, 1, 8)
+	dst[0] = ChunkKey{Layer: "prefix"}
+	got := planner.VisibleKeysInto(dst, viewport, "roads")
+	if len(got) != 5 || got[0] != dst[0] {
+		t.Fatalf("unexpected destination contents: len=%d keys=%#v", len(got), got)
+	}
+	want := planner.VisibleKeys(viewport, "roads")
+	for index := range want {
+		if got[index+1] != want[index] {
+			t.Fatalf("key[%d] = %#v, want %#v", index, got[index+1], want[index])
+		}
+	}
+}

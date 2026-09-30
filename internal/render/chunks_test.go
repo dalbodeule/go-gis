@@ -110,6 +110,50 @@ func TestBatchStoreMergesChunksAndDropsOutOfExtentData(t *testing.T) {
 	}
 }
 
+func TestBatchStoreDeduplicatesVisibleKeysAcrossSameGeneration(t *testing.T) {
+	store := NewBatchStore()
+	first := ChunkKey{Layer: "roads", X: 0, Y: 0}
+	second := ChunkKey{Layer: "roads", X: 1, Y: 0}
+	if !store.Apply(ChunkResult{Key: first, Chunk: Chunk{Vertices: []Vertex{{X: 1}}}}) {
+		t.Fatal("first chunk was rejected")
+	}
+	if !store.Apply(ChunkResult{Key: second, Chunk: Chunk{Vertices: []Vertex{{X: 2}}}}) {
+		t.Fatal("second chunk was rejected")
+	}
+	if !store.BeginGeneration(1, first, first, second) {
+		t.Fatal("first visible generation was rejected")
+	}
+	if _, vertices := store.Current(); len(vertices) != 2 {
+		t.Fatalf("deduplicated vertices = %#v", vertices)
+	}
+	if !store.BeginGeneration(1, second) {
+		t.Fatal("same-numbered generation refresh was rejected")
+	}
+	if _, vertices := store.Current(); len(vertices) != 1 || vertices[0].X != 2 {
+		t.Fatalf("same-generation extent = %#v", vertices)
+	}
+}
+
+func TestBatchStoreSameVisibleKeysOnlyUpdatesGeneration(t *testing.T) {
+	store := NewBatchStore()
+	keys := []ChunkKey{{Layer: "roads", X: 0}, {Layer: "roads", X: 1}}
+	if !store.BeginGeneration(1, keys...) {
+		t.Fatal("initial generation was rejected")
+	}
+	if !store.ApplyImmutable(ChunkResult{Key: keys[0], Generation: 1, Chunk: Chunk{Vertices: []Vertex{{X: 1}}}}) {
+		t.Fatal("initial chunk was rejected")
+	}
+	if !store.BeginGeneration(2, keys...) {
+		t.Fatal("same visible generation was rejected")
+	}
+	if got := store.Generation(); got != 2 {
+		t.Fatalf("generation = %d, want 2", got)
+	}
+	if _, vertices := store.Current(); len(vertices) != 1 || vertices[0].X != 1 {
+		t.Fatalf("same visible keys dropped current vertices: %#v", vertices)
+	}
+}
+
 func TestSchedulerDoesNotCacheStaleWork(t *testing.T) {
 	scheduler := NewScheduler()
 	key := ChunkKey{Layer: "buildings", ZoomBucket: 8, X: 1, Y: 1}

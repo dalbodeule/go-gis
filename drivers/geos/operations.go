@@ -5,6 +5,7 @@ package geos
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	"gogis/internal/core"
 
@@ -35,7 +36,7 @@ func (o *Operator) Difference(ctx context.Context, left, right core.Layer) (core
 }
 
 func (o *Operator) Buffer(ctx context.Context, layer core.Layer, distance float64) (core.Layer, error) {
-	result := layer.Clone()
+	result := cloneLayerForOperation(layer)
 	for i := range result.Features {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -46,7 +47,7 @@ func (o *Operator) Buffer(ctx context.Context, layer core.Layer, distance float6
 		}
 		output := input.Buffer(distance, 8)
 		input.Destroy()
-		result.Features[i].Geometry = core.WKTGeometry{WKT: output.ToWKT()}
+		result.Features[i].Geometry = core.WKBGeometry{WKB: output.ToWKB()}
 		output.Destroy()
 	}
 	return result, nil
@@ -56,7 +57,7 @@ func (o *Operator) binary(ctx context.Context, left, right core.Layer, operation
 	if len(left.Features) != len(right.Features) {
 		return core.Layer{}, fmt.Errorf("binary GEOS operation requires equal feature counts")
 	}
-	result := left.Clone()
+	result := cloneLayerForOperation(left)
 	for i := range result.Features {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -73,16 +74,44 @@ func (o *Operator) binary(ctx context.Context, left, right core.Layer, operation
 		output := operation(a, b)
 		a.Destroy()
 		b.Destroy()
-		result.Features[i].Geometry = core.WKTGeometry{WKT: output.ToWKT()}
+		result.Features[i].Geometry = core.WKBGeometry{WKB: output.ToWKB()}
 		output.Destroy()
 	}
 	return result, nil
 }
 
+// cloneLayerForOperation detaches mutable metadata without cloning input
+// geometries. Every successful operation replaces the corresponding geometry
+// with a newly serialized GEOS result, so cloning the old geometry first only
+// adds memory traffic. The input layers remain untouched while properties and
+// labels stay detached for callers of the operator.
+func cloneLayerForOperation(layer core.Layer) core.Layer {
+	result := layer
+	result.Fields = append([]core.Field(nil), layer.Fields...)
+	result.Features = make([]core.Feature, len(layer.Features))
+	var labelArena []core.Label
+	for index, feature := range layer.Features {
+		clone := feature
+		clone.Properties = maps.Clone(feature.Properties)
+		if feature.Label != nil {
+			if labelArena == nil {
+				labelArena = make([]core.Label, len(layer.Features))
+			}
+			labelArena[index] = *feature.Label
+			clone.Label = &labelArena[index]
+		}
+		result.Features[index] = clone
+	}
+	return result
+}
+
 func (o *Operator) read(geometry core.Geometry) (*geoslib.Geom, error) {
-	wkt, ok := geometry.(core.WKTGeometry)
-	if !ok {
-		return nil, fmt.Errorf("geometry is not core.WKTGeometry")
+	if wkbGeometry, ok := geometry.(core.WKBGeometry); ok {
+		return o.context.NewGeomFromWKB(wkbGeometry.WKB)
+	}
+	wkt, err := core.ToWKT(geometry)
+	if err != nil {
+		return nil, fmt.Errorf("convert geometry to WKT: %w", err)
 	}
 	return o.context.NewGeomFromWKT(wkt.WKT)
 }

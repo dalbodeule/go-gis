@@ -11,6 +11,10 @@ void gogis_register_qml_types(void);
 // the input memory after this function returns.
 void gogis_set_vertices(const float* xy, int vertex_count);
 
+// Copies the XY fields from Go's numeric render.Vertex layout synchronously.
+// The bridge does not retain the caller's memory after this function returns.
+void gogis_set_vertices_vertex_layout(const void* vertices, int vertex_count);
+
 // Returns the monotonically increasing generation produced by MapCanvas
 // transform changes (pan/zoom).
 unsigned long long gogis_viewport_generation(void);
@@ -46,6 +50,10 @@ void gogis_edit_event(char* action, int action_length, char* value, int value_le
 
 // Publishes a JSON attribute-row payload for the QML table.
 void gogis_set_attribute_payload(const char* payload);
+
+// Reads the latest QML attribute-table page request.
+unsigned long long gogis_attribute_page_generation(void);
+int gogis_attribute_page(void);
 
 // Publishes a JSON layer-tree payload for the QML layer model.
 void gogis_set_layer_tree_payload(const char* payload);

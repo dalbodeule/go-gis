@@ -52,12 +52,17 @@ type Feature struct {
 
 // Clone returns a detached copy suitable for edit snapshots.
 func (f Feature) Clone() Feature {
-	clone := f
-	clone.Properties = maps.Clone(f.Properties)
+	clone := cloneFeatureWithoutLabel(f)
 	if f.Label != nil {
 		label := *f.Label
 		clone.Label = &label
 	}
+	return clone
+}
+
+func cloneFeatureWithoutLabel(f Feature) Feature {
+	clone := f
+	clone.Properties = maps.Clone(f.Properties)
 	if f.Geometry != nil {
 		clone.Geometry = f.Geometry.Clone()
 	}
@@ -78,8 +83,47 @@ func (l Layer) Clone() Layer {
 	clone := l
 	clone.Fields = append([]Field(nil), l.Fields...)
 	clone.Features = make([]Feature, len(l.Features))
+	wkbBytes := 0
+	for _, feature := range l.Features {
+		geometry, ok := feature.Geometry.(WKBGeometry)
+		if !ok || len(geometry.WKB) == 0 {
+			continue
+		}
+		if wkbBytes > int(^uint(0)>>1)-len(geometry.WKB) {
+			wkbBytes = 0
+			break
+		}
+		wkbBytes += len(geometry.WKB)
+	}
+	var wkbArena []byte
+	if wkbBytes > 0 {
+		wkbArena = make([]byte, 0, wkbBytes)
+	}
+	var labelArena []Label
 	for i, feature := range l.Features {
-		clone.Features[i] = feature.Clone()
+		clone.Features[i] = cloneFeatureForLayer(feature, &wkbArena)
+		if feature.Label != nil {
+			if labelArena == nil {
+				labelArena = make([]Label, len(l.Features))
+			}
+			labelArena[i] = *feature.Label
+			clone.Features[i].Label = &labelArena[i]
+		}
+	}
+	return clone
+}
+
+func cloneFeatureForLayer(f Feature, wkbArena *[]byte) Feature {
+	clone := f
+	clone.Properties = maps.Clone(f.Properties)
+	if geometry, ok := f.Geometry.(WKBGeometry); ok {
+		start := len(*wkbArena)
+		*wkbArena = append(*wkbArena, geometry.WKB...)
+		clone.Geometry = WKBGeometry{WKB: (*wkbArena)[start:]}
+		return clone
+	}
+	if f.Geometry != nil {
+		clone.Geometry = f.Geometry.Clone()
 	}
 	return clone
 }

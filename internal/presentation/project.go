@@ -49,6 +49,18 @@ type AttributeTableModel struct {
 
 // AttributeTable returns a detached attribute-table model for one layer.
 func AttributeTable(layer core.Layer) AttributeTableModel {
+	return attributeTable(layer, true)
+}
+
+// AttributeTableOwned builds an attribute-table model while retaining the
+// caller-owned property maps. Use this only when the input layer is already a
+// detached snapshot and the returned model is read-only, such as a JSON/QML
+// publication path.
+func AttributeTableOwned(layer core.Layer) AttributeTableModel {
+	return attributeTable(layer, false)
+}
+
+func attributeTable(layer core.Layer, clonePropertyMaps bool) AttributeTableModel {
 	columns := make([]AttributeColumn, 0, len(layer.Fields))
 	known := make(map[string]struct{}, len(layer.Fields))
 	for _, field := range layer.Fields {
@@ -61,26 +73,35 @@ func AttributeTable(layer core.Layer) AttributeTableModel {
 
 	// Drivers may provide features before a complete schema is available. Add
 	// those keys deterministically instead of silently dropping them.
-	missing := map[string]struct{}{}
+	var missing map[string]struct{}
 	for _, feature := range layer.Features {
 		for key := range feature.Properties {
 			if _, ok := known[key]; !ok {
+				if missing == nil {
+					missing = make(map[string]struct{})
+				}
 				missing[key] = struct{}{}
 			}
 		}
 	}
-	missingNames := make([]string, 0, len(missing))
-	for name := range missing {
-		missingNames = append(missingNames, name)
-	}
-	sort.Strings(missingNames)
-	for _, name := range missingNames {
-		columns = append(columns, AttributeColumn{Name: name, Type: inferFieldType(layer.Features, name)})
+	if len(missing) > 0 {
+		missingNames := make([]string, 0, len(missing))
+		for name := range missing {
+			missingNames = append(missingNames, name)
+		}
+		sort.Strings(missingNames)
+		for _, name := range missingNames {
+			columns = append(columns, AttributeColumn{Name: name, Type: inferFieldType(layer.Features, name)})
+		}
 	}
 
 	rows := make([]AttributeRow, len(layer.Features))
 	for i, feature := range layer.Features {
-		rows[i] = AttributeRow{FeatureID: feature.ID, Values: cloneProperties(feature.Properties)}
+		values := feature.Properties
+		if clonePropertyMaps {
+			values = cloneProperties(values)
+		}
+		rows[i] = AttributeRow{FeatureID: feature.ID, Values: values}
 	}
 	return AttributeTableModel{Columns: columns, Rows: rows}
 }

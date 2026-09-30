@@ -66,6 +66,11 @@ func TestMergeProjectLayersIsAtomic(t *testing.T) {
 	if len(service.Project().Layers) != 3 {
 		t.Fatal("merged layer was not committed")
 	}
+	service.project.Layers[0].Features[0].Properties["name"] = "source-mutated"
+	merged, ok := service.Layer("merged")
+	if !ok || merged.Features[0].Properties["name"] != "a" {
+		t.Fatal("merged layer shares feature data with its source")
+	}
 	if err := service.MergeProjectLayers(context.Background(), []string{"a", "missing"}, "bad"); err == nil {
 		t.Fatal("expected missing source error")
 	}

@@ -36,7 +36,7 @@ func (Writer) Write(ctx context.Context, destination string, layer core.Layer) e
 		return fmt.Errorf("layer %q has no features to infer geometry type", layer.Name)
 	}
 
-	godal.RegisterAll()
+	registerDrivers()
 	driver, err := driverForDestination(destination)
 	if err != nil {
 		return err
@@ -105,11 +105,7 @@ func (Writer) Write(ctx context.Context, destination string, layer core.Layer) e
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		geometry, ok := feature.Geometry.(core.WKTGeometry)
-		if !ok {
-			return fmt.Errorf("feature %d geometry is not core.WKTGeometry", feature.ID)
-		}
-		ogrGeometry, err := godal.NewGeometryFromWKT(geometry.WKT, spatialRef)
+		ogrGeometry, err := newOGRGeometry(feature.Geometry, spatialRef)
 		if err != nil {
 			return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
 		}
@@ -154,11 +150,10 @@ func driverForDestination(destination string) (godal.DriverName, error) {
 }
 
 func ogrGeometryType(feature core.Feature) (godal.GeometryType, error) {
-	geometry, ok := feature.Geometry.(core.WKTGeometry)
-	if !ok {
-		return godal.GTUnknown, fmt.Errorf("feature %d geometry is not core.WKTGeometry", feature.ID)
+	if feature.Geometry == nil {
+		return godal.GTUnknown, fmt.Errorf("feature %d geometry is nil", feature.ID)
 	}
-	switch geometry.GeometryType() {
+	switch feature.Geometry.GeometryType() {
 	case "POINT":
 		return godal.GTPoint, nil
 	case "LINESTRING":
@@ -166,7 +161,23 @@ func ogrGeometryType(feature core.Feature) (godal.GeometryType, error) {
 	case "POLYGON":
 		return godal.GTPolygon, nil
 	default:
-		return godal.GTUnknown, fmt.Errorf("feature %d has unsupported geometry type %q", feature.ID, geometry.GeometryType())
+		return godal.GTUnknown, fmt.Errorf("feature %d has unsupported geometry type %q", feature.ID, feature.Geometry.GeometryType())
+	}
+}
+
+func newOGRGeometry(geometry core.Geometry, spatialRef *godal.SpatialRef) (*godal.Geometry, error) {
+	switch value := geometry.(type) {
+	case core.WKBGeometry:
+		if len(value.WKB) == 0 {
+			return nil, fmt.Errorf("WKB geometry is empty")
+		}
+		return godal.NewGeometryFromWKB(value.WKB, spatialRef)
+	default:
+		wkt, err := core.ToWKT(geometry)
+		if err != nil {
+			return nil, err
+		}
+		return godal.NewGeometryFromWKT(wkt.WKT, spatialRef)
 	}
 }
 

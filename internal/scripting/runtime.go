@@ -135,10 +135,9 @@ func (r *Runtime) Run(ctx context.Context, script string) error {
 }
 
 func (r *Runtime) layers(state *lua.LState) int {
-	project := r.service.Project()
 	result := state.NewTable()
-	for index, layer := range project.Layers {
-		result.RawSetInt(index+1, lua.LString(layer.Name))
+	for index, name := range r.service.LayerNames() {
+		result.RawSetInt(index+1, lua.LString(name))
 	}
 	state.Push(result)
 	return 1
@@ -176,15 +175,14 @@ func (r *Runtime) exportDXF(state *lua.LState) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	for _, layer := range r.service.Project().Layers {
-		if layer.Name == layerName {
-			if err := r.exporter.Export(ctx, destination, layer, profile); err != nil {
-				state.RaiseError("export DXF: %v", err)
-			}
-			return 0
-		}
+	layer, ok := r.service.Layer(layerName)
+	if !ok {
+		state.RaiseError("layer %q not found", layerName)
+		return 0
 	}
-	state.RaiseError("layer %q not found", layerName)
+	if err := r.exporter.Export(ctx, destination, layer, profile); err != nil {
+		state.RaiseError("export DXF: %v", err)
+	}
 	return 0
 }
 

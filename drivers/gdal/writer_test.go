@@ -4,12 +4,41 @@ package gdal
 
 import (
 	"context"
+	"encoding/hex"
 	"path/filepath"
 	"testing"
 
 	"gogis/internal/commands"
 	"gogis/internal/core"
 )
+
+func BenchmarkNewOGRGeometryWKBPoint(b *testing.B) {
+	data, err := hex.DecodeString("0101000000000000000000f03f0000000000000040")
+	if err != nil {
+		b.Fatal(err)
+	}
+	geometry := core.WKBGeometry{WKB: data}
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		ogrGeometry, err := newOGRGeometry(geometry, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ogrGeometry.Close()
+	}
+}
+
+func BenchmarkNewOGRGeometryWKTPoint(b *testing.B) {
+	geometry := core.WKTGeometry{WKT: "POINT (1 2)"}
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		ogrGeometry, err := newOGRGeometry(geometry, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ogrGeometry.Close()
+	}
+}
 
 func TestWriterRoundTripsGeoPackage(t *testing.T) {
 	destination := filepath.Join(t.TempDir(), "roads.gpkg")
@@ -35,6 +64,26 @@ func TestWriterRoundTripsShapefile(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRoundTrip(t, got)
+}
+
+func TestWriterRoundTripsWKBGeometry(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "wkb.gpkg")
+	data, err := hex.DecodeString("0101000000000000000000f03f0000000000000040")
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := writableLayer()
+	layer.Features[0].Geometry = core.WKBGeometry{WKB: data}
+	if err := (Writer{}).Write(context.Background(), destination, layer); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (Reader{}).Open(context.Background(), destination, "roads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Features) != 1 || got.Features[0].Geometry == nil {
+		t.Fatalf("WKB round trip = %#v", got)
+	}
 }
 
 func TestWriterRejectsUnsupportedOutput(t *testing.T) {

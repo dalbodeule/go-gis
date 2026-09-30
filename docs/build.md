@@ -124,6 +124,16 @@ CGO_CXXFLAGS=-std=c++17 go run -tags qt ./cmd/gis-desktop
   --save build/sample-edited.gpkg
 ```
 
+편집·저장이 필요 없는 대용량 시각화는 `--read-only`를 추가하면 geometry-only
+초기 로딩과 원본 GDAL attribute page 조회를 사용합니다.
+
+```sh
+./build/gogis-desktop-native --read-only --input data/large.gpkg
+```
+
+이 모드에서는 편집 Commit과 `--save`를 사용하지 않으며, 속성은 페이지를
+넘길 때 필요한 행만 읽습니다.
+
 `desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
 실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면
 dataset의 모든 layer를 로드합니다. `--save`를 지정하면 편집 Commit 결과를
@@ -268,6 +278,22 @@ vcpkg를 선택하는 경우에는 GDAL·PROJ·GEOS를 동일한 triplet으로 �
 set PROJ_DATA=C:\OSGeo4W\share\proj
 set GDAL_DATA=C:\OSGeo4W\share\gdal
 ```
+
+### Windows 대용량 로딩 기준 측정
+
+네이티브 의존성 및 Qt 빌드가 통과한 뒤 같은 셸에서 다음 benchmark를 실행합니다.
+fixture는 테스트가 임시 디렉터리에 생성하며 실제 업무 데이터를 사용하지 않습니다.
+서로 다른 OS의 절대 시간보다 같은 Windows 환경에서의 쌍 비교와 할당량을
+우선 기록합니다.
+
+```powershell
+go test -tags native ./drivers/gdal -run '^$' -bench 'BenchmarkGDALOpen(VectorOnly)?GeoJSON10KPoints|BenchmarkAttributeSessionOpen(All)?GeometryOnlyMultiLayerGeoPackage' -benchtime=10x -count=3 -benchmem
+$env:CGO_CXXFLAGS = '-std=c++17'
+go test -tags 'qt native' ./cmd/gis-desktop -run '^$' -bench 'BenchmarkDesktop(GDALSnapshot|RenderSources|ReadOnlyLoad)GeoJSON10K' -benchtime=3x -count=3 -benchmem
+```
+
+실제 파일에서는 최초 표시 시간, pan/zoom 응답, 최대 메모리 사용량도 따로
+측정합니다. synthetic benchmark만으로 UI 체감 성능을 판단하지 않습니다.
 
 ## 의존성 확인 스크립트
 

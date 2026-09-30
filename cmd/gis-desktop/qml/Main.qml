@@ -88,6 +88,9 @@ ApplicationWindow {
                 property string layerTreePayloadSeen: ""
                 property string activeLayer: ""
                 property var attributeColumns: []
+                property int attributePage: 0
+                property int attributePageSize: 0
+                property int attributeTotal: 0
                 property string renderStatus: "Ready"
 
                 ListModel { id: attributeModel }
@@ -113,6 +116,15 @@ ApplicationWindow {
                     activeLayer = name
                     mapCanvas.activeLayer = name
                     mapCanvas.activeLayerGeneration += 1
+                }
+
+                function requestAttributePage(page) {
+                    var pageSize = attributePageSize > 0 ? attributePageSize : 200
+                    var pageCount = Math.max(1, Math.ceil(attributeTotal / pageSize))
+                    page = Math.max(0, Math.min(pageCount - 1, page))
+                    if (page === attributePage) return
+                    mapCanvas.attributePage = page
+                    mapCanvas.attributePageGeneration += 1
                 }
 
                 function syncLayerVisibility() {
@@ -141,6 +153,8 @@ ApplicationWindow {
                     property string editValue: ""
                     property int editGeneration: 0
                     property string attributePayload: "[]"
+                    property int attributePage: 0
+                    property int attributePageGeneration: 0
                     property string layerTreePayload: "[]"
                     property string activeLayer: ""
                     property int activeLayerGeneration: 0
@@ -247,6 +261,9 @@ ApplicationWindow {
                             attributeModel.clear()
                             var table = JSON.parse(mapCanvas.attributePayload)
                             mapViewport.attributeColumns = table.columns || []
+                            mapViewport.attributePage = table.page || 0
+                            mapViewport.attributePageSize = table.pageSize || 0
+                            mapViewport.attributeTotal = table.total || 0
                             var rows = table.rows || []
                             for (var i = 0; i < rows.length; ++i) {
                                 attributeModel.append(rows[i])
@@ -332,6 +349,26 @@ ApplicationWindow {
                     text: "Attributes"
                     font.bold: true
                     visible: attributeModel.count > 0
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: mapViewport.attributeTotal > mapViewport.attributePageSize && mapViewport.attributePageSize > 0
+                    Button {
+                        text: "Previous"
+                        enabled: mapViewport.attributePage > 0
+                        onClicked: mapViewport.requestAttributePage(mapViewport.attributePage - 1)
+                    }
+                    Label {
+                        text: "Page " + (mapViewport.attributePage + 1) + " / " +
+                              Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                    Button {
+                        text: "Next"
+                        enabled: mapViewport.attributePage + 1 < Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize)
+                        onClicked: mapViewport.requestAttributePage(mapViewport.attributePage + 1)
+                    }
                 }
                 ListView {
                     Layout.fillWidth: true

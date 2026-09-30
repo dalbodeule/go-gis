@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -16,47 +15,102 @@ var ErrFilterFieldMissing = errors.New("filter field is required")
 // FilterLayerByProperty keeps features whose property equals expected. The
 // comparison is typed for common string, boolean, and numeric field values.
 func FilterLayerByProperty(ctx context.Context, layer core.Layer, field, expected string) (core.Layer, error) {
+	return filterLayerByProperty(ctx, layer, field, expected, true)
+}
+
+func filterLayerByProperty(ctx context.Context, layer core.Layer, field, expected string, cloneFeatures bool) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
 	if field == "" {
 		return core.Layer{}, ErrFilterFieldMissing
 	}
-	result := layer.Clone()
-	result.Features = result.Features[:0]
+	matcher := newPropertyMatcher(expected)
+	result := core.Layer{
+		Name:     layer.Name,
+		CRS:      layer.CRS,
+		Editable: layer.Editable,
+		Fields:   append([]core.Field(nil), layer.Fields...),
+		Features: make([]core.Feature, 0),
+	}
 	for _, feature := range layer.Features {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
 		}
 		value, exists := feature.Properties[field]
-		if exists && propertyEquals(value, expected) {
-			result.Features = append(result.Features, feature.Clone())
+		if exists && matcher.matches(value) {
+			if cloneFeatures {
+				result.Features = append(result.Features, feature.Clone())
+			} else {
+				result.Features = append(result.Features, feature)
+			}
 		}
 	}
 	return result, nil
 }
 
 func propertyEquals(value any, expected string) bool {
+	return newPropertyMatcher(expected).matches(value)
+}
+
+type propertyMatcher struct {
+	expected   string
+	boolValue  bool
+	boolOK     bool
+	intValue   int64
+	intOK      bool
+	uintValue  uint64
+	uintOK     bool
+	floatValue float64
+	floatOK    bool
+}
+
+func newPropertyMatcher(expected string) propertyMatcher {
+	matcher := propertyMatcher{expected: expected}
+	var err error
+	matcher.boolValue, err = strconv.ParseBool(expected)
+	matcher.boolOK = err == nil
+	matcher.intValue, err = strconv.ParseInt(expected, 10, 64)
+	matcher.intOK = err == nil
+	matcher.uintValue, err = strconv.ParseUint(expected, 10, 64)
+	matcher.uintOK = err == nil
+	matcher.floatValue, err = strconv.ParseFloat(expected, 64)
+	matcher.floatOK = err == nil
+	return matcher
+}
+
+func (matcher propertyMatcher) matches(value any) bool {
 	switch typed := value.(type) {
 	case string:
-		return typed == expected
+		return typed == matcher.expected
 	case bool:
-		parsed, err := strconv.ParseBool(expected)
-		return err == nil && typed == parsed
+		return matcher.boolOK && typed == matcher.boolValue
 	case int:
-		parsed, err := strconv.ParseInt(expected, 10, 64)
-		return err == nil && int64(typed) == parsed
-	case int8, int16, int32, int64:
-		parsed, err := strconv.ParseInt(expected, 10, 64)
-		return err == nil && reflect.ValueOf(typed).Int() == parsed
-	case uint, uint8, uint16, uint32, uint64:
-		parsed, err := strconv.ParseUint(expected, 10, 64)
-		return err == nil && reflect.ValueOf(typed).Uint() == parsed
-	case float32, float64:
-		parsed, err := strconv.ParseFloat(expected, 64)
-		return err == nil && reflect.ValueOf(typed).Float() == parsed
+		return matcher.intOK && int64(typed) == matcher.intValue
+	case int8:
+		return matcher.intOK && int64(typed) == matcher.intValue
+	case int16:
+		return matcher.intOK && int64(typed) == matcher.intValue
+	case int32:
+		return matcher.intOK && int64(typed) == matcher.intValue
+	case int64:
+		return matcher.intOK && typed == matcher.intValue
+	case uint:
+		return matcher.uintOK && uint64(typed) == matcher.uintValue
+	case uint8:
+		return matcher.uintOK && uint64(typed) == matcher.uintValue
+	case uint16:
+		return matcher.uintOK && uint64(typed) == matcher.uintValue
+	case uint32:
+		return matcher.uintOK && uint64(typed) == matcher.uintValue
+	case uint64:
+		return matcher.uintOK && typed == matcher.uintValue
+	case float32:
+		return matcher.floatOK && float64(typed) == matcher.floatValue
+	case float64:
+		return matcher.floatOK && typed == matcher.floatValue
 	default:
-		return strings.TrimSpace(fmt.Sprint(value)) == expected
+		return strings.TrimSpace(fmt.Sprint(value)) == matcher.expected
 	}
 }
 
@@ -65,28 +119,36 @@ func (s *ProjectService) FilterProjectLayer(ctx context.Context, sourceName, fie
 	if resultName == "" {
 		return errors.New("result layer name is required")
 	}
-	project := s.Project()
-	for _, layer := range project.Layers {
-		if layer.Name != sourceName {
-			continue
+	var layer core.Layer
+	found := false
+	for _, candidate := range s.project.Layers {
+		if candidate.Name == sourceName {
+			layer = candidate
+			found = true
+			break
 		}
-		result, err := FilterLayerByProperty(ctx, layer, field, expected)
-		if err != nil {
-			return err
-		}
-		result.Name = resultName
-		if err := s.BeginEdit(); err != nil {
-			return err
-		}
-		if err := s.AddLayer(result); err != nil {
-			_ = s.Rollback()
-			return err
-		}
-		if err := s.Commit(); err != nil {
-			_ = s.Rollback()
-			return err
-		}
-		return nil
 	}
-	return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
+	if !found {
+		return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
+	}
+	// AddLayer performs the ownership copy. The committed source remains
+	// untouched, so cloning only matching features here avoids a full input
+	// snapshot and a second copy at the edit boundary.
+	result, err := filterLayerByProperty(ctx, layer, field, expected, false)
+	if err != nil {
+		return err
+	}
+	result.Name = resultName
+	if err := s.BeginEdit(); err != nil {
+		return err
+	}
+	if err := s.AddLayer(result); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	if err := s.Commit(); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	return nil
 }

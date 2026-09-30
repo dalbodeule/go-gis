@@ -19,6 +19,14 @@ var (
 // MergeLayers combines layers with an identical field schema and CRS. Every
 // feature is cloned, so callers can safely use the result as an edit snapshot.
 func MergeLayers(ctx context.Context, layers ...core.Layer) (core.Layer, error) {
+	return mergeLayers(ctx, true, layers...)
+}
+
+// mergeLayers combines layers after validating their schema, CRS, and feature
+// IDs. When cloneFeatures is false, the returned feature slice is only a
+// temporary read-only view for an immediate ownership transfer by the caller;
+// it must not escape without cloning.
+func mergeLayers(ctx context.Context, cloneFeatures bool, layers ...core.Layer) (core.Layer, error) {
 	if len(layers) < 2 {
 		return core.Layer{}, ErrMergeNeedsLayers
 	}
@@ -29,7 +37,12 @@ func MergeLayers(ctx context.Context, layers ...core.Layer) (core.Layer, error) 
 		Fields:   append([]core.Field(nil), base.Fields...),
 		Editable: true,
 	}
-	seenIDs := make(map[uint64]struct{})
+	totalFeatures := 0
+	for _, layer := range layers {
+		totalFeatures += len(layer.Features)
+	}
+	result.Features = make([]core.Feature, 0, totalFeatures)
+	seenIDs := make(map[uint64]struct{}, totalFeatures)
 	for layerIndex, layer := range layers {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -47,7 +60,11 @@ func MergeLayers(ctx context.Context, layers ...core.Layer) (core.Layer, error) 
 				return core.Layer{}, fmt.Errorf("%w: %d", ErrDuplicateID, feature.ID)
 			}
 			seenIDs[feature.ID] = struct{}{}
-			result.Features = append(result.Features, feature.Clone())
+			if cloneFeatures {
+				result.Features = append(result.Features, feature.Clone())
+			} else {
+				result.Features = append(result.Features, feature)
+			}
 		}
 	}
 	return result, nil
@@ -78,13 +95,13 @@ func (s *ProjectService) MergeProjectLayers(ctx context.Context, sourceNames []s
 	if len(sourceNames) < 2 {
 		return ErrMergeNeedsLayers
 	}
-	project := s.Project()
 	layers := make([]core.Layer, 0, len(sourceNames))
 	for _, sourceName := range sourceNames {
+		var layer core.Layer
 		found := false
-		for _, layer := range project.Layers {
-			if layer.Name == sourceName {
-				layers = append(layers, layer)
+		for _, candidate := range s.project.Layers {
+			if candidate.Name == sourceName {
+				layer = candidate
 				found = true
 				break
 			}
@@ -92,8 +109,12 @@ func (s *ProjectService) MergeProjectLayers(ctx context.Context, sourceNames []s
 		if !found {
 			return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
 		}
+		layers = append(layers, layer)
 	}
-	result, err := MergeLayers(ctx, layers...)
+	// AddLayer performs the single ownership copy needed by the committed
+	// project. Avoid cloning each selected layer and then cloning every feature
+	// again in MergeLayers; the source project remains untouched throughout.
+	result, err := mergeLayers(ctx, false, layers...)
 	if err != nil {
 		return err
 	}

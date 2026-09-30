@@ -160,9 +160,9 @@ func (t *Transaction) WriteLayer(ctx context.Context, layer core.Layer) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		geometry, ok := feature.Geometry.(core.WKTGeometry)
-		if !ok {
-			return fmt.Errorf("feature %d geometry is not core.WKTGeometry", feature.ID)
+		geometry, err := core.ToWKT(feature.Geometry)
+		if err != nil {
+			return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
 		}
 		properties, err := json.Marshal(feature.Properties)
 		if err != nil {

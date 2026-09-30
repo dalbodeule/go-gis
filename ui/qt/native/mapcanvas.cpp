@@ -10,6 +10,7 @@
 #include <QtQml/qqml.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -18,7 +19,14 @@
 namespace {
 
 std::mutex g_vertices_mutex;
-std::vector<QPointF> g_vertices;
+struct GoGISVertex {
+    float x;
+    float y;
+    std::uint32_t color;
+};
+static_assert(sizeof(GoGISVertex) == 12, "unexpected Go vertex layout");
+std::vector<GoGISVertex> g_vertices;
+std::atomic<unsigned long long> g_vertices_generation{0};
 std::atomic<unsigned long long> g_viewport_generation{0};
 std::atomic<double> g_pan_x{0};
 std::atomic<double> g_pan_y{0};
@@ -39,6 +47,8 @@ std::atomic<unsigned long long> g_edit_generation{0};
 std::mutex g_attribute_mutex;
 std::string g_attribute_payload;
 std::atomic<unsigned long long> g_attribute_generation{0};
+std::atomic<unsigned long long> g_attribute_page_generation{0};
+std::atomic<int> g_attribute_page{0};
 std::mutex g_layer_tree_mutex;
 std::string g_layer_tree_payload;
 std::atomic<unsigned long long> g_layer_tree_generation{0};
@@ -60,11 +70,6 @@ std::string g_selection_status;
 std::atomic<unsigned long long> g_selection_generation{0};
 std::mutex g_canvas_mutex;
 QQuickItem* g_canvas = nullptr;
-
-std::vector<QPointF> snapshot_vertices() {
-    std::lock_guard<std::mutex> lock(g_vertices_mutex);
-    return g_vertices;
-}
 
 void update_viewport_snapshot(const QQuickItem* item) {
     g_pan_x.store(item->x(), std::memory_order_relaxed);
@@ -132,6 +137,12 @@ public:
                 attribute_generation_ = attribute_generation;
             }
 
+            const auto attribute_page_generation = property("attributePageGeneration").toULongLong();
+            if (attribute_page_generation != g_attribute_page_generation.load(std::memory_order_relaxed)) {
+                g_attribute_page.store(property("attributePage").toInt(), std::memory_order_relaxed);
+                g_attribute_page_generation.store(attribute_page_generation, std::memory_order_relaxed);
+            }
+
             const auto layer_tree_generation = g_layer_tree_generation.load(std::memory_order_relaxed);
             if (layer_tree_generation != layer_tree_generation_) {
                 std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
@@ -191,18 +202,37 @@ protected:
 
         const float width = static_cast<float>(this->width());
         const float height = static_cast<float>(this->height());
-        const auto source_vertices = snapshot_vertices();
-        geometry_.allocate(static_cast<int>(source_vertices.size()));
-        auto* vertices = geometry_.vertexDataAsPoint2D();
-        for (size_t i = 0; i < source_vertices.size(); ++i) {
-            const auto& source = source_vertices[i];
-            vertices[i] = {
-                static_cast<float>(source.x() * width),
-                static_cast<float>((1.0 - source.y()) * height),
-            };
+        bool geometry_changed = false;
+        {
+            // Copy only when the source batch or canvas dimensions changed.
+            // Repaint requests can arrive for unrelated QML updates; avoiding
+            // a full geometry rewrite keeps large static layers cheap.
+            std::lock_guard<std::mutex> lock(g_vertices_mutex);
+            const auto source_generation = g_vertices_generation.load(std::memory_order_relaxed);
+            if (source_generation != rendered_generation_ || width != rendered_width_ ||
+                height != rendered_height_) {
+                const size_t source_vertex_count = g_vertices.size();
+                if (source_vertex_count != rendered_vertex_count_) {
+                    geometry_.allocate(static_cast<int>(source_vertex_count));
+                    rendered_vertex_count_ = source_vertex_count;
+                }
+                auto* vertices = geometry_.vertexDataAsPoint2D();
+                for (size_t i = 0; i < source_vertex_count; ++i) {
+                    vertices[i] = {
+                        g_vertices[i].x * width,
+                        (1.0f - g_vertices[i].y) * height,
+                    };
+                }
+                rendered_generation_ = source_generation;
+                rendered_width_ = width;
+                rendered_height_ = height;
+                geometry_changed = true;
+            }
         }
-        geometry_.setDrawingMode(QSGGeometry::DrawLines);
-        node->markDirty(QSGNode::DirtyGeometry);
+        if (geometry_changed) {
+            geometry_.setDrawingMode(QSGGeometry::DrawLines);
+            node->markDirty(QSGNode::DirtyGeometry);
+        }
         return node;
     }
 
@@ -228,6 +258,10 @@ private:
     unsigned long long attribute_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
+    unsigned long long rendered_generation_ = 0;
+    size_t rendered_vertex_count_ = 0;
+    float rendered_width_ = -1.0f;
+    float rendered_height_ = -1.0f;
 };
 
 extern "C" void gogis_register_qml_types(void) {
@@ -235,16 +269,32 @@ extern "C" void gogis_register_qml_types(void) {
 }
 
 extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
-    std::vector<QPointF> next_vertices;
-    if (xy != nullptr && vertex_count > 0) {
-        next_vertices.reserve(static_cast<size_t>(vertex_count));
-        for (int i = 0; i < vertex_count; ++i) {
-            next_vertices.emplace_back(xy[i * 2], xy[i * 2 + 1]);
-        }
-    }
-
     std::lock_guard<std::mutex> lock(g_vertices_mutex);
-    g_vertices = std::move(next_vertices);
+    const size_t count = xy != nullptr && vertex_count > 0
+                             ? static_cast<size_t>(vertex_count)
+                             : 0;
+    // Keep the vector capacity across frame publishes. The Go bridge already
+    // holds a reusable scratch buffer, so recreating this C++ vector here
+    // would add a second heap allocation to every batch update.
+    g_vertices.resize(count);
+    for (size_t index = 0; index < count; ++index) {
+        g_vertices[index] = {xy[index * 2], xy[index * 2 + 1], 0};
+    }
+    g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_vertices_vertex_layout(const void* raw_vertices,
+                                                   int vertex_count) {
+    const auto* vertices = static_cast<const GoGISVertex*>(raw_vertices);
+    std::lock_guard<std::mutex> lock(g_vertices_mutex);
+    const size_t count = vertices != nullptr && vertex_count > 0
+                             ? static_cast<size_t>(vertex_count)
+                             : 0;
+    g_vertices.resize(count);
+    if (count > 0) {
+        std::memcpy(g_vertices.data(), vertices, count * sizeof(GoGISVertex));
+    }
+    g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 extern "C" unsigned long long gogis_viewport_generation(void) {
@@ -344,6 +394,14 @@ extern "C" void gogis_set_attribute_payload(const char* payload) {
         g_attribute_payload = payload != nullptr ? payload : "[]";
     }
     g_attribute_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" unsigned long long gogis_attribute_page_generation(void) {
+    return g_attribute_page_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" int gogis_attribute_page(void) {
+    return g_attribute_page.load(std::memory_order_relaxed);
 }
 
 extern "C" void gogis_set_layer_tree_payload(const char* payload) {

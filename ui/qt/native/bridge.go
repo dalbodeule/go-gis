@@ -22,19 +22,15 @@ func RegisterMapCanvas() {
 }
 
 // SetVertices copies normalized XY positions into the C++ scene-graph bridge.
-// The C++ side owns the copy after this function returns.
+// Vertex contains only numeric fields, so C++ can read its stable 12-byte
+// layout synchronously and copy only XY. The C++ side owns the copy after the
+// call returns and does not retain the Go pointer.
 func SetVertices(vertices []render.Vertex) {
 	if len(vertices) == 0 {
 		C.gogis_set_vertices(nil, 0)
 		return
 	}
-
-	xy := make([]C.float, len(vertices)*2)
-	for i, vertex := range vertices {
-		xy[i*2] = C.float(vertex.X)
-		xy[i*2+1] = C.float(vertex.Y)
-	}
-	C.gogis_set_vertices((*C.float)(unsafe.Pointer(&xy[0])), C.int(len(vertices)))
+	C.gogis_set_vertices_vertex_layout(unsafe.Pointer(&vertices[0]), C.int(len(vertices)))
 }
 
 // ViewportGeneration returns the generation raised by QML pan/zoom changes.
@@ -147,6 +143,16 @@ func SetAttributePayload(payload string) {
 	cPayload := C.CString(payload)
 	defer C.free(unsafe.Pointer(cPayload))
 	C.gogis_set_attribute_payload(cPayload)
+}
+
+// AttributePageGeneration returns the latest QML attribute page request.
+func AttributePageGeneration() uint64 {
+	return uint64(C.gogis_attribute_page_generation())
+}
+
+// CurrentAttributePage returns the zero-based page requested by QML.
+func CurrentAttributePage() int {
+	return int(C.gogis_attribute_page())
 }
 
 // SetLayerTreePayload publishes the current Go-side layer tree to QML.

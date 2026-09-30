@@ -2,7 +2,6 @@ package render
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -59,14 +58,29 @@ type SchedulerStats struct {
 // accepts only results for its active viewport generation, preventing late
 // worker results from replacing a newer frame.
 type BatchStore struct {
-	mu         sync.RWMutex
-	generation uint64
-	chunks     map[ChunkKey][]Vertex
+	mu           sync.RWMutex
+	generation   uint64
+	chunks       map[ChunkKey][]Vertex
+	orderedKeys  []ChunkKey
+	orderedVerts [][]Vertex
+	orderedIndex map[ChunkKey]orderedPosition
+	knownKeys    map[ChunkKey]uint64
+	visibleEpoch uint64
+	vertexCount  int
+}
+
+type orderedPosition struct {
+	epoch uint64
+	index int
 }
 
 // NewBatchStore creates an empty active batch at generation zero.
 func NewBatchStore() *BatchStore {
-	return &BatchStore{chunks: make(map[ChunkKey][]Vertex)}
+	return &BatchStore{
+		chunks:       make(map[ChunkKey][]Vertex),
+		orderedIndex: make(map[ChunkKey]orderedPosition),
+		knownKeys:    make(map[ChunkKey]uint64),
+	}
 }
 
 // BeginGeneration switches the active viewport generation. Existing vertices
@@ -81,14 +95,57 @@ func (s *BatchStore) BeginGeneration(generation uint64, visible ...ChunkKey) boo
 	}
 	s.generation = generation
 	if len(visible) > 0 {
-		keep := make(map[ChunkKey]struct{}, len(visible))
+		if sameChunkKeyOrder(s.orderedKeys, visible) {
+			return true
+		}
+		s.visibleEpoch++
+		if s.visibleEpoch == 0 {
+			// Epoch wraparound is practically unreachable, but resetting the
+			// markers keeps the invariant explicit if it ever occurs.
+			for key := range s.knownKeys {
+				delete(s.knownKeys, key)
+			}
+			for key := range s.orderedIndex {
+				delete(s.orderedIndex, key)
+			}
+			s.visibleEpoch = 1
+		}
+		epoch := s.visibleEpoch
+		ordered := s.orderedKeys[:0]
+		orderedVerts := s.orderedVerts[:0]
 		for _, key := range visible {
-			keep[key] = struct{}{}
+			if s.knownKeys[key] == epoch {
+				continue
+			}
+			s.knownKeys[key] = epoch
+			ordered = append(ordered, key)
+			orderedVerts = append(orderedVerts, s.chunks[key])
+			s.orderedIndex[key] = orderedPosition{epoch: epoch, index: len(ordered) - 1}
 		}
 		for key := range s.chunks {
-			if _, ok := keep[key]; !ok {
+			if s.knownKeys[key] != epoch {
+				s.vertexCount -= len(s.chunks[key])
 				delete(s.chunks, key)
 			}
+		}
+		for key, marker := range s.knownKeys {
+			if marker != epoch {
+				delete(s.knownKeys, key)
+			}
+		}
+		s.orderedKeys = ordered
+		s.orderedVerts = orderedVerts
+	}
+	return true
+}
+
+func sameChunkKeyOrder(left, right []ChunkKey) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
 		}
 	}
 	return true
@@ -103,6 +160,17 @@ func (s *BatchStore) Generation() uint64 {
 
 // Apply installs a result only when it belongs to the active generation.
 func (s *BatchStore) Apply(result ChunkResult) bool {
+	return s.apply(result, true)
+}
+
+// ApplyImmutable installs a result whose Vertices slice is immutable for the
+// lifetime of the batch. Scheduler/cache-backed render paths can use this to
+// avoid copying a chunk that is already owned by an immutable source.
+func (s *BatchStore) ApplyImmutable(result ChunkResult) bool {
+	return s.apply(result, false)
+}
+
+func (s *BatchStore) apply(result ChunkResult, cloneVertices bool) bool {
 	if result.Err != nil || result.Stale {
 		return false
 	}
@@ -112,37 +180,47 @@ func (s *BatchStore) Apply(result ChunkResult) bool {
 	if result.Generation != s.generation {
 		return false
 	}
-	s.chunks[result.Key] = append([]Vertex(nil), result.Chunk.Vertices...)
+	previousCount := len(s.chunks[result.Key])
+	vertices := result.Chunk.Vertices
+	if cloneVertices {
+		vertices = append([]Vertex(nil), vertices...)
+	}
+	s.chunks[result.Key] = vertices
+	s.vertexCount += len(vertices) - previousCount
+	if position, exists := s.orderedIndex[result.Key]; exists && position.epoch == s.visibleEpoch {
+		s.orderedVerts[position.index] = vertices
+	} else {
+		s.knownKeys[result.Key] = 0
+		s.orderedKeys = append(s.orderedKeys, result.Key)
+		s.orderedVerts = append(s.orderedVerts, vertices)
+		s.orderedIndex[result.Key] = orderedPosition{epoch: s.visibleEpoch, index: len(s.orderedKeys) - 1}
+	}
 	return true
 }
 
 // Current returns a copy so a renderer adapter cannot mutate the store while
-// another worker is preparing the next batch.
+// another worker is preparing the next batch. Chunk order follows the visible
+// request order, avoiding a map-key sort on every frame.
 func (s *BatchStore) Current() (uint64, []Vertex) {
+	return s.CurrentInto(nil)
+}
+
+// CurrentInto copies the current batch into dst when its capacity is enough,
+// allowing a renderer adapter to reuse the flatten buffer across publishes.
+// The returned slice remains caller-owned and is safe to pass to a synchronous
+// adapter such as the Qt bridge.
+func (s *BatchStore) CurrentInto(dst []Vertex) (uint64, []Vertex) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	keys := make([]ChunkKey, 0, len(s.chunks))
-	for key := range s.chunks {
-		keys = append(keys, key)
+	if cap(dst) < s.vertexCount {
+		dst = make([]Vertex, 0, s.vertexCount)
+	} else {
+		dst = dst[:0]
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		left, right := keys[i], keys[j]
-		if left.Layer != right.Layer {
-			return left.Layer < right.Layer
-		}
-		if left.ZoomBucket != right.ZoomBucket {
-			return left.ZoomBucket < right.ZoomBucket
-		}
-		if left.Y != right.Y {
-			return left.Y < right.Y
-		}
-		return left.X < right.X
-	})
-	var vertices []Vertex
-	for _, key := range keys {
-		vertices = append(vertices, s.chunks[key]...)
+	for _, vertices := range s.orderedVerts {
+		dst = append(dst, vertices...)
 	}
-	return s.generation, vertices
+	return s.generation, dst
 }
 
 // Clear removes all currently retained chunks. The generation itself is kept
@@ -151,6 +229,14 @@ func (s *BatchStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.chunks = make(map[ChunkKey][]Vertex)
+	s.orderedKeys = nil
+	s.orderedVerts = nil
+	s.orderedIndex = make(map[ChunkKey]orderedPosition)
+	for key := range s.knownKeys {
+		delete(s.knownKeys, key)
+	}
+	s.visibleEpoch = 0
+	s.vertexCount = 0
 }
 
 // Scheduler coordinates asynchronous chunk creation with viewport generations.
@@ -158,10 +244,28 @@ func (s *BatchStore) Clear() {
 // work completing for an older generation is reported as stale and is never
 // inserted into the cache.
 type Scheduler struct {
-	mu         sync.RWMutex
-	generation uint64
-	cache      map[ChunkKey]Chunk
-	stats      schedulerCounters
+	mu          sync.RWMutex
+	generation  uint64
+	cache       map[ChunkKey]Chunk
+	stats       schedulerCounters
+	cachedPool  sync.Pool
+	requestPool sync.Pool
+	keyPool     sync.Pool
+}
+
+type cachedChunkSnapshot struct {
+	chunks []Chunk
+}
+
+// ChunkKeyBuffer owns reusable viewport keys until it is returned to a
+// Scheduler. Callers may mutate Keys while they own the buffer.
+type ChunkKeyBuffer struct {
+	Keys []ChunkKey
+}
+
+type schedulerRequestBuffers struct {
+	cachedKeys []ChunkKey
+	missing    []ChunkKey
 }
 
 type schedulerCounters struct {
@@ -175,6 +279,35 @@ type schedulerCounters struct {
 // NewScheduler creates an empty chunk scheduler.
 func NewScheduler() *Scheduler {
 	return &Scheduler{cache: make(map[ChunkKey]Chunk)}
+}
+
+// AcquireChunkKeyBuffer returns a reusable scratch buffer for viewport
+// requests. The caller owns it until ReleaseChunkKeyBuffer and must not mutate
+// it while a scheduler request still references it.
+func (s *Scheduler) AcquireChunkKeyBuffer(minCapacity int) *ChunkKeyBuffer {
+	value := s.keyPool.Get()
+	if value == nil {
+		return &ChunkKeyBuffer{Keys: make([]ChunkKey, 0, minCapacity)}
+	}
+	buffer := value.(*ChunkKeyBuffer)
+	keys := buffer.Keys
+	if cap(keys) < minCapacity {
+		buffer.Keys = make([]ChunkKey, 0, minCapacity)
+		return buffer
+	}
+	buffer.Keys = keys[:0]
+	return buffer
+}
+
+// ReleaseChunkKeyBuffer returns a viewport key buffer after its request
+// channel has closed. Keeping ownership explicit prevents a canceled request
+// from racing with the next viewport refresh.
+func (s *Scheduler) ReleaseChunkKeyBuffer(buffer *ChunkKeyBuffer) {
+	if buffer == nil {
+		return
+	}
+	buffer.Keys = buffer.Keys[:0]
+	s.keyPool.Put(buffer)
 }
 
 // Generation returns the current viewport generation.
@@ -228,10 +361,86 @@ func (s *Scheduler) Cached(key ChunkKey) (Chunk, bool) {
 // completion order, which allows a UI adapter to present low-latency chunks
 // before slower work finishes. The channel is always closed when all work ends.
 func (s *Scheduler) Request(ctx context.Context, keys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
-	results := make(chan ChunkResult, len(keys))
+	return s.request(ctx, uniqueChunkKeys(keys), builder)
+}
+
+// RequestUnique is the allocation-friendly form of Request for callers that
+// already guarantee each key appears once. The planner/visibility pipeline
+// uses this path because it creates disjoint row-major keys per layer.
+func (s *Scheduler) RequestUnique(ctx context.Context, keys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
+	return s.request(ctx, keys, builder)
+}
+
+func (s *Scheduler) request(ctx context.Context, uniqueKeys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
+	resultBuffer := len(uniqueKeys)
+	if resultBuffer > 32 {
+		resultBuffer = 32
+	}
+	results := make(chan ChunkResult, resultBuffer)
 	requestGeneration := s.Generation()
-	uniqueKeys := uniqueChunkKeys(keys)
 	s.stats.requests.Add(1)
+	snapshot, cachedKeys, missing, buffers := s.splitCachedRequest(uniqueKeys)
+	var cached []Chunk
+	if snapshot != nil {
+		cached = snapshot.chunks
+	}
+	if missing == nil {
+		s.stats.cacheHits.Add(uint64(len(cached)))
+		if len(cached) <= resultBuffer {
+			for index, chunk := range cached {
+				if ctx.Err() != nil {
+					break
+				}
+				results <- ChunkResult{Key: uniqueKeys[index], Generation: requestGeneration, Chunk: chunk}
+			}
+			s.releaseCachedSnapshot(snapshot)
+			if ctx.Err() != nil {
+				s.stats.canceledCalls.Add(1)
+			}
+			close(results)
+			return results
+		}
+		go func(snapshot *cachedChunkSnapshot, buffers *schedulerRequestBuffers) {
+			defer close(results)
+			defer s.releaseCachedSnapshot(snapshot)
+			defer s.releaseRequestBuffers(buffers)
+			defer func() {
+				if ctx.Err() != nil {
+					s.stats.canceledCalls.Add(1)
+				}
+			}()
+			for index, chunk := range cached {
+				select {
+				case results <- ChunkResult{Key: uniqueKeys[index], Generation: requestGeneration, Chunk: chunk}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(snapshot, buffers)
+		return results
+	}
+	if len(cached) > 0 {
+		s.stats.cacheHits.Add(uint64(len(cached)))
+		go func(snapshot *cachedChunkSnapshot, buffers *schedulerRequestBuffers) {
+			defer close(results)
+			defer s.releaseCachedSnapshot(snapshot)
+			defer s.releaseRequestBuffers(buffers)
+			defer func() {
+				if ctx.Err() != nil {
+					s.stats.canceledCalls.Add(1)
+				}
+			}()
+			for index, chunk := range cached {
+				select {
+				case results <- ChunkResult{Key: cachedKeys[index], Generation: requestGeneration, Chunk: chunk}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			s.runMissing(ctx, requestGeneration, missing, builder, results)
+		}(snapshot, buffers)
+		return results
+	}
 
 	go func() {
 		defer close(results)
@@ -240,39 +449,150 @@ func (s *Scheduler) Request(ctx context.Context, keys []ChunkKey, builder ChunkB
 				s.stats.canceledCalls.Add(1)
 			}
 		}()
-		workers := len(uniqueKeys)
-		if workers > 4 {
-			workers = 4
-		}
-		if workers == 0 {
-			return
-		}
-		semaphore := make(chan struct{}, workers)
-		var wait sync.WaitGroup
-		for _, key := range uniqueKeys {
-			key := key
-			wait.Add(1)
-			go func() {
-				defer wait.Done()
-				if ctx.Err() != nil {
-					return
-				}
-				select {
-				case semaphore <- struct{}{}:
-				case <-ctx.Done():
-					return
-				}
-				defer func() { <-semaphore }()
-				if ctx.Err() != nil {
-					return
-				}
-				s.buildChunk(ctx, requestGeneration, key, builder, results)
-			}()
-		}
-		wait.Wait()
+		s.runMissing(ctx, requestGeneration, missing, builder, results)
 	}()
 
 	return results
+}
+
+func (s *Scheduler) splitCachedRequest(keys []ChunkKey) (*cachedChunkSnapshot, []ChunkKey, []ChunkKey, *schedulerRequestBuffers) {
+	if len(keys) == 0 {
+		return nil, nil, keys, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var snapshot *cachedChunkSnapshot
+	var cachedKeys []ChunkKey
+	var missing []ChunkKey
+	var buffers *schedulerRequestBuffers
+	firstMissing := -1
+	seenHit := false
+	for index, key := range keys {
+		chunk, ok := s.cache[key]
+		if !ok {
+			if !seenHit {
+				if firstMissing < 0 {
+					firstMissing = index
+				}
+				continue
+			}
+			if missing == nil {
+				missing = make([]ChunkKey, 0, len(keys))
+				cachedKeys = append([]ChunkKey(nil), keys[:len(snapshot.chunks)]...)
+			}
+			missing = append(missing, key)
+			continue
+		}
+		if !seenHit {
+			seenHit = true
+			snapshot = s.acquireCachedSnapshot(len(keys))
+			if firstMissing >= 0 {
+				buffers = s.acquireRequestBuffers(len(keys))
+				missing = append(buffers.missing, keys[:firstMissing]...)
+				cachedKeys = buffers.cachedKeys
+			}
+		}
+		snapshot.chunks = append(snapshot.chunks, chunk)
+		if cachedKeys != nil {
+			cachedKeys = append(cachedKeys, key)
+		}
+	}
+	if !seenHit {
+		return nil, nil, keys, nil
+	}
+	if len(missing) == 0 {
+		return snapshot, nil, nil, nil
+	}
+	if buffers == nil {
+		buffers = s.acquireRequestBuffers(len(keys))
+		cachedKeys = append(buffers.cachedKeys, keys[:len(snapshot.chunks)]...)
+		missing = buffers.missing
+	}
+	buffers.cachedKeys = cachedKeys
+	buffers.missing = missing
+	return snapshot, cachedKeys, missing, buffers
+}
+
+func (s *Scheduler) acquireCachedSnapshot(capacity int) *cachedChunkSnapshot {
+	value := s.cachedPool.Get()
+	if value == nil {
+		return &cachedChunkSnapshot{chunks: make([]Chunk, 0, capacity)}
+	}
+	snapshot := value.(*cachedChunkSnapshot)
+	if cap(snapshot.chunks) < capacity {
+		snapshot.chunks = make([]Chunk, 0, capacity)
+	} else {
+		snapshot.chunks = snapshot.chunks[:0]
+	}
+	return snapshot
+}
+
+func (s *Scheduler) releaseCachedSnapshot(snapshot *cachedChunkSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	clear(snapshot.chunks)
+	snapshot.chunks = snapshot.chunks[:0]
+	s.cachedPool.Put(snapshot)
+}
+
+func (s *Scheduler) acquireRequestBuffers(capacity int) *schedulerRequestBuffers {
+	value := s.requestPool.Get()
+	if value == nil {
+		return &schedulerRequestBuffers{
+			cachedKeys: make([]ChunkKey, 0, capacity),
+			missing:    make([]ChunkKey, 0, capacity),
+		}
+	}
+	buffers := value.(*schedulerRequestBuffers)
+	if cap(buffers.cachedKeys) < capacity {
+		buffers.cachedKeys = make([]ChunkKey, 0, capacity)
+	} else {
+		buffers.cachedKeys = buffers.cachedKeys[:0]
+	}
+	if cap(buffers.missing) < capacity {
+		buffers.missing = make([]ChunkKey, 0, capacity)
+	} else {
+		buffers.missing = buffers.missing[:0]
+	}
+	return buffers
+}
+
+func (s *Scheduler) releaseRequestBuffers(buffers *schedulerRequestBuffers) {
+	if buffers == nil {
+		return
+	}
+	clear(buffers.cachedKeys)
+	clear(buffers.missing)
+	buffers.cachedKeys = buffers.cachedKeys[:0]
+	buffers.missing = buffers.missing[:0]
+	s.requestPool.Put(buffers)
+}
+
+func (s *Scheduler) runMissing(ctx context.Context, requestGeneration uint64, keys []ChunkKey, builder ChunkBuilder, results chan<- ChunkResult) {
+	workers := len(keys)
+	if workers > 4 {
+		workers = 4
+	}
+	if workers == 0 {
+		return
+	}
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		start := len(keys) * worker / workers
+		end := len(keys) * (worker + 1) / workers
+		go func(start, end int) {
+			defer wait.Done()
+			for index := start; index < end; index++ {
+				if ctx.Err() != nil {
+					return
+				}
+				s.buildChunk(ctx, requestGeneration, keys[index], builder, results)
+			}
+		}(start, end)
+	}
+	wait.Wait()
 }
 
 func uniqueChunkKeys(keys []ChunkKey) []ChunkKey {

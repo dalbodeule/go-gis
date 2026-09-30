@@ -21,6 +21,27 @@ func TestLayerVisibilityFiltersUnknownAndHiddenLayers(t *testing.T) {
 	}
 }
 
+func TestLayerVisibilityFilterChunkKeysInPlace(t *testing.T) {
+	state := NewLayerVisibility("roads", "buildings")
+	state.Set("buildings", false)
+	keys := []ChunkKey{
+		{Layer: "roads", X: 1},
+		{Layer: "buildings", X: 2},
+		{Layer: "unknown", X: 3},
+		{Layer: "roads", X: 4},
+	}
+	filtered := state.FilterChunkKeysInPlace(keys)
+	want := []ChunkKey{{Layer: "roads", X: 1}, {Layer: "roads", X: 4}}
+	if len(filtered) != len(want) {
+		t.Fatalf("filtered length = %d, want %d", len(filtered), len(want))
+	}
+	for index := range want {
+		if filtered[index] != want[index] {
+			t.Fatalf("filtered[%d] = %#v, want %#v", index, filtered[index], want[index])
+		}
+	}
+}
+
 func TestLayerVisibilityPreservesLayerTreeOrder(t *testing.T) {
 	state := NewLayerVisibility("roads", "buildings", "labels")
 	state.Set("buildings", false)

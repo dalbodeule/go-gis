@@ -2,7 +2,10 @@ package commands
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"math"
 	"testing"
 
 	"gogis/internal/core"
@@ -54,5 +57,96 @@ func TestGenerateLabelsUsesDistanceMidpointForLine(t *testing.T) {
 	label := result.Features[0].Label
 	if label == nil || label.X != 2 || label.Y != 4 {
 		t.Fatalf("label midpoint = %#v, want (2,4)", label)
+	}
+}
+
+func TestGenerateLabelsReadsWKBPointDirectly(t *testing.T) {
+	data, err := hex.DecodeString("0101000000000000000000f03f0000000000000040")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := GenerateLabels(context.Background(), core.Layer{Features: []core.Feature{{
+		ID: 1, Geometry: core.WKBGeometry{WKB: data}, Properties: map[string]any{"name": "point"},
+	}}}, "name", 1, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label := result.Features[0].Label; label == nil || label.X != 1 || label.Y != 2 {
+		t.Fatalf("WKB label = %#v", label)
+	}
+}
+
+func TestGenerateLabelsReadsWKBLineDirectly(t *testing.T) {
+	data := make([]byte, 57)
+	data[0] = 1
+	binary.LittleEndian.PutUint32(data[1:5], 2)
+	binary.LittleEndian.PutUint32(data[5:9], 3)
+	for index, point := range [][2]float64{{0, 0}, {2, 0}, {2, 10}} {
+		offset := 9 + index*16
+		binary.LittleEndian.PutUint64(data[offset:offset+8], math.Float64bits(point[0]))
+		binary.LittleEndian.PutUint64(data[offset+8:offset+16], math.Float64bits(point[1]))
+	}
+	point, handled, err := representativeStandardWKB(data)
+	if err != nil || !handled || point != (labelPoint{X: 2, Y: 4}) {
+		t.Fatalf("WKB line representative = %#v, handled=%v, err=%v", point, handled, err)
+	}
+}
+
+func TestGenerateLabelsReadsWKBPolygonDirectly(t *testing.T) {
+	data := make([]byte, 93)
+	data[0] = 1
+	binary.LittleEndian.PutUint32(data[1:5], 3)
+	binary.LittleEndian.PutUint32(data[5:9], 1)
+	binary.LittleEndian.PutUint32(data[9:13], 5)
+	for index, point := range [][2]float64{{0, 0}, {10, 0}, {10, 10}, {0, 10}, {0, 0}} {
+		offset := 13 + index*16
+		binary.LittleEndian.PutUint64(data[offset:offset+8], math.Float64bits(point[0]))
+		binary.LittleEndian.PutUint64(data[offset+8:offset+16], math.Float64bits(point[1]))
+	}
+	point, handled, err := representativeStandardWKB(data)
+	if err != nil || !handled || point != (labelPoint{X: 5, Y: 5}) {
+		t.Fatalf("WKB polygon representative = %#v, handled=%v, err=%v", point, handled, err)
+	}
+}
+
+func TestCoordinatePairsSupportsExponentAndRejectsOddValues(t *testing.T) {
+	pairs, err := coordinatePairs("POINT (1.5e+1 -2.5E-1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pairs) != 1 || pairs[0] != (labelPoint{X: 15, Y: -0.25}) {
+		t.Fatalf("pairs = %#v", pairs)
+	}
+	if _, err := coordinatePairs("POINT (1 2 3)"); err == nil {
+		t.Fatal("expected odd coordinate error")
+	}
+	if _, err := coordinatePairs("POINT (1e 2)"); err == nil {
+		t.Fatal("expected malformed number error")
+	}
+}
+
+func TestLabelProjectLayerDoesNotMutateSourceFeatures(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{
+		Name:     "roads",
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "road"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.LabelProjectLayer(context.Background(), "roads", "name", "labeled", 1, "default"); err != nil {
+		t.Fatal(err)
+	}
+	if service.project.Layers[0].Features[0].Label != nil {
+		t.Fatal("label command mutated source feature")
+	}
+	result, ok := service.Layer("labeled")
+	if !ok || result.Features[0].Label == nil || result.Features[0].Label.Text != "road" {
+		t.Fatalf("labeled result = %#v", result)
 	}
 }
