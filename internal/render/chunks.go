@@ -19,10 +19,18 @@ type ChunkKey struct {
 
 // Vertex is the compact representation consumed by a renderer adapter.
 type Vertex struct {
-	X     float32
-	Y     float32
-	Color uint32
+	X      float32
+	Y      float32
+	Color  uint32
+	SizeMM float32
+	Kind   uint32
 }
+
+const (
+	VertexLine uint32 = iota
+	VertexPoint
+	VertexFill
+)
 
 // Chunk is an immutable render payload once returned by a ChunkBuilder.
 type Chunk struct {

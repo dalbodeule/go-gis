@@ -285,6 +285,63 @@ func TestProjectSaveLayerRequiresNameForMultipleLayers(t *testing.T) {
 	}
 }
 
+func TestRenameLayerPreservesSourceIdentityAndRejectsDuplicates(t *testing.T) {
+	service := &ProjectService{project: &core.Project{Name: "field work", Layers: []core.Layer{
+		{Name: "roads", SourcePath: "roads.shp", SourceLayerName: "roads"}, {Name: "buildings"},
+	}}}
+	if err := service.RenameLayer("roads", "  local roads "); err != nil {
+		t.Fatal(err)
+	}
+	layer, ok := service.Layer("roads")
+	if !ok || layer.DisplayName != "local roads" || layer.SourcePath != "roads.shp" || layer.SourceLayerName != "roads" {
+		t.Fatalf("rename lost source identity: %+v, %v", layer, ok)
+	}
+	if err := service.RenameLayer("roads", "BUILDINGS"); err == nil {
+		t.Fatal("expected case-insensitive duplicate rejection")
+	}
+}
+
+func TestProjectLayersExceptReturnsDetachedUnrelatedSnapshots(t *testing.T) {
+	service := &ProjectService{project: &core.Project{Layers: []core.Layer{
+		{Name: "roads", Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "edited"}}}},
+		{Name: "buildings", Features: []core.Feature{{ID: 2}}},
+	}}}
+
+	layers := service.ProjectLayersExcept("buildings")
+	if len(layers) != 1 || layers[0].Name != "roads" || layers[0].Features[0].Properties["name"] != "edited" {
+		t.Fatalf("unrelated project snapshots = %+v", layers)
+	}
+	layers[0].Features[0].Properties["name"] = "changed clone"
+	layers[0].Features[0].Geometry = core.WKTGeometry{WKT: "POINT (9 9)"}
+	if got := service.Project().Layers[0].Features[0].Properties["name"]; got != "edited" {
+		t.Fatalf("mutating returned snapshot changed project property to %v", got)
+	}
+	if got := service.Project().Layers[0].Features[0].Geometry.(core.WKTGeometry).WKT; got != "POINT (1 2)" {
+		t.Fatalf("mutating returned snapshot changed project geometry to %q", got)
+	}
+}
+
+func TestUpdateLayerSettingsValidatesAndPersistsPresentation(t *testing.T) {
+	layer := core.Layer{Name: "roads", SourcePath: "roads.shp", SourceLayerName: "roads", Visible: true,
+		Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}
+	service := &ProjectService{project: &core.Project{Name: "field work", Layers: []core.Layer{layer}}}
+	layer.SourceEncoding = "CP949"
+	layer.Visible = false
+	layer.Style.LineColor = "#ff0000"
+	layer.Labels = core.LabelSettings{Enabled: true, Expression: "name", Placement: "free-angle", HeightMM: 3}
+	if err := service.UpdateLayerSettings("roads", layer); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := service.Layer("roads")
+	if got.SourceEncoding != "CP949" || got.Visible || got.Style.LineColor != "#ff0000" || got.Labels != layer.Labels {
+		t.Fatalf("settings were not retained: %+v", got)
+	}
+	layer.Style.LineColor = "blue"
+	if err := service.UpdateLayerSettings("roads", layer); err == nil {
+		t.Fatal("expected invalid style rejection")
+	}
+}
+
 func TestProjectAddFeatureIsTransactional(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{})
 	if err := service.BeginEdit(); err != nil {

@@ -72,6 +72,11 @@ go build -tags native -o bin/gis-cli ./cmd/gis-cli
 
 현재 `drivers/native`에는 세 바인딩의 import와 초기화/생성 경계가 들어 있습니다. GDAL/PROJ/GEOS 개발 라이브러리가 설치되지 않은 환경에서 `-tags native`를 사용하면 의도적으로 CGO 헤더/링커 오류가 발생합니다.
 
+데스크톱 폴리곤 채움은 GEOS constrained Delaunay API를 사용하므로 native
+빌드에 GEOS 3.10 이상이 필요합니다. 설치 후 `geos-config --version` 또는
+`pkg-config --modversion geos`로 버전을 확인합니다. 해당 API는 GEOS 3.10에서
+추가되었습니다([GEOS 3.10 릴리스 노트](https://libgeos.org/posts/2021-10-01-geos-3-10-released/)).
+
 ## macOS
 
 Apple Silicon과 Intel 모두 Homebrew 경로를 먼저 확인합니다.
@@ -113,6 +118,19 @@ C/C++ compiler are visible in the same shell.
 ```sh
 CGO_CXXFLAGS=-std=c++17 go run -tags qt ./cmd/gis-desktop
 ```
+
+The layer-properties QML interaction test uses an offscreen mock map canvas and
+requires Qt Quick Test (`qmltestrunner`):
+
+```sh
+QT_QPA_PLATFORM=offscreen qmltestrunner \
+  -import cmd/gis-desktop/qmltests \
+  -input cmd/gis-desktop/qmltests
+```
+
+This verifies that the dialog's Apply button submits its settings payload. It
+does not replace native GDAL/Qt integration tests or the Windows desktop
+interaction checklist.
 
 저장소 빌드 스크립트는 데모 UI와 native 데이터 UI를 구분합니다.
 

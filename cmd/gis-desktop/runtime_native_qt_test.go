@@ -4,14 +4,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"gogis/drivers/gdal"
 	"gogis/internal/core"
+	"gogis/internal/render"
+	"gogis/internal/workspace"
+	"gogis/ui/qt/native"
 
 	"github.com/airbusgeo/godal"
 )
@@ -86,6 +92,37 @@ func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 	}
 }
 
+func TestDesktopSourceEncodingAppliesToLazyAttributeReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.shp")
+	layer := core.Layer{
+		Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields: []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{
+			ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"},
+			Properties: map[string]any{"name": "한글 도로"},
+		}},
+	}
+	if err := (gdal.Writer{}).Write(context.Background(), path, layer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(strings.TrimSuffix(path, filepath.Ext(path))+".cpg", []byte("CP949\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime, err := loadDataRuntimeModeContextWithEncoding(context.Background(), path, "roads", "", "", "", "UTF-8", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, total, err := runtime.attributePageReader(context.Background(), "roads", 0, 10)
+	if err != nil || total != 1 || page.Features[0].Properties["name"] != "한글 도로" {
+		t.Fatalf("encoded lazy attribute page=%#v total=%d err=%v", page, total, err)
+	}
+	feature, err := runtime.attributeFeatureReader(context.Background(), "roads", 1)
+	if err != nil || feature.Properties["name"] != "한글 도로" {
+		t.Fatalf("encoded lazy feature=%#v err=%v", feature, err)
+	}
+}
+
 func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
 	root := t.TempDir()
 	firstDirectory := filepath.Join(root, "first")
@@ -131,6 +168,14 @@ func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
 	if len(added.features) != 2 {
 		t.Fatalf("combined feature count = %d, want 2", len(added.features))
 	}
+	roads, ok := added.service.Layer("roads")
+	if !ok || roads.SourcePath != firstPath || roads.SourceLayerName != "roads" || roads.Style != core.DefaultLayerStyle() {
+		t.Fatalf("first layer source/presentation = %+v, found=%t", roads, ok)
+	}
+	addedRoads, ok := added.service.Layer("roads_roads")
+	if !ok || addedRoads.SourcePath != secondPath || addedRoads.SourceLayerName != "roads" {
+		t.Fatalf("added layer source identity = %+v, found=%t", addedRoads, ok)
+	}
 	if added.mapExtent != [4]float64{127, 37, 128, 38} {
 		t.Fatalf("combined extent = %v", added.mapExtent)
 	}
@@ -156,6 +201,333 @@ func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
 	page, total, err = readOnlyAdded.attributePageReader(context.Background(), "roads_roads", 0, 10)
 	if err != nil || total != 1 || page.Features[0].Properties["name"] != "second" {
 		t.Fatalf("read-only added layer page=%#v total=%d err=%v", page, total, err)
+	}
+}
+
+func TestDesktopReloadingOneSourcePreservesOtherEditedLayersAndOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.gpkg")
+	reloaded := core.Layer{
+		Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields: []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{
+			ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (127 37, 127.1 37.1)"},
+			Properties: map[string]any{"name": "reloaded source"},
+		}},
+	}
+	if err := (gdal.Writer{}).Write(context.Background(), path, reloaded); err != nil {
+		t.Fatal(err)
+	}
+	baseLayers := []core.Layer{{
+		Name: "buildings", DisplayName: "Edited buildings", SourcePath: "buildings.gpkg",
+		SourceLayerName: "buildings", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(),
+		Fields: []core.Field{{Name: "status", Type: core.FieldTypeText}},
+		Features: []core.Feature{{
+			ID: 9, Geometry: core.WKTGeometry{WKT: "POINT (127.2 37.2)"},
+			Properties: map[string]any{"status": "unsaved edit"},
+		}},
+	}}
+	visible := true
+	runtime, err := loadDataRuntimeSourcesWithCRS(context.Background(), []vectorSourceSpec{{
+		Path: path, LayerName: "roads", Name: "roads", DisplayName: "Relinked roads",
+		Visible: &visible, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(),
+		InsertAt: 0, InsertAtSet: true,
+	}}, baseLayers, "", "EPSG:4326")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := runtime.service.Project()
+	if len(project.Layers) != 2 || project.Layers[0].Name != "roads" || project.Layers[1].Name != "buildings" {
+		t.Fatalf("reloaded project layer order = %+v", runtime.service.LayerNames())
+	}
+	if project.Layers[0].DisplayName != "Relinked roads" || project.Layers[0].Features[0].Properties["name"] != "reloaded source" {
+		t.Fatalf("replacement source layer = %+v", project.Layers[0])
+	}
+	if project.Layers[1].DisplayName != "Edited buildings" || project.Layers[1].Features[0].Properties["status"] != "unsaved edit" {
+		t.Fatalf("unrelated edited layer was not preserved: %+v", project.Layers[1])
+	}
+}
+
+func TestWorkspaceReopensOriginalSourcesAndLayerSettings(t *testing.T) {
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "roads.gpkg")
+	layer := core.Layer{
+		Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields:   []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (127 37, 127.1 37.1)"}, Properties: map[string]any{"name": "길"}}},
+	}
+	if err := (gdal.Writer{}).Write(context.Background(), sourcePath, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadDataRuntimeFiles(context.Background(), []string{sourcePath}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, _ := runtime.service.LayerProperties("roads")
+	settings.DisplayName = "Local roads"
+	settings.SourceEncoding = "UTF-8"
+	settings.Visible = false
+	settings.Style.PointColor = "#aabbcc"
+	settings.Style.PointSizeMM = 3.2
+	settings.Style.LineColor = "#0066cc"
+	settings.Style.LineWidthMM = 1.4
+	settings.Style.PolygonColor = "#123456"
+	settings.Style.FillOpacity = 0.6
+	settings.Labels = core.LabelSettings{
+		Enabled: true, Expression: "${name}", Rule: `return feature.kind == "primary"`,
+		LuaScript: `return feature.name .. " (" .. feature.kind .. ")"`, Placement: "free-angle",
+		RotationField: "angle", HeightMM: 2.5, MinScale: 1000, MaxScale: 50000,
+	}
+	if err := runtime.service.UpdateLayerSettings("roads", settings); err != nil {
+		t.Fatal(err)
+	}
+	projectName, projectCRS := runtime.service.ProjectInfo()
+	workspacePath := filepath.Join(directory, "field.gogis")
+	projectLayers := runtime.service.ProjectLayerProperties()
+	projectLayers = append(projectLayers, core.Layer{
+		Name: "buildings", DisplayName: "Buildings", SourcePath: filepath.Join(directory, "moved", "buildings.gpkg"),
+		SourceLayerName: "buildings", SourceCRS: "EPSG:4326", CRS: projectCRS,
+		Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(),
+	})
+	doc := workspace.FromProject(core.Project{Name: projectName, CRS: projectCRS, Layers: projectLayers})
+	doc.View = &workspace.ViewState{CenterX: 0.35, CenterY: 0.72, Zoom: 2.5, ActiveLayer: "roads"}
+	if err := workspace.Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := loadWorkspaceRuntime(context.Background(), workspacePath, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	properties, ok := reopened.service.LayerProperties("roads")
+	if !ok || properties.SourcePath != sourcePath || properties.DisplayName != "Local roads" || properties.SourceEncoding != "UTF-8" ||
+		properties.Visible || properties.Style != settings.Style || properties.Labels != settings.Labels {
+		t.Fatalf("workspace layer settings were not restored: %+v, found=%t", properties, ok)
+	}
+	if reopened.workspaceView == nil || *reopened.workspaceView != *doc.View {
+		t.Fatalf("workspace view was not restored: %+v, want %+v", reopened.workspaceView, doc.View)
+	}
+	missing, ok := reopened.service.LayerProperties("buildings")
+	if !ok || missing.SourcePath != filepath.Join(directory, "moved", "buildings.gpkg") || reopened.unavailableSources["buildings"].Reason == "" {
+		t.Fatalf("missing source was not retained for relinking: layer=%+v unavailable=%+v", missing, reopened.unavailableSources)
+	}
+	if got := len(reopened.service.LayerNames()); got != 2 {
+		t.Fatalf("workspace layer count = %d, want both loaded and missing layers", got)
+	}
+	readOnly, err := loadWorkspaceRuntime(context.Background(), workspacePath, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readOnly.closeAttributeSource != nil {
+		defer readOnly.closeAttributeSource()
+	}
+	if _, ok := readOnly.service.LayerProperties("buildings"); !ok || readOnly.unavailableSources["buildings"].Reason == "" {
+		t.Fatalf("read-only workspace did not retain missing source: %+v", readOnly.unavailableSources)
+	}
+}
+
+func TestWorkspaceViewNormalizesPanAndZoom(t *testing.T) {
+	got := workspaceViewFromViewport(native.Viewport{PanX: 120, PanY: -60, Zoom: 2, Width: 800, Height: 400}, "roads")
+	want := workspace.ViewState{CenterX: 0.425, CenterY: 0.425, Zoom: 2, ActiveLayer: "roads"}
+	if got != want {
+		t.Fatalf("saved view state = %+v, want %+v", got, want)
+	}
+	runtime := &demoRuntime{workspaceView: &got}
+	if viewport := runtimeInitialViewport(runtime); viewport.Center != (render.Point{X: want.CenterX, Y: want.CenterY}) || viewport.Zoom != want.Zoom {
+		t.Fatalf("restored initial viewport = %+v, want center (%v, %v) zoom %v", viewport, want.CenterX, want.CenterY, want.Zoom)
+	}
+}
+
+func TestIsWorkspacePathUsesExtensionCaseInsensitively(t *testing.T) {
+	for path, want := range map[string]bool{
+		"field.gogis": true, "FIELD.GOGIS": true, "field.gpkg": false, "folder.gogis/data.gpkg": false,
+	} {
+		if got := isWorkspacePath(path); got != want {
+			t.Errorf("isWorkspacePath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestApplyLayerSettingsRejectsEmptyDisplayName(t *testing.T) {
+	err := applyLayerSettings(&demoRuntime{}, `{"name":"roads","displayName":"   "}`)
+	if err == nil || !strings.Contains(err.Error(), "display name") {
+		t.Fatalf("empty display name error = %v", err)
+	}
+}
+
+func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
+	style := core.DefaultLayerStyle()
+	labels := core.DefaultLabelSettings()
+	labels.Enabled = true
+	labels.Expression = "${street} ${number}"
+	labels.Rule = `return feature.active == true`
+	labels.LuaScript = `return feature.name`
+	labels.Placement = "free-angle"
+	labels.RotationField = "angle"
+	labels.HeightMM = 2.5
+	labels.MinScale = 1000
+	labels.MaxScale = 50000
+	service := newLoadedProjectService([]core.Layer{{
+		Name: "roads", DisplayName: "roads", SourcePath: "roads.shp", SourceLayerName: "roads",
+		Visible: true, Style: style, Labels: core.DefaultLabelSettings(),
+	}})
+	runtime := &demoRuntime{
+		service: service, visibleLayers: map[string]bool{"roads": true},
+		visibility:  render.NewLayerVisibility("roads"),
+		layerStyles: map[string]core.LayerStyle{}, layerStyleMu: &sync.RWMutex{},
+	}
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: "roads", DisplayName: "Cadastral Roads", SourcePath: "roads.shp",
+		SourceLayerName: "roads", Visible: false, Style: style, Labels: labels,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(payload)); err != nil {
+		t.Fatal(err)
+	}
+	layer, ok := service.LayerProperties("roads")
+	if !ok || layer.DisplayName != "Cadastral Roads" || layer.Visible || layer.Labels != labels {
+		t.Fatalf("updated layer properties = %+v, found=%t", layer, ok)
+	}
+	if runtime.loadGeneration != 0 {
+		t.Fatalf("non-source layer settings triggered a source reload (generation %d)", runtime.loadGeneration)
+	}
+	if runtime.visibleLayers["roads"] || runtime.visibility.IsVisible("roads") {
+		t.Fatal("layer visibility was not updated in render state")
+	}
+}
+
+func TestPolygonRuntimeBuilderPublishesClippedFillMeshWithOpacity(t *testing.T) {
+	style := core.DefaultLayerStyle()
+	layers := []core.Layer{{
+		Name: "areas", Style: style,
+		Features: []core.Feature{{ID: 7, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))"}}},
+	}}
+	runtime, err := buildDataRuntime(context.Background(), layers, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "areas", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fills := 0
+	for _, vertex := range chunk.Vertices {
+		if vertex.Kind == render.VertexFill {
+			fills++
+			if vertex.Color != render.ColorForPolygonFill(style) {
+				t.Fatalf("polygon fill color/opacity = %#08x, want %#08x", vertex.Color, render.ColorForPolygonFill(style))
+			}
+		}
+	}
+	if fills == 0 || fills%3 != 0 {
+		t.Fatalf("polygon fill mesh has %d vertices, expected triangle groups", fills)
+	}
+}
+
+func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
+	style := core.DefaultLayerStyle()
+	style.FillOpacity = 0
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
+		Name: "areas", Style: style,
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))"}}},
+	}}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := style
+	updated.FillOpacity = 0.6
+	runtime.layerStyleMu.Lock()
+	runtime.layerStyles["areas"] = updated
+	runtime.layerStyleMu.Unlock()
+	chunk, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "areas", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := render.ColorForPolygonFill(updated)
+	for _, vertex := range chunk.Vertices {
+		if vertex.Kind == render.VertexFill && vertex.Color == want {
+			return
+		}
+	}
+	t.Fatalf("fill mesh did not become visible after opacity update; expected fill color %#08x", want)
+}
+
+func TestConfiguredLabelsUseTemplateLuaRuleAndRenderPlacement(t *testing.T) {
+	layers := []core.Layer{{
+		Name: "roads",
+		Labels: core.LabelSettings{
+			Enabled: true, Expression: "${street} ${number}", Rule: `return feature.kind == "primary"`,
+			Placement: "center-rotated", RotationField: "angle", HeightMM: 2.5, MinScale: 1000, MaxScale: 50000,
+		},
+		Features: []core.Feature{{ID: 7, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 2 0)"}, Properties: map[string]any{
+			"street": "한강로", "number": 12, "kind": "primary", "angle": 30,
+		}}},
+	}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	source, err := render.NewLayerSource(layers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(source.Labels) != 1 {
+		t.Fatalf("layer labels = %#v", source.Labels)
+	}
+	label := source.Labels[0]
+	if label.Text != "한강로 12" || label.FeatureID != 7 || label.Rotation != 30 || label.HeightMM != 2.5 || label.MinScale != 1000 || label.MaxScale != 50000 {
+		t.Fatalf("configured label = %#v", label)
+	}
+}
+
+func TestConfiguredLabelRotationRejectsMissingOrNonFiniteValues(t *testing.T) {
+	tests := []struct {
+		name       string
+		properties map[string]any
+		wantError  string
+	}{
+		{name: "missing field", properties: map[string]any{"name": "Road"}, wantError: `rotation field "angle" is missing`},
+		{name: "non-numeric", properties: map[string]any{"name": "Road", "angle": "north"}, wantError: `rotation field "angle" must contain a finite number`},
+		{name: "not finite", properties: map[string]any{"name": "Road", "angle": "NaN"}, wantError: `rotation field "angle" must contain a finite number`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layers := []core.Layer{{
+				Name: "roads", Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center-rotated", RotationField: "angle"},
+				Features: []core.Feature{{ID: 9, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: test.properties}},
+			}}
+			err := prepareLayerLabels(context.Background(), layers)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("prepareLayerLabels error = %v, want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestPolygonLabelIsAnchoredOnConcaveInterior(t *testing.T) {
+	layers := []core.Layer{{
+		Name:   "areas",
+		Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center", HeightMM: 2.5},
+		Features: []core.Feature{{ID: 3, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 4, 4 4, 4 10, 0 10, 0 0))"},
+			Properties: map[string]any{"name": "L area"}}},
+	}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	feature := layers[0].Features[0]
+	if feature.Label == nil || !feature.Label.AnchorSet {
+		t.Fatalf("polygon label has no explicit interior anchor: %+v", feature.Label)
+	}
+	anchorX, anchorY := feature.Label.X, feature.Label.Y
+	if anchorX < 0 || anchorY < 0 || anchorX > 10 || anchorY > 10 || anchorX > 4 && anchorY > 4 {
+		t.Fatalf("polygon label lies outside the concave polygon: (%v, %v)", anchorX, anchorY)
+	}
+	source, err := render.NewLayerSource(layers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(source.Labels) != 1 || math.Abs(source.Labels[0].X-anchorX/10) > 1e-12 || math.Abs(source.Labels[0].Y-anchorY/10) > 1e-12 {
+		t.Fatalf("normalized polygon label = %+v, expected (%v, %v)", source.Labels, anchorX/10, anchorY/10)
 	}
 }
 

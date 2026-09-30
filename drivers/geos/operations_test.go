@@ -6,11 +6,42 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
 	"gogis/internal/core"
 )
+
+func TestConstrainedTrianglesRespectPolygonHole(t *testing.T) {
+	operator := NewOperator()
+	geometry := core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (3 3, 7 3, 7 7, 3 7, 3 3))"}
+	triangles, err := operator.ConstrainedTriangles(context.Background(), geometry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	area := 0.0
+	for _, triangle := range triangles {
+		area += math.Abs((triangle[1][0]-triangle[0][0])*(triangle[2][1]-triangle[0][1])-
+			(triangle[2][0]-triangle[0][0])*(triangle[1][1]-triangle[0][1])) / 2
+	}
+	if len(triangles) == 0 || math.Abs(area-84) > 1e-8 {
+		t.Fatalf("triangles=%d, covered area=%v; want 84 (including a 4x4 hole excluded)", len(triangles), area)
+	}
+}
+
+func TestPointOnSurfaceFindsInteriorOfConcavePolygon(t *testing.T) {
+	geometry := core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 4, 4 4, 4 10, 0 10, 0 0))"}
+	operator := NewOperator()
+	anchor, found, err := operator.PointOnSurface(context.Background(), geometry)
+	if err != nil || !found {
+		t.Fatalf("point on surface = %v, found=%v, err=%v", anchor, found, err)
+	}
+	// This L-shaped polygon excludes the upper-right notch (x>4 && y>4).
+	if anchor[0] < 0 || anchor[1] < 0 || anchor[0] > 10 || anchor[1] > 10 || anchor[0] > 4 && anchor[1] > 4 {
+		t.Fatalf("label anchor is outside the concave polygon: %v", anchor)
+	}
+}
 
 func BenchmarkCloneLayerForOperation10KPoints(b *testing.B) {
 	layer := benchmarkGEOSLayer(10_000)

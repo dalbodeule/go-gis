@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -17,9 +18,22 @@ import (
 // apply viewport transforms without knowing the source CRS units.
 type LayerSource struct {
 	Features  []HitFeature
+	Labels    []LayerLabel
 	Builder   ChunkBuilder
 	ChunkSize float64
 	Extent    [4]float64
+}
+
+type LayerLabel struct {
+	Layer     string  `json:"layer"`
+	FeatureID uint64  `json:"featureId"`
+	Text      string  `json:"text"`
+	X         float64 `json:"x"`
+	Y         float64 `json:"y"`
+	Rotation  float64 `json:"rotation"`
+	HeightMM  float64 `json:"heightMm"`
+	MinScale  float64 `json:"minScale"`
+	MaxScale  float64 `json:"maxScale"`
 }
 
 // parsedFeaturePoints keeps the common single-part representation flat. A
@@ -701,6 +715,10 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 	if len(layer.Features) == 0 {
 		return LayerSource{ChunkSize: 0.25, Builder: emptyChunkBuilder()}
 	}
+	style := layer.Style
+	if style == (core.LayerStyle{}) {
+		style = core.DefaultLayerStyle()
+	}
 	spanX, spanY := maxX-minX, maxY-minY
 	if spanX == 0 {
 		spanX = 1
@@ -764,11 +782,13 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				point := part[0]
 				cellX := int(math.Floor(point.X / chunkSize))
 				cellY := int(math.Floor(point.Y / chunkSize))
-				cellMinX, cellMinY := float64(cellX)*chunkSize, float64(cellY)*chunkSize
-				if point.X-0.004 >= cellMinX && point.X+0.004 <= cellMinX+chunkSize &&
-					point.Y-0.004 >= cellMinY && point.Y+0.004 <= cellMinY+chunkSize {
-					chunkHints[[2]int{cellX, cellY}] += 4
+				if cellX == 4 {
+					cellX = 3
 				}
+				if cellY == 4 {
+					cellY = 3
+				}
+				chunkHints[[2]int{cellX, cellY}] += 2
 				return
 			}
 			for pointIndex := 1; pointIndex < len(part); pointIndex++ {
@@ -813,6 +833,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 	// feature.
 	var partsArena [][]Point
 	var normalizedArena []Point
+	var labels []LayerLabel
 	totalMultipartPoints := 0
 	for _, geometry := range parsed {
 		if geometry.parts == nil {
@@ -833,8 +854,8 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		if startCellX == endCellX && startCellY == endCellY {
 			key := [2]int{startCellX, startCellY}
 			appendChunkVertices(key,
-				Vertex{X: float32(start.X), Y: float32(start.Y)},
-				Vertex{X: float32(end.X), Y: float32(end.Y)})
+				newLineVertex(start, style.LineWidthMM),
+				newLineVertex(end, style.LineWidthMM))
 			return
 		}
 		if start.Y == end.Y {
@@ -855,8 +876,8 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 					first, second = second, first
 				}
 				appendChunkVertices([2]int{cellX, startCellY},
-					Vertex{X: float32(first.X), Y: float32(first.Y)},
-					Vertex{X: float32(second.X), Y: float32(second.Y)})
+					newLineVertex(first, style.LineWidthMM),
+					newLineVertex(second, style.LineWidthMM))
 			}
 			return
 		}
@@ -878,8 +899,8 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 					first, second = second, first
 				}
 				appendChunkVertices([2]int{startCellX, cellY},
-					Vertex{X: float32(first.X), Y: float32(first.Y)},
-					Vertex{X: float32(second.X), Y: float32(second.Y)})
+					newLineVertex(first, style.LineWidthMM),
+					newLineVertex(second, style.LineWidthMM))
 			}
 			return
 		}
@@ -897,8 +918,8 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				}
 				key := [2]int{cellX, cellY}
 				appendChunkVertices(key,
-					Vertex{X: float32(clippedStart.X), Y: float32(clippedStart.Y)},
-					Vertex{X: float32(clippedEnd.X), Y: float32(clippedEnd.Y)})
+					newLineVertex(clippedStart, style.LineWidthMM),
+					newLineVertex(clippedEnd, style.LineWidthMM))
 			}
 		}
 	}
@@ -914,26 +935,19 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				}
 			}
 			if len(part) == 1 {
-				// Draw a small cross for point features and keep the actual point
-				// for hit testing.
+				// A coincident vertex pair becomes a screen-sized square marker in
+				// the Qt adapter; geometry and hit testing retain the real point.
 				point := part[0]
-				const radius = 0.004
 				cellX := int(math.Floor(point.X / chunkSize))
 				cellY := int(math.Floor(point.Y / chunkSize))
-				cellMinX, cellMinY := float64(cellX)*chunkSize, float64(cellY)*chunkSize
-				cellMaxX, cellMaxY := cellMinX+chunkSize, cellMinY+chunkSize
-				if point.X-radius >= cellMinX && point.X+radius <= cellMaxX &&
-					point.Y-radius >= cellMinY && point.Y+radius <= cellMaxY {
-					key := [2]int{cellX, cellY}
-					appendChunkVertices(key,
-						Vertex{X: float32(point.X - radius), Y: float32(point.Y)},
-						Vertex{X: float32(point.X + radius), Y: float32(point.Y)},
-						Vertex{X: float32(point.X), Y: float32(point.Y - radius)},
-						Vertex{X: float32(point.X), Y: float32(point.Y + radius)})
-				} else {
-					appendSegment(Point{X: point.X - radius, Y: point.Y}, Point{X: point.X + radius, Y: point.Y})
-					appendSegment(Point{X: point.X, Y: point.Y - radius}, Point{X: point.X, Y: point.Y + radius})
+				if cellX == 4 {
+					cellX = 3
 				}
+				if cellY == 4 {
+					cellY = 3
+				}
+				marker := Vertex{X: float32(point.X), Y: float32(point.Y), SizeMM: float32(style.PointSizeMM), Kind: VertexPoint}
+				appendChunkVertices([2]int{cellX, cellY}, marker, marker)
 			} else {
 				for pointIndex := 1; pointIndex < len(part); pointIndex++ {
 					appendSegment(part[pointIndex-1], part[pointIndex])
@@ -986,9 +1000,54 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 			}
 		}
 		features[index] = HitFeature{Layer: layer.Name, FeatureID: feature.ID, Vertices: normalized, Parts: hitParts}
+		if layer.Labels.Enabled && feature.Label != nil && feature.Label.Text != "" {
+			anchor := labelAnchor(normalized)
+			lineAngle := 0.0
+			lineGeometry := lineFlags[index] || isLineGeometry(feature.Geometry)
+			if feature.Label.AnchorSet {
+				anchor = Point{X: (feature.Label.X - minX) / spanX, Y: (feature.Label.Y - minY) / spanY}
+			} else if lineGeometry {
+				anchor, lineAngle, _ = labelLinePlacement(geometry)
+			}
+			rotation := 0.0
+			switch layer.Labels.Placement {
+			case "center-rotated":
+				rotation = feature.Label.Rotation
+			case "free-angle":
+				rotation = feature.Label.Rotation
+				if layer.Labels.RotationField == "" {
+					if lineGeometry {
+						rotation = lineAngle
+					}
+				}
+			}
+			labels = append(labels, LayerLabel{
+				Layer: layer.Name, FeatureID: feature.ID, Text: feature.Label.Text,
+				X: anchor.X, Y: anchor.Y, Rotation: rotation, HeightMM: layer.Labels.HeightMM,
+				MinScale: layer.Labels.MinScale, MaxScale: layer.Labels.MaxScale,
+			})
+		}
+	}
+	geometryType := ""
+	if layer.Features[0].Geometry != nil {
+		geometryType = strings.ToUpper(layer.Features[0].Geometry.GeometryType())
+	}
+	color := style.PolygonColor
+	if strings.Contains(geometryType, "POINT") {
+		color = style.PointColor
+	} else if strings.Contains(geometryType, "LINE") || strings.Contains(geometryType, "CURVE") {
+		color = style.LineColor
+	}
+	packedColor := styleColor(color)
+	for key, vertices := range chunkVertices {
+		for index := range vertices {
+			vertices[index].Color = packedColor
+		}
+		chunkVertices[key] = vertices
 	}
 	return LayerSource{
 		Features:  features,
+		Labels:    labels,
 		ChunkSize: chunkSize,
 		Extent:    [4]float64{minX, minY, maxX, maxY},
 		Builder: func(ctx context.Context, key ChunkKey) (Chunk, error) {
@@ -1002,6 +1061,105 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 			return Chunk{Key: key, Vertices: vertices}, nil
 		},
 	}
+}
+
+func labelAnchor(points []Point) Point {
+	if len(points) == 0 {
+		return Point{}
+	}
+	var result Point
+	for _, point := range points {
+		result.X += point.X
+		result.Y += point.Y
+	}
+	result.X /= float64(len(points))
+	result.Y /= float64(len(points))
+	return result
+}
+
+func labelLinePlacement(geometry *parsedFeaturePoints) (Point, float64, float64) {
+	if geometry == nil {
+		return Point{}, 0, 0
+	}
+	parts := geometry.parts
+	if parts == nil {
+		parts = [][]Point{geometry.points}
+	}
+	var bestAnchor Point
+	var bestAngle, longest float64
+	for _, part := range parts {
+		var length float64
+		for index := 1; index < len(part); index++ {
+			dx, dy := part[index].X-part[index-1].X, part[index].Y-part[index-1].Y
+			length += math.Hypot(dx, dy)
+		}
+		if length <= longest || length == 0 {
+			continue
+		}
+		target := length * 0.5
+		var traveled float64
+		for index := 1; index < len(part); index++ {
+			start, end := part[index-1], part[index]
+			dx, dy := end.X-start.X, end.Y-start.Y
+			segmentLength := math.Hypot(dx, dy)
+			if segmentLength == 0 {
+				continue
+			}
+			if traveled+segmentLength >= target {
+				ratio := (target - traveled) / segmentLength
+				bestAnchor = Point{X: start.X + dx*ratio, Y: start.Y + dy*ratio}
+				bestAngle = math.Atan2(dy, dx) * 180 / math.Pi
+				break
+			}
+			traveled += segmentLength
+		}
+		longest = length
+	}
+	return bestAnchor, bestAngle, longest
+}
+
+// ColorForGeometry selects the configured stroke color for the OGR/core
+// geometry family represented by a layer's render source.
+func ColorForGeometry(style core.LayerStyle, geometryType string) uint32 {
+	if style == (core.LayerStyle{}) {
+		style = core.DefaultLayerStyle()
+	}
+	geometryType = strings.ToUpper(geometryType)
+	color := style.PolygonColor
+	if strings.Contains(geometryType, "POINT") {
+		color = style.PointColor
+	} else if strings.Contains(geometryType, "LINE") || strings.Contains(geometryType, "CURVE") {
+		color = style.LineColor
+	}
+	return styleColor(color)
+}
+
+// ColorForPolygonFill combines the configured polygon color alpha and opacity.
+func ColorForPolygonFill(style core.LayerStyle) uint32 {
+	if style == (core.LayerStyle{}) {
+		style = core.DefaultLayerStyle()
+	}
+	color := styleColor(style.PolygonColor)
+	alpha := float64(color&0xff) * style.FillOpacity
+	return color&0xffffff00 | uint32(math.Round(alpha))
+}
+
+func newLineVertex(point Point, widthMM float64) Vertex {
+	return Vertex{X: float32(point.X), Y: float32(point.Y), SizeMM: float32(widthMM), Kind: VertexLine}
+}
+
+func styleColor(value string) uint32 {
+	if len(value) != 7 && len(value) != 9 || !strings.HasPrefix(value, "#") {
+		return 0x2b6cb0ff
+	}
+	bytes, err := hex.DecodeString(value[1:])
+	if err != nil {
+		return 0x2b6cb0ff
+	}
+	if len(bytes) == 3 {
+		bytes = append(bytes, 0xff)
+	}
+	return uint32(bytes[0])<<24 | uint32(bytes[1])<<16 | uint32(bytes[2])<<8 | uint32(bytes[3])
 }
 
 // clipSegmentToRect applies Liang-Barsky clipping and returns the visible

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"gogis/internal/core"
 	"gogis/internal/presentation"
 	"gogis/internal/render"
+	"gogis/internal/workspace"
 	"gogis/ui/qt/native"
 )
 
@@ -47,6 +49,11 @@ type demoRuntime struct {
 	planner                     render.ChunkPlanner
 	visibility                  *render.LayerVisibility
 	visibleLayers               map[string]bool
+	layerStyles                 map[string]core.LayerStyle
+	baseLayerStyles             map[string]core.LayerStyle
+	layerGeometryTypes          map[string]string
+	layerStyleMu                *sync.RWMutex
+	mapLabels                   []render.LayerLabel
 	builder                     render.ChunkBuilder
 	mu                          sync.Mutex
 	cancel                      context.CancelFunc
@@ -62,8 +69,10 @@ type demoRuntime struct {
 	saveDestination             string
 	readOnlySources             []vectorSourceSpec
 	readOnlyDisplayCRS          string
+	unavailableSources          map[string]unavailableSource
 	mapExtent                   [4]float64
 	mapCRS                      string
+	workspaceView               *workspace.ViewState
 	persist                     func(context.Context, string) error
 	attributePageReader         func(context.Context, string, int, int) (core.Layer, int, error)
 	attributeFeatureReader      func(context.Context, string, uint64) (core.Feature, error)
@@ -87,9 +96,26 @@ type demoRuntime struct {
 }
 
 type vectorSourceSpec struct {
+	Path             string
+	LayerName        string
+	Encoding         string
+	SourceCRS        string
+	FallbackCRS      string
+	Name             string
+	DisplayName      string
+	Visible          *bool
+	Style            core.LayerStyle
+	Labels           core.LabelSettings
+	AllowUnavailable bool
+	InsertAt         int
+	InsertAtSet      bool
+}
+
+type unavailableSource struct {
 	Path      string
 	LayerName string
-	SourceCRS string
+	Encoding  string
+	Reason    string
 }
 
 func loadDemoChunk() *demoRuntime {
@@ -129,8 +155,17 @@ type attributePageKey struct {
 }
 
 type layerTreePayloadRow struct {
-	Name    string `json:"name"`
-	Visible bool   `json:"visible"`
+	Name            string             `json:"name"`
+	DisplayName     string             `json:"displayName"`
+	SourcePath      string             `json:"sourcePath"`
+	SourceLayerName string             `json:"sourceLayerName"`
+	SourceEncoding  string             `json:"sourceEncoding"`
+	SourceCRS       string             `json:"sourceCrs"`
+	CRS             string             `json:"crs"`
+	Visible         bool               `json:"visible"`
+	SourceError     string             `json:"sourceError,omitempty"`
+	Style           core.LayerStyle    `json:"style"`
+	Labels          core.LabelSettings `json:"labels"`
 }
 
 func (r *demoRuntime) publishLayerTree() {
@@ -145,7 +180,19 @@ func (r *demoRuntime) publishLayerTree() {
 		if state, exists := r.visibleLayers[name]; exists {
 			visible = state
 		}
-		rows[index] = layerTreePayloadRow{Name: name, Visible: visible}
+		layer, ok := r.service.LayerProperties(name)
+		if !ok {
+			continue
+		}
+		displayName := layer.DisplayName
+		if displayName == "" {
+			displayName = name
+		}
+		rows[index] = layerTreePayloadRow{
+			Name: name, DisplayName: displayName, SourcePath: layer.SourcePath,
+			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
+			CRS: layer.CRS.AuthorityCode, Visible: visible, SourceError: r.unavailableSources[name].Reason, Style: layer.Style, Labels: layer.Labels,
+		}
 	}
 	payload, err := json.Marshal(rows)
 	if err != nil {
@@ -153,6 +200,15 @@ func (r *demoRuntime) publishLayerTree() {
 		return
 	}
 	native.SetLayerTreePayload(string(payload))
+}
+
+func (r *demoRuntime) publishLayerLabels() {
+	payload, err := json.Marshal(r.mapLabels)
+	if err != nil {
+		native.SetLayerLabelPayload("[]")
+		return
+	}
+	native.SetLayerLabelPayload(string(payload))
 }
 
 func (r *demoRuntime) publishAttributes(layerName string) {
@@ -742,6 +798,7 @@ func demoChunkBuilder(chunkSize float64) render.ChunkBuilder {
 func startViewportSync(runtime *demoRuntime) {
 	lastQtGeneration := native.ViewportGeneration()
 	lastLayerVisibilityGeneration := native.LayerVisibilityGeneration()
+	lastLayerSettingsGeneration := native.LayerSettingsGeneration()
 	lastClickGeneration := native.ClickGeneration()
 	lastEditGeneration := native.EditGeneration()
 	lastCancelGeneration := native.CancelGeneration()
@@ -770,6 +827,16 @@ func startViewportSync(runtime *demoRuntime) {
 			}
 			qtGeneration := native.ViewportGeneration()
 			layerVisibilityGeneration := native.LayerVisibilityGeneration()
+			layerSettingsGeneration := native.LayerSettingsGeneration()
+			if layerSettingsGeneration != lastLayerSettingsGeneration {
+				lastLayerSettingsGeneration = layerSettingsGeneration
+				if err := applyLayerSettings(runtime, native.CurrentLayerSettings()); err != nil {
+					native.SetRenderStatus("Layer settings failed: " + err.Error())
+					runtime.publishLayerTree()
+				} else {
+					native.SetRenderStatus("Layer settings applied")
+				}
+			}
 			viewport := native.CurrentViewport()
 			if qtGeneration != lastQtGeneration || layerVisibilityGeneration != lastLayerVisibilityGeneration {
 				lastQtGeneration = qtGeneration
@@ -830,10 +897,129 @@ func startViewportSync(runtime *demoRuntime) {
 	}()
 }
 
+type layerSettingsRequest struct {
+	Name            string             `json:"name"`
+	DisplayName     string             `json:"displayName"`
+	SourcePath      string             `json:"sourcePath"`
+	SourceLayerName string             `json:"sourceLayerName"`
+	SourceEncoding  string             `json:"sourceEncoding"`
+	Visible         bool               `json:"visible"`
+	Style           core.LayerStyle    `json:"style"`
+	Labels          core.LabelSettings `json:"labels"`
+}
+
+func applyLayerSettings(runtime *demoRuntime, payload string) error {
+	var request layerSettingsRequest
+	if err := json.Unmarshal([]byte(payload), &request); err != nil {
+		return fmt.Errorf("invalid settings payload: %w", err)
+	}
+	if request.Name == "" {
+		return fmt.Errorf("layer identity is missing")
+	}
+	request.DisplayName = strings.TrimSpace(request.DisplayName)
+	if request.DisplayName == "" {
+		return fmt.Errorf("display name must not be empty")
+	}
+	if strings.TrimSpace(request.SourcePath) == "" || strings.TrimSpace(request.SourceLayerName) == "" {
+		return fmt.Errorf("source path and source layer name are required")
+	}
+	if err := request.Style.Validate(); err != nil {
+		return err
+	}
+	if err := request.Labels.Validate(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	readOnly := runtime.readOnly
+	displayCRS := runtime.readOnlyDisplayCRS
+	saveDestination := runtime.saveDestination
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	if displayCRS == "" {
+		_, projectCRS := service.ProjectInfo()
+		displayCRS = projectCRS.AuthorityCode
+	}
+	current, ok := service.LayerProperties(request.Name)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.Name)
+	}
+	if request.SourcePath != current.SourcePath || request.SourceLayerName != current.SourceLayerName ||
+		request.SourceEncoding != current.SourceEncoding {
+		return runtime.reloadLayerWithSettings(request, readOnly, displayCRS, saveDestination)
+	}
+	if request.DisplayName != "" && request.DisplayName != current.DisplayName {
+		if err := service.RenameLayer(request.Name, request.DisplayName); err != nil {
+			return err
+		}
+	}
+	updated := current
+	updated.DisplayName = request.DisplayName
+	updated.SourceEncoding = request.SourceEncoding
+	updated.Visible = request.Visible
+	updated.Style = request.Style
+	updated.Labels = request.Labels
+	if err := service.UpdateLayerSettings(request.Name, updated); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	if runtime.visibleLayers == nil {
+		runtime.visibleLayers = make(map[string]bool)
+	}
+	runtime.visibleLayers[request.Name] = request.Visible
+	if runtime.visibility != nil {
+		runtime.visibility.Set(request.Name, request.Visible)
+	}
+	styleChanged := current.Style != updated.Style
+	scheduler := runtime.scheduler
+	styleMu := runtime.layerStyleMu
+	runtime.mu.Unlock()
+	if styleMu == nil {
+		styleMu = &sync.RWMutex{}
+		runtime.mu.Lock()
+		runtime.layerStyleMu = styleMu
+		runtime.mu.Unlock()
+	}
+	styleMu.Lock()
+	if runtime.layerStyles == nil {
+		runtime.layerStyles = make(map[string]core.LayerStyle)
+	}
+	runtime.layerStyles[request.Name] = updated.Style
+	styleMu.Unlock()
+	if styleChanged && scheduler != nil {
+		scheduler.InvalidateLayer(request.Name)
+		runtime.refreshCurrentViewport()
+	}
+	runtime.publishLayerTree()
+	return nil
+}
+
 func (r *demoRuntime) advanceRenderGeneration() {
 	r.mu.Lock()
 	r.scheduler.AdvanceGeneration()
 	r.mu.Unlock()
+}
+
+func (r *demoRuntime) refreshCurrentViewport() {
+	viewport := native.CurrentViewport()
+	width, height := viewport.Width, viewport.Height
+	if width <= 0 {
+		width = 1
+	}
+	if height <= 0 {
+		height = 1
+	}
+	zoom := viewport.Zoom
+	if zoom <= 0 {
+		zoom = 1
+	}
+	r.advanceRenderGeneration()
+	r.refresh(context.Background(), render.Viewport{
+		Center: render.Point{X: 0.5 - viewport.PanX/(width*zoom), Y: 0.5 + viewport.PanY/(height*zoom)},
+		Zoom:   zoom,
+	})
 }
 
 func applyLayerVisibility(runtime *demoRuntime, payload string) {
@@ -847,6 +1033,12 @@ func applyLayerVisibility(runtime *demoRuntime, payload string) {
 	for layer, visible := range visibility {
 		if runtime.visibility.IsVisible(layer) != visible {
 			if runtime.visibility.Set(layer, visible) {
+				if runtime.service != nil {
+					if settings, ok := runtime.service.LayerProperties(layer); ok {
+						settings.Visible = visible
+						_ = runtime.service.UpdateLayerSettings(layer, settings)
+					}
+				}
 				if visibleSnapshot == nil {
 					visibleSnapshot = make(map[string]bool, len(runtime.visibleLayers))
 					for name, state := range runtime.visibleLayers {

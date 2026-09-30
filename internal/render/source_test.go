@@ -10,6 +10,83 @@ import (
 	"gogis/internal/core"
 )
 
+func TestLayerSourceCarriesConfiguredGeometryColor(t *testing.T) {
+	layer := core.Layer{
+		Name: "roads", Style: core.LayerStyle{LineColor: "#aabbcc", PointColor: "#010203", PolygonColor: "#ffffff", LineWidthMM: 1.4, PointSizeMM: 3.2},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 1 1)"}}},
+	}
+	source, err := NewLayerSource(layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := source.Builder(context.Background(), ChunkKey{Layer: "roads", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunk.Vertices) == 0 || chunk.Vertices[0].Color != 0xaabbccff {
+		t.Fatalf("configured line color not carried by render vertices: %#v", chunk.Vertices)
+	}
+	if chunk.Vertices[0].Kind != VertexLine || chunk.Vertices[0].SizeMM != 1.4 {
+		t.Fatalf("configured physical line width not carried by render vertices: %#v", chunk.Vertices[0])
+	}
+}
+
+func TestPointRenderVerticesCarryPhysicalSymbolSize(t *testing.T) {
+	style := core.LayerStyle{LineColor: "#111111", PointColor: "#010203", PolygonColor: "#ffffff", LineWidthMM: 0.5, PointSizeMM: 4.25}
+	source, err := NewLayerSource(core.Layer{Name: "places", Style: style, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (3 7)"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := source.Builder(context.Background(), ChunkKey{Layer: "places", X: 2, Y: 2})
+	if err != nil || len(chunk.Vertices) != 2 {
+		t.Fatalf("point render chunk = %#v, %v", chunk, err)
+	}
+	for _, vertex := range chunk.Vertices {
+		if vertex.Kind != VertexPoint || vertex.SizeMM != 4.25 || vertex.Color != 0x010203ff {
+			t.Fatalf("point symbol style not carried by vertex: %+v", vertex)
+		}
+	}
+	if chunk.Vertices[0].X != chunk.Vertices[1].X || chunk.Vertices[0].Y != chunk.Vertices[1].Y {
+		t.Fatalf("point symbol should be represented by a coincident pair: %+v", chunk.Vertices)
+	}
+}
+
+func TestPolygonFillColorMultipliesColorAlphaByFillOpacity(t *testing.T) {
+	style := core.DefaultLayerStyle()
+	style.PolygonColor = "#12345680"
+	style.FillOpacity = 0.5
+	if got, want := ColorForPolygonFill(style), uint32(0x12345640); got != want {
+		t.Fatalf("polygon fill color = %#08x, want %#08x", got, want)
+	}
+}
+
+func TestLineLabelUsesHalfLengthAndPolygonLabelUsesExplicitInteriorAnchor(t *testing.T) {
+	settings := core.LabelSettings{Enabled: true, Expression: "name", Placement: "free-angle", HeightMM: 2.5}
+	line, err := NewLayerSource(core.Layer{Name: "routes", Labels: settings, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 1 1, 101 101)"},
+		Label: &core.Label{Text: "Route"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line.Labels) != 1 || math.Abs(line.Labels[0].X-0.5) > 1e-12 || math.Abs(line.Labels[0].Y-0.5) > 1e-12 || line.Labels[0].Rotation != 45 {
+		t.Fatalf("line label placement = %+v, want geometric midpoint and 45-degree map tangent", line.Labels)
+	}
+
+	polygon, err := NewLayerSource(core.Layer{Name: "areas", Labels: settings, Features: []core.Feature{{
+		ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))"},
+		Label: &core.Label{Text: "Area", X: 2, Y: 5, AnchorSet: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(polygon.Labels) != 1 || math.Abs(polygon.Labels[0].X-0.2) > 1e-12 || math.Abs(polygon.Labels[0].Y-0.5) > 1e-12 {
+		t.Fatalf("explicit polygon label anchor = %+v, want normalized interior point (0.2, 0.5)", polygon.Labels)
+	}
+}
+
 func TestParseWKBStandardXYFastPath(t *testing.T) {
 	data, err := hex.DecodeString("0000000002000000023ff0000000000000400000000000000040080000000000004010000000000000")
 	if err != nil {
@@ -122,7 +199,7 @@ func TestNewLayerSourceSupportsPointsAndCancellation(t *testing.T) {
 		t.Fatalf("point extent = %v", source.Extent)
 	}
 	chunk, err := source.Builder(context.Background(), ChunkKey{X: 2, Y: 2})
-	if err != nil || len(chunk.Vertices) != 4 {
+	if err != nil || len(chunk.Vertices) != 2 || chunk.Vertices[0].Kind != VertexPoint || chunk.Vertices[1].Kind != VertexPoint {
 		t.Fatalf("unexpected point chunk: %#v, %v", chunk, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

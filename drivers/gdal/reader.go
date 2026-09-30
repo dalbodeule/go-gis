@@ -17,7 +17,26 @@ import (
 
 // Reader opens vector layers through GDAL/OGR. It supports any installed GDAL
 // vector driver, including SHP and GeoPackage.
-type Reader struct{}
+// Reader reads a dataset. Encoding overrides the source's declared DBF
+// encoding for Shapefile inputs only; an empty value follows GDAL's detection.
+type Reader struct{ Encoding string }
+
+func openDataset(source, encoding string) (*godal.Dataset, error) {
+	if encoding == "" || !isShapefilePath(source) {
+		return godal.Open(source)
+	}
+	if strings.ContainsAny(encoding, "\x00\r\n") {
+		return nil, fmt.Errorf("invalid source encoding %q", encoding)
+	}
+	// ENCODING is an OGR Shapefile open option. It is scoped to this dataset
+	// open and avoids mutating GDAL's process-wide SHAPE_ENCODING config.
+	return godal.Open(source, godal.DriverOpenOption("ENCODING="+encoding))
+}
+
+func isShapefilePath(source string) bool {
+	path := strings.ToLower(source)
+	return strings.HasSuffix(path, ".shp") || strings.HasSuffix(path, ".shz") || strings.HasSuffix(path, ".shp.zip")
+}
 
 var _ drivers.LayerReader = Reader{}
 var _ drivers.GeometryOnlyReader = Reader{}
@@ -31,12 +50,12 @@ var _ drivers.GeometryOnlyWindowReader = Reader{}
 // Open reads a layer into the core snapshot model. Feature IDs are assigned
 // in read order because the current core model intentionally does not expose
 // a GDAL-specific FID type.
-func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, error) {
+func (reader Reader) Open(ctx context.Context, source, layerName string) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
 	}
@@ -63,12 +82,12 @@ func (Reader) Open(ctx context.Context, source, layerName string) (core.Layer, e
 // OpenGeometryOnly reads layer identity, CRS, feature IDs, and geometry while
 // skipping attribute maps. Render pipelines can use this path when properties
 // are fetched separately on demand.
-func (Reader) OpenGeometryOnly(ctx context.Context, source, layerName string) (core.Layer, error) {
+func (reader Reader) OpenGeometryOnly(ctx context.Context, source, layerName string) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
 	}
@@ -94,7 +113,7 @@ func (Reader) OpenGeometryOnly(ctx context.Context, source, layerName string) (c
 // OpenFeature reads one feature by the sequential application ID assigned by
 // this reader. It avoids materializing properties for preceding features;
 // the underlying driver still scans until the requested ordinal is reached.
-func (Reader) OpenFeature(ctx context.Context, source, layerName string, featureID uint64) (core.Feature, error) {
+func (reader Reader) OpenFeature(ctx context.Context, source, layerName string, featureID uint64) (core.Feature, error) {
 	if featureID == 0 {
 		return core.Feature{}, fmt.Errorf("feature ID must be positive")
 	}
@@ -102,7 +121,7 @@ func (Reader) OpenFeature(ctx context.Context, source, layerName string, feature
 		return core.Feature{}, err
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return core.Feature{}, fmt.Errorf("open %q: %w", source, err)
 	}
@@ -150,7 +169,7 @@ func openFeatureLayer(ctx context.Context, layer godal.Layer, featureID, nextID 
 // OpenAttributePage reads only one property page. It scans preceding features
 // to preserve the reader's sequential IDs but does not decode their fields or
 // geometries.
-func (Reader) OpenAttributePage(ctx context.Context, source, layerName string, offset, limit int) (core.Layer, int, error) {
+func (reader Reader) OpenAttributePage(ctx context.Context, source, layerName string, offset, limit int) (core.Layer, int, error) {
 	if offset < 0 || limit <= 0 {
 		return core.Layer{}, 0, fmt.Errorf("invalid attribute page: offset=%d limit=%d", offset, limit)
 	}
@@ -158,7 +177,7 @@ func (Reader) OpenAttributePage(ctx context.Context, source, layerName string, o
 		return core.Layer{}, 0, err
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return core.Layer{}, 0, fmt.Errorf("open %q: %w", source, err)
 	}
@@ -325,18 +344,18 @@ func selectLayer(dataset *godal.Dataset, source, layerName string) (godal.Layer,
 // OpenWindow reads only features intersecting bounds, which is useful for
 // viewport-driven loading of large vector layers. Bounds are minX, minY,
 // maxX, maxY in the source layer's CRS.
-func (Reader) OpenWindow(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
-	return (Reader{}).openWindow(ctx, source, layerName, bounds, true)
+func (reader Reader) OpenWindow(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
+	return reader.openWindow(ctx, source, layerName, bounds, true)
 }
 
 // OpenWindowGeometryOnly reads only features intersecting bounds and skips
 // properties. It is intended for viewport renderers that load attributes on
 // demand through OpenFeature or OpenAttributePage.
-func (Reader) OpenWindowGeometryOnly(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
-	return (Reader{}).openWindow(ctx, source, layerName, bounds, false)
+func (reader Reader) OpenWindowGeometryOnly(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
+	return reader.openWindow(ctx, source, layerName, bounds, false)
 }
 
-func (Reader) openWindow(ctx context.Context, source, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+func (reader Reader) openWindow(ctx context.Context, source, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
@@ -344,7 +363,7 @@ func (Reader) openWindow(ctx context.Context, source, layerName string, bounds [
 		return core.Layer{}, fmt.Errorf("invalid spatial window: [%v %v %v %v]", bounds[0], bounds[1], bounds[2], bounds[3])
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open %q: %w", source, err)
 	}
@@ -480,23 +499,23 @@ func quoteSQLIdentifier(name string) string {
 // OpenAll reads every vector layer in a dataset as detached core snapshots.
 // It is used by the desktop project loader so a multi-layer GeoPackage can be
 // displayed without reopening the dataset per layer.
-func (Reader) OpenAll(ctx context.Context, source string) ([]core.Layer, error) {
-	return (Reader{}).openAll(ctx, source, true)
+func (reader Reader) OpenAll(ctx context.Context, source string) ([]core.Layer, error) {
+	return reader.openAll(ctx, source, true)
 }
 
 // OpenAllGeometryOnly reads all layers and geometry while skipping properties.
 // It is intended for read-only render pipelines; callers that edit or save
 // must use OpenAll so source attributes remain available.
-func (Reader) OpenAllGeometryOnly(ctx context.Context, source string) ([]core.Layer, error) {
-	return (Reader{}).openAll(ctx, source, false)
+func (reader Reader) OpenAllGeometryOnly(ctx context.Context, source string) ([]core.Layer, error) {
+	return reader.openAll(ctx, source, false)
 }
 
-func (Reader) openAll(ctx context.Context, source string, includeProperties bool) ([]core.Layer, error) {
+func (reader Reader) openAll(ctx context.Context, source string, includeProperties bool) ([]core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", source, err)
 	}

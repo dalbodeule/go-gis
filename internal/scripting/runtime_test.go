@@ -13,6 +13,48 @@ import (
 	"gogis/internal/core"
 )
 
+func TestLabelProgramEvaluatesPropertyTemplatesAndRules(t *testing.T) {
+	textProgram, err := CompileLabelProgram(`return feature.street .. " " .. feature.number`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer textProgram.Close()
+	text, err := textProgram.EvaluateText(context.Background(), map[string]any{"street": "한강로", "number": 12})
+	if err != nil || text != "한강로 12" {
+		t.Fatalf("label text = %q, %v", text, err)
+	}
+	ruleProgram, err := CompileLabelProgram(`return feature.active == true and feature.rank >= 3`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ruleProgram.Close()
+	matched, err := ruleProgram.EvaluateRule(context.Background(), map[string]any{"active": true, "rank": 4})
+	if err != nil || !matched {
+		t.Fatalf("label rule = %t, %v", matched, err)
+	}
+}
+
+func TestLabelProgramIsSandboxedAndCancelable(t *testing.T) {
+	program, err := CompileLabelProgram(`return os.execute("true")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := program.EvaluateText(context.Background(), nil); err == nil {
+		t.Fatal("label script gained access to os.execute")
+	}
+	program.Close()
+	loopProgram, err := CompileLabelProgram(`while true do end`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loopProgram.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := loopProgram.Evaluate(ctx, nil); err == nil {
+		t.Fatal("infinite label script did not observe cancellation")
+	}
+}
+
 func TestRuntimeChangesPropertyAndExports(t *testing.T) {
 	service := commands.NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
 	if err := service.BeginEdit(); err != nil {

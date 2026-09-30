@@ -29,9 +29,9 @@ func BeginLoadTrace() {
 }
 
 // SetVertices copies normalized XY positions into the C++ scene-graph bridge.
-// Vertex contains only numeric fields, so C++ can read its stable 12-byte
-// layout synchronously and copy only XY. The C++ side owns the copy after the
-// call returns and does not retain the Go pointer.
+// Vertex contains only numeric fields, so C++ can copy its stable layout
+// synchronously. The C++ side owns the copy after the call returns and does not
+// retain the Go pointer.
 func SetVertices(vertices []render.Vertex) {
 	SetVerticesStage(vertices, 0)
 }
@@ -126,6 +126,19 @@ func CurrentLayerVisibility() string {
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }
 
+// LayerSettingsGeneration returns the latest QML layer-property apply event.
+func LayerSettingsGeneration() uint64 {
+	return uint64(C.gogis_layer_settings_generation())
+}
+
+// CurrentLayerSettings returns the JSON settings submitted by the properties
+// panel. The payload buffer allows multiline Lua snippets.
+func CurrentLayerSettings() string {
+	buffer := make([]C.char, 1<<20)
+	C.gogis_layer_settings((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}
+
 // EditGeneration returns the latest QML edit event generation.
 func EditGeneration() uint64 {
 	return uint64(C.gogis_edit_generation())
@@ -175,6 +188,13 @@ func SetLayerTreePayload(payload string) {
 	C.gogis_set_layer_tree_payload(cPayload)
 }
 
+// SetLayerLabelPayload publishes normalized vector labels for the viewport.
+func SetLayerLabelPayload(payload string) {
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_layer_label_payload(cPayload)
+}
+
 // ActiveLayerGeneration returns the latest QML layer selection generation.
 func ActiveLayerGeneration() uint64 {
 	return uint64(C.gogis_active_layer_generation())
@@ -196,10 +216,24 @@ func SetRenderStatus(status string) {
 
 // SetMapMetadata publishes the current full data extent in display CRS order.
 func SetMapMetadata(crs string, extent [4]float64) {
+	SetMapMetadataWithView(crs, extent, nil)
+}
+
+// MapViewState is normalized to the dataset extent, so it survives window resizing.
+type MapViewState struct {
+	CenterX     float64 `json:"centerX"`
+	CenterY     float64 `json:"centerY"`
+	Zoom        float64 `json:"zoom"`
+	ActiveLayer string  `json:"activeLayer,omitempty"`
+}
+
+// SetMapMetadataWithView publishes the map extent and optional saved workspace view.
+func SetMapMetadataWithView(crs string, extent [4]float64, view *MapViewState) {
 	payload, err := json.Marshal(struct {
-		CRS    string     `json:"crs"`
-		Bounds [4]float64 `json:"bounds"`
-	}{CRS: crs, Bounds: extent})
+		CRS    string        `json:"crs"`
+		Bounds [4]float64    `json:"bounds"`
+		View   *MapViewState `json:"view,omitempty"`
+	}{CRS: crs, Bounds: extent, View: view})
 	if err != nil {
 		return
 	}

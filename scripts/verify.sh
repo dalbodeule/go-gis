@@ -34,6 +34,14 @@ echo "== native build =="
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists Qt6Core Qt6Quick Qt6Qml; then
 	 echo "== Qt native test =="
 	 CGO_CXXFLAGS="${CGO_CXXFLAGS:-} -std=c++17" go test -tags "qt native" ./cmd/gis-desktop
+	 if command -v qmltestrunner >/dev/null 2>&1; then
+		 echo "== layer properties QML test =="
+		 QT_QPA_PLATFORM=offscreen qmltestrunner \
+			-import cmd/gis-desktop/qmltests \
+			-input cmd/gis-desktop/qmltests -v1
+	 else
+		 echo "== layer properties QML test skipped: qmltestrunner not found =="
+	 fi
 else
 	 echo "== Qt native test skipped: Qt6 pkg-config modules not found =="
 fi

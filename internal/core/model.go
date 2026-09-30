@@ -34,12 +34,13 @@ type Field struct {
 // Label describes a CAD-ready text annotation without coupling the core to a
 // particular export format.
 type Label struct {
-	Text     string
-	X        float64
-	Y        float64
-	Rotation float64
-	Height   float64
-	Style    string
+	Text      string
+	X         float64
+	Y         float64
+	AnchorSet bool
+	Rotation  float64
+	Height    float64
+	Style     string
 }
 
 // Feature is a vector feature with an application-level identifier.
@@ -71,11 +72,45 @@ func cloneFeatureWithoutLabel(f Feature) Feature {
 
 // Layer is the initial in-memory representation of a vector layer.
 type Layer struct {
-	Name     string
-	CRS      CRS
-	Fields   []Field
-	Features []Feature
-	Editable bool
+	Name            string
+	DisplayName     string
+	SourcePath      string
+	SourceLayerName string
+	SourceEncoding  string
+	SourceCRS       string
+	CRS             CRS
+	Fields          []Field
+	Features        []Feature
+	Editable        bool
+	Visible         bool
+	Style           LayerStyle
+	Labels          LabelSettings
+}
+
+// LayerStyle stores renderer-independent display options for a vector layer.
+// Colors use #RRGGBB or #RRGGBBAA notation.
+type LayerStyle struct {
+	PointColor   string  `json:"pointColor"`
+	LineColor    string  `json:"lineColor"`
+	PolygonColor string  `json:"polygonColor"`
+	PointSizeMM  float64 `json:"pointSizeMm"`
+	LineWidthMM  float64 `json:"lineWidthMm"`
+	FillOpacity  float64 `json:"fillOpacity"`
+}
+
+// LabelSettings describes data-driven label rendering in map units and
+// physical millimeters. Expression is a field name or safe property template;
+// LuaScript is reserved for an explicitly enabled, sandboxed label evaluator.
+type LabelSettings struct {
+	Enabled       bool    `json:"enabled"`
+	Expression    string  `json:"expression"`
+	LuaScript     string  `json:"luaScript,omitempty"`
+	Placement     string  `json:"placement"` // center, center-rotated, or free-angle
+	RotationField string  `json:"rotationField,omitempty"`
+	HeightMM      float64 `json:"heightMm"`
+	MinScale      float64 `json:"minScale,omitempty"`
+	MaxScale      float64 `json:"maxScale,omitempty"`
+	Rule          string  `json:"rule,omitempty"`
 }
 
 // Clone returns a detached copy suitable for edit snapshots.

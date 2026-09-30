@@ -35,9 +35,13 @@ type AttributeSession struct {
 }
 
 // OpenAttributeSession opens a reusable read session for attribute requests.
-func OpenAttributeSession(source string) (*AttributeSession, error) {
+func OpenAttributeSession(source string, encoding ...string) (*AttributeSession, error) {
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	selectedEncoding := ""
+	if len(encoding) > 0 {
+		selectedEncoding = encoding[0]
+	}
+	dataset, err := openDataset(source, selectedEncoding)
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", source, err)
 	}

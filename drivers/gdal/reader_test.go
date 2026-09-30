@@ -35,6 +35,50 @@ func TestReaderOpensGeoJSONFixtureThroughGDAL(t *testing.T) {
 	}
 }
 
+func TestReaderEncodingOverridesShapefileCPGPerOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.shp")
+	layer := core.Layer{Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Fields: []core.Field{{Name: "name", Type: core.FieldTypeText}}, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}, Properties: map[string]any{"name": "한글 도로"},
+	}}}
+	if err := (Writer{}).Write(context.Background(), path, layer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(strings.TrimSuffix(path, filepath.Ext(path))+".cpg", []byte("CP949\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (Reader{Encoding: "UTF-8"}).Open(context.Background(), path, "roads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value := got.Features[0].Properties["name"]; value != "한글 도로" {
+		t.Fatalf("explicitly decoded value = %v; layer=%#v", value, got)
+	}
+	session, err := OpenAttributeSession(path, "UTF-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	page, total, err := session.OpenAttributePage(context.Background(), "roads", 0, 10)
+	if err != nil || total != 1 || page.Features[0].Properties["name"] != "한글 도로" {
+		t.Fatalf("encoded attribute page=%#v total=%d err=%v", page, total, err)
+	}
+}
+
+func TestReaderEncodingIsOnlyAppliedToShapefileDriver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.gpkg")
+	if err := (Writer{}).Write(context.Background(), path, core.Layer{Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}, Properties: map[string]any{"name": "도로"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Reader{Encoding: "CP949"}).Open(context.Background(), path, "roads"); err != nil {
+		t.Fatalf("encoding option leaked to GeoPackage open: %v", err)
+	}
+	if _, err := openDataset("roads.shp", "bad\nENCODING=OTHER"); err == nil {
+		t.Fatal("invalid option injection was accepted")
+	}
+}
+
 func TestReaderOpenWindowPushesSpatialFilterThroughGDAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}},{"type":"Feature","properties":{"name":"outside"},"geometry":{"type":"Point","coordinates":[128.1,38.4]}}]}`

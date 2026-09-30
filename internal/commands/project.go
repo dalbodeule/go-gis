@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 
 	"gogis/internal/core"
 )
@@ -50,6 +51,17 @@ func (s *ProjectService) Project() core.Project {
 	return s.project.Clone()
 }
 
+// ProjectInfo returns project identity without cloning its layer data.
+func (s *ProjectService) ProjectInfo() (string, core.CRS) {
+	return s.project.Name, s.project.CRS
+}
+
+// SetProjectInfo updates workspace identity without touching layer snapshots.
+func (s *ProjectService) SetProjectInfo(name string, crs core.CRS) {
+	s.project.Name = name
+	s.project.CRS = crs
+}
+
 // LayerNames returns only layer identity metadata. UI layer trees should use
 // this instead of Project when they do not need geometry or properties.
 func (s *ProjectService) LayerNames() []string {
@@ -58,6 +70,63 @@ func (s *ProjectService) LayerNames() []string {
 		names[index] = layer.Name
 	}
 	return names
+}
+
+// RenameLayer changes the project display name without changing the source
+// dataset's internal layer identity.
+func (s *ProjectService) RenameLayer(name, newName string) error {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return fmt.Errorf("layer name must not be empty")
+	}
+	index := -1
+	for i := range s.project.Layers {
+		if s.project.Layers[i].Name == name {
+			index = i
+			continue
+		}
+		otherName := s.project.Layers[i].DisplayName
+		if otherName == "" {
+			otherName = s.project.Layers[i].Name
+		}
+		if strings.EqualFold(otherName, newName) {
+			return fmt.Errorf("%w: %s", ErrLayerExists, newName)
+		}
+	}
+	if index < 0 {
+		return ErrLayerMissing
+	}
+	s.project.Layers[index].DisplayName = newName
+	return nil
+}
+
+// UpdateLayerSettings validates and replaces one layer's source and display
+// settings. Dataset reopening and renderer refresh remain runtime concerns.
+func (s *ProjectService) UpdateLayerSettings(name string, updated core.Layer) error {
+	if updated.Name != "" && updated.Name != name {
+		return fmt.Errorf("layer identity cannot be changed through settings")
+	}
+	if err := updated.Style.Validate(); err != nil {
+		return err
+	}
+	if err := updated.Labels.Validate(); err != nil {
+		return err
+	}
+	for index := range s.project.Layers {
+		if s.project.Layers[index].Name != name {
+			continue
+		}
+		s.project.Layers[index].SourcePath = updated.SourcePath
+		s.project.Layers[index].DisplayName = updated.DisplayName
+		s.project.Layers[index].SourceLayerName = updated.SourceLayerName
+		s.project.Layers[index].SourceEncoding = updated.SourceEncoding
+		s.project.Layers[index].SourceCRS = updated.SourceCRS
+		s.project.Layers[index].Visible = updated.Visible
+		s.project.Layers[index].Style = updated.Style
+		s.project.Layers[index].Labels = updated.Labels
+		return nil
+	}
+	return ErrLayerMissing
 }
 
 // Layer returns a detached snapshot of one named layer without cloning other
@@ -70,6 +139,51 @@ func (s *ProjectService) Layer(name string) (core.Layer, bool) {
 		}
 	}
 	return core.Layer{}, false
+}
+
+// LayerProperties returns one lightweight settings snapshot without cloning
+// feature geometry or attribute maps.
+func (s *ProjectService) LayerProperties(name string) (core.Layer, bool) {
+	for _, layer := range s.project.Layers {
+		if layer.Name == name {
+			return core.Layer{
+				Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
+				SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
+				CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
+				Style: layer.Style, Labels: layer.Labels,
+			}, true
+		}
+	}
+	return core.Layer{}, false
+}
+
+// ProjectLayerProperties returns only metadata and presentation settings for
+// all layers, avoiding copies of large feature snapshots during workspace IO.
+func (s *ProjectService) ProjectLayerProperties() []core.Layer {
+	result := make([]core.Layer, len(s.project.Layers))
+	for index, layer := range s.project.Layers {
+		result[index] = core.Layer{
+			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
+			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
+			CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
+			Style: layer.Style, Labels: layer.Labels,
+		}
+	}
+	return result
+}
+
+// ProjectLayersExcept returns detached layer snapshots except for one layer.
+// Runtime source replacement uses it to reload a single dataset without
+// reopening unrelated layers or discarding their in-memory edits.
+func (s *ProjectService) ProjectLayersExcept(excludedName string) []core.Layer {
+	result := make([]core.Layer, 0, len(s.project.Layers))
+	for _, layer := range s.project.Layers {
+		if layer.Name == excludedName {
+			continue
+		}
+		result = append(result, layer.Clone())
+	}
+	return result
 }
 
 // LayerAttributes returns a detached layer snapshot containing only schema

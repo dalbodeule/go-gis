@@ -2,7 +2,11 @@
 
 package main
 
-import "gogis/ui/qt/native"
+import (
+	"fmt"
+
+	"gogis/ui/qt/native"
+)
 
 func loadRuntime(_ []string) *demoRuntime {
 	return loadDemoChunk()
@@ -18,4 +22,8 @@ func (r *demoRuntime) startDataLoadPaths(_ []string) {
 
 func (r *demoRuntime) saveDataset(destination string) {
 	native.SetRenderStatus("Save failed: build desktop with native GDAL support")
+}
+
+func (r *demoRuntime) reloadLayerWithSettings(_ layerSettingsRequest, _ bool, _, _ string) error {
+	return fmt.Errorf("relinking layer sources requires the native GDAL build")
 }

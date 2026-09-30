@@ -26,9 +26,13 @@ type GeometrySession struct {
 }
 
 // OpenGeometrySession opens a reusable read-only window session.
-func OpenGeometrySession(source string) (*GeometrySession, error) {
+func OpenGeometrySession(source string, encoding ...string) (*GeometrySession, error) {
 	registerDrivers()
-	dataset, err := godal.Open(source)
+	selectedEncoding := ""
+	if len(encoding) > 0 {
+		selectedEncoding = encoding[0]
+	}
+	dataset, err := openDataset(source, selectedEncoding)
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", source, err)
 	}

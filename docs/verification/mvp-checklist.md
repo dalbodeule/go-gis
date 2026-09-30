@@ -13,6 +13,7 @@
 | DXF를 ARES에서 열어 한글·레이어·좌표 확인 | UTF-8/CP949 exporter와 GDAL precheck | `scripts/verify-ares-precheck.sh` | ARES 실제 앱 검증 필요 |
 | GeoPackage/PostGIS 읽기·쓰기와 트랜잭션 | GDAL writer, PostGIS atomic replacement | `go test -tags native ./drivers/postgis ./...` | 자동 검증 완료 |
 | CLI 재현성과 최소 Lua API | CLI subcommands, Lua layers/property/spatial/export API | `go test ./...`, scripting tests | 자동 검증 완료 |
+| 레이어 속성·워크스페이스 | 레이어 이름/원본 경로·인코딩/표시, mm 점 크기·선 두께 및 GEOS 삼각분할 기반 폴리곤 채움/투명도 렌더링; `.gogis`에 원본 참조, 설정, 지도 중심/확대율/활성 레이어 저장·복원; 원본 누락 시 재연결 가능한 항목 보존; 제한된 Lua 레이블/규칙 평가 | `qmltestrunner` Apply payload UI test; `drivers/geos`, `internal/render`, `internal/workspace`, `internal/scripting`, desktop native tests | 코드·QML 상호작용 검증 완료; Windows 빌드 및 실제 화면 상호작용 확인 미완료 |
 
 ## 통합 검증
 
@@ -43,3 +44,16 @@ Qt와 native dependencies가 준비된 Windows에서 다음을 확인한다.
 5. 선/폴리곤을 지도 경계 밖으로 패닝해도 viewport 영역 밖에 그려지지 않는지,
    X/Y 좌표 이동·커서 좌표·근사 축척이 함께 갱신되는지 확인한다.
 6. GDAL 사용 오류, Windows 경로/한글 파일명, 저장 대상 교체 실패가 없는지 기록한다.
+7. 각 레이어의 `Layer properties`에서 표시 이름을 바꾸고, 원본 경로 Browse로
+   다른 복사본에 재연결하며, CP949 SHP의 source encoding 변경 후 한글 속성을
+   확인한다. 원본 내부 layer 이름과 작업공간 표시 이름이 구분되어야 한다.
+8. 점 크기·선 두께(mm), 점/선/폴리곤 색, 폴리곤 채움 투명도를 바꾸고 지도
+   확대율을 바꿔도 심볼 물리 크기는 일정한지, 폴리곤 구멍이 채워지지 않는지 본다.
+9. 필드 템플릿 및 Lua 레이블/표시 규칙, 위치·회전·높이(mm)·축척 범위를 설정한다.
+   긴 굴곡 선의 레이블이 선 길이 중간에 놓이고, 오목 폴리곤/구멍이 있는 폴리곤의
+   레이블은 내부에 놓이는지 확인한다.
+   `.gogis`로 저장한 뒤 앱을 다시 열어 원본 참조, 속성, 현재 중심/확대율과 활성
+   레이어가 복원되는지 확인한다.
+10. 재배포 가능한 테스트 데이터 복사본 하나의 경로를 바꿔 워크스페이스를 연다.
+    해당 레이어에 누락 경고가 표시되고 다른 레이어는 유지되어야 하며, Browse로
+    새 위치를 지정해 Apply한 뒤 경고가 사라지고 데이터가 다시 렌더되는지 확인한다.

@@ -51,6 +51,8 @@ void gogis_set_selection(const char* layer, const char* feature,
 // Reads the latest JSON layer visibility payload observed on the GUI thread.
 unsigned long long gogis_layer_visibility_generation(void);
 void gogis_layer_visibility(char* buffer, int buffer_length);
+unsigned long long gogis_layer_settings_generation(void);
+void gogis_layer_settings(char* buffer, int buffer_length);
 
 // Reads the latest QML edit action and value observed on the GUI thread.
 unsigned long long gogis_edit_generation(void);
@@ -65,6 +67,7 @@ int gogis_attribute_page(void);
 
 // Publishes a JSON layer-tree payload for the QML layer model.
 void gogis_set_layer_tree_payload(const char* payload);
+void gogis_set_layer_label_payload(const char* payload);
 
 // Reads the latest QML-selected layer name.
 unsigned long long gogis_active_layer_generation(void);

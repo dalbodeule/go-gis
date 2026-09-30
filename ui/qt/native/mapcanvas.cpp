@@ -2,8 +2,8 @@
 
 #include <QColor>
 #include <QQuickItem>
-#include <QSGFlatColorMaterial>
 #include <QSGGeometryNode>
+#include <QSGVertexColorMaterial>
 #include <QMetaObject>
 #include <QTimer>
 #include <QVariant>
@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -26,8 +28,13 @@ struct GoGISVertex {
     float x;
     float y;
     std::uint32_t color;
+    float size_mm;
+    std::uint32_t kind;
 };
-static_assert(sizeof(GoGISVertex) == 12, "unexpected Go vertex layout");
+static_assert(sizeof(GoGISVertex) == 20, "unexpected Go vertex layout");
+static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm) == 12 &&
+                  offsetof(GoGISVertex, kind) == 16,
+              "Go render.Vertex field offsets changed");
 std::vector<GoGISVertex> g_vertices;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
@@ -38,6 +45,7 @@ std::atomic<double> g_pan_y{0};
 std::atomic<double> g_zoom{1};
 std::atomic<double> g_width{1};
 std::atomic<double> g_height{1};
+std::atomic<double> g_logical_pixels_per_mm{96.0 / 25.4};
 std::atomic<bool> g_visible{true};
 std::atomic<unsigned long long> g_click_generation{0};
 std::atomic<double> g_click_x{0};
@@ -45,6 +53,9 @@ std::atomic<double> g_click_y{0};
 std::mutex g_layer_visibility_mutex;
 std::string g_layer_visibility_payload;
 std::atomic<unsigned long long> g_layer_visibility_generation{0};
+std::mutex g_layer_settings_mutex;
+std::string g_layer_settings_payload;
+std::atomic<unsigned long long> g_layer_settings_generation{0};
 std::mutex g_edit_mutex;
 std::string g_edit_action;
 std::string g_edit_value;
@@ -57,6 +68,9 @@ std::atomic<int> g_attribute_page{0};
 std::mutex g_layer_tree_mutex;
 std::string g_layer_tree_payload;
 std::atomic<unsigned long long> g_layer_tree_generation{0};
+std::mutex g_layer_label_mutex;
+std::string g_layer_label_payload;
+std::atomic<unsigned long long> g_layer_label_generation{0};
 std::mutex g_active_layer_mutex;
 std::string g_active_layer;
 std::atomic<unsigned long long> g_active_layer_generation{0};
@@ -135,10 +149,9 @@ class GoGISMapCanvas : public QQuickItem {
 public:
     explicit GoGISMapCanvas(QQuickItem* parent = nullptr)
         : QQuickItem(parent),
-          geometry_(QSGGeometry::defaultAttributes_Point2D(), 0),
+          geometry_(QSGGeometry::defaultAttributes_ColoredPoint2D(), 0),
           material_() {
         setFlag(ItemHasContents, true);
-        material_.setColor(QColor(QStringLiteral("#2b6cb0")));
         update_viewport_snapshot(this);
 
         // QML adds clickX/clickY/clickGeneration to the registered item. Read
@@ -146,6 +159,11 @@ public:
         // QObject from its render polling goroutine.
         click_timer_.setInterval(16);
         QObject::connect(&click_timer_, &QTimer::timeout, this, [this]() {
+            const double logical_pixels_per_mm = property("logicalPixelsPerMm").toDouble();
+            if (std::isfinite(logical_pixels_per_mm) && logical_pixels_per_mm > 0.0) {
+                g_logical_pixels_per_mm.store(logical_pixels_per_mm, std::memory_order_relaxed);
+            }
+
             const QVariant generation = property("clickGeneration");
             const auto next_generation = generation.toULongLong();
             if (next_generation != g_click_generation.load(std::memory_order_relaxed)) {
@@ -159,6 +177,13 @@ public:
                 std::lock_guard<std::mutex> lock(g_layer_visibility_mutex);
                 g_layer_visibility_payload = property("layerVisibilityPayload").toString().toStdString();
                 g_layer_visibility_generation.store(layer_generation, std::memory_order_relaxed);
+            }
+
+            const auto settings_generation = property("layerSettingsGeneration").toULongLong();
+            if (settings_generation != g_layer_settings_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_layer_settings_mutex);
+                g_layer_settings_payload = property("layerSettingsPayload").toString().toStdString();
+                g_layer_settings_generation.store(settings_generation, std::memory_order_relaxed);
             }
 
             const auto edit_generation = property("editGeneration").toULongLong();
@@ -197,6 +222,14 @@ public:
                 std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
                 setProperty("layerTreePayload", QString::fromStdString(g_layer_tree_payload));
                 layer_tree_generation_ = layer_tree_generation;
+            }
+
+            const auto label_generation = g_layer_label_generation.load(std::memory_order_relaxed);
+            if (label_generation != layer_label_generation_) {
+                std::lock_guard<std::mutex> lock(g_layer_label_mutex);
+                setProperty("layerLabelPayload", QString::fromStdString(g_layer_label_payload));
+                setProperty("layerLabelGeneration", QVariant::fromValue<qulonglong>(label_generation));
+                layer_label_generation_ = label_generation;
             }
 
             const auto render_status_generation = g_render_status_generation.load(std::memory_order_relaxed);
@@ -276,16 +309,82 @@ protected:
             if (source_generation != rendered_generation_ || width != rendered_width_ ||
                 height != rendered_height_) {
                 const size_t source_vertex_count = g_vertices.size();
-                if (source_vertex_count != rendered_vertex_count_) {
-                    geometry_.allocate(static_cast<int>(source_vertex_count));
-                    rendered_vertex_count_ = source_vertex_count;
+                size_t output_vertex_count = 0;
+                for (size_t cursor = 0; cursor < source_vertex_count;) {
+                    if (g_vertices[cursor].kind == 2 && source_vertex_count - cursor >= 3) {
+                        output_vertex_count += 3;
+                        cursor += 3;
+                    } else {
+                        output_vertex_count += 6;
+                        cursor += std::min<size_t>(2, source_vertex_count - cursor);
+                    }
                 }
-                auto* vertices = geometry_.vertexDataAsPoint2D();
-                for (size_t i = 0; i < source_vertex_count; ++i) {
-                    vertices[i] = {
-                        g_vertices[i].x * width,
-                        (1.0f - g_vertices[i].y) * height,
-                    };
+                if (output_vertex_count != rendered_vertex_count_) {
+                    geometry_.allocate(static_cast<int>(output_vertex_count));
+                    rendered_vertex_count_ = output_vertex_count;
+                }
+                auto* vertices = geometry_.vertexDataAsColoredPoint2D();
+                const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
+                size_t output = 0;
+                auto set_vertex = [vertices](size_t index, float x, float y, std::uint32_t color) {
+                    const auto alpha = static_cast<unsigned char>(color & 0xff);
+                    const auto red = static_cast<unsigned char>((color >> 24) & 0xff);
+                    const auto green = static_cast<unsigned char>((color >> 16) & 0xff);
+                    const auto blue = static_cast<unsigned char>((color >> 8) & 0xff);
+                    vertices[index].set(x, y,
+                                        static_cast<unsigned char>((red * alpha + 127) / 255),
+                                        static_cast<unsigned char>((green * alpha + 127) / 255),
+                                        static_cast<unsigned char>((blue * alpha + 127) / 255),
+                                        alpha);
+                };
+                for (size_t i = 0; i < source_vertex_count;) {
+                    const auto& first = g_vertices[i];
+                    if (first.kind == 2 && source_vertex_count - i >= 3) {
+                        for (size_t triangle_vertex = 0; triangle_vertex < 3; ++triangle_vertex) {
+                            const auto& source = g_vertices[i + triangle_vertex];
+                            const auto color = source.color == 0 ? 0x2b6cb0ff : source.color;
+                            set_vertex(output++, source.x * width, (1.0f - source.y) * height, color);
+                        }
+                        i += 3;
+                        continue;
+                    }
+                    if (source_vertex_count - i < 2) break;
+                    const auto& second = g_vertices[i + 1];
+                    const auto color = first.color == 0 ? 0x2b6cb0ff : first.color;
+                    const float x1 = first.x * width;
+                    const float y1 = (1.0f - first.y) * height;
+                    const float x2 = second.x * width;
+                    const float y2 = (1.0f - second.y) * height;
+                    const float logical_pixels_per_mm = static_cast<float>(
+                        g_logical_pixels_per_mm.load(std::memory_order_relaxed));
+                    const float size = std::max(0.5f, first.size_mm * logical_pixels_per_mm / item_scale);
+                    if (first.kind == 1) {
+                        const float half = size * 0.5f;
+                        set_vertex(output++, x1 - half, y1 - half, color);
+                        set_vertex(output++, x1 + half, y1 - half, color);
+                        set_vertex(output++, x1 - half, y1 + half, color);
+                        set_vertex(output++, x1 - half, y1 + half, color);
+                        set_vertex(output++, x1 + half, y1 - half, color);
+                        set_vertex(output++, x1 + half, y1 + half, color);
+                        continue;
+                    }
+                    const float dx = x2 - x1;
+                    const float dy = y2 - y1;
+                    const float length = std::sqrt(dx * dx + dy * dy);
+                    if (length <= 0.0001f) {
+                        for (int duplicate = 0; duplicate < 6; ++duplicate) set_vertex(output++, x1, y1, color);
+                        i += 2;
+                        continue;
+                    }
+                    const float nx = -dy / length * size * 0.5f;
+                    const float ny = dx / length * size * 0.5f;
+                    set_vertex(output++, x1 + nx, y1 + ny, color);
+                    set_vertex(output++, x1 - nx, y1 - ny, color);
+                    set_vertex(output++, x2 + nx, y2 + ny, color);
+                    set_vertex(output++, x2 + nx, y2 + ny, color);
+                    set_vertex(output++, x1 - nx, y1 - ny, color);
+                    set_vertex(output++, x2 - nx, y2 - ny, color);
+                    i += 2;
                 }
                 rendered_generation_ = source_generation;
                 rendered_stage_ = g_vertices_stage;
@@ -295,7 +394,7 @@ protected:
             }
         }
         if (geometry_changed) {
-            geometry_.setDrawingMode(QSGGeometry::DrawLines);
+            geometry_.setDrawingMode(QSGGeometry::DrawTriangles);
             node->markDirty(QSGNode::DirtyGeometry);
             if (rendered_vertex_count_ > 0) {
                 trace_load_event("scenegraph", rendered_stage_, rendered_vertex_count_);
@@ -320,11 +419,12 @@ protected:
 
 private:
     QSGGeometry geometry_;
-    QSGFlatColorMaterial material_;
+    QSGVertexColorMaterial material_;
     QTimer click_timer_;
     unsigned long long selection_generation_ = 0;
     unsigned long long attribute_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;
+    unsigned long long layer_label_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
     unsigned long long map_metadata_generation_ = 0;
     unsigned long long rendered_generation_ = 0;
@@ -349,7 +449,7 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
     g_vertices.resize(count);
     g_vertices_stage = 0;
     for (size_t index = 0; index < count; ++index) {
-        g_vertices[index] = {xy[index * 2], xy[index * 2 + 1], 0};
+        g_vertices[index] = {xy[index * 2], xy[index * 2 + 1], 0, 0, 0};
     }
     g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
 }
@@ -458,6 +558,20 @@ extern "C" void gogis_layer_visibility(char* buffer, int buffer_length) {
     buffer[copy_length] = '\0';
 }
 
+extern "C" unsigned long long gogis_layer_settings_generation(void) {
+    return g_layer_settings_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_layer_settings(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_layer_settings_mutex);
+    const auto copy_length = std::min<size_t>(g_layer_settings_payload.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_layer_settings_payload.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
 extern "C" unsigned long long gogis_edit_generation(void) {
     return g_edit_generation.load(std::memory_order_relaxed);
 }
@@ -498,6 +612,14 @@ extern "C" void gogis_set_layer_tree_payload(const char* payload) {
         g_layer_tree_payload = payload != nullptr ? payload : "[]";
     }
     g_layer_tree_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_layer_label_payload(const char* payload) {
+    {
+        std::lock_guard<std::mutex> lock(g_layer_label_mutex);
+        g_layer_label_payload = payload != nullptr ? payload : "[]";
+    }
+    g_layer_label_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 extern "C" unsigned long long gogis_active_layer_generation(void) {
