@@ -16,6 +16,17 @@ import (
 	"github.com/airbusgeo/godal"
 )
 
+func TestInitialFeatureCapacityIsBounded(t *testing.T) {
+	for _, test := range []struct {
+		count int
+		want  int
+	}{{-1, 0}, {0, 0}, {12, 12}, {maxInitialFeatureCapacity, maxInitialFeatureCapacity}, {maxInitialFeatureCapacity * 100, maxInitialFeatureCapacity}} {
+		if got := initialFeatureCapacity(test.count); got != test.want {
+			t.Errorf("initialFeatureCapacity(%d) = %d, want %d", test.count, got, test.want)
+		}
+	}
+}
+
 func TestReaderOpensGeoJSONFixtureThroughGDAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"한글 도로","speed":40},"geometry":{"type":"Point","coordinates":[127.1,37.4]}}]}`

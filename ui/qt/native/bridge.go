@@ -43,6 +43,10 @@ func SetVerticesStage(vertices []render.Vertex, stage int) {
 		C.gogis_set_vertices(nil, 0)
 		return
 	}
+	if uint64(len(vertices)) > uint64(^uint32(0)>>1) {
+		SetRenderStatus("Render skipped: vertex batch exceeds the native API limit")
+		return
+	}
 	C.gogis_set_vertices_vertex_layout_stage(unsafe.Pointer(&vertices[0]), C.int(len(vertices)), C.int(stage))
 }
 

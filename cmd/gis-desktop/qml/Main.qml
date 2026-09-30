@@ -747,6 +747,13 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.leftMargin: 12
             anchors.rightMargin: 12
+            BusyIndicator {
+                objectName: "loadBusyIndicator"
+                running: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
+                visible: running
+                implicitWidth: 22
+                implicitHeight: 22
+            }
             Label {
                 objectName: "renderStatusLabel"
                 text: mapViewport.renderStatus
@@ -775,8 +782,8 @@ ApplicationWindow {
                 color: "#65717d"
             }
             Button {
-                text: "Cancel render"
-                enabled: mapViewport.renderStatus.indexOf("Loading") === 0
+                text: "Cancel loading/render"
+                enabled: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
                 onClicked: mapCanvas.cancelGeneration += 1
             }
             Item {

@@ -44,6 +44,7 @@ TestCase {
     function test_applySubmitsLayerSettings() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var renderStatus = findChild(appWindow, "renderStatusLabel");
+        var loadIndicator = findChild(appWindow, "loadBusyIndicator");
         var layerModel = findChild(appWindow, "layerModel");
         var dialog = findChild(appWindow, "layerSettingsDialog");
         var displayName = findChild(appWindow, "displayNameField");
@@ -70,6 +71,7 @@ TestCase {
         dialogItem = dialog;
         verify(canvas !== null);
         verify(renderStatus !== null);
+        verify(loadIndicator !== null);
         verify(layerModel !== null);
         verify(canvas.logicalPixelsPerMm > 0);
         verify(dialog !== null);

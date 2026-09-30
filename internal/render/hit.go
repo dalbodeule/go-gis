@@ -49,6 +49,18 @@ type hitSpan struct {
 	horizontal   bool
 }
 
+const maxInitialHitMembershipCapacity = 1 << 20
+
+func initialHitMembershipCapacity(featureCount int) int {
+	if featureCount <= 0 {
+		return 0
+	}
+	if featureCount > int(^uint(0)>>1)/2 {
+		return maxInitialHitMembershipCapacity
+	}
+	return min(featureCount*2, maxInitialHitMembershipCapacity)
+}
+
 // NewHitIndex builds a uniform-grid index. A non-positive cell size uses a
 // conservative default suitable for normalized layer coordinates.
 func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
@@ -69,10 +81,7 @@ func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
 	// A typical normalized line touches one or two cells. Reserve that common
 	// membership count up front; unusual long segments can still grow these
 	// slices safely through append.
-	initialCapacity := len(features)
-	if initialCapacity <= int(^uint(0)>>1)/2 {
-		initialCapacity *= 2
-	}
+	initialCapacity := initialHitMembershipCapacity(len(features))
 	index.indices = make([]int32, 0, initialCapacity)
 	index.next = make([]int32, 0, initialCapacity)
 	// Append memberships to one flat array and link them per cell. Index the

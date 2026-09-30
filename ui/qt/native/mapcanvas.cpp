@@ -17,7 +17,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -95,6 +97,18 @@ std::string g_selection_status;
 std::atomic<unsigned long long> g_selection_generation{0};
 std::mutex g_canvas_mutex;
 QQuickItem* g_canvas = nullptr;
+
+void set_render_status_safely(const char* status) noexcept {
+    try {
+        {
+            std::lock_guard<std::mutex> lock(g_render_status_mutex);
+            g_render_status = status != nullptr ? status : "";
+        }
+        g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        // Reporting a rendering allocation failure must not terminate the UI.
+    }
+}
 
 long long steady_nanoseconds() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -310,7 +324,16 @@ protected:
                 height != rendered_height_) {
                 const size_t source_vertex_count = g_vertices.size();
                 size_t output_vertex_count = 0;
+                bool can_render_geometry = true;
+                const size_t max_qt_vertex_count =
+                    static_cast<size_t>(std::numeric_limits<int>::max());
                 for (size_t cursor = 0; cursor < source_vertex_count;) {
+                    const size_t increment =
+                        g_vertices[cursor].kind == 2 && source_vertex_count - cursor >= 3 ? 3 : 6;
+                    if (output_vertex_count > max_qt_vertex_count - increment) {
+                        can_render_geometry = false;
+                        break;
+                    }
                     if (g_vertices[cursor].kind == 2 && source_vertex_count - cursor >= 3) {
                         output_vertex_count += 3;
                         cursor += 3;
@@ -319,72 +342,101 @@ protected:
                         cursor += std::min<size_t>(2, source_vertex_count - cursor);
                     }
                 }
-                if (output_vertex_count != rendered_vertex_count_) {
-                    geometry_.allocate(static_cast<int>(output_vertex_count));
-                    rendered_vertex_count_ = output_vertex_count;
-                }
-                auto* vertices = geometry_.vertexDataAsColoredPoint2D();
-                const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
-                size_t output = 0;
-                auto set_vertex = [vertices](size_t index, float x, float y, std::uint32_t color) {
-                    const auto alpha = static_cast<unsigned char>(color & 0xff);
-                    const auto red = static_cast<unsigned char>((color >> 24) & 0xff);
-                    const auto green = static_cast<unsigned char>((color >> 16) & 0xff);
-                    const auto blue = static_cast<unsigned char>((color >> 8) & 0xff);
-                    vertices[index].set(x, y,
-                                        static_cast<unsigned char>((red * alpha + 127) / 255),
-                                        static_cast<unsigned char>((green * alpha + 127) / 255),
-                                        static_cast<unsigned char>((blue * alpha + 127) / 255),
-                                        alpha);
-                };
-                for (size_t i = 0; i < source_vertex_count;) {
-                    const auto& first = g_vertices[i];
-                    if (first.kind == 2 && source_vertex_count - i >= 3) {
-                        for (size_t triangle_vertex = 0; triangle_vertex < 3; ++triangle_vertex) {
-                            const auto& source = g_vertices[i + triangle_vertex];
-                            const auto color = source.color == 0 ? 0x2b6cb0ff : source.color;
-                            set_vertex(output++, source.x * width, (1.0f - source.y) * height, color);
+                if (!can_render_geometry) {
+                    set_render_status_safely(
+                        "Render error: geometry exceeds Qt's vertex-count limit");
+                    try {
+                        geometry_.allocate(0);
+                    } catch (...) {
+                    }
+                    rendered_vertex_count_ = 0;
+                } else if (output_vertex_count != rendered_vertex_count_) {
+                    try {
+                        geometry_.allocate(static_cast<int>(output_vertex_count));
+                        rendered_vertex_count_ = output_vertex_count;
+                    } catch (const std::bad_alloc&) {
+                        can_render_geometry = false;
+                        set_render_status_safely(
+                            "Render error: insufficient memory for map geometry");
+                    } catch (...) {
+                        can_render_geometry = false;
+                        set_render_status_safely("Render error: Qt geometry allocation failed");
+                    }
+                    if (!can_render_geometry) {
+                        try {
+                            geometry_.allocate(0);
+                        } catch (...) {
                         }
-                        i += 3;
-                        continue;
+                        rendered_vertex_count_ = 0;
                     }
-                    if (source_vertex_count - i < 2) break;
-                    const auto& second = g_vertices[i + 1];
-                    const auto color = first.color == 0 ? 0x2b6cb0ff : first.color;
-                    const float x1 = first.x * width;
-                    const float y1 = (1.0f - first.y) * height;
-                    const float x2 = second.x * width;
-                    const float y2 = (1.0f - second.y) * height;
-                    const float logical_pixels_per_mm = static_cast<float>(
-                        g_logical_pixels_per_mm.load(std::memory_order_relaxed));
-                    const float size = std::max(0.5f, first.size_mm * logical_pixels_per_mm / item_scale);
-                    if (first.kind == 1) {
-                        const float half = size * 0.5f;
-                        set_vertex(output++, x1 - half, y1 - half, color);
-                        set_vertex(output++, x1 + half, y1 - half, color);
-                        set_vertex(output++, x1 - half, y1 + half, color);
-                        set_vertex(output++, x1 - half, y1 + half, color);
-                        set_vertex(output++, x1 + half, y1 - half, color);
-                        set_vertex(output++, x1 + half, y1 + half, color);
-                        continue;
-                    }
-                    const float dx = x2 - x1;
-                    const float dy = y2 - y1;
-                    const float length = std::sqrt(dx * dx + dy * dy);
-                    if (length <= 0.0001f) {
-                        for (int duplicate = 0; duplicate < 6; ++duplicate) set_vertex(output++, x1, y1, color);
+                }
+                auto* vertices = can_render_geometry ? geometry_.vertexDataAsColoredPoint2D() : nullptr;
+                if (can_render_geometry) {
+                    const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
+                    size_t output = 0;
+                    auto set_vertex = [vertices](size_t index, float x, float y, std::uint32_t color) {
+                        const auto alpha = static_cast<unsigned char>(color & 0xff);
+                        const auto red = static_cast<unsigned char>((color >> 24) & 0xff);
+                        const auto green = static_cast<unsigned char>((color >> 16) & 0xff);
+                        const auto blue = static_cast<unsigned char>((color >> 8) & 0xff);
+                        vertices[index].set(x, y,
+                                            static_cast<unsigned char>((red * alpha + 127) / 255),
+                                            static_cast<unsigned char>((green * alpha + 127) / 255),
+                                            static_cast<unsigned char>((blue * alpha + 127) / 255),
+                                            alpha);
+                    };
+                    for (size_t i = 0; i < source_vertex_count;) {
+                        const auto& first = g_vertices[i];
+                        if (first.kind == 2 && source_vertex_count - i >= 3) {
+                            for (size_t triangle_vertex = 0; triangle_vertex < 3; ++triangle_vertex) {
+                                const auto& source = g_vertices[i + triangle_vertex];
+                                const auto color = source.color == 0 ? 0x2b6cb0ff : source.color;
+                                set_vertex(output++, source.x * width, (1.0f - source.y) * height, color);
+                            }
+                            i += 3;
+                            continue;
+                        }
+                        if (source_vertex_count - i < 2) break;
+                        const auto& second = g_vertices[i + 1];
+                        const auto color = first.color == 0 ? 0x2b6cb0ff : first.color;
+                        const float x1 = first.x * width;
+                        const float y1 = (1.0f - first.y) * height;
+                        const float x2 = second.x * width;
+                        const float y2 = (1.0f - second.y) * height;
+                        const float logical_pixels_per_mm = static_cast<float>(
+                            g_logical_pixels_per_mm.load(std::memory_order_relaxed));
+                        const float size = std::max(0.5f, first.size_mm * logical_pixels_per_mm / item_scale);
+                        if (first.kind == 1) {
+                            const float half = size * 0.5f;
+                            set_vertex(output++, x1 - half, y1 - half, color);
+                            set_vertex(output++, x1 + half, y1 - half, color);
+                            set_vertex(output++, x1 - half, y1 + half, color);
+                            set_vertex(output++, x1 - half, y1 + half, color);
+                            set_vertex(output++, x1 + half, y1 - half, color);
+                            set_vertex(output++, x1 + half, y1 + half, color);
+                            i += 2;
+                            continue;
+                        }
+                        const float dx = x2 - x1;
+                        const float dy = y2 - y1;
+                        const float length = std::sqrt(dx * dx + dy * dy);
+                        if (length <= 0.0001f) {
+                            for (int duplicate = 0; duplicate < 6; ++duplicate) {
+                                set_vertex(output++, x1, y1, color);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        const float nx = -dy / length * size * 0.5f;
+                        const float ny = dx / length * size * 0.5f;
+                        set_vertex(output++, x1 + nx, y1 + ny, color);
+                        set_vertex(output++, x1 - nx, y1 - ny, color);
+                        set_vertex(output++, x2 + nx, y2 + ny, color);
+                        set_vertex(output++, x2 + nx, y2 + ny, color);
+                        set_vertex(output++, x1 - nx, y1 - ny, color);
+                        set_vertex(output++, x2 - nx, y2 - ny, color);
                         i += 2;
-                        continue;
                     }
-                    const float nx = -dy / length * size * 0.5f;
-                    const float ny = dx / length * size * 0.5f;
-                    set_vertex(output++, x1 + nx, y1 + ny, color);
-                    set_vertex(output++, x1 - nx, y1 - ny, color);
-                    set_vertex(output++, x2 + nx, y2 + ny, color);
-                    set_vertex(output++, x2 + nx, y2 + ny, color);
-                    set_vertex(output++, x1 - nx, y1 - ny, color);
-                    set_vertex(output++, x2 - nx, y2 - ny, color);
-                    i += 2;
                 }
                 rendered_generation_ = source_generation;
                 rendered_stage_ = g_vertices_stage;
@@ -446,7 +498,15 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
     // Keep the vector capacity across frame publishes. The Go bridge already
     // holds a reusable scratch buffer, so recreating this C++ vector here
     // would add a second heap allocation to every batch update.
-    g_vertices.resize(count);
+    try {
+        g_vertices.resize(count);
+    } catch (const std::bad_alloc&) {
+        set_render_status_safely("Render error: insufficient memory for vertex batch");
+        return;
+    } catch (...) {
+        set_render_status_safely("Render error: native vertex allocation failed");
+        return;
+    }
     g_vertices_stage = 0;
     for (size_t index = 0; index < count; ++index) {
         g_vertices[index] = {xy[index * 2], xy[index * 2 + 1], 0, 0, 0};
@@ -466,7 +526,15 @@ extern "C" void gogis_set_vertices_vertex_layout_stage(const void* raw_vertices,
     const size_t count = vertices != nullptr && vertex_count > 0
                              ? static_cast<size_t>(vertex_count)
                              : 0;
-    g_vertices.resize(count);
+    try {
+        g_vertices.resize(count);
+    } catch (const std::bad_alloc&) {
+        set_render_status_safely("Render error: insufficient memory for vertex batch");
+        return;
+    } catch (...) {
+        set_render_status_safely("Render error: native vertex allocation failed");
+        return;
+    }
     g_vertices_stage = stage;
     if (count > 0) {
         std::memcpy(g_vertices.data(), vertices, count * sizeof(GoGISVertex));

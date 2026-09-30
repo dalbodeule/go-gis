@@ -142,11 +142,16 @@ interaction checklist.
   --save build/sample-edited.gpkg
 ```
 
-편집·저장이 필요 없는 대용량 시각화는 `--read-only`를 추가하면 geometry-only
-초기 로딩과 원본 GDAL attribute page 조회를 사용합니다.
+데스크톱에서 100,000개 이상의 feature를 가진 데이터 또는 개수를 확인할 수 없는
+데이터를 열면 메모리 사용을 줄이기 위해 자동으로 읽기 전용으로 전환합니다.
+geometry-only 초기 로딩과 원본 GDAL attribute page 조회를 사용하며, 상태 표시줄에
+전환 이유가 표시됩니다. 대용량 데이터를 꼭 편집해야 하면 `--editable-large`를
+지정해 기존 전체 편집 모드를 선택할 수 있습니다(메모리 사용량이 커질 수 있습니다).
+편집·저장이 필요 없는 대용량 시각화는 `--read-only`로도 직접 실행할 수 있습니다.
 
 ```sh
 ./build/gogis-desktop-native --read-only --input data/large.gpkg
+./build/gogis-desktop-native --editable-large
 ```
 
 이 모드에서는 편집 Commit과 `--save`를 사용하지 않으며, 속성은 페이지를

@@ -2,6 +2,15 @@ package render
 
 import "testing"
 
+func TestInitialHitMembershipCapacityIsBounded(t *testing.T) {
+	if got := initialHitMembershipCapacity(10); got != 20 {
+		t.Fatalf("small membership capacity = %d, want 20", got)
+	}
+	if got := initialHitMembershipCapacity(maxInitialHitMembershipCapacity * 100); got != maxInitialHitMembershipCapacity {
+		t.Fatalf("large membership capacity = %d, want %d", got, maxInitialHitMembershipCapacity)
+	}
+}
+
 func TestHitTestReturnsClosestLineFeature(t *testing.T) {
 	features := []HitFeature{
 		{Layer: "roads", FeatureID: 10, Vertices: []Point{{X: 0, Y: 0}, {X: 10, Y: 0}}},

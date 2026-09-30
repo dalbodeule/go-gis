@@ -10,6 +10,18 @@ import (
 	"gogis/internal/core"
 )
 
+func TestInitialRenderArenasAreBounded(t *testing.T) {
+	if got := initialPartArenaCapacity(10); got != 20 {
+		t.Fatalf("small part arena capacity = %d, want 20", got)
+	}
+	if got := initialPartArenaCapacity(maxInitialPointArenaCapacity); got != maxInitialPointArenaCapacity {
+		t.Fatalf("large part arena capacity = %d, want %d", got, maxInitialPointArenaCapacity)
+	}
+	if got := boundedInitialPointArenaCapacity(maxInitialPointArenaCapacity * 100); got != maxInitialPointArenaCapacity {
+		t.Fatalf("large point arena capacity = %d, want %d", got, maxInitialPointArenaCapacity)
+	}
+}
+
 func TestLayerSourceCarriesConfiguredGeometryColor(t *testing.T) {
 	layer := core.Layer{
 		Name: "roads", Style: core.LayerStyle{LineColor: "#aabbcc", PointColor: "#010203", PolygonColor: "#ffffff", LineWidthMM: 1.4, PointSizeMM: 3.2},

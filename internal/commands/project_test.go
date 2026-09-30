@@ -2,10 +2,39 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"gogis/internal/core"
 )
+
+func TestProjectServiceAdoptsLoadedLayerSnapshots(t *testing.T) {
+	layers := []core.Layer{{Name: "roads", Editable: true, Features: []core.Feature{{ID: 1, Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3}}}}}}
+	service, err := NewProjectServiceWithLayers("loaded", core.CRS{}, layers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.project.Layers[0].Features; len(got) != 1 || &got[0] != &layers[0].Features[0] {
+		t.Fatal("constructor cloned the loader-owned feature slice")
+	}
+
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetFeatureProperty("roads", 1, "name", "edited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if value := service.project.Layers[0].Features[0].Properties["name"]; value != nil {
+		t.Fatalf("rolled-back adopted snapshot property = %v", value)
+	}
+
+	if _, err := NewProjectServiceWithLayers("loaded", core.CRS{}, []core.Layer{{Name: "same"}, {Name: "same"}}); !errors.Is(err, ErrLayerExists) {
+		t.Fatalf("duplicate layer constructor error = %v, want ErrLayerExists", err)
+	}
+}
 
 func TestProjectEditCommitAndRollback(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})

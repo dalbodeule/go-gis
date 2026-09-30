@@ -47,6 +47,22 @@ type parsedFeaturePoints struct {
 	parts  [][]Point
 }
 
+const maxInitialPointArenaCapacity = 1 << 20
+
+func boundedInitialPointArenaCapacity(capacity int) int {
+	return min(max(0, capacity), maxInitialPointArenaCapacity)
+}
+
+func initialPartArenaCapacity(featureCount int) int {
+	if featureCount <= 0 {
+		return 0
+	}
+	if featureCount > int(^uint(0)>>1)/2 {
+		return maxInitialPointArenaCapacity
+	}
+	return min(featureCount*2, maxInitialPointArenaCapacity)
+}
+
 // NewLayerSource converts Point, LineString, and Polygon WKT features into a
 // normalized render source. The builder returns one immutable batch for the
 // source layer; chunk scheduling and viewport policy remain adapter concerns.
@@ -333,7 +349,7 @@ func parseUniformWKTMultiLineLayer(layer core.Layer) ([]parsedFeaturePoints, []b
 	parsed := make([]parsedFeaturePoints, len(layer.Features))
 	lineFlags := make([]bool, len(layer.Features))
 	pointArena := make([]Point, 0, pointArenaCapacity(layer.Features))
-	partArena := make([][]Point, 0, len(layer.Features)*2)
+	partArena := make([][]Point, 0, initialPartArenaCapacity(len(layer.Features)))
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
 	for index, feature := range layer.Features {
@@ -356,7 +372,7 @@ func parseUniformWKTPartsLayer(layer core.Layer, parentDepth int) ([]parsedFeatu
 	parsed := make([]parsedFeaturePoints, len(layer.Features))
 	lineFlags := make([]bool, len(layer.Features))
 	pointArena := make([]Point, 0, pointArenaCapacity(layer.Features))
-	partArena := make([][]Point, 0, len(layer.Features)*2)
+	partArena := make([][]Point, 0, initialPartArenaCapacity(len(layer.Features)))
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
 	for index, feature := range layer.Features {
@@ -379,7 +395,7 @@ func parseUniformWKTGeometryCollectionLayer(layer core.Layer) ([]parsedFeaturePo
 	parsed := make([]parsedFeaturePoints, len(layer.Features))
 	lineFlags := make([]bool, len(layer.Features))
 	pointArena := make([]Point, 0, pointArenaCapacity(layer.Features))
-	partArena := make([][]Point, 0, len(layer.Features)*2)
+	partArena := make([][]Point, 0, initialPartArenaCapacity(len(layer.Features)))
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
 	for index, feature := range layer.Features {
@@ -398,11 +414,12 @@ func parseUniformWKTGeometryCollectionLayer(layer core.Layer) ([]parsedFeaturePo
 	return parsed, lineFlags, minX, minY, maxX, maxY, nil
 }
 
-func pointArenaCapacity(features []core.Feature) int {
+func pointArenaCapacity(features []core.Feature) (capacity int) {
+	defer func() { capacity = boundedInitialPointArenaCapacity(capacity) }()
 	if len(features) == 0 {
 		return 0
 	}
-	capacity := len(features)
+	capacity = len(features)
 	if capacity <= int(^uint(0)>>1)/2 {
 		capacity *= 2
 	}
@@ -455,7 +472,7 @@ func pointArenaCapacity(features []core.Feature) int {
 			}
 		}
 	}
-	return capacity
+	return min(capacity, maxInitialPointArenaCapacity)
 }
 
 func standardWKBGeometryCollectionPointCount(data []byte) (int, bool) {

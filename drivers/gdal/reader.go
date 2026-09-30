@@ -15,6 +15,12 @@ import (
 	"github.com/airbusgeo/godal"
 )
 
+const maxInitialFeatureCapacity = 65536
+
+func initialFeatureCapacity(count int) int {
+	return max(0, min(count, maxInitialFeatureCapacity))
+}
+
 // Reader opens vector layers through GDAL/OGR. It supports any installed GDAL
 // vector driver, including SHP and GeoPackage.
 // Reader reads a dataset. Encoding overrides the source's declared DBF
@@ -546,10 +552,11 @@ func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
 func readLayerOptions(ctx context.Context, layer godal.Layer, includeProperties bool) (core.Layer, error) {
 	result := readLayerHeader(layer)
 	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
-	// feature slice up front. Some streaming or filtered drivers cannot provide
-	// an exact count, so failure is intentionally ignored.
+	// feature slice up front. Driver counts are not always trustworthy, however,
+	// and a very large reservation can exhaust memory before the first feature
+	// is read. Bound the eager reservation; append grows the slice as needed.
 	if count, countErr := layer.FeatureCount(); countErr == nil && count > 0 {
-		result.Features = make([]core.Feature, 0, count)
+		result.Features = make([]core.Feature, 0, initialFeatureCapacity(count))
 	}
 
 	layer.ResetReading()

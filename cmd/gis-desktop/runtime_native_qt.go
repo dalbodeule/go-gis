@@ -56,6 +56,7 @@ func loadRuntime(args []string) *demoRuntime {
 }
 
 func startInitialDataLoad(runtime *demoRuntime, args []string) {
+	runtime.allowLargeEditable = desktopAllowLargeEditable(args)
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
 	if input == "" {
 		return
@@ -73,6 +74,34 @@ func isWorkspacePath(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".gogis")
 }
 
+func normalizedSourcePath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		absolute = path
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+		absolute = resolved
+	}
+	return filepath.Clean(absolute)
+}
+
+func uniqueSourcePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	unique := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		key := normalizedSourcePath(path)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, path)
+	}
+	return unique
+}
+
 func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, savePath string, readOnly bool) {
 	loadContext, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
@@ -86,17 +115,33 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 	}
 	native.BeginLoadTrace()
 	native.SetRenderStatus("Loading " + input)
-	var onPreview func(*demoRuntime)
-	if readOnly && os.Getenv("GOGIS_DISABLE_PREVIEW") != "1" {
-		onPreview = func(preview *demoRuntime) {
-			r.replaceWithPreview(preview, generation)
-		}
-	}
 	go func() {
-		next, err := loadDataRuntimeModeContextWithPreview(loadContext, input, layerName, sourceCRS, targetCRS, savePath, readOnly, onPreview)
+		loadAsReadOnly := readOnly
+		largeReadOnly := false
+		featureCount := 0
+		if !loadAsReadOnly && savePath == "" && !r.allowLargeEditable {
+			native.SetRenderStatus("Loading: checking feature count")
+			var inspectErr error
+			featureCount, largeReadOnly, inspectErr = inspectSourceFeatureCount(loadContext, []vectorSourceSpec{{Path: input}})
+			if inspectErr != nil {
+				if loadContext.Err() != nil {
+					return
+				}
+				largeReadOnly = true
+			}
+			loadAsReadOnly = shouldOpenLargeDatasetReadOnly(featureCount, largeReadOnly, r.allowLargeEditable)
+			largeReadOnly = loadAsReadOnly
+		}
+		var onPreview func(*demoRuntime)
+		if loadAsReadOnly && savePath == "" && os.Getenv("GOGIS_DISABLE_PREVIEW") != "1" {
+			onPreview = func(preview *demoRuntime) {
+				r.replaceWithPreview(preview, generation)
+			}
+		}
+		next, err := loadDataRuntimeModeContextWithPreview(loadContext, input, layerName, sourceCRS, targetCRS, savePath, loadAsReadOnly, onPreview)
 		r.mu.Lock()
 		current := generation == r.loadGeneration
-		if current {
+		if current && err != nil {
 			r.loadCancel = nil
 		}
 		r.mu.Unlock()
@@ -111,7 +156,17 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 			return
 		}
 		r.replaceWithLoaded(next, generation)
+		if largeReadOnly {
+			native.SetRenderStatus(largeDatasetReadOnlyStatus(featureCount))
+		}
 	}()
+}
+
+func largeDatasetReadOnlyStatus(featureCount int) string {
+	if featureCount < largeDatasetReadOnlyThreshold {
+		return "Dataset size unavailable; opened read-only to limit memory; use --editable-large to edit"
+	}
+	return fmt.Sprintf("Dataset has at least %d features; opened read-only to limit memory. Use --editable-large to edit", featureCount)
 }
 
 func loadDataRuntime(input, layerName, sourceCRS, targetCRS, savePath string) (*demoRuntime, error) {
@@ -195,6 +250,65 @@ func loadDataRuntimeModeContextWithEncoding(ctx context.Context, input, layerNam
 
 const previewFeatureLimit = 2000
 const previewMinimumFeatures = 50000
+const largeDatasetReadOnlyThreshold = 100000
+
+func shouldOpenLargeDatasetReadOnly(featureCount int, unknownCount, allowEditable bool) bool {
+	return !allowEditable && (unknownCount || featureCount >= largeDatasetReadOnlyThreshold)
+}
+
+func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) (int, bool, error) {
+	total := 0
+	unknownCount := false
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return total, false, err
+		}
+		session, err := gdal.OpenAttributeSession(source.Path, source.Encoding)
+		if err != nil {
+			if source.AllowUnavailable {
+				continue
+			}
+			return total, false, err
+		}
+		overviews, inspectErr := session.Inspect(ctx)
+		closeErr := session.Close()
+		if inspectErr != nil {
+			if source.AllowUnavailable {
+				continue
+			}
+			return total, false, inspectErr
+		}
+		if closeErr != nil {
+			if source.AllowUnavailable {
+				continue
+			}
+			return total, false, closeErr
+		}
+		for _, overview := range overviews {
+			if source.LayerName != "" && overview.Name != source.LayerName {
+				continue
+			}
+			if overview.FeatureCount < 0 {
+				unknownCount = true
+				continue
+			}
+			if overview.FeatureCount >= largeDatasetReadOnlyThreshold-total {
+				return largeDatasetReadOnlyThreshold, true, nil
+			}
+			total += overview.FeatureCount
+		}
+	}
+	return total, unknownCount, nil
+}
+
+func desktopAllowLargeEditable(args []string) bool {
+	for _, arg := range args {
+		if arg == "--editable-large" {
+			return true
+		}
+	}
+	return false
+}
 
 // A preview is only safe when metadata bounds and the eventual render CRS
 // describe the same coordinate space. Mixed-CRS layers need the full transform
@@ -502,7 +616,10 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		// GDAL pages on demand.
 		serviceLayers = layerMetadataOnly(layers)
 	}
-	loadedService := newLoadedProjectService(serviceLayers)
+	loadedService, err := newLoadedProjectService(serviceLayers)
+	if err != nil {
+		return nil, fmt.Errorf("create project service: %w", err)
+	}
 	layerStyleMu := &sync.RWMutex{}
 	mapLabels := make([]render.LayerLabel, 0)
 	for _, name := range layerNames {
@@ -807,6 +924,30 @@ func loadDataRuntimeFiles(ctx context.Context, paths []string, baseLayers []core
 	return loadDataRuntimeSources(ctx, sources, baseLayers, saveDestination)
 }
 
+func loadDataRuntimeFilesWithLargePolicy(ctx context.Context, paths []string, baseLayers []core.Layer, saveDestination string, allowLargeEditable bool) (*demoRuntime, bool, int, error) {
+	featureCount := 0
+	if len(baseLayers) == 0 && saveDestination == "" && !allowLargeEditable {
+		sources := make([]vectorSourceSpec, len(paths))
+		for index, path := range paths {
+			sources[index] = vectorSourceSpec{Path: path}
+		}
+		count, unknownCount, inspectErr := inspectSourceFeatureCount(ctx, sources)
+		featureCount = count
+		if inspectErr != nil {
+			if ctx.Err() != nil {
+				return nil, false, featureCount, ctx.Err()
+			}
+			unknownCount = true
+		}
+		if shouldOpenLargeDatasetReadOnly(featureCount, unknownCount, allowLargeEditable) {
+			runtime, err := loadReadOnlyDataRuntime(ctx, sources, "")
+			return runtime, true, featureCount, err
+		}
+	}
+	runtime, err := loadDataRuntimeFiles(ctx, paths, baseLayers, saveDestination)
+	return runtime, false, featureCount, err
+}
+
 func loadDataRuntimeSources(ctx context.Context, sources []vectorSourceSpec, baseLayers []core.Layer, saveDestination string) (*demoRuntime, error) {
 	return loadDataRuntimeSourcesWithCRS(ctx, sources, baseLayers, saveDestination, "")
 }
@@ -1021,7 +1162,21 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 		r.startWorkspaceLoad(paths[0])
 		return
 	}
+	paths = uniqueSourcePaths(paths)
+	if len(paths) == 0 {
+		native.SetRenderStatus("No vector files selected")
+		return
+	}
 	r.mu.Lock()
+	if r.loadCancel != nil {
+		r.mu.Unlock()
+		native.SetRenderStatus("A file load is already in progress")
+		return
+	}
+	loadContext, cancel := context.WithCancel(context.Background())
+	r.loadCancel = cancel
+	r.loadGeneration++
+	generation := r.loadGeneration
 	service := r.service
 	appendLayers := r.dataMode && service != nil
 	readOnly := r.readOnly
@@ -1036,42 +1191,90 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 		}
 	}
 	r.mu.Unlock()
+	native.SetRenderStatus(fmt.Sprintf("Loading %d vector file(s)", len(paths)))
 	var baseLayers []core.Layer
 	if appendLayers && !readOnly {
+		knownSources := make(map[string]struct{})
+		for _, layer := range service.ProjectLayerProperties() {
+			if layer.SourcePath != "" {
+				knownSources[normalizedSourcePath(layer.SourcePath)] = struct{}{}
+			}
+		}
+		filtered := paths[:0]
+		for _, path := range paths {
+			if _, exists := knownSources[normalizedSourcePath(path)]; !exists {
+				filtered = append(filtered, path)
+			}
+		}
+		paths = filtered
+		if len(paths) == 0 {
+			cancel()
+			r.mu.Lock()
+			if generation == r.loadGeneration {
+				r.loadCancel = nil
+			}
+			r.mu.Unlock()
+			native.SetRenderStatus("Selected source is already loaded")
+			return
+		}
+		// Clone feature data only after filtering duplicate paths. Project() is
+		// intentionally detached for callers that will rebuild the runtime.
 		baseLayers = service.Project().Layers
 	}
 	if appendLayers && readOnly && len(readOnlySources) == 0 {
+		cancel()
+		r.mu.Lock()
+		if generation == r.loadGeneration {
+			r.loadCancel = nil
+		}
+		r.mu.Unlock()
 		native.SetRenderStatus("Cannot add files until the read-only source is ready")
 		return
 	}
 	if readOnly {
+		knownSources := make(map[string]struct{}, len(readOnlySources))
+		for _, source := range readOnlySources {
+			knownSources[normalizedSourcePath(source.Path)] = struct{}{}
+		}
+		filtered := paths[:0]
+		for _, path := range paths {
+			if _, exists := knownSources[normalizedSourcePath(path)]; !exists {
+				filtered = append(filtered, path)
+			}
+		}
+		paths = filtered
+		if len(paths) == 0 {
+			cancel()
+			r.mu.Lock()
+			if generation == r.loadGeneration {
+				r.loadCancel = nil
+			}
+			r.mu.Unlock()
+			native.SetRenderStatus("Selected source is already loaded")
+			return
+		}
 		for _, path := range paths {
 			readOnlySources = append(readOnlySources, vectorSourceSpec{Path: path})
 		}
 	}
-	loadContext, cancel := context.WithCancel(context.Background())
-	r.mu.Lock()
-	previousCancel := r.loadCancel
-	r.loadCancel = cancel
-	r.loadGeneration++
-	generation := r.loadGeneration
-	r.mu.Unlock()
-	if previousCancel != nil {
-		previousCancel()
-	}
 	native.BeginLoadTrace()
-	native.SetRenderStatus(fmt.Sprintf("Loading %d vector file(s)", len(paths)))
 	go func() {
 		var next *demoRuntime
 		var err error
+		largeReadOnly := false
+		featureCount := 0
 		if readOnly {
 			next, err = loadReadOnlyDataRuntime(loadContext, readOnlySources, displayCRS)
 		} else {
-			next, err = loadDataRuntimeFiles(loadContext, paths, baseLayers, saveDestination)
+			if !appendLayers && saveDestination == "" && !r.allowLargeEditable {
+				native.SetRenderStatus("Loading: checking feature count")
+			}
+			next, largeReadOnly, featureCount, err = loadDataRuntimeFilesWithLargePolicy(
+				loadContext, paths, baseLayers, saveDestination, r.allowLargeEditable)
 		}
 		r.mu.Lock()
 		current := generation == r.loadGeneration
-		if current {
+		if current && err != nil {
 			r.loadCancel = nil
 		}
 		r.mu.Unlock()
@@ -1092,17 +1295,25 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			}
 		}
 		r.replaceWithLoaded(next, generation)
+		if largeReadOnly {
+			native.SetRenderStatus(largeDatasetReadOnlyStatus(featureCount))
+		}
 	}()
 }
 
 func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveDestination string) (*demoRuntime, error) {
+	runtime, _, _, err := loadWorkspaceRuntimeWithLargePolicy(ctx, path, readOnly, saveDestination, false)
+	return runtime, err
+}
+
+func loadWorkspaceRuntimeWithLargePolicy(ctx context.Context, path string, readOnly bool, saveDestination string, allowLargeEditable bool) (*demoRuntime, bool, int, error) {
 	doc, err := workspace.Load(path)
 	if err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
 	project, err := doc.Project()
 	if err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
 	sources := make([]vectorSourceSpec, len(project.Layers))
 	for index, layer := range project.Layers {
@@ -1118,6 +1329,20 @@ func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveD
 			Visible: &visible, Style: layer.Style, Labels: layer.Labels,
 		}
 	}
+	largeReadOnly := false
+	featureCount := 0
+	if !readOnly && saveDestination == "" && !allowLargeEditable {
+		count, unknownCount, inspectErr := inspectSourceFeatureCount(ctx, sources)
+		featureCount = count
+		if inspectErr != nil {
+			if ctx.Err() != nil {
+				return nil, false, featureCount, ctx.Err()
+			}
+			unknownCount = true
+		}
+		largeReadOnly = shouldOpenLargeDatasetReadOnly(featureCount, unknownCount, allowLargeEditable)
+		readOnly = largeReadOnly
+	}
 	var runtime *demoRuntime
 	if readOnly {
 		runtime, err = loadReadOnlyDataRuntime(ctx, sources, project.CRS.AuthorityCode)
@@ -1125,7 +1350,7 @@ func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveD
 		runtime, err = loadDataRuntimeSourcesWithCRS(ctx, sources, nil, saveDestination, project.CRS.AuthorityCode)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load workspace sources: %w", err)
+		return nil, largeReadOnly, featureCount, fmt.Errorf("load workspace sources: %w", err)
 	}
 	if runtime.service != nil {
 		runtime.service.SetProjectInfo(project.Name, project.CRS)
@@ -1136,28 +1361,30 @@ func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveD
 		runtime.workspaceView = &view
 	}
 	runtime.readOnlyDisplayCRS = project.CRS.AuthorityCode
-	return runtime, nil
+	return runtime, largeReadOnly, featureCount, nil
 }
 
 func (r *demoRuntime) startWorkspaceLoad(path string) {
 	r.mu.Lock()
+	if r.loadCancel != nil {
+		r.mu.Unlock()
+		native.SetRenderStatus("A file load is already in progress")
+		return
+	}
 	readOnly := r.readOnly
 	saveDestination := r.saveDestination
-	previousCancel := r.loadCancel
 	ctx, cancel := context.WithCancel(context.Background())
 	r.loadCancel = cancel
 	r.loadGeneration++
 	generation := r.loadGeneration
 	r.mu.Unlock()
-	if previousCancel != nil {
-		previousCancel()
-	}
 	native.SetRenderStatus("Loading workspace " + filepath.Base(path))
 	go func() {
-		next, err := loadWorkspaceRuntime(ctx, path, readOnly, saveDestination)
+		next, largeReadOnly, featureCount, err := loadWorkspaceRuntimeWithLargePolicy(
+			ctx, path, readOnly, saveDestination, r.allowLargeEditable)
 		r.mu.Lock()
 		current := generation == r.loadGeneration
-		if current {
+		if current && err != nil {
 			r.loadCancel = nil
 		}
 		r.mu.Unlock()
@@ -1179,6 +1406,8 @@ func (r *demoRuntime) startWorkspaceLoad(path string) {
 		r.replaceWithLoaded(next, generation)
 		if len(warningNames) > 0 {
 			native.SetRenderStatus("Workspace loaded; relink unavailable layers: " + strings.Join(warningNames, ", "))
+		} else if largeReadOnly {
+			native.SetRenderStatus(largeDatasetReadOnlyStatus(featureCount))
 		} else {
 			native.SetRenderStatus("Workspace loaded " + filepath.Base(path))
 		}
@@ -1387,22 +1616,10 @@ func desktopInputArgs(args []string) (string, string, string, string) {
 	return input, layer, sourceCRS, targetCRS
 }
 
-func newLoadedProjectService(layers []core.Layer) *commands.ProjectService {
-	if len(layers) == 0 {
-		return commands.NewProjectService("loaded", core.CRS{})
+func newLoadedProjectService(layers []core.Layer) (*commands.ProjectService, error) {
+	crs := core.CRS{}
+	if len(layers) > 0 {
+		crs = layers[0].CRS
 	}
-	service := commands.NewProjectService("loaded", layers[0].CRS)
-	if err := service.BeginEdit(); err != nil {
-		return service
-	}
-	for _, layer := range layers {
-		if err := service.AddLayer(layer); err != nil {
-			_ = service.Rollback()
-			return service
-		}
-	}
-	if err := service.Commit(); err != nil {
-		_ = service.Rollback()
-	}
-	return service
+	return commands.NewProjectServiceWithLayers("loaded", crs, layers)
 }

@@ -93,6 +93,7 @@ type demoRuntime struct {
 	hasSelect                   bool
 	selectionGeneration         uint64
 	selectionCancel             context.CancelFunc
+	allowLargeEditable          bool
 }
 
 type vectorSourceSpec struct {
@@ -775,10 +776,24 @@ func (r *demoRuntime) featureName(layerName string, featureID uint64) string {
 
 func (r *demoRuntime) cancelCurrentRender() {
 	r.mu.Lock()
-	cancel := r.cancel
+	renderCancel := r.cancel
+	loadCancel := r.loadCancel
+	loading := loadCancel != nil
+	if loading {
+		r.loadGeneration++
+		r.loadCancel = nil
+		r.previewLoading = false
+	}
 	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if renderCancel != nil {
+		renderCancel()
+	}
+	if loadCancel != nil {
+		loadCancel()
+	}
+	if loading {
+		native.SetRenderStatus("Loading cancelled")
+	} else if renderCancel != nil {
 		native.SetRenderStatus("Render cancelled")
 	}
 }

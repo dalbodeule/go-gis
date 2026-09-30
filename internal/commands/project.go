@@ -46,6 +46,25 @@ func NewProjectService(name string, crs core.CRS) *ProjectService {
 	return &ProjectService{project: &project}
 }
 
+// NewProjectServiceWithLayers adopts loader-owned layer snapshots without
+// cloning every feature geometry and property map. The caller must not mutate
+// the supplied layers after the call; ProjectService owns their feature data.
+func NewProjectServiceWithLayers(name string, crs core.CRS, layers []core.Layer) (*ProjectService, error) {
+	ownedLayers := append([]core.Layer(nil), layers...)
+	seen := make(map[string]struct{}, len(ownedLayers))
+	for _, layer := range ownedLayers {
+		if layer.Name == "" {
+			return nil, errors.New("layer name is required")
+		}
+		if _, exists := seen[layer.Name]; exists {
+			return nil, fmt.Errorf("%w: %s", ErrLayerExists, layer.Name)
+		}
+		seen[layer.Name] = struct{}{}
+	}
+	project := core.Project{Name: name, CRS: crs, Layers: ownedLayers}
+	return &ProjectService{project: &project}, nil
+}
+
 // Project returns the committed project snapshot.
 func (s *ProjectService) Project() core.Project {
 	return s.project.Clone()

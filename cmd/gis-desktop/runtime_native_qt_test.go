@@ -22,6 +22,94 @@ import (
 	"github.com/airbusgeo/godal"
 )
 
+func TestUniqueSourcePathsRemovesRepeatedFiles(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "roads.gpkg")
+	got := uniqueSourcePaths([]string{path, filepath.Join(directory, ".", "roads.gpkg"), "", "   "})
+	if len(got) != 1 || normalizedSourcePath(got[0]) != normalizedSourcePath(path) {
+		t.Fatalf("unique source paths = %v, want one normalized %q", got, path)
+	}
+}
+
+func TestLargeDatasetReadOnlyThresholdAndOverride(t *testing.T) {
+	if !shouldOpenLargeDatasetReadOnly(largeDatasetReadOnlyThreshold, false, false) {
+		t.Fatal("dataset at threshold was not selected for read-only mode")
+	}
+	if !shouldOpenLargeDatasetReadOnly(0, true, false) {
+		t.Fatal("dataset with unknown feature count was not selected for read-only mode")
+	}
+	if shouldOpenLargeDatasetReadOnly(largeDatasetReadOnlyThreshold, false, true) {
+		t.Fatal("--editable-large override did not preserve editable mode")
+	}
+	if !desktopAllowLargeEditable([]string{"gogis-desktop-native", "--editable-large"}) {
+		t.Fatal("--editable-large was not recognized")
+	}
+}
+
+func TestDatasetPreflightDetectsLargeFeatureCount(t *testing.T) {
+	path := largeGeoJSONFixture(t, largeDatasetReadOnlyThreshold+3)
+	count, large, err := inspectSourceFeatureCount(context.Background(), []vectorSourceSpec{{Path: path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !large || count != largeDatasetReadOnlyThreshold {
+		t.Fatalf("preflight count/large = %d/%t, want threshold/%t", count, large, true)
+	}
+
+	runtime, autoReadOnly, count, err := loadDataRuntimeFilesWithLargePolicy(
+		context.Background(), []string{path}, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !autoReadOnly || !runtime.readOnly || count != largeDatasetReadOnlyThreshold {
+		t.Fatalf("large load policy = read-only:%t runtime:%t count:%d", autoReadOnly, runtime.readOnly, count)
+	}
+	if names := runtime.service.LayerNames(); len(names) != 1 {
+		t.Fatalf("loaded layer names = %v", names)
+	} else {
+		page, total, pageErr := runtime.attributePageReader(context.Background(), names[0], 0, 1)
+		if pageErr != nil {
+			t.Fatal(pageErr)
+		}
+		if total != largeDatasetReadOnlyThreshold+3 || len(page.Features) != 1 || page.Features[0].Properties["name"] != "point-0" {
+			t.Fatalf("lazy attribute page total/features = %d/%v", total, page.Features)
+		}
+	}
+
+	workspacePath := filepath.Join(t.TempDir(), "large.gogis")
+	doc := workspace.FromProject(core.Project{
+		Name: "large", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Layers: []core.Layer{{Name: "large", SourcePath: path, SourceLayerName: "large",
+			SourceCRS: "EPSG:4326", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Visible: true,
+			Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}},
+	})
+	if err := workspace.Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	workspaceRuntime, workspaceAutoReadOnly, workspaceCount, err := loadWorkspaceRuntimeWithLargePolicy(
+		context.Background(), workspacePath, false, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspaceRuntime.closeAttributeSource()
+	if !workspaceAutoReadOnly || !workspaceRuntime.readOnly || workspaceCount != largeDatasetReadOnlyThreshold {
+		t.Fatalf("large workspace policy = read-only:%t runtime:%t count:%d", workspaceAutoReadOnly, workspaceRuntime.readOnly, workspaceCount)
+	}
+}
+
+func TestCancelCurrentOperationCancelsLoadAndInvalidatesResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := &demoRuntime{loadCancel: cancel, loadGeneration: 4, previewLoading: true}
+	runtime.cancelCurrentRender()
+	if ctx.Err() == nil {
+		t.Fatal("load context was not cancelled")
+	}
+	if runtime.loadCancel != nil || runtime.loadGeneration != 5 || runtime.previewLoading {
+		t.Fatalf("cancelled load state = cancel:%v generation:%d preview:%v", runtime.loadCancel != nil, runtime.loadGeneration, runtime.previewLoading)
+	}
+}
+
 func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 	godal.RegisterAll()
 	path := filepath.Join(t.TempDir(), "layers.gpkg")
@@ -313,6 +401,9 @@ func TestWorkspaceReopensOriginalSourcesAndLayerSettings(t *testing.T) {
 	if got := len(reopened.service.LayerNames()); got != 2 {
 		t.Fatalf("workspace layer count = %d, want both loaded and missing layers", got)
 	}
+	if reopened.readOnly {
+		t.Fatal("an unavailable, empty workspace source incorrectly forced read-only mode")
+	}
 	readOnly, err := loadWorkspaceRuntime(context.Background(), workspacePath, true, "")
 	if err != nil {
 		t.Fatal(err)
@@ -366,10 +457,13 @@ func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	labels.HeightMM = 2.5
 	labels.MinScale = 1000
 	labels.MaxScale = 50000
-	service := newLoadedProjectService([]core.Layer{{
+	service, err := newLoadedProjectService([]core.Layer{{
 		Name: "roads", DisplayName: "roads", SourcePath: "roads.shp", SourceLayerName: "roads",
 		Visible: true, Style: style, Labels: core.DefaultLabelSettings(),
 	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	runtime := &demoRuntime{
 		service: service, visibleLayers: map[string]bool{"roads": true},
 		visibility:  render.NewLayerVisibility("roads"),
@@ -600,12 +694,16 @@ func TestLargeReadOnlyLoadPublishesStablePreview(t *testing.T) {
 }
 
 func largeReadOnlyFixture(tb testing.TB) string {
+	return largeGeoJSONFixture(tb, previewMinimumFeatures)
+}
+
+func largeGeoJSONFixture(tb testing.TB, featureCount int) string {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "large.geojson")
 	var fixture strings.Builder
-	fixture.Grow(previewMinimumFeatures * 100)
+	fixture.Grow(featureCount * 100)
 	fixture.WriteString(`{"type":"FeatureCollection","features":[`)
-	for index := 0; index < previewMinimumFeatures; index++ {
+	for index := 0; index < featureCount; index++ {
 		if index > 0 {
 			fixture.WriteByte(',')
 		}
