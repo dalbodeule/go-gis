@@ -43,6 +43,7 @@ func main() {
 type demoRuntime struct {
 	scheduler                   *render.Scheduler
 	batchStore                  *render.BatchStore
+	publishedRevision           uint64
 	planner                     render.ChunkPlanner
 	visibility                  *render.LayerVisibility
 	visibleLayers               map[string]bool
@@ -321,6 +322,13 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	builder := r.builder
 	planner := r.planner
 	visibility := r.visibility
+	renderStage := 0
+	if r.dataMode {
+		renderStage = 2
+		if r.previewLoading {
+			renderStage = 1
+		}
+	}
 	r.mu.Unlock()
 	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)
 	keys := keyBuffer.Keys
@@ -331,6 +339,11 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	generation := scheduler.Generation()
 	batchStore.BeginGeneration(generation, keys...)
 	r.mu.Lock()
+	if r.scheduler != scheduler {
+		r.mu.Unlock()
+		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
+		return
+	}
 	previousCancel := r.cancel
 	r.cancel = nil
 	if !r.dataMode {
@@ -343,11 +356,19 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		previousCancel()
 	}
 	if len(keys) == 0 {
+		r.mu.Lock()
+		if r.scheduler != scheduler {
+			r.mu.Unlock()
+			scheduler.ReleaseChunkKeyBuffer(keyBuffer)
+			return
+		}
 		native.SetRenderStatus("No visible layers")
 		batchStore.Clear()
 		native.SetVertices(nil)
 		native.RequestCanvasUpdate()
+		r.publishedRevision = batchStore.Revision()
 		native.SetSelection("", "", "", "No feature selected")
+		r.mu.Unlock()
 		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		return
 	}
@@ -355,6 +376,12 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	requestContext, cancel := context.WithCancel(ctx)
 	requestGeneration := generation
 	r.mu.Lock()
+	if r.scheduler != scheduler {
+		r.mu.Unlock()
+		cancel()
+		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
+		return
+	}
 	r.cancel = cancel
 	r.mu.Unlock()
 	lastProgress := time.Time{}
@@ -396,11 +423,17 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				r.mu.Unlock()
 				return
 			}
-			currentGeneration, vertices := batchStore.CurrentInto(publishScratch)
+			if batchStore.Revision() == r.publishedRevision {
+				dirty = false
+				r.mu.Unlock()
+				return
+			}
+			currentGeneration, revision, vertices := batchStore.CurrentIntoVersion(publishScratch)
 			publishScratch = vertices
 			if currentGeneration == requestGeneration && requestContext.Err() == nil {
-				native.SetVertices(publishScratch)
+				native.SetVerticesStage(publishScratch, renderStage)
 				native.RequestCanvasUpdate()
+				r.publishedRevision = revision
 				dirty = false
 				lastPublish = time.Now()
 			}
@@ -720,7 +753,7 @@ func startViewportSync(runtime *demoRuntime) {
 					lastLayerVisibilityGeneration = layerVisibilityGeneration
 					applyLayerVisibility(runtime, native.CurrentLayerVisibility())
 				}
-				runtime.scheduler.AdvanceGeneration()
+				runtime.advanceRenderGeneration()
 				width, height := viewport.Width, viewport.Height
 				if width <= 0 {
 					width = 1
@@ -773,18 +806,34 @@ func startViewportSync(runtime *demoRuntime) {
 	}()
 }
 
+func (r *demoRuntime) advanceRenderGeneration() {
+	r.mu.Lock()
+	r.scheduler.AdvanceGeneration()
+	r.mu.Unlock()
+}
+
 func applyLayerVisibility(runtime *demoRuntime, payload string) {
 	var visibility map[string]bool
 	if err := json.Unmarshal([]byte(payload), &visibility); err != nil {
 		return
 	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	var visibleSnapshot map[string]bool
 	for layer, visible := range visibility {
 		if runtime.visibility.IsVisible(layer) != visible {
 			if runtime.visibility.Set(layer, visible) {
-				runtime.mu.Lock()
-				runtime.visibleLayers[layer] = visible
-				runtime.mu.Unlock()
+				if visibleSnapshot == nil {
+					visibleSnapshot = make(map[string]bool, len(runtime.visibleLayers))
+					for name, state := range runtime.visibleLayers {
+						visibleSnapshot[name] = state
+					}
+				}
+				visibleSnapshot[layer] = visible
 			}
 		}
+	}
+	if visibleSnapshot != nil {
+		runtime.visibleLayers = visibleSnapshot
 	}
 }

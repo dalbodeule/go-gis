@@ -21,16 +21,28 @@ func RegisterMapCanvas() {
 	C.gogis_register_qml_types()
 }
 
+// BeginLoadTrace starts optional GOGIS_PERF=1 diagnostics. The C++ bridge
+// timestamps vertex publication and scene-graph geometry updates from here.
+func BeginLoadTrace() {
+	C.gogis_trace_load_start()
+}
+
 // SetVertices copies normalized XY positions into the C++ scene-graph bridge.
 // Vertex contains only numeric fields, so C++ can read its stable 12-byte
 // layout synchronously and copy only XY. The C++ side owns the copy after the
 // call returns and does not retain the Go pointer.
 func SetVertices(vertices []render.Vertex) {
+	SetVerticesStage(vertices, 0)
+}
+
+// SetVerticesStage labels a batch for optional load-to-scene-graph timing:
+// 0=demo, 1=preview, 2=full dataset.
+func SetVerticesStage(vertices []render.Vertex, stage int) {
 	if len(vertices) == 0 {
 		C.gogis_set_vertices(nil, 0)
 		return
 	}
-	C.gogis_set_vertices_vertex_layout(unsafe.Pointer(&vertices[0]), C.int(len(vertices)))
+	C.gogis_set_vertices_vertex_layout_stage(unsafe.Pointer(&vertices[0]), C.int(len(vertices)), C.int(stage))
 }
 
 // ViewportGeneration returns the generation raised by QML pan/zoom changes.

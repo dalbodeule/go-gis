@@ -1201,10 +1201,53 @@ count를 제공하고, prefix는 이후 전체 읽기와 같은 read-order featu
 사용한다. GeoPackage 10K point benchmark에서 overview+첫 1,000개 geometry는
 약 1.27ms/133KB/7,017 allocations였고, retained 전체 10K geometry는
 약 7.03ms/1.32MB/70,010 allocations였다. GDAL open+Bounds는 같은 파일에서
-약 2.54ms로 open-only 약 2.11ms보다 약 0.43ms 더 걸렸다. 이 수치는 preview
-native read만 비교하며 아직 Qt UI에 연결되지 않았다. 다음 단계는 전체 dataset
-bounds를 유지하는 render normalization, preview→full 교체의 취소/소유권 계약,
-그리고 feature 수가 큰 입력에만 preview를 쓰는 정책을 검증하는 것이다.
+약 2.54ms로 open-only 약 2.11ms보다 약 0.43ms 더 걸렸다.
+
+Qt read-only 로더는 이제 50,000개 이상의 feature가 있고 모든 대상 레이어의
+bounds·count가 유효하며 표시 CRS가 같은 경우, 레이어당 최대 2,000개를 먼저
+보여준다. 많은 소형 레이어에서 prefix 총량이 전체 feature의 절반을 넘으면
+미리보기가 중복 full read가 되는 것을 피하기 위해 생략한다. 전체 extent로
+prefix와 full snapshot을 정규화해 지도 위치가 교체
+중 이동하지 않으며, preview는 GDAL attribute session을 소유하지 않는다.
+혼합 CRS나 표시 CRS 변환이 필요한 경우에는 잘못된 bounds를 추정하지 않고
+기존 전체 로드 경로를 사용한다. 같은 Apple M3에서 50K GeoJSON point의
+전체 로드는 약 182~184ms/18.9MB, preview 경로는 첫 preview 생성까지 약
+104ms, 전체 완료까지 약 200~201ms/19.7MB였다(각 5회, 2회 반복).
+첫 preview 준비는 약 43% 빨랐지만 전체 완료 시간은 약 9% 늘었다.
+이는 실제 Qt 첫 paint 시각이 아닌 Go loader callback 시각이며, 큰 실제
+파일 및 Windows에서 화면 표시 시간과 메모리를 별도로 확인해야 한다.
+preview→full 전환 중 viewport polling이 교체 가능한 scheduler와 visibility를
+락 없이 참조하던 경로도 함께 수정했다. 레이어 표시 상태는 hit-test가 보유한
+이전 map snapshot을 변경하지 않도록 copy-on-write로 갱신한다. Qt race
+테스트에서 병렬 scheduler 교체·viewport 상태 변경을 반복 검증했다.
+
+동일 viewport/key의 캐시 재방문은 이전에는 변경되지 않은 chunk를 다시
+flatten하고 Qt bridge에 복사해 scene graph geometry를 반복 갱신했다.
+`BatchStore`에 visible order/immutable chunk backing 기준 content revision을
+추가하고, 마지막 게시 revision과 같으면 flatten·C++ 복사를 생략한다.
+Apple M3의 100K vertex 반복 캐시 마이크로벤치마크에서 기존 flatten은
+약 24.6~26.3µs, revision-skip은 약 51~54ns였다. `GOGIS_PERF=1`로
+작은 샘플을 오프스크린 실행하면 시작 직후 동일 34 vertex의 게시·scenegraph
+반영이 여러 번 발생하던 것이 각각 한 번으로 줄었다. 이 수치는 반복 게시
+경로만의 비용이며 대용량 파일의 실제 첫 화면 시간 개선율은 아직 아니다.
+Qt bridge 단에서 `memcmp`로 동일 vertex 배열을 판별하는 대안은 100K
+vertex 반복 호출을 기존 약 25~36µs에서 약 40~56µs로 악화시켜 제거했다.
+
+실제 Qt scene graph 경로를 확인하기 위해 재배포 가능한 sample 선형 feature를
+GDAL SQLite recursive query로 50,000회 반복한 임시 GeoPackage를 만들었다.
+Apple M3 오프스크린 software backend 단일 실행에서 `GOGIS_PERF=1` 계측은
+미리보기 52,000 vertices를 17.2ms에 게시하고 33.2ms에 scene graph에
+반영했으며, 전체 1,300,000 vertices는 92.8ms 게시·102.7ms 반영을
+기록했다. 같은 파일을 `GOGIS_DISABLE_PREVIEW=1`로 실행한 기준값은
+전체 데이터가 91.9ms 게시·101.8ms scene graph 반영이었다. 즉 이 입력에서
+첫 실제 데이터 geometry의 scene graph 도달은 약 68.6ms 앞당겨졌다.
+추가 교차 3회 측정에서 미리보기 첫 scene graph 반영은 29.4~41.6ms,
+미리보기 없는 전체 데이터는 92.5~108.3ms로, 같은 순서의 쌍 비교에서
+약 59.5~78.9ms 앞섰다. 미리보기 포함 전체 완료는 95.6~105.3ms,
+미사용은 92.5~108.3ms로 총 완료 시간 차이는 실행 변동 범위 안이었다.
+startup demo 배치는 입력 파일 데이터가 아니므로 첫 데이터 표시 시간에서
+제외했다. 오프스크린 scene graph 반영은 화면 present 완료가 아니며,
+Windows 실제 파일의 지연과 메모리는 별도로 검증해야 한다.
 
 ## 다음 단계
 

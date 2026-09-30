@@ -154,6 +154,40 @@ func TestBatchStoreSameVisibleKeysOnlyUpdatesGeneration(t *testing.T) {
 	}
 }
 
+func TestBatchStoreRevisionSkipsIdenticalImmutableBatch(t *testing.T) {
+	store := NewBatchStore()
+	first := ChunkKey{Layer: "roads", X: 0}
+	second := ChunkKey{Layer: "roads", X: 1}
+	vertices := []Vertex{{X: 1, Y: 2}}
+	store.BeginGeneration(1, first, second)
+	initialRevision := store.Revision()
+	if !store.ApplyImmutable(ChunkResult{Key: first, Generation: 1, Chunk: Chunk{Vertices: vertices}}) {
+		t.Fatal("first immutable chunk was rejected")
+	}
+	loadedRevision := store.Revision()
+	if loadedRevision <= initialRevision {
+		t.Fatal("new chunk did not change the batch revision")
+	}
+	store.BeginGeneration(2, first, second)
+	if store.Revision() != loadedRevision {
+		t.Fatal("identical visible order changed the batch revision")
+	}
+	if !store.ApplyImmutable(ChunkResult{Key: first, Generation: 2, Chunk: Chunk{Vertices: vertices}}) {
+		t.Fatal("cached immutable chunk was rejected")
+	}
+	if store.Revision() != loadedRevision {
+		t.Fatal("identical cached backing changed the batch revision")
+	}
+	_, copiedRevision, copied := store.CurrentIntoVersion(nil)
+	if copiedRevision != loadedRevision || len(copied) != 1 || copied[0] != vertices[0] {
+		t.Fatalf("copied batch revision=%d vertices=%v", copiedRevision, copied)
+	}
+	store.BeginGeneration(3, second, first)
+	if store.Revision() <= loadedRevision {
+		t.Fatal("changed draw order did not change the batch revision")
+	}
+}
+
 func TestSchedulerDoesNotCacheStaleWork(t *testing.T) {
 	scheduler := NewScheduler()
 	key := ChunkKey{Layer: "buildings", ZoomBucket: 8, X: 1, Y: 1}

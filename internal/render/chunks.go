@@ -67,6 +67,7 @@ type BatchStore struct {
 	knownKeys    map[ChunkKey]uint64
 	visibleEpoch uint64
 	vertexCount  int
+	revision     uint64
 }
 
 type orderedPosition struct {
@@ -98,6 +99,7 @@ func (s *BatchStore) BeginGeneration(generation uint64, visible ...ChunkKey) boo
 		if sameChunkKeyOrder(s.orderedKeys, visible) {
 			return true
 		}
+		s.revision++
 		s.visibleEpoch++
 		if s.visibleEpoch == 0 {
 			// Epoch wraparound is practically unreachable, but resetting the
@@ -158,6 +160,14 @@ func (s *BatchStore) Generation() uint64 {
 	return s.generation
 }
 
+// Revision changes only when visible batch content or its draw order changes.
+// A new viewport generation with identical cached geometry retains its revision.
+func (s *BatchStore) Revision() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.revision
+}
+
 // Apply installs a result only when it belongs to the active generation.
 func (s *BatchStore) Apply(result ChunkResult) bool {
 	return s.apply(result, true)
@@ -182,10 +192,17 @@ func (s *BatchStore) apply(result ChunkResult, cloneVertices bool) bool {
 	}
 	previousCount := len(s.chunks[result.Key])
 	vertices := result.Chunk.Vertices
+	if !cloneVertices {
+		if previous, exists := s.chunks[result.Key]; exists && len(previous) == len(vertices) &&
+			(len(vertices) == 0 || &previous[0] == &vertices[0]) {
+			return true
+		}
+	}
 	if cloneVertices {
 		vertices = append([]Vertex(nil), vertices...)
 	}
 	s.chunks[result.Key] = vertices
+	s.revision++
 	s.vertexCount += len(vertices) - previousCount
 	if position, exists := s.orderedIndex[result.Key]; exists && position.epoch == s.visibleEpoch {
 		s.orderedVerts[position.index] = vertices
@@ -210,6 +227,12 @@ func (s *BatchStore) Current() (uint64, []Vertex) {
 // The returned slice remains caller-owned and is safe to pass to a synchronous
 // adapter such as the Qt bridge.
 func (s *BatchStore) CurrentInto(dst []Vertex) (uint64, []Vertex) {
+	generation, _, vertices := s.CurrentIntoVersion(dst)
+	return generation, vertices
+}
+
+// CurrentIntoVersion also returns the content revision of the copied batch.
+func (s *BatchStore) CurrentIntoVersion(dst []Vertex) (uint64, uint64, []Vertex) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if cap(dst) < s.vertexCount {
@@ -220,7 +243,7 @@ func (s *BatchStore) CurrentInto(dst []Vertex) (uint64, []Vertex) {
 	for _, vertices := range s.orderedVerts {
 		dst = append(dst, vertices...)
 	}
-	return s.generation, dst
+	return s.generation, s.revision, dst
 }
 
 // Clear removes all currently retained chunks. The generation itself is kept
@@ -228,6 +251,9 @@ func (s *BatchStore) CurrentInto(dst []Vertex) (uint64, []Vertex) {
 func (s *BatchStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.orderedKeys) > 0 || s.vertexCount > 0 {
+		s.revision++
+	}
 	s.chunks = make(map[ChunkKey][]Vertex)
 	s.orderedKeys = nil
 	s.orderedVerts = nil

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gogis/drivers/gdal"
 	"gogis/internal/render"
@@ -113,4 +114,40 @@ func BenchmarkDesktopReadOnlyLoadGeoJSON10K(b *testing.B) {
 		}
 		runtime.closeAttributeSource()
 	}
+}
+
+func BenchmarkDesktopReadOnlyLoadGeoJSON50K(b *testing.B) {
+	path := largeReadOnlyFixture(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		runtime, err := loadDataRuntimeModeContext(context.Background(), path, "", "", "", "", true)
+		if err != nil {
+			b.Fatal(err)
+		}
+		runtime.closeAttributeSource()
+	}
+}
+
+func BenchmarkDesktopReadOnlyPreviewGeoJSON50K(b *testing.B) {
+	path := largeReadOnlyFixture(b)
+	var previewElapsed time.Duration
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		start := time.Now()
+		seenPreview := false
+		runtime, err := loadDataRuntimeModeContextWithPreview(context.Background(), path, "", "", "", "", true, func(preview *demoRuntime) {
+			seenPreview = true
+			previewElapsed += time.Since(start)
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		runtime.closeAttributeSource()
+		if !seenPreview {
+			b.Fatal("large dataset did not publish a preview")
+		}
+	}
+	b.ReportMetric(float64(previewElapsed.Microseconds())/1000/float64(b.N), "first-preview-ms/op")
 }

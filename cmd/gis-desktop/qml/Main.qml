@@ -97,9 +97,10 @@ ApplicationWindow {
 
                 function formatAttributeValues(values) {
                     var parts = []
+                    var rowValues = (values && typeof values === "object") ? values : {}
                     for (var i = 0; i < attributeColumns.length; ++i) {
                         var key = attributeColumns[i]
-                        var value = values[key]
+                        var value = rowValues[key]
                         parts.push(key + "=" + (value === undefined || value === null ? "" : String(value)))
                     }
                     return parts.join(" · ")
@@ -223,27 +224,27 @@ ApplicationWindow {
                     property real lastX: 0
                     property real lastY: 0
 
-                    onPressed: {
-                        lastX = mouseX
-                        lastY = mouseY
+                    onPressed: function(mouse) {
+                        lastX = mouse.x
+                        lastY = mouse.y
                     }
-                    onPositionChanged: {
+                    onPositionChanged: function(mouse) {
                         if (!pressed) return
-                        mapViewport.panX += mouseX - lastX
-                        mapViewport.panY += mouseY - lastY
-                        lastX = mouseX
-                        lastY = mouseY
+                        mapViewport.panX += mouse.x - lastX
+                        mapViewport.panY += mouse.y - lastY
+                        lastX = mouse.x
+                        lastY = mouse.y
                         mapViewport.viewportGeneration += 1
                     }
-                    onWheel: {
+                    onWheel: function(wheel) {
                         var factor = wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15
                         mapViewport.mapZoom = Math.max(0.25, Math.min(8.0, mapViewport.mapZoom * factor))
                         mapViewport.viewportGeneration += 1
                     }
-                    onClicked: {
+                    onClicked: function(mouse) {
                         if (!mapViewport.mapZoom) return
-                        mapCanvas.clickX = mouseX
-                        mapCanvas.clickY = mouseY
+                        mapCanvas.clickX = mouse.x
+                        mapCanvas.clickY = mouse.y
                         mapCanvas.clickGeneration += 1
                     }
                 }
@@ -379,9 +380,9 @@ ApplicationWindow {
                     delegate: RowLayout {
                         width: ListView.view.width
                         spacing: 6
-                        Label { text: String(featureId); Layout.preferredWidth: 92; elide: Text.ElideRight }
+                        Label { text: String(model.featureId); Layout.preferredWidth: 92; elide: Text.ElideRight }
                         Label {
-                            text: mapViewport.formatAttributeValues(values)
+                            text: mapViewport.formatAttributeValues(model.values)
                             Layout.fillWidth: true
                             elide: Text.ElideRight
                         }

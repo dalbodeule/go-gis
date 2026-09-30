@@ -10,6 +10,9 @@
 #include <QtQml/qqml.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -26,7 +29,9 @@ struct GoGISVertex {
 };
 static_assert(sizeof(GoGISVertex) == 12, "unexpected Go vertex layout");
 std::vector<GoGISVertex> g_vertices;
+int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
+std::atomic<long long> g_perf_load_started_ns{0};
 std::atomic<unsigned long long> g_viewport_generation{0};
 std::atomic<double> g_pan_x{0};
 std::atomic<double> g_pan_y{0};
@@ -70,6 +75,44 @@ std::string g_selection_status;
 std::atomic<unsigned long long> g_selection_generation{0};
 std::mutex g_canvas_mutex;
 QQuickItem* g_canvas = nullptr;
+
+long long steady_nanoseconds() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool perf_trace_enabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("GOGIS_PERF");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+const char* stage_name(int stage) {
+    switch (stage) {
+    case 1:
+        return "preview";
+    case 2:
+        return "full";
+    default:
+        return "demo";
+    }
+}
+
+void trace_load_event(const char* event, int stage, size_t vertex_count) {
+    if (!perf_trace_enabled()) {
+        return;
+    }
+    const auto start = g_perf_load_started_ns.load(std::memory_order_relaxed);
+    if (start == 0) {
+        return;
+    }
+    const double elapsed_ms = static_cast<double>(steady_nanoseconds() - start) / 1'000'000.0;
+    std::fprintf(stderr, "GoGIS perf: %s stage=%s %.1fms vertices=%zu\n",
+                 event, stage_name(stage), elapsed_ms, vertex_count);
+}
 
 void update_viewport_snapshot(const QQuickItem* item) {
     g_pan_x.store(item->x(), std::memory_order_relaxed);
@@ -224,6 +267,7 @@ protected:
                     };
                 }
                 rendered_generation_ = source_generation;
+                rendered_stage_ = g_vertices_stage;
                 rendered_width_ = width;
                 rendered_height_ = height;
                 geometry_changed = true;
@@ -232,6 +276,9 @@ protected:
         if (geometry_changed) {
             geometry_.setDrawingMode(QSGGeometry::DrawLines);
             node->markDirty(QSGNode::DirtyGeometry);
+            if (rendered_vertex_count_ > 0) {
+                trace_load_event("scenegraph", rendered_stage_, rendered_vertex_count_);
+            }
         }
         return node;
     }
@@ -260,6 +307,7 @@ private:
     unsigned long long render_status_generation_ = 0;
     unsigned long long rendered_generation_ = 0;
     size_t rendered_vertex_count_ = 0;
+    int rendered_stage_ = 0;
     float rendered_width_ = -1.0f;
     float rendered_height_ = -1.0f;
 };
@@ -277,6 +325,7 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
     // holds a reusable scratch buffer, so recreating this C++ vector here
     // would add a second heap allocation to every batch update.
     g_vertices.resize(count);
+    g_vertices_stage = 0;
     for (size_t index = 0; index < count; ++index) {
         g_vertices[index] = {xy[index * 2], xy[index * 2 + 1], 0};
     }
@@ -285,16 +334,33 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
 
 extern "C" void gogis_set_vertices_vertex_layout(const void* raw_vertices,
                                                    int vertex_count) {
+    gogis_set_vertices_vertex_layout_stage(raw_vertices, vertex_count, 0);
+}
+
+extern "C" void gogis_set_vertices_vertex_layout_stage(const void* raw_vertices,
+                                                         int vertex_count, int stage) {
     const auto* vertices = static_cast<const GoGISVertex*>(raw_vertices);
     std::lock_guard<std::mutex> lock(g_vertices_mutex);
     const size_t count = vertices != nullptr && vertex_count > 0
                              ? static_cast<size_t>(vertex_count)
                              : 0;
     g_vertices.resize(count);
+    g_vertices_stage = stage;
     if (count > 0) {
         std::memcpy(g_vertices.data(), vertices, count * sizeof(GoGISVertex));
     }
     g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
+    if (count > 0) {
+        trace_load_event("vertices-published", stage, count);
+    }
+}
+
+extern "C" void gogis_trace_load_start(void) {
+    if (!perf_trace_enabled()) {
+        return;
+    }
+    g_perf_load_started_ns.store(steady_nanoseconds(), std::memory_order_relaxed);
+    std::fprintf(stderr, "GoGIS perf: load-start 0.0ms vertices=0\n");
 }
 
 extern "C" unsigned long long gogis_viewport_generation(void) {

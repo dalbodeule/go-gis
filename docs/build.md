@@ -133,6 +133,9 @@ CGO_CXXFLAGS=-std=c++17 go run -tags qt ./cmd/gis-desktop
 
 이 모드에서는 편집 Commit과 `--save`를 사용하지 않으며, 속성은 페이지를
 넘길 때 필요한 행만 읽습니다.
+50,000개 이상의 feature를 가진 단일 CRS 입력은 첫 2,000개 feature를
+미리 표시한 뒤 전체 geometry로 교체합니다. 혼합 CRS 또는 재투영이 필요한
+입력은 정확한 전체 범위를 유지하기 위해 미리보기를 생략합니다.
 
 `desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
 실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면
@@ -290,10 +293,25 @@ fixture는 테스트가 임시 디렉터리에 생성하며 실제 업무 데이
 go test -tags native ./drivers/gdal -run '^$' -bench 'BenchmarkGDALOpen(VectorOnly)?GeoJSON10KPoints|BenchmarkAttributeSessionOpen(All)?GeometryOnlyMultiLayerGeoPackage' -benchtime=10x -count=3 -benchmem
 $env:CGO_CXXFLAGS = '-std=c++17'
 go test -tags 'qt native' ./cmd/gis-desktop -run '^$' -bench 'BenchmarkDesktop(GDALSnapshot|RenderSources|ReadOnlyLoad)GeoJSON10K' -benchtime=3x -count=3 -benchmem
+go test -tags 'qt native' ./cmd/gis-desktop -run '^$' -bench 'BenchmarkDesktopReadOnly(Load|Preview)GeoJSON50K' -benchtime=5x -count=2 -benchmem
 ```
 
 실제 파일에서는 최초 표시 시간, pan/zoom 응답, 최대 메모리 사용량도 따로
 측정합니다. synthetic benchmark만으로 UI 체감 성능을 판단하지 않습니다.
+실제 데스크톱 실행 시 `GOGIS_PERF=1`을 설정하면 로드 시작을 기준으로
+`vertices-published`와 Qt `scenegraph` geometry 반영 시간·버텍스 수를
+표준 오류에 출력합니다. `stage=preview`가 `stage=full`보다 먼저
+`scenegraph`에 나타나는지 확인할 수 있습니다. 이 시각은 화면 present 완료가
+아니므로 실제 첫 화면 표시도 별도로 관찰해야 합니다.
+
+```powershell
+$env:GOGIS_PERF = '1'
+.\build\gogis-desktop-native.exe --read-only --input C:\data\large.gpkg
+```
+
+같은 파일의 미리보기 없는 기준값은 `$env:GOGIS_DISABLE_PREVIEW = '1'`을
+추가하고 다시 실행해 비교합니다. 측정 후 두 환경변수를 제거하면 기본
+미리보기 동작으로 돌아갑니다.
 
 ## 의존성 확인 스크립트
 

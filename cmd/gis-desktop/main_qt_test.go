@@ -206,3 +206,57 @@ func TestRefreshCancelsBuilderWhenAllLayersHidden(t *testing.T) {
 		t.Fatal("render builder was not canceled after hiding all layers")
 	}
 }
+
+func TestApplyLayerVisibilityKeepsHitTestSnapshotImmutable(t *testing.T) {
+	runtime := &demoRuntime{
+		visibility:    render.NewLayerVisibility("roads", "buildings"),
+		visibleLayers: map[string]bool{"roads": true, "buildings": true},
+	}
+	previous := runtime.visibleLayers
+	applyLayerVisibility(runtime, `{"roads":false,"buildings":true}`)
+	if !previous["roads"] || runtime.visibleLayers["roads"] || !runtime.visibleLayers["buildings"] {
+		t.Fatalf("visibility snapshots = old %v, new %v", previous, runtime.visibleLayers)
+	}
+}
+
+func TestAdvanceRenderGenerationUsesSwappedScheduler(t *testing.T) {
+	oldScheduler := render.NewScheduler()
+	newScheduler := render.NewScheduler()
+	runtime := &demoRuntime{scheduler: oldScheduler}
+	runtime.mu.Lock()
+	runtime.scheduler = newScheduler
+	runtime.mu.Unlock()
+	runtime.advanceRenderGeneration()
+	if oldScheduler.Generation() != 0 || newScheduler.Generation() != 1 {
+		t.Fatalf("scheduler generations = old %d, new %d", oldScheduler.Generation(), newScheduler.Generation())
+	}
+}
+
+func TestViewportStateAccessDuringPreviewSwap(t *testing.T) {
+	runtime := &demoRuntime{
+		scheduler:     render.NewScheduler(),
+		visibility:    render.NewLayerVisibility("roads"),
+		visibleLayers: map[string]bool{"roads": true},
+	}
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		for index := 0; index < 1000; index++ {
+			runtime.advanceRenderGeneration()
+			applyLayerVisibility(runtime, `{"roads":false}`)
+			applyLayerVisibility(runtime, `{"roads":true}`)
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for index := 0; index < 1000; index++ {
+			runtime.mu.Lock()
+			runtime.scheduler = render.NewScheduler()
+			runtime.visibility = render.NewLayerVisibility("roads")
+			runtime.visibleLayers = map[string]bool{"roads": true}
+			runtime.mu.Unlock()
+		}
+	}()
+	workers.Wait()
+}

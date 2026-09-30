@@ -358,6 +358,37 @@ func BenchmarkBatchStoreBeginGenerationReusesVisibilityMap(b *testing.B) {
 	}
 }
 
+func BenchmarkBatchStoreRepeatedCachedBatch100K(b *testing.B) {
+	for _, skipUnchanged := range []bool{false, true} {
+		name := "always-flatten"
+		if skipUnchanged {
+			name = "revision-skip"
+		}
+		b.Run(name, func(b *testing.B) {
+			store := NewBatchStore()
+			key := ChunkKey{Layer: "roads"}
+			vertices := make([]Vertex, 100_000)
+			store.BeginGeneration(1, key)
+			result := ChunkResult{Key: key, Generation: 1, Chunk: Chunk{Vertices: vertices}}
+			store.ApplyImmutable(result)
+			publishedRevision := store.Revision()
+			var scratch []Vertex
+			b.ReportAllocs()
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				generation := uint64(index + 2)
+				store.BeginGeneration(generation, key)
+				result.Generation = generation
+				store.ApplyImmutable(result)
+				if !skipUnchanged || store.Revision() != publishedRevision {
+					_, scratch = store.CurrentInto(scratch)
+					publishedRevision = store.Revision()
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkBatchStoreSortedBaseline10KChunks(b *testing.B) {
 	chunks := make(map[ChunkKey][]Vertex, 10_000)
 	for index := 0; index < 10_000; index++ {

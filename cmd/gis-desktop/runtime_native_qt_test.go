@@ -4,7 +4,10 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gogis/drivers/gdal"
@@ -99,6 +102,13 @@ func TestPreviewBoundsRequiresLargeCommonCRSDataset(t *testing.T) {
 	if _, ok := previewBounds(overviews, "", "EPSG:4326", ""); ok {
 		t.Fatal("preview accepted a layer without bounds")
 	}
+	manySmall := make([]gdal.LayerOverview, 100)
+	for index := range manySmall {
+		manySmall[index] = gdal.LayerOverview{Name: fmt.Sprintf("layer-%d", index), CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Bounds: [4]float64{0, 0, 1, 1}, HasBounds: true, FeatureCount: 500}
+	}
+	if _, ok := previewBounds(manySmall, "", "", ""); ok {
+		t.Fatal("preview would duplicate a full read across many small layers")
+	}
 }
 
 func TestStalePreviewDoesNotReplaceRuntime(t *testing.T) {
@@ -108,6 +118,46 @@ func TestStalePreviewDoesNotReplaceRuntime(t *testing.T) {
 	if current.previewLoading || current.scheduler != nil || current.loadGeneration != 2 {
 		t.Fatal("stale preview changed current runtime")
 	}
+}
+
+func TestLargeReadOnlyLoadPublishesStablePreview(t *testing.T) {
+	path := largeReadOnlyFixture(t)
+	var preview *demoRuntime
+	full, err := loadDataRuntimeModeContextWithPreview(context.Background(), path, "", "", "", "", true, func(next *demoRuntime) {
+		preview = next
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer full.closeAttributeSource()
+	if preview == nil || len(preview.features) != previewFeatureLimit || len(full.features) != previewMinimumFeatures {
+		t.Fatalf("preview/full feature counts = %d/%d", len(preview.features), len(full.features))
+	}
+	if preview.features[previewFeatureLimit-1].Vertices[0] != full.features[previewFeatureLimit-1].Vertices[0] {
+		t.Fatalf("preview/full coordinates differ: %v / %v", preview.features[previewFeatureLimit-1].Vertices[0], full.features[previewFeatureLimit-1].Vertices[0])
+	}
+	if preview.closeAttributeSource != nil || preview.attributeFeatureReader != nil {
+		t.Fatal("preview retained the full loader's attribute session")
+	}
+}
+
+func largeReadOnlyFixture(tb testing.TB) string {
+	tb.Helper()
+	path := filepath.Join(tb.TempDir(), "large.geojson")
+	var fixture strings.Builder
+	fixture.Grow(previewMinimumFeatures * 100)
+	fixture.WriteString(`{"type":"FeatureCollection","features":[`)
+	for index := 0; index < previewMinimumFeatures; index++ {
+		if index > 0 {
+			fixture.WriteByte(',')
+		}
+		fmt.Fprintf(&fixture, `{"type":"Feature","properties":{"name":"point-%d"},"geometry":{"type":"Point","coordinates":[%d,%d]}}`, index, index, index)
+	}
+	fixture.WriteString(`]}`)
+	if err := os.WriteFile(path, []byte(fixture.String()), 0o600); err != nil {
+		tb.Fatal(err)
+	}
+	return path
 }
 
 func TestDesktopInputArgsIncludesCRSOverrides(t *testing.T) {

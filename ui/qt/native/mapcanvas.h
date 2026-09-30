@@ -15,6 +15,14 @@ void gogis_set_vertices(const float* xy, int vertex_count);
 // The bridge does not retain the caller's memory after this function returns.
 void gogis_set_vertices_vertex_layout(const void* vertices, int vertex_count);
 
+// The staged variant labels demo (0), preview (1), and full data (2) batches
+// in optional performance diagnostics.
+void gogis_set_vertices_vertex_layout_stage(const void* vertices, int vertex_count,
+                                            int stage);
+
+// Starts optional GOGIS_PERF=1 load-to-scene-graph timing.
+void gogis_trace_load_start(void);
+
 // Returns the monotonically increasing generation produced by MapCanvas
 // transform changes (pan/zoom).
 unsigned long long gogis_viewport_generation(void);

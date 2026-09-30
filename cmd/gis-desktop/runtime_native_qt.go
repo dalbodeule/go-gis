@@ -58,11 +58,16 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 	if previousCancel != nil {
 		previousCancel()
 	}
+	native.BeginLoadTrace()
 	native.SetRenderStatus("Loading " + input)
-	go func() {
-		next, err := loadDataRuntimeModeContextWithPreview(loadContext, input, layerName, sourceCRS, targetCRS, savePath, readOnly, func(preview *demoRuntime) {
+	var onPreview func(*demoRuntime)
+	if readOnly && os.Getenv("GOGIS_DISABLE_PREVIEW") != "1" {
+		onPreview = func(preview *demoRuntime) {
 			r.replaceWithPreview(preview, generation)
-		})
+		}
+	}
+	go func() {
+		next, err := loadDataRuntimeModeContextWithPreview(loadContext, input, layerName, sourceCRS, targetCRS, savePath, readOnly, onPreview)
 		r.mu.Lock()
 		current := generation == r.loadGeneration
 		if current {
@@ -154,6 +159,7 @@ func previewBounds(overviews []gdal.LayerOverview, layerName, sourceCRS, targetC
 	var crs string
 	selected := 0
 	featureCount := 0
+	previewCount := 0
 	for _, layer := range overviews {
 		if layerName != "" && layer.Name != layerName {
 			continue
@@ -181,9 +187,10 @@ func previewBounds(overviews []gdal.LayerOverview, layerName, sourceCRS, targetC
 			bounds[3] = math.Max(bounds[3], layer.Bounds[3])
 		}
 		featureCount += layer.FeatureCount
+		previewCount += min(layer.FeatureCount, previewFeatureLimit)
 		selected++
 	}
-	return bounds, selected > 0 && featureCount >= previewMinimumFeatures
+	return bounds, selected > 0 && featureCount >= previewMinimumFeatures && previewCount*2 <= featureCount
 }
 
 func tryReadOnlyPreview(ctx context.Context, session *gdal.AttributeSession, layerName, sourceCRS, targetCRS, input string, onPreview func(*demoRuntime)) {
@@ -344,6 +351,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	previousAttributeCloser := r.closeAttributeSource
 	r.scheduler = next.scheduler
 	r.batchStore = next.batchStore
+	r.publishedRevision = 0
 	r.planner = next.planner
 	r.visibility = next.visibility
 	r.visibleLayers = next.visibleLayers
