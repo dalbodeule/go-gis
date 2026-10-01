@@ -20,6 +20,49 @@ import (
 // are intentionally rejected until their axis and unit semantics are fixed.
 type Transformer struct{}
 
+// TransformBounds transforms a source-CRS XY envelope to a target-CRS XY
+// envelope. PROJ samples 21 points along each edge so curved transformations
+// are bounded more reliably than transforming only the four corners.
+func (Transformer) TransformBounds(ctx context.Context, source, target core.CRS, bounds [4]float64) ([4]float64, error) {
+	if err := ctx.Err(); err != nil {
+		return [4]float64{}, err
+	}
+	if source.AuthorityCode == "" || target.AuthorityCode == "" {
+		return [4]float64{}, fmt.Errorf("source and target CRS are required")
+	}
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return [4]float64{}, fmt.Errorf("invalid source bounds %v", bounds)
+		}
+	}
+	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+		return [4]float64{}, fmt.Errorf("invalid source bounds %v", bounds)
+	}
+	if strings.EqualFold(source.AuthorityCode, target.AuthorityCode) {
+		return bounds, nil
+	}
+	visualizationPJ, err := newVisualizationPJ(source, target)
+	if err != nil {
+		return [4]float64{}, fmt.Errorf("create PROJ bounds transformation: %w", err)
+	}
+	transformed, err := visualizationPJ.ForwardBounds(projlib.Bounds{
+		XMin: bounds[0], YMin: bounds[1], XMax: bounds[2], YMax: bounds[3],
+	}, 21)
+	if err != nil {
+		return [4]float64{}, fmt.Errorf("transform bounds from %s to %s: %w", source.AuthorityCode, target.AuthorityCode, err)
+	}
+	result := [4]float64{transformed.XMin, transformed.YMin, transformed.XMax, transformed.YMax}
+	for _, value := range result {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return [4]float64{}, fmt.Errorf("transformed bounds are not finite: %v", result)
+		}
+	}
+	if result[0] > result[2] || result[1] > result[3] {
+		return [4]float64{}, fmt.Errorf("invalid transformed bounds %v", result)
+	}
+	return result, nil
+}
+
 // Transform applies one CRS transformation to every WKT feature in a layer.
 func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer core.Layer) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
@@ -28,7 +71,7 @@ func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer
 	if source.AuthorityCode == "" || target.AuthorityCode == "" {
 		return core.Layer{}, fmt.Errorf("source and target CRS are required")
 	}
-	pj, err := projlib.NewCRSToCRS(source.AuthorityCode, target.AuthorityCode, nil)
+	pj, err := newVisualizationPJ(source, target)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("create PROJ transformation: %w", err)
 	}
@@ -45,7 +88,7 @@ func (Transformer) TransformLayers(ctx context.Context, source, target core.CRS,
 	if source.AuthorityCode == "" || target.AuthorityCode == "" {
 		return nil, fmt.Errorf("source and target CRS are required")
 	}
-	pj, err := projlib.NewCRSToCRS(source.AuthorityCode, target.AuthorityCode, nil)
+	pj, err := newVisualizationPJ(source, target)
 	if err != nil {
 		return nil, fmt.Errorf("create PROJ transformation: %w", err)
 	}
@@ -60,12 +103,21 @@ func (Transformer) TransformLayers(ctx context.Context, source, target core.CRS,
 	return result, nil
 }
 
+func newVisualizationPJ(source, target core.CRS) (*projlib.PJ, error) {
+	pj, err := projlib.NewCRSToCRS(source.AuthorityCode, target.AuthorityCode, nil)
+	if err != nil {
+		return nil, err
+	}
+	return pj.NormalizeForVisualization()
+}
+
 func transformLayerWithPJ(ctx context.Context, source, target core.CRS, layer core.Layer, pj *projlib.PJ) (core.Layer, error) {
 
 	result := cloneLayerForTransform(layer)
 	result.CRS = target
-	sourceLatLon := isLatitudeLongitudeCRS(source)
-	targetLatLon := isLatitudeLongitudeCRS(target)
+	// The shared PROJ object is visualization-normalized, so core/WKT XY is
+	// always longitude/easting first and latitude/northing second.
+	const sourceLatLon, targetLatLon = false, false
 	if handled, err := transformWKBPointLayer(result.Features, pj, sourceLatLon, targetLatLon); handled {
 		if err != nil {
 			return core.Layer{}, err
@@ -1230,10 +1282,8 @@ func transformCoordinate(x, y float64, pj *projlib.PJ, sourceLatLon, targetLatLo
 	return outputX, outputY, nil
 }
 
-// transformXY keeps the core WKT contract in XY order while using PROJ's
-// native axis order at the C boundary. EPSG:4326 is latitude/longitude in
-// PROJ's native order; the projected Korean CRSs used by the MVP are already
-// consumed and returned as easting/northing.
+// transformXY keeps WKT coordinate pairs in the visualization-normalized XY
+// order used by the shared PROJ pipeline.
 func transformXY(wkt string, pj *projlib.PJ, sourceLatLon, targetLatLon bool) (string, error) {
 	if !containsWKTNumber(wkt) {
 		return wkt, nil
@@ -1299,8 +1349,4 @@ func scanWKTNumber(wkt string, start int) int {
 		break
 	}
 	return index
-}
-
-func isLatitudeLongitudeCRS(crs core.CRS) bool {
-	return strings.EqualFold(strings.TrimSpace(crs.AuthorityCode), "EPSG:4326")
 }

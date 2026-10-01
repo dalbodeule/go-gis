@@ -13,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gogis/drivers/gdal"
+	projdriver "gogis/drivers/proj"
 	"gogis/internal/core"
 	"gogis/internal/render"
 	"gogis/internal/workspace"
@@ -22,6 +24,31 @@ import (
 
 	"github.com/airbusgeo/godal"
 )
+
+func TestContextSemaphoreHonorsCapacityAndCancellation(t *testing.T) {
+	semaphore := newContextSemaphore(2)
+	first, err := semaphore.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := semaphore.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := semaphore.acquire(ctx); err != context.Canceled {
+		t.Fatalf("acquire with canceled context = %v; want context.Canceled", err)
+	}
+	first()
+	third, err := semaphore.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after permit release: %v", err)
+	}
+	third()
+	second()
+	second() // release callbacks are idempotent
+}
 
 func TestMoveSelectedVertexUpdatesProjectAndRenderSource(t *testing.T) {
 	wkb := make([]byte, 1+4+4+4*8)
@@ -84,6 +111,112 @@ func TestUniqueSourcePathsRemovesRepeatedFiles(t *testing.T) {
 	}
 }
 
+func TestRenderChunkBoundsMapsUnitTileToSourceCRS(t *testing.T) {
+	extent := [4]float64{10, 20, 110, 220}
+	bounds, ok := renderChunkBounds(extent, 0.25, render.ChunkKey{X: 1, Y: 2})
+	if !ok || bounds != [4]float64{35, 120, 60, 170} {
+		t.Fatalf("chunk bounds = %v, valid=%t", bounds, ok)
+	}
+	if _, ok := renderChunkBounds(extent, 0.25, render.ChunkKey{X: 4, Y: 0}); ok {
+		t.Fatal("chunk entirely outside normalized data extent was accepted")
+	}
+	fineBounds, ok := renderChunkBounds(extent, 0.125, render.ChunkKey{X: 6, Y: 4})
+	if !ok || fineBounds != [4]float64{85, 120, 97.5, 145} {
+		t.Fatalf("fine chunk bounds = %v, valid=%t", fineBounds, ok)
+	}
+}
+
+func TestReadOnlyWindowChunkSizeTracksZoomBucket(t *testing.T) {
+	for _, test := range []struct {
+		zoom   float64
+		bucket int
+		size   float64
+	}{{0.5, 0, 0.25}, {1, 0, 0.25}, {4, 2, 0.0625}, {16, 4, 0.015625}, {math.Inf(1), 0, 0.25}} {
+		if bucket := readOnlyWindowZoomBucket(test.zoom); bucket != test.bucket {
+			t.Errorf("zoom bucket for %v = %d, want %d", test.zoom, bucket, test.bucket)
+		}
+		if size := readOnlyWindowChunkSize(test.bucket); size != test.size {
+			t.Errorf("chunk size for bucket %d = %v, want %v", test.bucket, size, test.size)
+		}
+	}
+	if size := readOnlyWindowChunkSize(100); size != math.Ldexp(0.25, -10) {
+		t.Fatalf("extreme zoom chunk size = %v, want clamped size %v", size, math.Ldexp(0.25, -10))
+	}
+}
+
+func TestReadOnlyWindowRequiresCRSAndExtent(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		crs     string
+		bounds  bool
+		wantErr bool
+	}{{"known", "EPSG:5186", true, false}, {"unknown-crs", "", true, true}, {"unknown-bounds", "EPSG:5186", false, true}} {
+		err := validateReadOnlyWindowMetadata("parcels", test.crs, test.bounds)
+		if (err != nil) != test.wantErr {
+			t.Errorf("validate metadata (%s, %t) error = %v, wantErr=%t", test.crs, test.bounds, err, test.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "refusing a full-geometry fallback") {
+			t.Errorf("unsafe fallback error is not explicit: %v", err)
+		}
+	}
+}
+
+func TestReadOnlyWindowPayloadEstimateSaturatesAtBudget(t *testing.T) {
+	layer := core.Layer{Features: []core.Feature{{
+		Geometry: core.WKBGeometry{WKB: make([]byte, maxReadOnlyWindowBytes+1)},
+	}}}
+	if got := estimateReadOnlyWindowPayloadBytes(layer); got <= maxReadOnlyWindowBytes {
+		t.Fatalf("oversized geometry estimate = %d, want > %d", got, maxReadOnlyWindowBytes)
+	}
+	if got := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{{
+		Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3}}, Properties: map[string]any{"name": "short"},
+	}}}); got != int64(len([]byte{1, 2, 3})+len("name")+16+len("short")+24) {
+		t.Fatalf("small geometry/property estimate = %d", got)
+	}
+	largeNested := map[string]any{"items": []any{map[string]any{"value": strings.Repeat("x", maxReadOnlyWindowBytes+1)}}}
+	if got := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{{
+		Properties: map[string]any{"nested": largeNested},
+	}}}); got <= maxReadOnlyWindowBytes {
+		t.Fatalf("oversized nested property estimate = %d, want > %d", got, maxReadOnlyWindowBytes)
+	}
+	cyclic := map[string]any{}
+	cyclic["self"] = cyclic
+	if got := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{{
+		Properties: map[string]any{"cycle": cyclic},
+	}}}); got <= maxReadOnlyWindowBytes {
+		t.Fatalf("cyclic property estimate = %d, want saturated estimate", got)
+	}
+}
+
+func TestMaterializedRuntimeUsageEnforcesAggregateFeatureAndByteBudgets(t *testing.T) {
+	layer := core.Layer{Name: "roads", Features: []core.Feature{{
+		ID: 1, Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3, 4}},
+		Properties: map[string]any{"name": "road", "tags": []any{"primary", 4}},
+	}}}
+	features, bytes, err := accumulateMaterializedRuntimeLayerUsage(0, 0, layer, 2, 1<<20)
+	if err != nil || features != 1 || bytes <= 0 {
+		t.Fatalf("first layer usage features=%d bytes=%d err=%v", features, bytes, err)
+	}
+	if _, _, err := accumulateMaterializedRuntimeLayerUsage(features, bytes, layer, 1, 1<<20); err == nil || !strings.Contains(err.Error(), "feature safety limit") {
+		t.Fatalf("aggregate feature cap error = %v", err)
+	}
+	if _, _, err := accumulateMaterializedRuntimeLayerUsage(0, 0, layer, 10, bytes-1); err == nil || !strings.Contains(err.Error(), "payload safety limit") {
+		t.Fatalf("aggregate payload cap error = %v", err)
+	}
+}
+
+func TestPolygonFillVertexAppenderHonorsChunkLimit(t *testing.T) {
+	points := []render.Point{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 0, Y: 1}}
+	vertices, ok := appendPolygonFillPoints(nil, points[:2], 0xff00ffff, 3)
+	if !ok || len(vertices) != 2 {
+		t.Fatalf("bounded polygon fill append = %d vertices, ok=%t", len(vertices), ok)
+	}
+	unchanged, ok := appendPolygonFillPoints(vertices, points[2:], 0xff00ffff, 2)
+	if ok || len(unchanged) != 2 {
+		t.Fatalf("over-budget polygon fill append = %d vertices, ok=%t", len(unchanged), ok)
+	}
+}
+
 func TestLargeDatasetReadOnlyThresholdAndOverride(t *testing.T) {
 	if !shouldOpenLargeDatasetReadOnly(largeDatasetReadOnlyThreshold, false, false) {
 		t.Fatal("dataset at threshold was not selected for read-only mode")
@@ -96,6 +229,9 @@ func TestLargeDatasetReadOnlyThresholdAndOverride(t *testing.T) {
 	}
 	if !desktopAllowLargeEditable([]string{"gogis-desktop-native", "--editable-large"}) {
 		t.Fatal("--editable-large was not recognized")
+	}
+	if strings.Contains(largeDatasetReadOnlyStatus(largeDatasetReadOnlyThreshold), "--editable-large") {
+		t.Fatal("read-only status must not imply that --editable-large bypasses snapshot safety limits")
 	}
 }
 
@@ -117,6 +253,36 @@ func TestDatasetPreflightDetectsLargeFeatureCount(t *testing.T) {
 	defer runtime.closeAttributeSource()
 	if !autoReadOnly || !runtime.readOnly || count != largeDatasetReadOnlyThreshold {
 		t.Fatalf("large load policy = read-only:%t runtime:%t count:%d", autoReadOnly, runtime.readOnly, count)
+	}
+	base := core.Layer{Name: "existing", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Visible: true,
+		Fields:   []core.Field{{Name: "name", Type: "String"}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 1)"}, Properties: map[string]any{"name": "keep"}}}}
+	baseExtent := [4]float64{0, 0, float64(largeDatasetReadOnlyThreshold + 2), float64(largeDatasetReadOnlyThreshold + 2)}
+	appended, appendedReadOnly, appendedCount, appendErr := loadDataRuntimeFilesWithLargePolicyAndBaseExtent(
+		context.Background(), []string{path}, []core.Layer{base}, "", false, &baseExtent)
+	if appendErr != nil {
+		t.Fatal(appendErr)
+	}
+	defer appended.closeAttributeSource()
+	if !appendedReadOnly || !appended.readOnly || !appended.viewportReadOnly || appendedCount != largeDatasetReadOnlyThreshold {
+		t.Fatalf("large source append result = runtime:%v read-only:%t viewport:%t count:%d", appended != nil, appendedReadOnly, appended.viewportReadOnly, appendedCount)
+	}
+	if names := appended.service.LayerNames(); len(names) != 2 {
+		t.Fatalf("mixed read-only layer names = %v; want existing and large", names)
+	}
+	page, total, err := appended.attributePageReader(context.Background(), "existing", 0, 1)
+	if err != nil || total != 1 || len(page.Features) != 1 || page.Features[0].Properties["name"] != "keep" {
+		t.Fatalf("base-layer attributes = total:%d page:%v err:%v", total, page.Features, err)
+	}
+	appended.mu.Lock()
+	appended.rebuildWindowFeaturesLocked()
+	baseHitCount := len(appended.features)
+	appended.mu.Unlock()
+	if baseHitCount != 1 {
+		t.Fatalf("base-layer hit features after window rebuild = %d; want 1", baseHitCount)
+	}
+	if appended.nextWindowFeatureID < base.Features[0].ID {
+		t.Fatalf("window feature ID seed = %d; must not collide with base feature ID %d", appended.nextWindowFeatureID, base.Features[0].ID)
 	}
 	if names := runtime.service.LayerNames(); len(names) != 1 {
 		t.Fatalf("loaded layer names = %v", names)
@@ -224,8 +390,22 @@ func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 		if names := runtime.service.LayerNames(); len(names) != 1 || names[0] != "selected" {
 			t.Fatalf("readOnly=%t: layer names = %v", readOnly, names)
 		}
-		if len(runtime.features) != 1 {
-			t.Fatalf("readOnly=%t: features = %d", readOnly, len(runtime.features))
+		if readOnly && runtime.viewportReadOnly {
+			if len(runtime.features) != 0 {
+				t.Fatalf("windowed read-only eagerly loaded %d features", len(runtime.features))
+			}
+			key := render.ChunkKey{Layer: "selected", X: 2, Y: 2}
+			runtime.mu.Lock()
+			runtime.windowVisibleKeys[key] = struct{}{}
+			runtime.mu.Unlock()
+			if _, err := runtime.builder(context.Background(), key); err != nil {
+				t.Fatalf("read-only spatial window: %v", err)
+			}
+		}
+		if !readOnly || !runtime.viewportReadOnly {
+			if len(runtime.features) != 1 {
+				t.Fatalf("readOnly=%t: features = %d", readOnly, len(runtime.features))
+			}
 		}
 		if runtime.closeAttributeSource != nil {
 			runtime.closeAttributeSource()
@@ -336,12 +516,100 @@ func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer readOnlyAdded.closeAttributeSource()
-	if !readOnlyAdded.readOnly || len(readOnlyAdded.features) != 2 {
-		t.Fatalf("read-only combined runtime mode=%t features=%d", readOnlyAdded.readOnly, len(readOnlyAdded.features))
+	if !readOnlyAdded.readOnly || !readOnlyAdded.viewportReadOnly || len(readOnlyAdded.features) != 0 {
+		t.Fatalf("read-only combined runtime mode=%t viewport-backed=%t initial features=%d", readOnlyAdded.readOnly, readOnlyAdded.viewportReadOnly, len(readOnlyAdded.features))
+	}
+	windowKeys := []render.ChunkKey{
+		{Layer: "roads", X: 0, Y: 0},
+		{Layer: "roads_roads", X: 3, Y: 3},
+	}
+	readOnlyAdded.mu.Lock()
+	for _, key := range windowKeys {
+		readOnlyAdded.windowVisibleKeys[key] = struct{}{}
+	}
+	readOnlyAdded.mu.Unlock()
+	for _, key := range windowKeys {
+		if _, err := readOnlyAdded.builder(context.Background(), key); err != nil {
+			t.Fatalf("build windowed chunk %v: %v", key, err)
+		}
+	}
+	if len(readOnlyAdded.features) != 2 {
+		t.Fatalf("windowed hit feature count = %d, want 2", len(readOnlyAdded.features))
 	}
 	page, total, err = readOnlyAdded.attributePageReader(context.Background(), "roads_roads", 0, 10)
 	if err != nil || total != 1 || page.Features[0].Properties["name"] != "second" {
 		t.Fatalf("read-only added layer page=%#v total=%d err=%v", page, total, err)
+	}
+	var selected render.HitFeature
+	for _, hit := range readOnlyAdded.features {
+		if hit.Layer == "roads_roads" {
+			selected = hit
+			break
+		}
+	}
+	feature, err := readOnlyAdded.attributeFeatureReader(context.Background(), selected.Layer, selected.FeatureID)
+	if err != nil || feature.Properties["name"] != "second" {
+		t.Fatalf("windowed selected feature name=%v err=%v", feature.Properties["name"], err)
+	}
+}
+
+func TestWindowedReadOnlySupportsMixedCRSWithoutFullGeometryLoad(t *testing.T) {
+	ctx := context.Background()
+	wgs84 := core.Layer{
+		Name: "wgs84", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields:   []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}, Properties: map[string]any{"name": "origin"}}},
+	}
+	webMercator, err := (projdriver.Transformer{}).Transform(ctx, wgs84.CRS, core.CRS{AuthorityCode: "EPSG:3857"}, wgs84)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPath := filepath.Join(t.TempDir(), "wgs84.gpkg")
+	secondPath := filepath.Join(t.TempDir(), "mercator.gpkg")
+	if err := (gdal.Writer{}).Write(ctx, firstPath, wgs84); err != nil {
+		t.Fatal(err)
+	}
+	if err := (gdal.Writer{}).Write(ctx, secondPath, webMercator); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: firstPath}, {Path: secondPath}}, "EPSG:3857")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !runtime.viewportReadOnly || runtime.mapCRS != "EPSG:3857" || len(runtime.features) != 0 {
+		t.Fatalf("mixed-CRS runtime viewport=%t CRS=%q features=%d", runtime.viewportReadOnly, runtime.mapCRS, len(runtime.features))
+	}
+	names := runtime.service.LayerNames()
+	if len(names) != 2 {
+		t.Fatalf("layer names = %v", names)
+	}
+	var x, y float64
+	if _, err := fmt.Sscanf(webMercator.Features[0].Geometry.(core.WKTGeometry).WKT, "POINT (%f %f)", &x, &y); err != nil {
+		t.Fatalf("parse projected fixture point: %v", err)
+	}
+	spanX, spanY := runtime.mapExtent[2]-runtime.mapExtent[0], runtime.mapExtent[3]-runtime.mapExtent[1]
+	chunkX := int(math.Floor(((x - runtime.mapExtent[0]) / spanX) / runtime.planner.ChunkSize))
+	chunkY := int(math.Floor(((y - runtime.mapExtent[1]) / spanY) / runtime.planner.ChunkSize))
+	maxChunk := int(math.Ceil(1/runtime.planner.ChunkSize)) - 1
+	chunkX, chunkY = max(0, min(maxChunk, chunkX)), max(0, min(maxChunk, chunkY))
+	keys := []render.ChunkKey{{Layer: names[0], X: chunkX, Y: chunkY}, {Layer: names[1], X: chunkX, Y: chunkY}}
+	runtime.mu.Lock()
+	for _, key := range keys {
+		runtime.windowVisibleKeys[key] = struct{}{}
+	}
+	runtime.mu.Unlock()
+	for _, key := range keys {
+		if _, err := runtime.builder(ctx, key); err != nil {
+			t.Fatalf("build mixed-CRS window %v: %v", key, err)
+		}
+	}
+	if len(runtime.features) != 2 {
+		t.Fatalf("mixed-CRS window hit count = %d, want 2; extent=%v point=(%v,%v) key=(%d,%d) hits=%#v", len(runtime.features), runtime.mapExtent, x, y, chunkX, chunkY, runtime.features)
+	}
+	firstPoint, secondPoint := runtime.features[0].Vertices[0], runtime.features[1].Vertices[0]
+	if math.Abs(firstPoint.X-secondPoint.X) > 1e-6 || math.Abs(firstPoint.Y-secondPoint.Y) > 1e-6 {
+		t.Fatalf("same source point differs after window reprojection: %v vs %v", firstPoint, secondPoint)
 	}
 }
 
@@ -510,6 +778,23 @@ func TestApplyLayerSettingsRejectsEmptyDisplayName(t *testing.T) {
 	}
 }
 
+func TestApplyLayerSettingsRejectsInvalidLuaBeforeProjectMutation(t *testing.T) {
+	labels := core.DefaultLabelSettings()
+	labels.Enabled = true
+	labels.LuaScript = `return (`
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: "roads", DisplayName: "roads", SourcePath: "roads.shp", SourceLayerName: "roads",
+		Style: core.DefaultLayerStyle(), Labels: labels,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = applyLayerSettings(&demoRuntime{}, string(payload))
+	if err == nil || !strings.Contains(err.Error(), "invalid Lua label settings") {
+		t.Fatalf("invalid Lua settings error = %v", err)
+	}
+}
+
 func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	style := core.DefaultLayerStyle()
 	labels := core.DefaultLabelSettings()
@@ -584,6 +869,179 @@ func TestPolygonRuntimeBuilderPublishesClippedFillMeshWithOpacity(t *testing.T) 
 	}
 }
 
+func TestConvexPolygonFillFastPathTriangulatesAndRejectsConcavity(t *testing.T) {
+	ring := []render.Point{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 1, Y: 1}, {X: 0, Y: 1}, {X: 0, Y: 0}}
+	triangles := make([][3]render.Point, 0, 2)
+	if !appendConvexPolygonTriangles(ring, func(triangle [3]render.Point) {
+		triangles = append(triangles, triangle)
+	}) {
+		t.Fatal("closed convex ring did not use the direct triangulation path")
+	}
+	if len(triangles) != 2 {
+		t.Fatalf("convex square triangles = %d, want 2", len(triangles))
+	}
+	area := 0.0
+	for _, triangle := range triangles {
+		area += math.Abs((triangle[1].X-triangle[0].X)*(triangle[2].Y-triangle[0].Y)-
+			(triangle[2].X-triangle[0].X)*(triangle[1].Y-triangle[0].Y)) / 2
+	}
+	if math.Abs(area-1) > 1e-12 {
+		t.Fatalf("convex square triangle area = %v, want 1", area)
+	}
+	concave := []render.Point{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 0.4, Y: 0.4}, {X: 1, Y: 1}, {X: 0, Y: 1}, {X: 0, Y: 0}}
+	if appendConvexPolygonTriangles(concave, func([3]render.Point) {
+		t.Fatal("concave ring emitted direct triangles")
+	}) {
+		t.Fatal("concave ring was accepted by the convex fast path")
+	}
+}
+
+func TestPolygonFillCapacityEstimateUsesNormalizedTileBounds(t *testing.T) {
+	layer := core.Layer{
+		Name: "areas",
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{
+			WKT: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+		}}},
+	}
+	sources, _, err := render.NewLayerSourcesWithExtent([]core.Layer{layer}, [4]float64{-1, -1, 9, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacities := estimatePolygonFillCapacities(layer, sources["areas"], nil)
+	if capacities[[2]int{0, 0}] != 6 {
+		t.Fatalf("single-tile polygon fill capacity = %d, want 6", capacities[[2]int{0, 0}])
+	}
+	if len(capacities) != 1 {
+		t.Fatalf("unexpected fill capacity cells: %v", capacities)
+	}
+}
+
+func TestReadOnlyPolygonVertexBudgetRejectsComplexWindowBeforeGEOS(t *testing.T) {
+	layer := core.Layer{Name: "areas", Features: []core.Feature{{Geometry: core.WKTGeometry{
+		WKT: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+	}}}}
+	source := render.LayerSource{Features: []render.HitFeature{{Vertices: make([]render.Point, 4)}}}
+	if err := validateReadOnlyPolygonVertexBudget(layer, source, 3); err == nil || !strings.Contains(err.Error(), "triangulation safety limit") {
+		t.Fatalf("over-budget polygon error = %v", err)
+	}
+	if err := validateReadOnlyPolygonVertexBudget(layer, source, 4); err != nil {
+		t.Fatalf("polygon at budget was rejected: %v", err)
+	}
+}
+
+func TestPolygonFillProjectBudgetIncludesPreviouslyBuiltLayerMeshes(t *testing.T) {
+	makeLayer := func(name string, offset float64) core.Layer {
+		return core.Layer{Name: name, Style: core.DefaultLayerStyle(), Features: []core.Feature{{
+			ID: 1,
+			Geometry: core.WKTGeometry{WKT: fmt.Sprintf(
+				"POLYGON ((%f %f, %f %f, %f %f, %f %f, %f %f))",
+				offset, 0.1, offset+0.1, 0.1, offset+0.1, 0.2, offset, 0.2, offset, 0.1)},
+		}}}
+	}
+	first := makeLayer("first", 0.1)
+	firstSources, _, err := render.NewLayerSourcesWithExtent([]core.Layer{first}, [4]float64{0, 0, 1, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attachPolygonFillGeometryWithLimit(context.Background(), []core.Layer{first}, firstSources, nil, 6); err != nil {
+		t.Fatalf("build first layer fill: %v", err)
+	}
+	if got := firstSources[first.Name].PolygonFillVertices; got != 6 {
+		t.Fatalf("first layer fill vertices = %d, want 6", got)
+	}
+
+	second := makeLayer("second", 0.4)
+	secondSources, _, err := render.NewLayerSourcesWithExtent([]core.Layer{second}, [4]float64{0, 0, 1, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectSources := map[string]render.LayerSource{
+		first.Name:  firstSources[first.Name],
+		second.Name: secondSources[second.Name],
+	}
+	if err := attachPolygonFillGeometryWithLimit(context.Background(), []core.Layer{second}, projectSources, nil, 11); err == nil || !strings.Contains(err.Error(), "project safety limit") {
+		t.Fatalf("aggregate polygon-fill budget error = %v, want project limit", err)
+	}
+	if got := projectSources[first.Name].PolygonFillVertices; got != 6 {
+		t.Fatalf("previous layer accounting changed to %d, want 6", got)
+	}
+	if got := projectSources[second.Name].PolygonFillVertices; got != 0 {
+		t.Fatalf("rejected layer retained %d fill vertices, want 0", got)
+	}
+}
+
+func TestReadOnlyPolygonFillBuildsOnlyRequestedChunk(t *testing.T) {
+	layer := core.Layer{Name: "areas", Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{
+		WKT: "POLYGON ((0.65 0.35, 0.95 0.35, 0.95 0.7, 0.65 0.7, 0.65 0.35))",
+	}}}}
+	target := render.ChunkKey{Layer: "areas", X: 6, Y: 4}
+	sources, _, err := render.NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{layer}, [4]float64{0, 0, 1, 1}, 0.125, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attachPolygonFillGeometryForChunk(context.Background(), []core.Layer{layer}, sources, &target); err != nil {
+		t.Fatal(err)
+	}
+	requested, err := sources["areas"].Builder(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := sources["areas"].Builder(context.Background(), render.ChunkKey{Layer: "areas", X: 5, Y: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillCount := 0
+	for _, vertex := range requested.Vertices {
+		if vertex.Kind == render.VertexFill {
+			fillCount++
+		}
+	}
+	if fillCount == 0 || len(other.Vertices) != 0 {
+		t.Fatalf("target fill vertices=%d, off-target vertices=%d", fillCount, len(other.Vertices))
+	}
+}
+
+func TestPolygonWithHoleKeepsGEOSFillFallback(t *testing.T) {
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
+		Name:     "areas",
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (3 3, 3 7, 7 7, 7 3, 3 3))"}}},
+	}}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	area, fillVertices := 0.0, 0
+	for cellY := 0; cellY < 4; cellY++ {
+		for cellX := 0; cellX < 4; cellX++ {
+			chunk, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "areas", X: cellX, Y: cellY})
+			if err != nil {
+				t.Fatal(err)
+			}
+			triangle := [3]render.Vertex{}
+			triangleSize := 0
+			for _, vertex := range chunk.Vertices {
+				if vertex.Kind != render.VertexFill {
+					continue
+				}
+				triangle[triangleSize] = vertex
+				triangleSize++
+				fillVertices++
+				if triangleSize == len(triangle) {
+					a, b, c := triangle[0], triangle[1], triangle[2]
+					area += math.Abs(float64(b.X-a.X)*float64(c.Y-a.Y)-
+						float64(c.X-a.X)*float64(b.Y-a.Y)) / 2
+					triangleSize = 0
+				}
+			}
+			if triangleSize != 0 {
+				t.Fatalf("cell (%d,%d) returned an incomplete fill triangle", cellX, cellY)
+			}
+		}
+	}
+	if fillVertices == 0 || math.Abs(area-0.84) > 1e-5 {
+		t.Fatalf("polygon fill vertices/area = %d/%.8f, want non-empty mesh with area 0.84", fillVertices, area)
+	}
+}
+
 func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	style := core.DefaultLayerStyle()
 	style.FillOpacity = 0
@@ -636,6 +1094,73 @@ func TestConfiguredLabelsUseTemplateLuaRuleAndRenderPlacement(t *testing.T) {
 	label := source.Labels[0]
 	if label.Text != "한강로 12" || label.FeatureID != 7 || label.Rotation != 30 || label.HeightMM != 2.5 || label.MinScale != 1000 || label.MaxScale != 50000 {
 		t.Fatalf("configured label = %#v", label)
+	}
+}
+
+func TestConfiguredLuaLabelComposerPreservesUnmatchedFeatures(t *testing.T) {
+	layers := []core.Layer{{
+		Name: "roads",
+		Labels: core.LabelSettings{
+			Enabled:   true,
+			LuaScript: `return string.format("%s · %d차선", feature.name, feature.lanes)`,
+			Rule:      `return feature.kind == "primary"`,
+			HeightMM:  2.5,
+		},
+		Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "한강로", "lanes": 4, "kind": "primary"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (3 4)"}, Properties: map[string]any{"name": "세종로", "lanes": 2, "kind": "local"}},
+		},
+	}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	if len(layers[0].Features) != 2 {
+		t.Fatalf("label rule filtered map features, got %d", len(layers[0].Features))
+	}
+	if label := layers[0].Features[0].Label; label == nil || label.Text != "한강로 · 4차선" || label.Height != 2.5 {
+		t.Fatalf("composed Lua label = %+v", label)
+	}
+	if layers[0].Features[1].Label != nil {
+		t.Fatalf("nonmatching feature should remain but not receive a label: %+v", layers[0].Features[1])
+	}
+}
+
+func TestPreparedLabelsRespectPerFeatureAndProjectByteBudgets(t *testing.T) {
+	settings := core.LabelSettings{Enabled: true, Expression: "${name}"}
+	makeLayers := func(values ...string) []core.Layer {
+		features := make([]core.Feature, len(values))
+		for index, value := range values {
+			features[index] = core.Feature{ID: uint64(index + 1), Properties: map[string]any{"name": value}}
+		}
+		return []core.Layer{{Name: "roads", Labels: settings, Features: features}}
+	}
+	if err := prepareLayerLabelsCoreWithBudget(context.Background(), makeLayers("12345"), 100, 4); err == nil || !strings.Contains(err.Error(), "feature 1 label exceeds") {
+		t.Fatalf("per-feature label limit error = %v", err)
+	}
+	if err := prepareLayerLabelsCoreWithBudget(context.Background(), makeLayers("1234", "5678"), 6, 4); err == nil || !strings.Contains(err.Error(), "project safety limit") {
+		t.Fatalf("aggregate label limit error = %v", err)
+	}
+	allowed := makeLayers("1234", "5678")
+	if err := prepareLayerLabelsCoreWithBudget(context.Background(), allowed, 8, 4); err != nil {
+		t.Fatalf("labels at exact budget rejected: %v", err)
+	}
+}
+
+func TestConfiguredLuaLabelComposerHasExecutionLimit(t *testing.T) {
+	layers := []core.Layer{{
+		Name: "roads",
+		Labels: core.LabelSettings{
+			Enabled: true, LuaScript: `while true do end; return "never"`,
+		},
+		Features: []core.Feature{{ID: 1, Properties: map[string]any{"name": "road"}}},
+	}}
+	started := time.Now()
+	err := prepareLayerLabelsWithMaximumDuration(context.Background(), layers, 25*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("non-terminating label script error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("label script execution limit took %s", elapsed)
 	}
 }
 
@@ -747,14 +1272,256 @@ func TestLargeReadOnlyLoadPublishesStablePreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer full.closeAttributeSource()
-	if preview == nil || len(preview.features) != previewFeatureLimit || len(full.features) != previewMinimumFeatures {
-		t.Fatalf("preview/full feature counts = %d/%d", len(preview.features), len(full.features))
+	if preview == nil || len(preview.features) != previewFeatureLimit {
+		got := 0
+		if preview != nil {
+			got = len(preview.features)
+		}
+		t.Fatalf("preview feature count = %d, want %d", got, previewFeatureLimit)
 	}
-	if preview.features[previewFeatureLimit-1].Vertices[0] != full.features[previewFeatureLimit-1].Vertices[0] {
-		t.Fatalf("preview/full coordinates differ: %v / %v", preview.features[previewFeatureLimit-1].Vertices[0], full.features[previewFeatureLimit-1].Vertices[0])
+	if !full.viewportReadOnly {
+		t.Fatal("compatible large source did not use viewport-backed read-only loading")
+	}
+	if full.viewportReadOnly {
+		if len(full.features) != 0 {
+			t.Fatalf("windowed full runtime eagerly loaded %d features", len(full.features))
+		}
+		key := render.ChunkKey{Layer: "large", X: 0, Y: 0}
+		full.mu.Lock()
+		full.windowVisibleKeys[key] = struct{}{}
+		full.mu.Unlock()
+		if _, err := full.builder(context.Background(), key); err != nil {
+			t.Fatalf("build preview comparison window: %v", err)
+		}
+		if len(full.features) < previewFeatureLimit || preview.features[previewFeatureLimit-1].Vertices[0] != full.features[previewFeatureLimit-1].Vertices[0] {
+			t.Fatalf("preview/window coordinates differ: preview=%d window=%d", len(preview.features), len(full.features))
+		}
+	} else if len(full.features) != previewMinimumFeatures || preview.features[previewFeatureLimit-1].Vertices[0] != full.features[previewFeatureLimit-1].Vertices[0] {
+		t.Fatalf("preview/full feature counts or coordinates differ: preview=%d full=%d", len(preview.features), len(full.features))
 	}
 	if preview.closeAttributeSource != nil || preview.attributeFeatureReader != nil {
 		t.Fatal("preview retained the full loader's attribute session")
+	}
+}
+
+func TestWindowedReadOnlyRuntimeTakesOwnershipOfPreviewSession(t *testing.T) {
+	path := largeReadOnlyFixture(t)
+	session, err := gdal.OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	tryReadOnlyPreview(context.Background(), session, "", "", "", path, "", func(*demoRuntime) {})
+
+	runtime, ok, err := tryLoadWindowedReadOnlyRuntimeWithSession(context.Background(), []vectorSourceSpec{{Path: path}}, "", session)
+	if err != nil || !ok {
+		t.Fatalf("windowed runtime = %v, %t, want success: %v", runtime, ok, err)
+	}
+	if _, err := session.Inspect(context.Background()); err != nil {
+		t.Fatalf("transferred preview session is not live: %v", err)
+	}
+	runtime.closeAttributeSource()
+	if _, err := session.Inspect(context.Background()); err == nil {
+		t.Fatal("runtime close did not release the transferred GDAL session")
+	}
+}
+
+func TestWindowedReadOnlyRejectsDenseChunkWithoutCachingPartialData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dense.geojson")
+	const featureCount = maxReadOnlyWindowFeatures + 1
+	var fixture strings.Builder
+	fixture.Grow(featureCount * 115)
+	fixture.WriteString(`{"type":"FeatureCollection","features":[`)
+	for index := 0; index < featureCount; index++ {
+		if index > 0 {
+			fixture.WriteByte(',')
+		}
+		fmt.Fprintf(&fixture, `{"type":"Feature","properties":{"name":"p%d"},"geometry":{"type":"Point","coordinates":[127,37]}}`, index)
+	}
+	fixture.WriteString(`]}`)
+	if err := os.WriteFile(path, []byte(fixture.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !runtime.viewportReadOnly || len(runtime.features) != 0 {
+		t.Fatalf("initial runtime viewport-backed=%t features=%d", runtime.viewportReadOnly, len(runtime.features))
+	}
+	key := render.ChunkKey{Layer: "dense", X: 2, Y: 2}
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys[key] = struct{}{}
+	runtime.mu.Unlock()
+	if _, err := runtime.builder(context.Background(), key); err == nil || !strings.Contains(err.Error(), "limit of 20000") {
+		t.Fatalf("dense chunk error = %v", err)
+	}
+	if len(runtime.features) != 0 || len(runtime.windowHits) != 0 || len(runtime.windowFeatureNames) != 0 {
+		t.Fatalf("partial chunk escaped safety limit: features=%d hits=%d names=%d", len(runtime.features), len(runtime.windowHits), len(runtime.windowFeatureNames))
+	}
+}
+
+func TestReadOnlyPolygonVertexBudgetPreflightsWKB(t *testing.T) {
+	wkb := make([]byte, 9+4+3*16)
+	wkb[0] = 1
+	binary.LittleEndian.PutUint32(wkb[1:5], 3) // Polygon
+	binary.LittleEndian.PutUint32(wkb[5:9], 1) // one ring
+	binary.LittleEndian.PutUint32(wkb[9:13], 3)
+	layer := core.Layer{Features: []core.Feature{{ID: 77, Geometry: core.WKBGeometry{WKB: wkb}}}}
+	if err := validateReadOnlyWindowPolygonVertexBudget(layer, 3); err != nil {
+		t.Fatalf("valid polygon WKB rejected: %v", err)
+	}
+	if err := validateReadOnlyWindowPolygonVertexBudget(layer, 2); err == nil || !strings.Contains(err.Error(), "triangulation safety limit") {
+		t.Fatalf("oversized polygon WKB error = %v", err)
+	}
+}
+
+func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
+	paths := filepath.SplitList(os.Getenv("GOGIS_TEST_LARGE_VECTOR_SOURCES"))
+	if len(paths) == 0 || paths[0] == "" {
+		t.Skip("set GOGIS_TEST_LARGE_VECTOR_SOURCES to a platform path-list of real large vector sources")
+	}
+	runtime, autoReadOnly, totalFeatureCount, err := loadDataRuntimeFilesWithLargePolicy(
+		context.Background(), paths, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !autoReadOnly || !runtime.readOnly || totalFeatureCount != largeDatasetReadOnlyThreshold {
+		t.Fatalf("real-source load policy = read-only:%t runtime:%t count:%d; want automatic read-only at threshold", autoReadOnly, runtime.readOnly, totalFeatureCount)
+	}
+	if !runtime.viewportReadOnly || len(runtime.features) != 0 {
+		t.Fatalf("large source runtime viewport=%t initial hits=%d", runtime.viewportReadOnly, len(runtime.features))
+	}
+	if workers := runtime.scheduler.MaxWorkers(); workers != 2 {
+		t.Fatalf("read-only render workers = %d, want bounded concurrency of 2", workers)
+	}
+	names := runtime.service.LayerNames()
+	readableChunks := make(map[string]int, len(names))
+	for _, name := range names {
+		_, sourceFeatureCount, countErr := runtime.attributePageReader(context.Background(), name, 0, 1)
+		if countErr != nil {
+			t.Fatalf("read source feature count for %s: %v", name, countErr)
+		}
+		t.Logf("real source layer=%s feature-count=%d", name, sourceFeatureCount)
+		for zoomBucket := 0; zoomBucket <= 4 && readableChunks[name] == 0; zoomBucket++ {
+			tileCount := 4 << zoomBucket
+			keys := make([]render.ChunkKey, 0, tileCount*tileCount)
+			for y := 0; y < tileCount; y++ {
+				for x := 0; x < tileCount; x++ {
+					keys = append(keys, render.ChunkKey{Layer: name, ZoomBucket: zoomBucket, X: x, Y: y})
+				}
+			}
+			runtime.mu.Lock()
+			runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{}, len(keys))
+			runtime.windowHits = make(map[render.ChunkKey][]render.HitFeature)
+			runtime.windowFeatureCounts = make(map[render.ChunkKey]int)
+			runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
+			runtime.windowPayloadBytes = make(map[render.ChunkKey]int64)
+			runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
+			runtime.windowFeatureNames = make(map[uint64]string)
+			runtime.windowVisibleFeatureCount = 0
+			runtime.windowVisiblePayloadBytes = 0
+			for _, key := range keys {
+				runtime.windowVisibleKeys[key] = struct{}{}
+			}
+			runtime.mu.Unlock()
+			for _, key := range keys {
+				if readableChunks[name] > 0 {
+					break
+				}
+				chunk, err := runtime.builder(context.Background(), key)
+				if err != nil && !strings.Contains(err.Error(), "safety limit") && !strings.Contains(err.Error(), "payload budget") && !strings.Contains(err.Error(), "limit of") {
+					t.Fatalf("real source chunk %v failed unexpectedly: %v", key, err)
+				}
+				if err == nil {
+					hitCount := len(runtime.windowHits[key])
+					if hitCount > 0 {
+						readableChunks[name]++
+						t.Logf("real source layer=%s bucket=%d first readable chunk=%v hits=%d vertices=%d", key.Layer, zoomBucket, key, hitCount, len(chunk.Vertices))
+					}
+				} else {
+					t.Logf("real source layer=%s bucket=%d correctly bounded: %v", key.Layer, zoomBucket, err)
+				}
+			}
+		}
+		if readableChunks[name] == 0 {
+			t.Errorf("real source layer %s yielded no features through zoom bucket 4", name)
+		}
+	}
+	if len(runtime.features) > maxReadOnlyVisibleFeatures || runtime.windowVisiblePayloadBytes > maxReadOnlyVisibleBytes {
+		t.Fatalf("real-source safety caps exceeded: hits=%d payload=%d", len(runtime.features), runtime.windowVisiblePayloadBytes)
+	}
+	if peakRSS, ok := benchmarkProcessMaxRSSBytes(); ok {
+		t.Logf("real source combined-layer test process peak-RSS-MiB=%d", peakRSS/(1<<20))
+	}
+}
+
+func TestWindowedReadOnlyRepeatedViewportMoves1M(t *testing.T) {
+	if os.Getenv("GOGIS_TEST_REPEATED_VIEWPORT_1M") != "1" {
+		t.Skip("set GOGIS_TEST_REPEATED_VIEWPORT_1M=1 to run the 1M-feature viewport stress test")
+	}
+	runWindowedReadOnlyRepeatedViewportStress(t, 1_000_000)
+}
+
+func TestWindowedReadOnlyRepeatedViewportMovesAboveIndexCap(t *testing.T) {
+	if os.Getenv("GOGIS_TEST_REPEATED_VIEWPORT_ABOVE_INDEX_CAP") != "1" {
+		t.Skip("set GOGIS_TEST_REPEATED_VIEWPORT_ABOVE_INDEX_CAP=1 to run the partial-index viewport stress test")
+	}
+	runWindowedReadOnlyRepeatedViewportStress(t, 1_000_001)
+}
+
+func runWindowedReadOnlyRepeatedViewportStress(t *testing.T, featureCount int) {
+	t.Helper()
+	path := desktopBenchmarkGeoJSONFixture(t, featureCount)
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{
+		Path: path, Labels: core.LabelSettings{Enabled: true, LuaScript: `return feature.name`},
+	}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !runtime.viewportReadOnly || len(runtime.features) != 0 {
+		t.Fatalf("million-feature runtime viewport-backed=%t retained features=%d", runtime.viewportReadOnly, len(runtime.features))
+	}
+
+	const moves = 128
+	var totalWindowHits int
+	var totalWindowLabels int
+	for move := 0; move < moves; move++ {
+		key := render.ChunkKey{
+			Layer: runtime.service.LayerNames()[0], ZoomBucket: 6,
+			X: move, Y: (move * 37) % 256,
+		}
+		runtime.mu.Lock()
+		runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{key})
+		runtime.mu.Unlock()
+		if _, err := runtime.builder(context.Background(), key); err != nil {
+			t.Fatalf("viewport move %d (%v): %v", move, key, err)
+		}
+		runtime.mu.Lock()
+		if len(runtime.windowVisibleKeys) != 1 || len(runtime.windowFeatureCounts) > 1 ||
+			runtime.windowVisibleFeatureCount > maxReadOnlyVisibleFeatures ||
+			runtime.windowVisiblePayloadBytes > maxReadOnlyVisibleBytes {
+			runtime.mu.Unlock()
+			t.Fatalf("viewport move %d retained unbounded state: keys=%d chunks=%d features=%d bytes=%d",
+				move, len(runtime.windowVisibleKeys), len(runtime.windowFeatureCounts),
+				runtime.windowVisibleFeatureCount, runtime.windowVisiblePayloadBytes)
+		}
+		totalWindowHits += len(runtime.features)
+		totalWindowLabels += len(runtime.windowLabels[key])
+		runtime.mu.Unlock()
+	}
+	if totalWindowHits == 0 {
+		t.Fatal("viewport stress test did not read any source features")
+	}
+	if totalWindowLabels == 0 {
+		t.Fatal("viewport stress test did not evaluate configured Lua labels")
+	}
+	if peakRSS, ok := benchmarkProcessMaxRSSBytes(); ok {
+		t.Logf("repeated viewport moves=%d source-features=%d total-window-hits=%d total-window-labels=%d peak-RSS-MiB=%d",
+			moves, featureCount, totalWindowHits, totalWindowLabels, peakRSS/(1<<20))
 	}
 }
 

@@ -1,6 +1,9 @@
 package render
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestChunkPlannerIncludesLookAheadMargin(t *testing.T) {
 	planner := ChunkPlanner{ChunkSize: 1, Margin: 1}
@@ -57,5 +60,67 @@ func TestChunkPlannerVisibleKeysIntoReusesDestination(t *testing.T) {
 		if got[index+1] != want[index] {
 			t.Fatalf("key[%d] = %#v, want %#v", index, got[index+1], want[index])
 		}
+	}
+}
+
+func TestChunkPlannerVisibleKeysIntoLimitRejectsAggregateWithoutMutation(t *testing.T) {
+	planner := ChunkPlanner{ChunkSize: 0.01, Margin: 0}
+	viewport := Viewport{Center: Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	prefix := []ChunkKey{{Layer: "existing", X: 7}}
+	got, withinLimit := planner.VisibleKeysIntoLimit(prefix, viewport, "roads", 20)
+	if withinLimit {
+		t.Fatal("oversized viewport plan was accepted")
+	}
+	if len(got) != len(prefix) || got[0] != prefix[0] {
+		t.Fatalf("overflow changed existing destination: %#v", got)
+	}
+
+	planner = ChunkPlanner{ChunkSize: 1, Margin: 0}
+	viewport.Zoom = 2
+	got, withinLimit = planner.VisibleKeysIntoLimit(prefix[:0], viewport, "roads", 1)
+	if !withinLimit || len(got) != 1 {
+		t.Fatalf("single-key plan = (%#v, %t), want one key within limit", got, withinLimit)
+	}
+}
+
+func TestChunkPlannerBoundsExtremeZoomToDataDomain(t *testing.T) {
+	planner := ChunkPlanner{
+		ChunkSize: 0.25,
+		Margin:    1,
+		Domain:    [4]float64{0, 0, 1, 1},
+		HasDomain: true,
+	}
+	keys := planner.VisibleKeys(Viewport{Zoom: 0.0001}, "roads")
+	if len(keys) != 49 {
+		t.Fatalf("extreme zoom-out planned %d keys, want 49 bounded keys", len(keys))
+	}
+	for _, key := range keys {
+		if key.X < -1 || key.X > 5 || key.Y < -1 || key.Y > 5 {
+			t.Fatalf("key is outside the bounded data domain: %+v", key)
+		}
+	}
+}
+
+func TestChunkPlannerRejectsUnboundedOrInvalidViewports(t *testing.T) {
+	planner := ChunkPlanner{ChunkSize: 0.25, Margin: 1}
+	viewport := Viewport{Zoom: 0.0001}
+	if keys := planner.VisibleKeys(viewport, "roads"); len(keys) != 0 {
+		t.Fatalf("unbounded extreme zoom planned %d keys, want safe empty result", len(keys))
+	}
+	viewport = Viewport{Center: Point{X: math.NaN()}, Zoom: 1}
+	if keys := planner.VisibleKeys(viewport, "roads"); len(keys) != 0 {
+		t.Fatalf("invalid viewport planned %d keys, want safe empty result", len(keys))
+	}
+}
+
+func TestChunkPlannerSkipsDataOutsideViewportDomain(t *testing.T) {
+	planner := ChunkPlanner{
+		ChunkSize: 0.25,
+		Domain:    [4]float64{0, 0, 1, 1},
+		HasDomain: true,
+	}
+	keys := planner.VisibleKeys(Viewport{Center: Point{X: 100, Y: 100}, Zoom: 1}, "roads")
+	if len(keys) != 0 {
+		t.Fatalf("off-domain viewport planned %d keys, want none", len(keys))
 	}
 }

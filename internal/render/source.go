@@ -17,11 +17,48 @@ import (
 // Coordinates are mapped into the unit square so Qt and other adapters can
 // apply viewport transforms without knowing the source CRS units.
 type LayerSource struct {
-	Features  []HitFeature
-	Labels    []LayerLabel
-	Builder   ChunkBuilder
-	ChunkSize float64
-	Extent    [4]float64
+	Features            []HitFeature
+	Labels              []LayerLabel
+	Builder             ChunkBuilder
+	ChunkSize           float64
+	Extent              [4]float64
+	PolygonFillVertices int
+	PolygonFillCapacity int
+}
+
+// MaxChunkVertices bounds retained render payload per spatial chunk before
+// publication to UI/native adapters.
+const MaxChunkVertices = 2 * 1024 * 1024
+
+// MaxBatchVertices bounds the flattened viewport payload before adapters copy
+// it into native memory. Keep this aligned with native renderer input limits.
+const MaxBatchVertices = 4 * 1024 * 1024
+
+// maxFullLayerChunkGridAxis bounds work when a builder prepares every
+// normalized cell. Single-target viewport builders do not use this full-grid
+// path and remain free to request finer chunk sizes.
+const maxFullLayerChunkGridAxis = 256
+
+// AppendVertexBatchWithinLimit appends a vertex batch without exceeding limit.
+// On rejection it returns current unchanged.
+func AppendVertexBatchWithinLimit(current, batch []Vertex, limit int) ([]Vertex, bool) {
+	if limit < 0 || len(current) > limit || len(batch) > limit-len(current) {
+		return current, false
+	}
+	needed := len(current) + len(batch)
+	if needed > cap(current) {
+		newCapacity := cap(current) * 2
+		if newCapacity < needed {
+			newCapacity = needed
+		}
+		if newCapacity > limit {
+			newCapacity = limit
+		}
+		grown := make([]Vertex, len(current), newCapacity)
+		copy(grown, current)
+		current = grown
+	}
+	return append(current, batch...), true
 }
 
 type LayerLabel struct {
@@ -73,7 +110,7 @@ func NewLayerSource(layer core.Layer) (LayerSource, error) {
 	}
 	bounds := paddedDegenerateExtent([4]float64{minX, minY, maxX, maxY}, layer.CRS.AuthorityCode)
 	minX, minY, maxX, maxY = bounds[0], bounds[1], bounds[2], bounds[3]
-	return newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, nil), nil
+	return newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, 0.25, nil, nil), nil
 }
 
 // NewLayerSources creates sources using one common extent. This is required
@@ -89,7 +126,7 @@ func NewLayerSources(layers []core.Layer) (map[string]LayerSource, error) {
 // storage with each source's Features slice; callers must treat both as
 // immutable after construction.
 func NewLayerSourcesWithFeatures(layers []core.Layer) (map[string]LayerSource, []HitFeature, error) {
-	return newLayerSourcesWithFeatures(layers, nil)
+	return newLayerSourcesWithFeatures(layers, nil, 0.25, nil)
 }
 
 // NewLayerSourcesWithExtent normalizes a partial layer snapshot against the
@@ -104,10 +141,50 @@ func NewLayerSourcesWithExtent(layers []core.Layer, bounds [4]float64) (map[stri
 	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
 		return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
 	}
-	return newLayerSourcesWithFeatures(layers, &bounds)
+	return newLayerSourcesWithFeatures(layers, &bounds, 0.25, nil)
 }
 
-func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64) (map[string]LayerSource, []HitFeature, error) {
+// NewLayerSourcesWithExtentAndChunkSize is NewLayerSourcesWithExtent with a
+// caller-selected normalized tile size. The size is part of cache semantics;
+// callers must keep it stable for the returned builder's lifetime.
+func NewLayerSourcesWithExtentAndChunkSize(layers []core.Layer, bounds [4]float64, chunkSize float64) (map[string]LayerSource, []HitFeature, error) {
+	if math.IsNaN(chunkSize) || math.IsInf(chunkSize, 0) || chunkSize <= 0 || chunkSize > 1 {
+		return nil, nil, fmt.Errorf("invalid render chunk size %v", chunkSize)
+	}
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
+		}
+	}
+	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+		return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
+	}
+	return newLayerSourcesWithFeatures(layers, &bounds, chunkSize, nil)
+}
+
+// NewLayerSourcesWithExtentAndChunkSizeForChunk builds render vertices only
+// for target.X/target.Y. Hit-test geometry still covers every feature returned
+// by the caller's spatial query.
+func NewLayerSourcesWithExtentAndChunkSizeForChunk(layers []core.Layer, bounds [4]float64, chunkSize float64, target ChunkKey) (map[string]LayerSource, []HitFeature, error) {
+	if math.IsNaN(chunkSize) || math.IsInf(chunkSize, 0) || chunkSize <= 0 || chunkSize > 1 {
+		return nil, nil, fmt.Errorf("invalid render chunk size %v", chunkSize)
+	}
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
+		}
+	}
+	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+		return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
+	}
+	targetCell := [2]int{target.X, target.Y}
+	return newLayerSourcesWithFeatures(layers, &bounds, chunkSize, &targetCell)
+}
+
+func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64, chunkSize float64, target *[2]int) (map[string]LayerSource, []HitFeature, error) {
+	if target == nil && 1/chunkSize > maxFullLayerChunkGridAxis {
+		return nil, nil, fmt.Errorf("full-layer render chunk size creates more than %d cells per axis", maxFullLayerChunkGridAxis)
+	}
 	parsed := make([][]parsedFeaturePoints, len(layers))
 	lineFlags := make([][]bool, len(layers))
 	seenLayers := make(map[string]struct{}, len(layers))
@@ -151,7 +228,7 @@ func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64) (map[s
 	featureOffset := 0
 	for index, layer := range layers {
 		featureEnd := featureOffset + len(layer.Features)
-		source := newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, features[featureOffset:featureEnd:featureEnd])
+		source := newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, chunkSize, features[featureOffset:featureEnd:featureEnd], target)
 		source.Extent = [4]float64{minX, minY, maxX, maxY}
 		sources[layer.Name] = source
 		featureOffset = featureEnd
@@ -164,9 +241,6 @@ func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64) (map[s
 // or scale, and normalized point coordinates collapse to an edge of the canvas.
 func paddedDegenerateExtent(bounds [4]float64, authorityCode string) [4]float64 {
 	spanX, spanY := bounds[2]-bounds[0], bounds[3]-bounds[1]
-	if spanX > 0 && spanY > 0 {
-		return bounds
-	}
 	padding := 0.5
 	switch strings.ToUpper(strings.TrimSpace(authorityCode)) {
 	case "EPSG:4326":
@@ -183,6 +257,24 @@ func paddedDegenerateExtent(bounds [4]float64, authorityCode string) [4]float64 
 		yPadding := math.Max(padding, spanX*0.05)
 		bounds[1] -= yPadding
 		bounds[3] += yPadding
+	}
+	// A CRS transform can turn a point extent into a tiny non-zero span due to
+	// floating-point rounding. Treat spans below coordinate precision as
+	// degenerate too, otherwise normalization magnifies noise and inverse
+	// viewport-window queries can miss the source feature.
+	for _, axis := range []int{0, 1} {
+		minIndex, maxIndex := axis, axis+2
+		span := bounds[maxIndex] - bounds[minIndex]
+		if span <= 0 {
+			continue
+		}
+		center := bounds[minIndex] + span/2
+		minimumSpan := math.Max(1, math.Abs(center)) * 1e-9
+		if span < minimumSpan {
+			extra := (minimumSpan - span) / 2
+			bounds[minIndex] -= extra
+			bounds[maxIndex] += extra
+		}
 	}
 	return bounds
 }
@@ -240,10 +332,14 @@ func parseLayerPoints(layer core.Layer) ([]parsedFeaturePoints, []bool, float64,
 		parsed[index] = geometry
 		lineFlags[index] = line
 		if geometry.parts == nil {
-			updateExtent(geometry.points, &minX, &minY, &maxX, &maxY)
+			if err := updateExtent(geometry.points, &minX, &minY, &maxX, &maxY); err != nil {
+				return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+			}
 		} else {
 			for _, points := range geometry.parts {
-				updateExtent(points, &minX, &minY, &maxX, &maxY)
+				if err := updateExtent(points, &minX, &minY, &maxX, &maxY); err != nil {
+					return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+				}
 			}
 		}
 	}
@@ -268,7 +364,9 @@ func parseUniformWKTLineLayer(layer core.Layer) ([]parsedFeaturePoints, []bool, 
 		pointArena = nextArena
 		parsed[index] = parsedFeaturePoints{points: points}
 		lineFlags[index] = true
-		updateExtent(points, &minX, &minY, &maxX, &maxY)
+		if err := updateExtent(points, &minX, &minY, &maxX, &maxY); err != nil {
+			return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+		}
 	}
 	return parsed, lineFlags, minX, minY, maxX, maxY, nil
 }
@@ -362,7 +460,9 @@ func parseUniformWKTMultiLineLayer(layer core.Layer) ([]parsedFeaturePoints, []b
 		pointArena, partArena = nextPointArena, nextPartArena
 		parsed[index] = parsedFeaturePoints{parts: parts}
 		for _, part := range parts {
-			updateExtent(part, &minX, &minY, &maxX, &maxY)
+			if err := updateExtent(part, &minX, &minY, &maxX, &maxY); err != nil {
+				return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+			}
 		}
 	}
 	return parsed, lineFlags, minX, minY, maxX, maxY, nil
@@ -385,7 +485,9 @@ func parseUniformWKTPartsLayer(layer core.Layer, parentDepth int) ([]parsedFeatu
 		pointArena, partArena = nextPointArena, nextPartArena
 		parsed[index] = parsedFeaturePoints{parts: parts}
 		for _, part := range parts {
-			updateExtent(part, &minX, &minY, &maxX, &maxY)
+			if err := updateExtent(part, &minX, &minY, &maxX, &maxY); err != nil {
+				return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+			}
 		}
 	}
 	return parsed, lineFlags, minX, minY, maxX, maxY, nil
@@ -408,7 +510,9 @@ func parseUniformWKTGeometryCollectionLayer(layer core.Layer) ([]parsedFeaturePo
 		pointArena, partArena = nextPointArena, nextPartArena
 		parsed[index] = parsedFeaturePoints{parts: parts}
 		for _, part := range parts {
-			updateExtent(part, &minX, &minY, &maxX, &maxY)
+			if err := updateExtent(part, &minX, &minY, &maxX, &maxY); err != nil {
+				return nil, nil, 0, 0, 0, 0, fmt.Errorf("feature %d: %w", feature.ID, err)
+			}
 		}
 	}
 	return parsed, lineFlags, minX, minY, maxX, maxY, nil
@@ -728,9 +832,9 @@ func countSegmentVertices(start, end Point, chunkSize float64, counts map[[2]int
 	}
 }
 
-func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []bool, minX, minY, maxX, maxY float64, features []HitFeature) LayerSource {
+func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []bool, minX, minY, maxX, maxY, chunkSize float64, features []HitFeature, target *[2]int) LayerSource {
 	if len(layer.Features) == 0 {
-		return LayerSource{ChunkSize: 0.25, Builder: emptyChunkBuilder()}
+		return LayerSource{ChunkSize: chunkSize, Builder: emptyChunkBuilder()}
 	}
 	style := layer.Style
 	if style == (core.LayerStyle{}) {
@@ -743,11 +847,12 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 	if spanY == 0 {
 		spanY = 1
 	}
+	maxChunkCell := int(math.Ceil(1/chunkSize)) - 1
 	if features == nil {
 		features = make([]HitFeature, len(layer.Features))
 	}
-	const chunkSize = 0.25
 	chunkVertices := make(map[[2]int][]Vertex)
+	chunkVertexLimitExceeded := make(map[[2]int]bool)
 	var chunkHints map[[2]int]int
 	coordinatesNormalized := false
 	allPoints := len(parsed) == len(layer.Features)
@@ -799,17 +904,29 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				point := part[0]
 				cellX := int(math.Floor(point.X / chunkSize))
 				cellY := int(math.Floor(point.Y / chunkSize))
-				if cellX == 4 {
-					cellX = 3
+				if cellX > maxChunkCell {
+					cellX = maxChunkCell
 				}
-				if cellY == 4 {
-					cellY = 3
+				if cellY > maxChunkCell {
+					cellY = maxChunkCell
 				}
-				chunkHints[[2]int{cellX, cellY}] += 2
+				cell := [2]int{cellX, cellY}
+				if target == nil || cell == *target {
+					chunkHints[cell] += 2
+				}
 				return
 			}
 			for pointIndex := 1; pointIndex < len(part); pointIndex++ {
-				countSegmentVertices(part[pointIndex-1], part[pointIndex], chunkSize, chunkHints)
+				start, end := part[pointIndex-1], part[pointIndex]
+				if target == nil {
+					countSegmentVertices(start, end, chunkSize, chunkHints)
+					continue
+				}
+				minX, minY := float64(target[0])*chunkSize, float64(target[1])*chunkSize
+				_, _, visible := clipSegmentToRect(start, end, minX, minY, minX+chunkSize, minY+chunkSize)
+				if visible {
+					chunkHints[*target] += 2
+				}
 			}
 		}
 		for index := range parsed {
@@ -825,25 +942,29 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		coordinatesNormalized = true
 	}
 	appendChunkVertices := func(key [2]int, vertices ...Vertex) {
+		if target != nil && key != *target {
+			return
+		}
+		if chunkVertexLimitExceeded[key] {
+			return
+		}
 		chunk := chunkVertices[key]
 		if chunk == nil && chunkHints != nil {
-			chunk = make([]Vertex, 0, chunkHints[key])
-		}
-		needed := len(chunk) + len(vertices)
-		if chunkHints == nil && needed > cap(chunk) {
-			// Generic multipart geometries do not have a cheap exact hint. A
-			// Doubling keeps repeated polygon/multipart appends from copying the
-			// same chunk through many intermediate capacities. Exact hints still
-			// take precedence for homogeneous points and simple lines.
-			newCapacity := cap(chunk) * 2
-			if newCapacity < needed {
-				newCapacity = needed
+			hint := chunkHints[key]
+			if hint > MaxChunkVertices {
+				chunkVertexLimitExceeded[key] = true
+				return
 			}
-			grown := make([]Vertex, len(chunk), newCapacity)
-			copy(grown, chunk)
-			chunk = grown
+			chunk = make([]Vertex, 0, hint)
 		}
-		chunkVertices[key] = append(chunk, vertices...)
+		var ok bool
+		chunk, ok = AppendVertexBatchWithinLimit(chunk, vertices, MaxChunkVertices)
+		if !ok {
+			delete(chunkVertices, key)
+			chunkVertexLimitExceeded[key] = true
+			return
+		}
+		chunkVertices[key] = chunk
 	}
 	// Multipart geometries retain their disjoint Parts view while the flattened
 	// hit-test view shares one layer-owned arena instead of allocating once per
@@ -864,6 +985,15 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		normalizedArena = make([]Point, 0, totalMultipartPoints)
 	}
 	appendSegment := func(start, end Point) {
+		if target != nil {
+			cellMinX, cellMinY := float64(target[0])*chunkSize, float64(target[1])*chunkSize
+			cellMaxX, cellMaxY := cellMinX+chunkSize, cellMinY+chunkSize
+			clippedStart, clippedEnd, visible := clipSegmentToRect(start, end, cellMinX, cellMinY, cellMaxX, cellMaxY)
+			if visible {
+				appendChunkVertices(*target, newLineVertex(clippedStart, style.LineWidthMM), newLineVertex(clippedEnd, style.LineWidthMM))
+			}
+			return
+		}
 		startCellX := int(math.Floor(start.X / chunkSize))
 		endCellX := int(math.Floor(end.X / chunkSize))
 		startCellY := int(math.Floor(start.Y / chunkSize))
@@ -957,11 +1087,11 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				point := part[0]
 				cellX := int(math.Floor(point.X / chunkSize))
 				cellY := int(math.Floor(point.Y / chunkSize))
-				if cellX == 4 {
-					cellX = 3
+				if cellX > maxChunkCell {
+					cellX = maxChunkCell
 				}
-				if cellY == 4 {
-					cellY = 3
+				if cellY > maxChunkCell {
+					cellY = maxChunkCell
 				}
 				marker := Vertex{X: float32(point.X), Y: float32(point.Y), SizeMM: float32(style.PointSizeMM), Kind: VertexPoint}
 				appendChunkVertices([2]int{cellX, cellY}, marker, marker)
@@ -1070,6 +1200,9 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		Builder: func(ctx context.Context, key ChunkKey) (Chunk, error) {
 			if err := ctx.Err(); err != nil {
 				return Chunk{}, err
+			}
+			if chunkVertexLimitExceeded[[2]int{key.X, key.Y}] {
+				return Chunk{}, fmt.Errorf("render chunk exceeds the %d-vertex safety limit", MaxChunkVertices)
 			}
 			vertices := chunkVertices[[2]int{key.X, key.Y}]
 			// chunkVertices is immutable after source construction. BatchStore
@@ -1825,11 +1958,13 @@ func wktSingleRingPointsInto(wkt string, pointArena []Point) ([]Point, []Point, 
 	return points, nextArena, true, err
 }
 
-func updateExtent(points []Point, minX, minY, maxX, maxY *float64) {
+func updateExtent(points []Point, minX, minY, maxX, maxY *float64) error {
 	for _, point := range points {
-		// Coordinate data is already validated by the geometry parser. Direct
-		// comparisons avoid four math.Min/Max calls for every point in a large
-		// import while preserving the extent result for finite coordinates.
+		if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
+			return fmt.Errorf("geometry coordinate is not finite: (%v, %v)", point.X, point.Y)
+		}
+		// Direct comparisons avoid four math.Min/Max calls for every point in a
+		// large import while preserving the extent result for finite coordinates.
 		if point.X < *minX {
 			*minX = point.X
 		}
@@ -1843,6 +1978,7 @@ func updateExtent(points []Point, minX, minY, maxX, maxY *float64) {
 			*maxY = point.Y
 		}
 	}
+	return nil
 }
 
 func wktParts(geometry core.Geometry) ([][]Point, error) {
@@ -2296,9 +2432,11 @@ type wkbCursor struct {
 	order  binary.ByteOrder
 }
 
+const maxWKBGeometryNestingDepth = 64
+
 func parseWKBParts(data []byte) ([][]Point, error) {
 	cursor := &wkbCursor{data: data}
-	parts, err := cursor.geometryParts()
+	parts, err := cursor.geometryParts(0)
 	if err != nil {
 		return nil, err
 	}
@@ -2308,7 +2446,10 @@ func parseWKBParts(data []byte) ([][]Point, error) {
 	return parts, nil
 }
 
-func (c *wkbCursor) geometryParts() ([][]Point, error) {
+func (c *wkbCursor) geometryParts(depth int) ([][]Point, error) {
+	if depth > maxWKBGeometryNestingDepth {
+		return nil, fmt.Errorf("WKB geometry nesting exceeds the limit of %d", maxWKBGeometryNestingDepth)
+	}
 	if c.offset >= len(c.data) {
 		return nil, errors.New("WKB is truncated")
 	}
@@ -2358,6 +2499,10 @@ func (c *wkbCursor) geometryParts() ([][]Point, error) {
 		if err != nil {
 			return nil, err
 		}
+		stride := 16 + 8*(wkbBoolInt(hasZ)+wkbBoolInt(hasM))
+		if uint64(count) > uint64(len(c.data)-c.offset)/uint64(stride) {
+			return nil, errors.New("WKB coordinate count exceeds the remaining data")
+		}
 		points := make([]Point, int(count))
 		for index := range points {
 			points[index], err = readPoint()
@@ -2389,6 +2534,9 @@ func (c *wkbCursor) geometryParts() ([][]Point, error) {
 		if err != nil {
 			return nil, err
 		}
+		if uint64(ringCount) > uint64(len(c.data)-c.offset)/4 {
+			return nil, errors.New("WKB ring count exceeds the remaining data")
+		}
 		parts := make([][]Point, int(ringCount))
 		for index := range parts {
 			parts[index], err = readPoints()
@@ -2402,9 +2550,12 @@ func (c *wkbCursor) geometryParts() ([][]Point, error) {
 		if err != nil {
 			return nil, err
 		}
+		if uint64(count) > uint64(len(c.data)-c.offset)/5 {
+			return nil, errors.New("WKB child geometry count exceeds the remaining data")
+		}
 		parts := make([][]Point, 0)
 		for index := uint32(0); index < count; index++ {
-			child, err := c.geometryParts()
+			child, err := c.geometryParts(depth + 1)
 			if err != nil {
 				return nil, err
 			}

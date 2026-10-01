@@ -75,7 +75,7 @@ func BenchmarkWKTLayerSource10KPolygonsGenericBaseline(b *testing.B) {
 				updateExtent(part, &minX, &minY, &maxX, &maxY)
 			}
 		}
-		_ = newLayerSource(layer, parsed, nil, minX, minY, maxX, maxY, nil)
+		_ = newLayerSource(layer, parsed, nil, minX, minY, maxX, maxY, 0.25, nil, nil)
 	}
 }
 
@@ -335,7 +335,7 @@ func BenchmarkWKBLayerSource10KPolygonsGenericBaseline(b *testing.B) {
 				updateExtent(part, &minX, &minY, &maxX, &maxY)
 			}
 		}
-		_ = newLayerSource(layer, parsed, nil, minX, minY, maxX, maxY, nil)
+		_ = newLayerSource(layer, parsed, nil, minX, minY, maxX, maxY, 0.25, nil, nil)
 	}
 }
 
@@ -381,7 +381,7 @@ func BenchmarkNormalizeLayerSource100KLines(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, nil)
+		_ = newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, 0.25, nil, nil)
 		b.StopTimer()
 		benchmarkRestoreParsedCoordinates(parsed, minX, minY, maxX, maxY)
 		b.StartTimer()
@@ -397,7 +397,7 @@ func BenchmarkNormalizeLayerSource100KPoints(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, nil)
+		_ = newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, 0.25, nil, nil)
 		b.StopTimer()
 		benchmarkRestoreParsedCoordinates(parsed, minX, minY, maxX, maxY)
 		b.StartTimer()

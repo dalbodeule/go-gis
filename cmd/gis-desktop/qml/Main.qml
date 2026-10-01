@@ -30,12 +30,223 @@ ApplicationWindow {
         jp: ({"Desktop GIS": "デスクトップGIS", "Layer properties": "レイヤーのプロパティ", "Select original layer source": "レイヤーソースを選択", "Add vector files as layers": "ベクターファイルをレイヤーとして追加", "Save GoGIS workspace": "GoGISワークスペースを保存", "Open GoGIS workspace": "GoGISワークスペースを開く", "Drop SHP, GeoPackage, or GeoJSON": "SHP、GeoPackage、GeoJSONをドロップ", "Display name": "表示名", "Original source path": "元のソースパス", "Internal layer name": "内部レイヤー名", "Auto encoding": "文字コードを自動判定", "Selected feature": "選択地物", "Feature name": "地物名", "Save": "保存", "Cancel": "キャンセル", "Previous": "前へ", "Next": "次へ", "No attribute records in this layer": "このレイヤーに属性レコードはありません", "X coordinate": "X座標", "Y coordinate": "Y座標", "Go": "移動", "Cancel loading/render": "読み込み/描画をキャンセル", "Layer settings": "レイヤー設定", "Source path": "ソースパス", "Data properties": "データ属性", "Point color": "ポイント色", "Point size (mm)": "ポイントサイズ (mm)", "Line color": "ライン色", "Line width (mm)": "ライン幅 (mm)", "Polygon color": "ポリゴン色", "Fill opacity (0–1)": "塗りの不透明度 (0–1)", "Show labels": "ラベルを表示", "Label field / template": "ラベルフィールド / テンプレート", "Placement": "配置", "Rotation field (optional)": "回転フィールド (任意)", "Text height (mm)": "文字の高さ (mm)", "Minimum scale denominator": "最小縮尺分母", "Maximum scale denominator": "最大縮尺分母"})
     })
 
+    property var luaTranslations: ({
+        en: ({
+            "Lua label editor": "Lua label editor",
+            "Open Lua editor and examples…": "Open Lua editor and examples…",
+            "Lua field access hint": "feature.FIELD reads an attribute; use feature[\"field name\"] when a field contains spaces. Types: %1",
+            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). Return boolean from rules and string/number/nil from label text.",
+            "Insert field into rule…": "Insert field into rule…",
+            "Insert field into label…": "Insert field into label…"
+        }),
+        ko: ({
+            "Lua label editor": "Lua 레이블 편집기",
+            "Open Lua editor and examples…": "Lua 편집기 및 예제 열기…",
+            "Lua field access hint": "feature.FIELD로 속성을 읽습니다. 필드명에 공백이 있으면 feature[\"필드 이름\"]을 사용하세요. 필드 형식: %1",
+            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). 규칙은 boolean, 레이블 식은 string/number/nil을 반환합니다.",
+            "Insert field into rule…": "규칙에 필드 삽입…",
+            "Insert field into label…": "레이블에 필드 삽입…"
+        }),
+        jp: ({
+            "Lua label editor": "Luaラベルエディター",
+            "Open Lua editor and examples…": "Luaエディターと例を開く…",
+            "Lua field access hint": "feature.FIELDで属性を読み取ります。空白を含むフィールド名にはfeature[\"フィールド名\"]を使用します。型: %1",
+            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style)。ルールはboolean、ラベル式はstring/number/nilを返します。",
+            "Insert field into rule…": "ルールにフィールドを挿入…",
+            "Insert field into label…": "ラベルにフィールドを挿入…"
+        })
+    })
+
     function tr(key) {
         var override = translationOverrides[language] || translationOverrides.en;
         if (override[key] !== undefined)
             return override[key];
+        var luaDictionary = luaTranslations[language] || luaTranslations.en;
+        if (luaDictionary[key] !== undefined)
+            return luaDictionary[key];
         var dictionary = translations[language] || translations.en;
         return dictionary[key] || translations.en[key] || key;
+    }
+
+    component LuaCodeEditor: Item {
+        id: luaCodeEditor
+        property alias text: sourceArea.text
+        property alias placeholderText: sourceArea.placeholderText
+        property alias cursorPosition: sourceArea.cursorPosition
+        property string highlightedHTML: ""
+        property string highlightedLineNumbers: "1"
+        readonly property var keywordLookup: ({"and": true, "break": true, "do": true, "else": true, "elseif": true, "end": true, "false": true, "for": true, "function": true, "if": true, "in": true, "local": true, "nil": true, "not": true, "or": true, "repeat": true, "return": true, "then": true, "true": true, "until": true, "while": true})
+        readonly property var apiLookup: ({"feature": true, "gogis": true, "math": true, "string": true, "table": true, "ipairs": true, "pairs": true, "tonumber": true, "tostring": true, "type": true})
+        implicitHeight: 144
+        clip: true
+
+        function scheduleHighlight() {
+            highlightTimer.restart();
+        }
+
+        Timer {
+            id: highlightTimer
+            interval: 75
+            repeat: false
+            onTriggered: {
+                luaCodeEditor.highlightedHTML = luaCodeEditor.highlightLua(sourceArea.text);
+                luaCodeEditor.highlightedLineNumbers = luaCodeEditor.lineNumberText(sourceArea.text);
+            }
+        }
+
+        Component.onCompleted: scheduleHighlight()
+
+        Rectangle {
+            anchors.fill: parent
+            z: -1
+            color: "#ffffff"
+            border.color: sourceArea.activeFocus ? "#4682b4" : "#cfd6dd"
+            radius: 3
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/[&<>\"]/g, escapeHtmlCharacter);
+        }
+
+        function escapeHtmlCharacter(character) {
+            if (character === "&") return "&amp;";
+            if (character === "<") return "&lt;";
+            if (character === ">") return "&gt;";
+            return "&quot;";
+        }
+
+        function lineNumberText(source) {
+            var count = 1;
+            for (var index = 0; index < source.length; ++index) {
+                if (source[index] === "\n") ++count;
+            }
+            var lines = [];
+            for (var line = 1; line <= count; ++line) lines.push(line);
+            return lines.join("\n");
+        }
+
+        function insert(position, value) {
+            sourceArea.insert(position, value);
+        }
+
+        function longBracketLevel(source, start) {
+            if (source[start] !== "[") return -1;
+            var cursor = start + 1;
+            while (source[cursor] === "=") ++cursor;
+            return source[cursor] === "[" ? cursor - start - 1 : -1;
+        }
+
+        function longBracketEnd(source, start, level) {
+            var closing = "]";
+            for (var equals = 0; equals < level; ++equals) closing += "=";
+            closing += "]";
+            var closeIndex = source.indexOf(closing, start);
+            return closeIndex < 0 ? source.length : closeIndex + closing.length;
+        }
+
+        function highlightLua(source) {
+            var output = ["<pre style='margin:0'>"];
+            var index = 0;
+            while (index < source.length) {
+                var start = index;
+                var character = source[index];
+                var category = "";
+                if (character === "-" && source[index + 1] === "-") {
+                    category = "comment";
+                    var commentLevel = longBracketLevel(source, index + 2);
+                    if (commentLevel >= 0)
+                        index = longBracketEnd(source, index + 2 + commentLevel + 2, commentLevel);
+                    else
+                        while (index < source.length && source[index] !== "\n") index++;
+                } else if (character === "[") {
+                    var stringLevel = longBracketLevel(source, index);
+                    if (stringLevel >= 0) {
+                        category = "string";
+                        index = longBracketEnd(source, index + stringLevel + 2, stringLevel);
+                    } else {
+                        index++;
+                    }
+                } else if (character === "\"" || character === "'") {
+                    category = "string";
+                    var quote = character;
+                    index++;
+                    while (index < source.length) {
+                        if (source[index] === "\\") { index += 2; continue; }
+                        if (source[index++] === quote) break;
+                    }
+                } else if (/[A-Za-z_]/.test(character)) {
+                    index++;
+                    while (index < source.length && /[A-Za-z0-9_]/.test(source[index])) index++;
+                    var identifier = source.slice(start, index);
+                    if (keywordLookup[identifier]) category = "keyword";
+                    else if (apiLookup[identifier]) category = "api";
+                } else if (/[0-9]/.test(character)) {
+                    category = "number";
+                    index++;
+                    while (index < source.length && /[0-9.eE+-]/.test(source[index])) index++;
+                } else {
+                    index++;
+                }
+                var token = source.slice(start, index);
+                var escaped = escapeHtml(token);
+                if (category === "keyword") output.push("<span style='color:#7b2cbf;font-weight:600'>", escaped, "</span>");
+                else if (category === "string") output.push("<span style='color:#16803c'>", escaped, "</span>");
+                else if (category === "number") output.push("<span style='color:#b45309'>", escaped, "</span>");
+                else if (category === "comment") output.push("<span style='color:#78838e;font-style:italic'>", escaped, "</span>");
+                else if (category === "api") output.push("<span style='color:#1769aa'>", escaped, "</span>");
+                else output.push(escaped);
+            }
+            output.push("</pre>");
+            return output.join("");
+        }
+
+        Text {
+            id: lineNumbers
+            x: 6
+            y: sourceArea.topPadding - sourceArea.contentY
+            width: 30
+            text: luaCodeEditor.highlightedLineNumbers
+            horizontalAlignment: Text.AlignRight
+            color: "#8a949e"
+            font: sourceArea.font
+        }
+        Rectangle {
+            x: 43
+            y: 0
+            width: 1
+            height: parent.height
+            color: "#e2e6ea"
+        }
+        Text {
+            id: syntaxText
+            x: sourceArea.leftPadding - sourceArea.contentX
+            y: sourceArea.topPadding - sourceArea.contentY
+            width: Math.max(sourceArea.contentWidth, sourceArea.width)
+            text: luaCodeEditor.highlightedHTML
+            textFormat: Text.RichText
+            font: sourceArea.font
+            color: "#263238"
+        }
+        TextArea {
+            id: sourceArea
+            anchors.fill: parent
+            leftPadding: 52
+            rightPadding: 8
+            topPadding: 8
+            bottomPadding: 8
+            wrapMode: TextEdit.NoWrap
+            selectByMouse: true
+            font.family: "monospace"
+            color: "transparent"
+            selectedTextColor: "transparent"
+            selectionColor: "#557aa6d6"
+            background: null
+            cursorDelegate: Rectangle {
+                width: 1
+                color: "#263238"
+            }
+            onTextChanged: luaCodeEditor.scheduleHighlight()
+        }
     }
 
     header: ToolBar {
@@ -200,6 +411,7 @@ ApplicationWindow {
                 property real cursorY: 0
                 property bool cursorValid: false
                 property var attributeColumns: []
+                property var attributeFieldHints: []
                 property int attributePage: 0
                 property int attributePageSize: 0
                 property int attributeTotal: 0
@@ -212,9 +424,11 @@ ApplicationWindow {
                 }
                 ListModel {
                     id: mapLabelModel
+                    objectName: "mapLabelModel"
                 }
                 ListModel {
                     id: vertexHandleModel
+                    objectName: "vertexHandleModel"
                 }
 
                 function anyLayerVisible() {
@@ -276,6 +490,21 @@ ApplicationWindow {
                     var y = bounds[1] + ny * (bounds[3] - bounds[1]);
                     var digits = dataCRS.toUpperCase() === "EPSG:4326" ? 6 : 2;
                     return "X " + Number(x).toFixed(digits) + "  Y " + Number(y).toFixed(digits);
+                }
+
+                function luaFieldAccess(name) {
+                    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? "feature." + name : "feature[" + JSON.stringify(name) + "]";
+                }
+
+                function luaFieldHintText() {
+                    if (!attributeFieldHints.length)
+                        return "Open the attribute table to inspect the layer schema.";
+                    var hints = [];
+                    for (var i = 0; i < attributeFieldHints.length; ++i) {
+                        var field = attributeFieldHints[i];
+                        hints.push(luaFieldAccess(field.name) + " : " + (field.type || "unknown"));
+                    }
+                    return hints.join("   ·   ");
                 }
 
                 function currentScaleText() {
@@ -620,6 +849,7 @@ ApplicationWindow {
                             attributeModel.clear();
                             var table = JSON.parse(mapCanvas.attributePayload);
                             mapViewport.attributeColumns = table.columns || [];
+                            mapViewport.attributeFieldHints = table.fields || mapViewport.attributeColumns.map(function(name) { return {name: name, type: "unknown"}; });
                             mapViewport.attributePage = table.page || 0;
                             mapViewport.attributePageSize = table.pageSize || 0;
                             mapViewport.attributeTotal = table.total || 0;
@@ -669,6 +899,8 @@ ApplicationWindow {
                             mapViewport.layerLabelGenerationSeen = mapCanvas.layerLabelGeneration;
                             mapLabelModel.clear();
                             var labels = JSON.parse(mapCanvas.layerLabelPayload || "[]");
+                            if (!Array.isArray(labels))
+                                labels = [];
                             for (var labelIndex = 0; labelIndex < labels.length; ++labelIndex)
                                 mapLabelModel.append(labels[labelIndex]);
                         }
@@ -676,6 +908,8 @@ ApplicationWindow {
                             mapViewport.vertexHandleGenerationSeen = mapCanvas.vertexHandleGeneration;
                             vertexHandleModel.clear();
                             var handles = JSON.parse(mapCanvas.vertexHandlePayload || "[]");
+                            if (!Array.isArray(handles))
+                                handles = [];
                             for (var handleIndex = 0; handleIndex < handles.length; ++handleIndex)
                                 vertexHandleModel.append(handles[handleIndex]);
                         }
@@ -1377,14 +1611,14 @@ ApplicationWindow {
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: "Available fields: " + (mapViewport.attributeColumns.length ? mapViewport.attributeColumns.join(", ") : "open the attribute table to inspect the layer schema")
+                    text: "Lua field types: " + mapViewport.luaFieldHintText()
                     color: "#65717d"
                     wrapMode: Text.WordWrap
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 Button {
                     objectName: "openLuaEditorButton"
-                    text: "Open Lua editor and examples…"
+                    text: rootWindow.tr("Open Lua editor and examples…")
                     Layout.fillWidth: true
                     onClicked: luaEditorDialog.open()
                     visible: layerSettingsDialog.activeCategory === "labels"
@@ -1418,36 +1652,64 @@ ApplicationWindow {
                 color: "#45515c"
             }
             Label {
-                text: "Available fields: " + (mapViewport.attributeColumns.length ? mapViewport.attributeColumns.join(", ") : "none loaded")
+                text: rootWindow.tr("Lua field access hint").replace("%1", mapViewport.luaFieldHintText())
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 color: "#65717d"
             }
             Label {
+                Layout.fillWidth: true
+                text: rootWindow.tr("Lua API help")
+                wrapMode: Text.WordWrap
+                color: "#45515c"
+            }
+            Label {
                 text: rootWindow.tr("Display rule — return true to show this feature's label")
                 font.bold: true
             }
-            TextArea {
+            LuaCodeEditor {
                 id: labelRuleEditor
                 objectName: "labelRuleEditor"
                 Layout.fillWidth: true
                 Layout.preferredHeight: 100
                 placeholderText: "return feature.CLASS == \"primary\""
-                wrapMode: TextEdit.Wrap
+            }
+            ComboBox {
+                objectName: "insertLuaRuleFieldCombo"
+                Layout.fillWidth: true
+                model: mapViewport.attributeFieldHints
+                textRole: "name"
+                enabled: mapViewport.attributeFieldHints.length > 0
+                displayText: rootWindow.tr("Insert field into rule…")
+                onActivated: function(index) {
+                    var fieldName = mapViewport.attributeFieldHints[index].name;
+                    labelRuleEditor.insert(labelRuleEditor.cursorPosition, mapViewport.luaFieldAccess(fieldName));
+                    currentIndex = -1;
+                }
             }
             Label {
                 text: rootWindow.tr("Label text — return string, number, or nil")
                 font.bold: true
             }
-            TextArea {
+            LuaCodeEditor {
                 id: labelLuaField
                 objectName: "labelLuaField"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 placeholderText: "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                font.family: "monospace"
+            }
+            ComboBox {
+                objectName: "insertLuaLabelFieldCombo"
+                Layout.fillWidth: true
+                model: mapViewport.attributeFieldHints
+                textRole: "name"
+                enabled: mapViewport.attributeFieldHints.length > 0
+                displayText: rootWindow.tr("Insert field into label…")
+                onActivated: function(index) {
+                    var fieldName = mapViewport.attributeFieldHints[index].name;
+                    labelLuaField.insert(labelLuaField.cursorPosition, mapViewport.luaFieldAccess(fieldName));
+                    currentIndex = -1;
+                }
             }
             RowLayout {
                 Layout.fillWidth: true

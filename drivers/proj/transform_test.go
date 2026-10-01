@@ -17,6 +17,24 @@ import (
 	"gogis/internal/core"
 )
 
+func TestTransformerTransformsBoundsWithVisualizationAxisOrder(t *testing.T) {
+	transformer := Transformer{}
+	got, err := transformer.TransformBounds(context.Background(), core.CRS{AuthorityCode: "EPSG:4326"}, core.CRS{AuthorityCode: "EPSG:3857"}, [4]float64{-1, -1, 1, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] > -111_000 || got[1] > -111_000 || got[2] < 111_000 || got[3] < 111_000 {
+		t.Fatalf("forward bounds = %v", got)
+	}
+	back, err := transformer.TransformBounds(context.Background(), core.CRS{AuthorityCode: "EPSG:3857"}, core.CRS{AuthorityCode: "EPSG:4326"}, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back[0] > -0.99 || back[1] > -0.99 || back[2] < 0.99 || back[3] < 0.99 {
+		t.Fatalf("inverse bounds = %v", back)
+	}
+}
+
 var numberPattern = regexp.MustCompile(`[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?`)
 
 func TestTransformerUsesPROJForPoint(t *testing.T) {
@@ -309,8 +327,9 @@ func TestTransformerKoreanCRSRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	point5179 := pointFromWKT(t, to5179.Features[0])
-	assertNear(t, point5179[0], 1889174.174347, 0.02)
-	assertNear(t, point5179[1], 955511.809285, 0.02)
+	assertNear(t, point5179[0], 955511.809285, 0.02)
+	assertNear(t, point5179[1], 1889174.174347, 0.02)
+	assertProjectedBoundsMatchPoint(t, transformer, "EPSG:5179", point5179)
 	if to5179.CRS.AuthorityCode != "EPSG:5179" {
 		t.Fatalf("target CRS = %q", to5179.CRS.AuthorityCode)
 	}
@@ -320,8 +339,9 @@ func TestTransformerKoreanCRSRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	point5186 := pointFromWKT(t, to5186.Features[0])
-	assertNear(t, point5186[0], 489012.955691, 0.02)
-	assertNear(t, point5186[1], 200000.0, 0.02)
+	assertNear(t, point5186[0], 200000.0, 0.02)
+	assertNear(t, point5186[1], 489012.955691, 0.02)
+	assertProjectedBoundsMatchPoint(t, transformer, "EPSG:5186", point5186)
 
 	from5179, err := transformer.Transform(context.Background(), core.CRS{AuthorityCode: "EPSG:5179"}, core.CRS{AuthorityCode: "EPSG:5186"}, to5179)
 	if err != nil {
@@ -330,6 +350,18 @@ func TestTransformerKoreanCRSRegression(t *testing.T) {
 	pointFrom5179 := pointFromWKT(t, from5179.Features[0])
 	assertNear(t, pointFrom5179[0], point5186[0], 0.02)
 	assertNear(t, pointFrom5179[1], point5186[1], 0.02)
+}
+
+func assertProjectedBoundsMatchPoint(t *testing.T, transformer Transformer, target string, point [2]float64) {
+	t.Helper()
+	bounds, err := transformer.TransformBounds(context.Background(), core.CRS{AuthorityCode: "EPSG:4326"}, core.CRS{AuthorityCode: target}, [4]float64{127, 37, 127, 37})
+	if err != nil {
+		t.Fatalf("transform point bounds to %s: %v", target, err)
+	}
+	assertNear(t, bounds[0], point[0], 0.02)
+	assertNear(t, bounds[1], point[1], 0.02)
+	assertNear(t, bounds[2], point[0], 0.02)
+	assertNear(t, bounds[3], point[1], 0.02)
 }
 
 func pointFromWKT(t *testing.T, feature core.Feature) [2]float64 {

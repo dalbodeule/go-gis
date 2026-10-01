@@ -38,6 +38,8 @@ static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm
                   offsetof(GoGISVertex, kind) == 16,
               "Go render.Vertex field offsets changed");
 std::vector<GoGISVertex> g_vertices;
+constexpr size_t kMaxSourceVertexCount = 4 * 1024 * 1024;
+constexpr size_t kMaxSceneGraphVertices = 8 * 1024 * 1024;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
 std::atomic<long long> g_perf_load_started_ns{0};
@@ -71,7 +73,7 @@ std::mutex g_layer_tree_mutex;
 std::string g_layer_tree_payload;
 std::atomic<unsigned long long> g_layer_tree_generation{0};
 std::mutex g_layer_label_mutex;
-std::string g_layer_label_payload;
+std::string g_layer_label_payload = "[]";
 std::atomic<unsigned long long> g_layer_label_generation{0};
 std::mutex g_vertex_handle_mutex;
 std::string g_vertex_handle_payload = "[]";
@@ -338,8 +340,9 @@ protected:
                 const size_t source_vertex_count = g_vertices.size();
                 size_t output_vertex_count = 0;
                 bool can_render_geometry = true;
-                const size_t max_qt_vertex_count =
-                    static_cast<size_t>(std::numeric_limits<int>::max());
+                const size_t max_qt_vertex_count = std::min(
+                    kMaxSceneGraphVertices,
+                    static_cast<size_t>(std::numeric_limits<int>::max()));
                 for (size_t cursor = 0; cursor < source_vertex_count;) {
                     const size_t increment =
                         g_vertices[cursor].kind == 2 && source_vertex_count - cursor >= 3 ? 3 : 6;
@@ -357,7 +360,7 @@ protected:
                 }
                 if (!can_render_geometry) {
                     set_render_status_safely(
-                        "Render error: geometry exceeds Qt's vertex-count limit");
+                        "Render error: scene-graph vertex safety limit exceeded; zoom in");
                     try {
                         geometry_.allocate(0);
                     } catch (...) {
@@ -384,10 +387,26 @@ protected:
                     }
                 }
                 auto* vertices = can_render_geometry ? geometry_.vertexDataAsColoredPoint2D() : nullptr;
+                if (can_render_geometry && output_vertex_count > 0 && vertices == nullptr) {
+                    can_render_geometry = false;
+                    set_render_status_safely(
+                        "Render error: Qt scene-graph vertex buffer allocation failed");
+                    try {
+                        geometry_.allocate(0);
+                    } catch (...) {
+                    }
+                    rendered_vertex_count_ = 0;
+                }
                 if (can_render_geometry) {
                     const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
                     size_t output = 0;
-                    auto set_vertex = [vertices](size_t index, float x, float y, std::uint32_t color) {
+                    bool vertex_write_out_of_bounds = false;
+                    auto set_vertex = [vertices, output_vertex_count, &vertex_write_out_of_bounds](
+                                          size_t index, float x, float y, std::uint32_t color) {
+                        if (vertices == nullptr || index >= output_vertex_count) {
+                            vertex_write_out_of_bounds = true;
+                            return;
+                        }
                         const auto alpha = static_cast<unsigned char>(color & 0xff);
                         const auto red = static_cast<unsigned char>((color >> 24) & 0xff);
                         const auto green = static_cast<unsigned char>((color >> 16) & 0xff);
@@ -450,6 +469,16 @@ protected:
                         set_vertex(output++, x2 - nx, y2 - ny, color);
                         i += 2;
                     }
+                    if (vertex_write_out_of_bounds || output != output_vertex_count) {
+                        can_render_geometry = false;
+                        set_render_status_safely(
+                            "Render error: scene-graph vertex count changed during conversion");
+                        try {
+                            geometry_.allocate(0);
+                        } catch (...) {
+                        }
+                        rendered_vertex_count_ = 0;
+                    }
                 }
                 rendered_generation_ = source_generation;
                 rendered_stage_ = g_vertices_stage;
@@ -509,6 +538,13 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
     const size_t count = xy != nullptr && vertex_count > 0
                              ? static_cast<size_t>(vertex_count)
                              : 0;
+    if (count > kMaxSourceVertexCount) {
+        std::vector<GoGISVertex>().swap(g_vertices);
+        set_render_status_safely("Render error: source vertex safety limit exceeded");
+        g_vertices_stage = 0;
+        g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     // Keep the vector capacity across frame publishes. The Go bridge already
     // holds a reusable scratch buffer, so recreating this C++ vector here
     // would add a second heap allocation to every batch update.
@@ -540,6 +576,13 @@ extern "C" void gogis_set_vertices_vertex_layout_stage(const void* raw_vertices,
     const size_t count = vertices != nullptr && vertex_count > 0
                              ? static_cast<size_t>(vertex_count)
                              : 0;
+    if (count > kMaxSourceVertexCount) {
+        std::vector<GoGISVertex>().swap(g_vertices);
+        set_render_status_safely("Render error: source vertex safety limit exceeded");
+        g_vertices_stage = stage;
+        g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     try {
         g_vertices.resize(count);
     } catch (const std::bad_alloc&) {

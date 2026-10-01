@@ -145,8 +145,10 @@ interaction checklist.
 데스크톱에서 100,000개 이상의 feature를 가진 데이터 또는 개수를 확인할 수 없는
 데이터를 열면 메모리 사용을 줄이기 위해 자동으로 읽기 전용으로 전환합니다.
 geometry-only 초기 로딩과 원본 GDAL attribute page 조회를 사용하며, 상태 표시줄에
-전환 이유가 표시됩니다. 대용량 데이터를 꼭 편집해야 하면 `--editable-large`를
-지정해 기존 전체 편집 모드를 선택할 수 있습니다(메모리 사용량이 커질 수 있습니다).
+전환 이유가 표시됩니다. `--editable-large`는 자동 read-only 전환을 건너뛰고 전체 편집
+snapshot을 시도하지만, reader 안전 상한(최대 100,000 feature/128 MiB)은 그대로 적용됩니다.
+따라서 이 옵션은 1M feature 레이어를 편집 가능하게 만들지 않으며, 한도를 넘으면 안전하게
+오류 처리됩니다. 대형 데이터는 기본 read-only viewport 모드로 여는 것을 권장합니다.
 편집·저장이 필요 없는 대용량 시각화는 `--read-only`로도 직접 실행할 수 있습니다.
 
 ```sh
@@ -159,6 +161,11 @@ geometry-only 초기 로딩과 원본 GDAL attribute page 조회를 사용하며
 50,000개 이상의 feature를 가진 단일 CRS 입력은 첫 2,000개 feature를
 미리 표시한 뒤 전체 geometry로 교체합니다. 혼합 CRS 또는 재투영이 필요한
 입력은 정확한 전체 범위를 유지하기 위해 미리보기를 생략합니다.
+
+현재 읽기 전용은 속성 맵과 중복 프로젝트 스냅샷을 피하지만 전체 geometry를
+메모리에 적재한다. GDAL `OpenWindowGeometryOnly`는 드라이버 API로 구현되어
+있으나 desktop viewport/chunk 렌더러에는 아직 연결하지 않았다. 그러므로 이 모드는
+전국 단위 데이터의 OOM 방지나 화면 영역만 로드하는 기능을 의미하지 않는다.
 
 `desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
 실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면
@@ -362,6 +369,37 @@ go vet ./...
 - macOS: 필요한 `.dylib`와 GDAL/PROJ data를 앱 번들 또는 설치 prefix에 포함
 - Linux: 배포판 패키지 의존성으로 설치하거나 호환되는 `.so`와 data directory를 패키징
 - Windows: 호환되는 `.dll`과 GDAL/PROJ data를 함께 배포
+
+### 단일 실행 파일 배포 점검
+
+현재 빌드 스크립트는 배포 패키지가 아니라 실행 파일만 `build/`에 만든다.
+macOS ARM64에서 2026-10-01 확인한 산출물은 다음과 같다.
+
+| 산출물 | 크기 | 검사 결과 | 의미 |
+| --- | ---: | --- | --- |
+| `build/gis-cli` (기본) | 2.5 MiB | OS 시스템 라이브러리 외 GIS shared library 없음 | 단일 CLI 파일은 가능하지만 GDAL/PROJ/GEOS 기반 명령은 native build 필요 오류를 반환 |
+| `build/gis-cli-native` | 5.5 MiB | GDAL 3.13, PROJ 9.9, GEOS C shared library에 동적 링크 | 해당 dylib와 GDAL/PROJ data가 별도로 필요 |
+| `build/gogis-desktop-native` | 54 MiB | Qt Widgets/Gui/Core/Qml/Quick와 GDAL/PROJ/GEOS에 동적 링크 | Qt framework, platform/QML plugin, GIS dylib와 data가 별도로 필요 |
+
+검사 근거는 `file`, `du -h`, `otool -L` 결과다. `cmd/gis-desktop/main_qt.go`는
+`Main.qml`을 Go 실행 파일에 embed하지만 Qt 런타임과 QML import plugin까지
+embed하지는 않는다. 같은 점검은 Linux에서 `ldd`, Windows Developer Command
+Prompt에서 `dumpbin /dependents`로 반복한다. PROJ grid/resource와 GDAL data는
+현재 별도 경로를 사용한다.
+
+따라서 지금 제공되는 단일 파일은 “native GIS 기능이 빠진 portable CLI”에
+한정된다. 전체 GIS 기능을 제공하는 native CLI와 Qt desktop은 단일파일 배포로
+검증되지 않았다. 권장 기본 산출물은 OS별 앱/배포 폴더이며 Qt framework/plugin,
+GDAL/PROJ/GEOS shared library와 data를 포함해야 한다. Qt static build는 기술적으로
+가능한 구성도 있지만 plugin/QML import를 정적으로 포함하고 재빌드해야 하며,
+현재 빌드 설정에는 없다. Qt의 LGPL/GPL/commercial licensing 조건과 사용자 재링크
+권리는 선택한 모듈과 배포 형태별로 별도 검토한다 ([Qt licensing](https://doc.qt.io/qt-6/licensing.html),
+[Qt LGPL obligations](https://www.qt.io/development/open-source-lgpl-obligations)).
+GDAL은 MIT 기반이지만 GDAL binary의 optional drivers/dependencies는 별도 라이선스
+조건을 가질 수 있다 ([GDAL license](https://gdal.org/en/stable/license.html)).
+
+현재 single-file audit의 상세 상태와 배포 전에 사람의 개입이 필요한 검증은
+[보안·배포·사용자 후속 확인](verification/deferred-user-validation.md)에 모았다.
 
 배포 전에는 다음을 실제 대상 OS에서 확인합니다.
 

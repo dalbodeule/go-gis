@@ -3,13 +3,19 @@
 package gdal
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+	"unsafe"
 
 	"gogis/internal/core"
 
@@ -24,6 +30,55 @@ func TestInitialFeatureCapacityIsBounded(t *testing.T) {
 		if got := initialFeatureCapacity(test.count); got != test.want {
 			t.Errorf("initialFeatureCapacity(%d) = %d, want %d", test.count, got, test.want)
 		}
+	}
+}
+
+func TestValidateSpatialWindowRejectsNonFiniteAndReversedBounds(t *testing.T) {
+	for _, bounds := range [][4]float64{
+		{math.NaN(), 0, 1, 1},
+		{0, math.Inf(1), 1, 1},
+		{0, 0, math.Inf(-1), 1},
+		{2, 0, 1, 1},
+	} {
+		if err := validateSpatialWindow(bounds); err == nil {
+			t.Errorf("invalid bounds %v were accepted", bounds)
+		}
+	}
+	if err := validateSpatialWindow([4]float64{0, 0, 1, 1}); err != nil {
+		t.Fatalf("finite ordered bounds rejected: %v", err)
+	}
+}
+
+func TestBoundedJSONMemberDecoderPreservesStream(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(`{"type":"FeatureCollection","features":[]}`))
+	decoder := json.NewDecoder(reader)
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		t.Fatalf("root token = %v, %v", token, err)
+	}
+	key, reader, closed, _, err := decodeBoundedJSONMember(decoder, reader, maxGeoJSONMetadataBytes, false)
+	if err != nil || closed || key != "type" {
+		t.Fatalf("first key = %v, %v", key, err)
+	}
+	decoder = json.NewDecoder(reader)
+	value, reader, _, err := decodeBoundedJSONRaw(decoder, reader, maxGeoJSONMetadataBytes)
+	if err != nil || string(value) != `"FeatureCollection"` {
+		t.Fatalf("first value = %s, %v", value, err)
+	}
+	decoder = json.NewDecoder(reader)
+	key, reader, closed, _, err = decodeBoundedJSONMember(decoder, reader, maxGeoJSONMetadataBytes, true)
+	if err != nil || closed || key != "features" {
+		t.Fatalf("second key = %v, %v", key, err)
+	}
+	decoder = json.NewDecoder(reader)
+	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
+		t.Fatalf("features value token = %v, %v", token, err)
+	}
+}
+
+func TestReaderRejectsNonFiniteSpatialWindowBeforeOpeningSource(t *testing.T) {
+	_, err := (Reader{}).OpenWindow(context.Background(), "does-not-exist.geojson", "", [4]float64{math.NaN(), 0, 1, 1})
+	if err == nil || !strings.Contains(err.Error(), "coordinates must be finite") {
+		t.Fatalf("OpenWindow error = %v; want finite-coordinate validation", err)
 	}
 }
 
@@ -43,6 +98,156 @@ func TestReaderOpensGeoJSONFixtureThroughGDAL(t *testing.T) {
 	}
 	if got := layer.Features[0].Properties["name"]; got != "한글 도로" {
 		t.Fatalf("name = %v", got)
+	}
+}
+
+func TestGeoJSONSingleFeatureSizeLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized.geojson")
+	feature := `{"type":"Feature","properties":{"payload":"` + strings.Repeat("x", 1<<20) + `"},"geometry":{"type":"Point","coordinates":[1,2]}}`
+	collection := `{"type":"FeatureCollection","features":[` + feature + `]}`
+	if err := os.WriteFile(path, []byte(collection), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registerDrivers()
+	dataset, err := openDatasetWithGeoJSONLimit(path, "", 1)
+	if dataset != nil {
+		_ = dataset.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "too complex/large") {
+		t.Fatalf("opening oversized feature error = %v, want GDAL size-limit error", err)
+	}
+}
+
+func TestReaderOpenRejectsOversizedGeoJSONSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.geojson")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	_, _ = writer.WriteString(`{"type":"FeatureCollection","features":[`)
+	for i := 0; i <= maxMaterializedSnapshotFeatures; i++ {
+		if i > 0 {
+			_, _ = writer.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(writer, `{"type":"Feature","properties":{"n":%d},"geometry":{"type":"Point","coordinates":[%d,0]}}`, i, i)
+	}
+	_, _ = writer.WriteString("]}")
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = (Reader{}).Open(context.Background(), path, "")
+	if err == nil || !strings.Contains(err.Error(), "in-memory snapshot limit") {
+		t.Fatalf("Open oversized GeoJSON error = %v, want snapshot-limit error", err)
+	}
+}
+
+func TestAttributeSessionGeometrySnapshotsEnforceFeatureLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-session.geojson")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	_, _ = writer.WriteString(`{"type":"FeatureCollection","features":[`)
+	for i := 0; i <= maxMaterializedSnapshotFeatures; i++ {
+		if i > 0 {
+			_, _ = writer.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(writer, `{"type":"Feature","properties":null,"geometry":{"type":"Point","coordinates":[%d,0]}}`, i)
+	}
+	_, _ = writer.WriteString("]}")
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if _, err := session.OpenAllGeometryOnly(context.Background()); err == nil || !strings.Contains(err.Error(), "in-memory snapshot limit") {
+		t.Fatalf("OpenAllGeometryOnly oversized GeoJSON error = %v, want snapshot-limit error", err)
+	}
+	if _, err := session.OpenGeometryOnly(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "in-memory snapshot limit") {
+		t.Fatalf("OpenGeometryOnly oversized GeoJSON error = %v, want snapshot-limit error", err)
+	}
+	bounds := [4]float64{-1, -1, float64(maxMaterializedSnapshotFeatures + 1), 1}
+	if _, err := session.OpenWindow(context.Background(), "", bounds, false); err == nil || !strings.Contains(err.Error(), "exceeds the limit of 100000 features") {
+		t.Fatalf("default OpenWindow oversized result error = %v, want safe feature-budget error", err)
+	}
+	if _, err := (Reader{}).OpenWindowGeometryOnly(context.Background(), path, "", bounds); err == nil || !strings.Contains(err.Error(), "exceeds the limit of 100000 features") {
+		t.Fatalf("Reader.OpenWindowGeometryOnly oversized result error = %v, want safe feature-budget error", err)
+	}
+}
+
+func TestGeoJSONSnapshotRejectsOversizedSingleFeatureBeforeGeometryDecode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wide-feature.geojson")
+	feature := `{"type":"Feature","properties":{"payload":"` + strings.Repeat("x", maxMaterializedSnapshotFeatureBytes) + `"},"geometry":{"type":"Point","coordinates":[1,2]}}`
+	if err := os.WriteFile(path, []byte(`{"type":"FeatureCollection","features":[`+feature+`]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (Reader{}).Open(context.Background(), path, "")
+	if err == nil || !strings.Contains(err.Error(), "feature limit") {
+		t.Fatalf("Open oversized single-feature error = %v, want per-feature limit error", err)
+	}
+}
+
+func TestFeaturePayloadEstimateIncludesNestedGeoJSONProperties(t *testing.T) {
+	nested := map[string]any{"array": []any{"a long string value", float64(3), map[string]any{"leaf": "nested value"}}}
+	feature := core.Feature{Properties: map[string]any{"outer": nested}}
+	got := estimateFeaturePayloadBytes(feature)
+	if got < 200 {
+		t.Fatalf("nested property estimate = %d bytes, want conservative container/key/value overhead", got)
+	}
+}
+
+func TestFeaturePayloadEstimateBoundsNestedAndCyclicProperties(t *testing.T) {
+	var nested any = "leaf"
+	for range 50_000 {
+		nested = []any{nested}
+	}
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: map[string]any{"deep": nested}}); got <= 50_000 {
+		t.Fatalf("deep property estimate = %d bytes, want container overhead to be included", got)
+	}
+
+	cyclic := map[string]any{}
+	cyclic["self"] = cyclic
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: map[string]any{"cycle": cyclic}}); got != int64(^uint64(0)>>1) {
+		t.Fatalf("cyclic property estimate = %d, want saturated estimate", got)
+	}
+}
+
+func TestFeaturePayloadEstimateBoundsWidePropertyWorklist(t *testing.T) {
+	const saturation = int64(^uint64(0) >> 1)
+	wide := make([]any, (1<<16)+1)
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: map[string]any{"wide": wide}}); got != saturation {
+		t.Fatalf("wide property estimate = %d, want saturated estimate %d", got, saturation)
+	}
+	wideStrings := make([]string, (1<<16)+1)
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: map[string]any{"wide": wideStrings}}); got != saturation {
+		t.Fatalf("wide string property estimate = %d, want saturated estimate %d", got, saturation)
+	}
+	wideMap := make(map[string]any, (1<<16)+1)
+	for index := 0; index < cap(wide); index++ {
+		wideMap[fmt.Sprint(index)] = nil
+	}
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: map[string]any{"wide": wideMap}}); got != saturation {
+		t.Fatalf("wide map property estimate = %d, want saturated estimate %d", got, saturation)
+	}
+	topLevel := make(map[string]any, (1<<16)+1)
+	for index := 0; index < (1<<16)+1; index++ {
+		topLevel[fmt.Sprint(index)] = nil
+	}
+	if got := estimateFeaturePayloadBytes(core.Feature{Properties: topLevel}); got != saturation {
+		t.Fatalf("wide top-level properties estimate = %d, want saturated estimate %d", got, saturation)
 	}
 }
 
@@ -109,6 +314,773 @@ func TestReaderOpenWindowPushesSpatialFilterThroughGDAL(t *testing.T) {
 	}
 }
 
+func TestReaderOpenWindowStreamsGeoJSONFeatureCollection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.geojson")
+	fixture := `{"type":"FeatureCollection","name":"roads","features":[{"type":"Feature","properties":{"name":"outside","speed":10},"geometry":{"type":"Point","coordinates":[0,0]}},{"type":"Feature","properties":{"name":"inside","speed":40,"active":true},"geometry":{"type":"Point","coordinates":[127.1,37.4]}},{"type":"Feature","properties":{"name":"collection"},"geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[127.2,37.5]},{"type":"LineString","coordinates":[[127.3,37.2],[127.4,37.6]]}]}}]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := (Reader{}).OpenWindow(context.Background(), path, "", [4]float64{127, 37, 127.25, 37.55})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "roads" || got.CRS.AuthorityCode != "EPSG:4326" || len(got.Features) != 2 {
+		t.Fatalf("streamed window metadata/features = %#v", got)
+	}
+	if got.Features[0].ID != 2 || got.Features[1].ID != 3 {
+		t.Fatalf("streamed IDs = %d, %d; want original collection ordinals 2, 3", got.Features[0].ID, got.Features[1].ID)
+	}
+	if got.Features[0].Properties["name"] != "inside" || got.Features[0].Properties["active"] != true || len(got.Fields) != 3 {
+		t.Fatalf("streamed properties/schema = %#v / %#v", got.Features[0].Properties, got.Fields)
+	}
+	if got.Features[1].Geometry.GeometryType() != "GEOMETRYCOLLECTION" {
+		t.Fatalf("streamed geometry type = %q", got.Features[1].Geometry.GeometryType())
+	}
+}
+
+func TestReaderOpenWindowStreamsGeoJSONGeometryOnlyAndEnforcesLimits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "points.geojson")
+	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"a"},"geometry":{"type":"Point","coordinates":[1,1]}},{"type":"Feature","properties":{"name":"b"},"geometry":{"type":"Point","coordinates":[2,2]}}]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	geometryOnly, err := (Reader{}).OpenWindowGeometryOnly(context.Background(), path, "", [4]float64{0, 0, 3, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(geometryOnly.Features) != 2 || geometryOnly.Features[0].Properties != nil || len(geometryOnly.Fields) != 0 {
+		t.Fatalf("geometry-only streamed result = %#v", geometryOnly)
+	}
+	if _, err := readGeoJSONWindow(context.Background(), path, "", [4]float64{0, 0, 3, 3}, true, 1, 0); err == nil || !strings.Contains(err.Error(), "limit of 1 features") {
+		t.Fatalf("streamed feature cap error = %v", err)
+	}
+}
+
+func TestGeoJSONStreamingAttributeSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.geojson")
+	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"outside","speed":10},"geometry":{"type":"Point","coordinates":[0,0]}},{"type":"Feature","properties":{"name":"inside","speed":40},"geometry":{"type":"Point","coordinates":[127.1,37.4]}},{"type":"Feature","properties":{"name":"last","speed":50},"geometry":{"type":"LineString","coordinates":[[127,37],[127.2,37.5]]}}],"name":"session-layer","crs":{"type":"name","properties":{"name":"EPSG:5179"}}}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].Name != "session-layer" || overviews[0].CRS.AuthorityCode != "EPSG:5179" || overviews[0].FeatureCount != 3 || !overviews[0].HasBounds || overviews[0].Bounds != [4]float64{0, 0, 127.2, 37.5} {
+		t.Fatalf("stream inspect = %#v, err=%v", overviews, err)
+	}
+	prefix, err := session.OpenGeometryPrefix(context.Background(), "session-layer", 1)
+	if err != nil || len(prefix.Features) != 1 || prefix.Features[0].ID != 1 {
+		t.Fatalf("stream prefix = %#v, err=%v", prefix, err)
+	}
+	window, err := session.OpenWindowWithLimits(context.Background(), "session-layer", [4]float64{127, 37, 128, 38}, true, 2, 1<<20)
+	if err != nil || len(window.Features) != 2 || window.Features[0].ID != 2 || window.Features[1].ID != 3 {
+		t.Fatalf("stream window = %#v, err=%v", window, err)
+	}
+	selected, err := session.OpenFeature(context.Background(), "session-layer", 3)
+	if err != nil || selected.ID != 3 || selected.Properties["name"] != "last" || selected.Geometry.GeometryType() != "LINESTRING" {
+		t.Fatalf("stream selected feature = %#v, err=%v", selected, err)
+	}
+	page, total, err := session.OpenAttributePage(context.Background(), "session-layer", 1, 1)
+	if err != nil || total != 3 || len(page.Features) != 1 || page.Features[0].ID != 2 || page.Features[0].Properties["name"] != "inside" {
+		t.Fatalf("stream attribute page = %#v total=%d err=%v", page, total, err)
+	}
+	if err := os.WriteFile(path, append([]byte(fixture), ' '), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.OpenWindow(context.Background(), "session-layer", [4]float64{0, 0, 1, 1}, false); err == nil || !strings.Contains(err.Error(), "changed after indexing") {
+		t.Fatalf("modified indexed source error = %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Inspect(context.Background()); err == nil {
+		t.Fatal("inspect succeeded after stream session close")
+	}
+}
+
+func TestGeoJSONFileStampDetectsSameSizeSameTimeReplacement(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "source.geojson")
+	replacement := filepath.Join(directory, "replacement.geojson")
+	backup := filepath.Join(directory, "original.geojson")
+	if err := os.WriteFile(path, []byte("original content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := geoJSONSourceStamp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacement, []byte("replaced content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, expected.file.ModTime(), expected.file.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := geoJSONSourceStamp(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected.size != actual.size || expected.modTimeNS != actual.modTimeNS {
+		t.Fatalf("replacement did not preserve size/time: before=%#v after=%#v", expected, actual)
+	}
+	if sameGeoJSONFileStamp(expected, actual) {
+		t.Fatal("source stamp accepted a different file with the same size and modtime")
+	}
+	if err := validateGeoJSONSourceStamp(path, expected); err == nil {
+		t.Fatal("source validation accepted an atomic replacement")
+	}
+}
+
+func TestReadJSONFeatureObjectHandlesEscapesAndStopsAtConfiguredLimit(t *testing.T) {
+	input := `{"properties":{"text":"escaped quote \" and delimiters } ] {"},"geometry":null},]`
+	buffer := make([]byte, 0, 32)
+	var offset int64
+	got, atEnd, start, end, err := readJSONFeatureObject(bufio.NewReader(strings.NewReader(input)), &buffer, &offset, 256)
+	if err != nil || atEnd || !strings.Contains(string(got), `delimiters } ] {`) {
+		t.Fatalf("bounded feature scan = %q, end=%v, err=%v", got, atEnd, err)
+	}
+	if start != 0 || end != int64(len(got)) {
+		t.Fatalf("feature offsets = [%d,%d), raw bytes=%d", start, end, len(got))
+	}
+	oversized := `{"properties":{"payload":"` + strings.Repeat("x", 1<<20) + `"}}]`
+	buffer = buffer[:0]
+	offset = 0
+	if _, _, _, _, err := readJSONFeatureObject(bufio.NewReader(strings.NewReader(oversized)), &buffer, &offset, 128); err == nil || !strings.Contains(err.Error(), "feature limit") {
+		t.Fatalf("oversized streamed feature error = %v", err)
+	}
+}
+
+func TestGeoJSONGeometryBoundsCoversStandardCoordinateNesting(t *testing.T) {
+	for _, test := range []struct {
+		kind        string
+		coordinates string
+		want        [4]float64
+	}{
+		{kind: "Point", coordinates: `[127,37,10]`, want: [4]float64{127, 37, 127, 37}},
+		{kind: "MultiPoint", coordinates: `[[1,2],[3,4]]`, want: [4]float64{1, 2, 3, 4}},
+		{kind: "LineString", coordinates: `[[1,2],[3,4]]`, want: [4]float64{1, 2, 3, 4}},
+		{kind: "MultiLineString", coordinates: `[[[1,2],[3,4]],[[5,6],[7,8]]]`, want: [4]float64{1, 2, 7, 8}},
+		{kind: "Polygon", coordinates: `[[[1,2],[3,4],[5,6],[1,2]]]`, want: [4]float64{1, 2, 5, 6}},
+		{kind: "MultiPolygon", coordinates: `[[[[1,2],[3,4],[1,2]]],[[[5,6],[7,8],[5,6]]]]`, want: [4]float64{1, 2, 7, 8}},
+	} {
+		bounds, hasCoordinates, err := geoJSONGeometryBounds([]byte(`{"type":"` + test.kind + `","coordinates":` + test.coordinates + `}`))
+		if err != nil || !hasCoordinates || bounds != test.want {
+			t.Errorf("%s bounds = %v, has=%v, err=%v; want %v", test.kind, bounds, hasCoordinates, err, test.want)
+		}
+	}
+}
+
+func TestGeoJSONGeometryBoundsHandlesCollectionsAndMalformedCoordinates(t *testing.T) {
+	collection := []byte(`{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[2,3]},{"type":"LineString","coordinates":[[1,5],[4,0]]}]}`)
+	if bounds, hasCoordinates, err := geoJSONGeometryBounds(collection); err != nil || !hasCoordinates || bounds != ([4]float64{1, 0, 4, 5}) {
+		t.Fatalf("geometry collection bounds = %v, has=%t, err=%v", bounds, hasCoordinates, err)
+	}
+	for _, fixture := range []string{
+		`{"type":"Point","coordinates":[1]}`,
+		`{"type":"LineString","coordinates":[[1,2],[3]]}`,
+		`{"type":"Polygon","coordinates":[[[1,2],3]]}`,
+		`{"type":"Point","coordinates":[1e999,2]}`,
+		`{"type":"Point","coordinates":[1,2]} {}`,
+	} {
+		if _, _, err := geoJSONGeometryBounds([]byte(fixture)); err == nil {
+			t.Errorf("malformed geometry accepted: %s", fixture)
+		}
+	}
+}
+
+func TestGeoJSONPointBoundsFastPathMatchesValidatedShapes(t *testing.T) {
+	for _, fixture := range []struct {
+		geometry string
+		want     [4]float64
+	}{
+		{`{"type":"Point","coordinates":[127.25,37.5]}`, [4]float64{127.25, 37.5, 127.25, 37.5}},
+		{` { "coordinates" : [ -1e2 , 2.5 ] , "name":"brace } in string", "type":"Point" } `, [4]float64{-100, 2.5, -100, 2.5}},
+	} {
+		bounds, hasCoordinates, err := geoJSONGeometryBounds([]byte(fixture.geometry))
+		if err != nil || !hasCoordinates || bounds != fixture.want {
+			t.Errorf("fast point bounds = %v, has=%t, err=%v; want %v", bounds, hasCoordinates, err, fixture.want)
+		}
+	}
+	for _, fixture := range []string{
+		`{"type":"Point","coordinates":[1,2],}`,
+		`{"type":"Point","coordinates":[1,2]} {}`,
+	} {
+		if _, _, err := geoJSONGeometryBounds([]byte(fixture)); err == nil {
+			t.Errorf("fallback geometry should reject malformed input: %s", fixture)
+		}
+	}
+	if bounds, hasCoordinates, err := geoJSONGeometryBounds([]byte(`{"type":"Point","coordinates":[1,2,3]}`)); err != nil || !hasCoordinates || bounds != ([4]float64{1, 2, 1, 2}) {
+		t.Fatalf("3D point fallback = %v, has=%t, err=%v", bounds, hasCoordinates, err)
+	}
+}
+
+func TestGeoJSONCoordinateScannerBoundsComplexity(t *testing.T) {
+	count := 0
+	bounds, hasCoordinates, err := geoJSONCoordinateBoundsWithLimit([]byte(`[[1,2],[3,4]]`), 1, &count, 2)
+	if err != nil || !hasCoordinates || bounds != ([4]float64{1, 2, 3, 4}) || count != 2 {
+		t.Fatalf("bounded coordinates = %v, has=%t count=%d err=%v", bounds, hasCoordinates, count, err)
+	}
+	count = 0
+	if _, _, err := geoJSONCoordinateBoundsWithLimit([]byte(`[[1,2],[3,4],[5,6]]`), 1, &count, 2); err == nil || !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("over-budget coordinate scan error = %v, want safety-limit error", err)
+	}
+	widePosition := `[` + strings.TrimSuffix(strings.Repeat("1,", maxGeoJSONPositionOrdinates+1), ",") + `]`
+	if _, _, err := geoJSONCoordinateBoundsWithLimit([]byte(widePosition), 0, new(int), 2); err == nil || !strings.Contains(err.Error(), "ordinate safety limit") {
+		t.Fatalf("over-wide coordinate position error = %v, want ordinate-limit error", err)
+	}
+}
+
+func TestGeoJSONGeometryCollectionDepthLimit(t *testing.T) {
+	geometry := `{"type":"Point","coordinates":[1,2]}`
+	for range maxGeoJSONGeometryCollectionDepth + 1 {
+		geometry = `{"type":"GeometryCollection","geometries":[` + geometry + `]}`
+	}
+	if _, _, err := geoJSONGeometryBounds([]byte(geometry)); err == nil || !strings.Contains(err.Error(), "nesting safety limit") {
+		t.Fatalf("over-depth GeometryCollection error = %v, want nesting safety limit", err)
+	}
+	geometry = `{"type":"Point","coordinates":[1,2]}`
+	for range maxGeoJSONGeometryCollectionDepth {
+		geometry = `{"type":"GeometryCollection","geometries":[` + geometry + `]}`
+	}
+	if bounds, hasCoordinates, err := geoJSONGeometryBounds([]byte(geometry)); err != nil || !hasCoordinates || bounds != ([4]float64{1, 2, 1, 2}) {
+		t.Fatalf("at-limit GeometryCollection = %v, has=%t, err=%v", bounds, hasCoordinates, err)
+	}
+}
+
+func TestGeoJSONGeometryCollectionMemberLimitPrecedesSliceMaterialization(t *testing.T) {
+	child := `{"type":"GeometryCollection","geometries":[]}`
+	geometry := `{"type":"\u0047eometryCollection","geometries":[` +
+		strings.TrimSuffix(strings.Repeat(child+",", maxGeoJSONGeometryCollectionMembers+1), ",") + `]}`
+	if _, _, err := geoJSONGeometryBounds([]byte(geometry)); err == nil || !strings.Contains(err.Error(), "member safety limit") {
+		t.Fatalf("over-budget GeometryCollection members error = %v; want member safety limit", err)
+	}
+}
+
+func FuzzGeoJSONGeometryBoundsNoPanic(f *testing.F) {
+	f.Add([]byte(`{"type":"Point","coordinates":[127,37]}`))
+	f.Add([]byte(`{"type":"GeometryCollection","geometries":[]}`))
+	f.Add([]byte(`{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]}]}`))
+	f.Add([]byte(`{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}`))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		_, _, _ = geoJSONGeometryBounds(raw)
+	})
+}
+
+func FuzzGeoJSONSequenceScannerNoPanic(f *testing.F) {
+	f.Add([]byte(`{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[127,37]}}\n`))
+	f.Add([]byte("\x1e{\"type\":\"Feature\",\"properties\":null,\"geometry\":null}\n"))
+	f.Add([]byte("\x1e{\"type\":\"Feature\",\"geometry\":{\"type\":\"GeometryCollection\",\"geometries\":["))
+	f.Add([]byte("\n\r\n\x1e{}\nnot-json\n"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 1<<20 {
+			t.Skip()
+		}
+		path := filepath.Join(t.TempDir(), "fuzz.geojsonl")
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, _, _, _ = scanGeoJSONSequence(context.Background(), path, nil)
+	})
+}
+
+func TestGeoJSONStreamingRejectsDuplicateMembersAndTrailingData(t *testing.T) {
+	for _, fixture := range []string{
+		`{"type":"FeatureCollection","features":[],"features":[]}`,
+		`{"type":"FeatureCollection","features":[]} trailing`,
+	} {
+		path := filepath.Join(t.TempDir(), "invalid.geojson")
+		if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		session, err := OpenAttributeSession(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, inspectErr := session.Inspect(context.Background())
+		_ = session.Close()
+		if inspectErr == nil {
+			t.Errorf("invalid FeatureCollection was accepted: %s", fixture)
+		}
+	}
+}
+
+func TestGeoJSONFeatureIndexRetainsBoundedPrefixAtConfiguredLimit(t *testing.T) {
+	index := make([]geoJSONFeatureIndex, 0)
+	var available bool
+	const limit = 1_003
+	for ordinal := 0; ordinal < limit; ordinal++ {
+		index, available = appendGeoJSONFeatureIndex(index, geoJSONFeatureIndex{offset: int64(ordinal), length: 20}, limit)
+		if !available || len(index) != ordinal+1 || cap(index) > limit {
+			t.Fatalf("index after entry %d has len=%d cap=%d available=%v; want bounded append", ordinal, len(index), cap(index), available)
+		}
+	}
+	index, available = appendGeoJSONFeatureIndex(index, geoJSONFeatureIndex{offset: 30, length: 40}, limit)
+	if available || len(index) != limit || cap(index) != limit || index[0].offset != 0 {
+		t.Fatalf("index after limit = len:%d cap:%d available=%v; want exact bounded prefix", len(index), cap(index), available)
+	}
+}
+
+func TestGeoJSONFeatureIndexEntryStaysCompact(t *testing.T) {
+	if size := unsafe.Sizeof(geoJSONFeatureIndex{}); size > 48 {
+		t.Fatalf("GeoJSON index entry is %d bytes; want at most 48", size)
+	}
+}
+
+func TestGeoJSONSeqStreamingUsesBoundedRecordsAndPreservesMissingFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "points.geojsonl")
+	content := "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[1,2]},\"properties\":{\"name\":\"first\"}}\n" +
+		"\x1e{\"type\":\"Feature\",\"properties\":{\"name\":\"second\"}}\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !isGeoJSONStreamSource(path) {
+		t.Fatal("GeoJSONSeq source did not route through the bounded streaming reader")
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != 2 {
+		t.Fatalf("GeoJSONSeq overview = %#v, %v; want one layer with two features", overviews, err)
+	}
+	window, err := session.OpenWindow(context.Background(), "", [4]float64{0, 0, 3, 3}, true)
+	if err != nil || len(window.Features) != 1 || window.Features[0].Properties["name"] != "first" {
+		t.Fatalf("GeoJSONSeq point window = %#v, %v; want only first point", window.Features, err)
+	}
+	page, total, err := session.OpenAttributePage(context.Background(), "", 1, 1)
+	if err != nil || total != 2 || len(page.Features) != 1 || page.Features[0].Properties["name"] != "second" {
+		t.Fatalf("GeoJSONSeq attribute page = %#v total=%d err=%v", page.Features, total, err)
+	}
+	selected, err := session.OpenFeature(context.Background(), "", 2)
+	if err != nil || selected.Geometry != nil || selected.Properties["name"] != "second" {
+		t.Fatalf("GeoJSONSeq feature without geometry = %#v, %v", selected, err)
+	}
+}
+
+func TestGeoJSONSequenceSessionRetainsBoundedIndexPrefix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "two.geojsonl")
+	fixture := "{\"type\":\"Feature\",\"properties\":{},\"geometry\":{\"type\":\"Point\",\"coordinates\":[1,2]}}\n" +
+		"{\"type\":\"Feature\",\"properties\":{},\"geometry\":{\"type\":\"Point\",\"coordinates\":[3,4]}}\n"
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if applied, err := session.SetGeoJSONStreamIndexFeatureLimit(1); err != nil || !applied {
+		t.Fatalf("set stream index limit applied=%t err=%v", applied, err)
+	}
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != 2 {
+		t.Fatalf("inspect with capped index = %#v, %v", overviews, err)
+	}
+	if len(session.streamIndex) != 1 {
+		t.Fatalf("index retained %d entries after exceeding one-entry limit; want bounded prefix of 1", len(session.streamIndex))
+	}
+	body, err := session.OpenWindow(context.Background(), "", [4]float64{0, 0, 5, 5}, false)
+	if err != nil || len(body.Features) != 2 || body.Features[1].ID != 2 {
+		t.Fatalf("unindexed window read features=%d err=%v", len(body.Features), err)
+	}
+	feature, err := session.OpenFeature(context.Background(), "", 2)
+	if err != nil || feature.Properties["name"] != nil {
+		t.Fatalf("tail GeoJSONSeq feature = %#v err=%v", feature, err)
+	}
+	page, total, err := session.OpenAttributePage(context.Background(), "", 1, 1)
+	if err != nil || total != 2 || len(page.Features) != 1 || page.Features[0].ID != 2 {
+		t.Fatalf("tail GeoJSONSeq attribute page = %#v total=%d err=%v", page.Features, total, err)
+	}
+}
+
+func TestGeoJSONSequenceTailBlocksSkipNonIntersectingRecordRanges(t *testing.T) {
+	const featureCount = 1 + geoJSONTailBlockFeatureCount + 2
+	path := filepath.Join(t.TempDir(), "tail-blocks.geojsonl")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ordinal := 1; ordinal <= featureCount; ordinal++ {
+		if _, err := fmt.Fprintf(file,
+			"\x1e{\"type\":\"Feature\",\"properties\":{\"id\":%d},\"geometry\":{\"type\":\"Point\",\"coordinates\":[%d,0]}}\n",
+			ordinal, ordinal); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if applied, err := session.SetGeoJSONStreamIndexFeatureLimit(1); err != nil || !applied {
+		t.Fatalf("set prefix index limit applied=%t err=%v", applied, err)
+	}
+	if _, err := session.Inspect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.streamTailBlocks) != 2 {
+		t.Fatalf("GeoJSONSeq tail blocks = %d; want 2", len(session.streamTailBlocks))
+	}
+	window, err := session.OpenWindow(context.Background(), "", [4]float64{featureCount - 1, -1, featureCount, 1}, false)
+	if err != nil || len(window.Features) != 2 || window.Features[0].ID != uint64(featureCount-1) ||
+		window.Features[1].ID != uint64(featureCount) {
+		t.Fatalf("last GeoJSONSeq tail-block window features=%#v err=%v", window.Features, err)
+	}
+	feature, err := session.OpenFeature(context.Background(), "", uint64(featureCount))
+	if err != nil || feature.ID != uint64(featureCount) || feature.Properties["id"] != float64(featureCount) {
+		t.Fatalf("last GeoJSONSeq tail-block feature=%#v err=%v", feature, err)
+	}
+}
+
+func TestGeoJSONAttributeSessionSerializesConcurrentStreamRequests(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.geojson")
+	var content strings.Builder
+	content.WriteString(`{"type":"FeatureCollection","features":[`)
+	for ordinal := 1; ordinal <= 64; ordinal++ {
+		if ordinal > 1 {
+			content.WriteByte(',')
+		}
+		fmt.Fprintf(&content, `{"type":"Feature","properties":{"id":%d},"geometry":{"type":"Point","coordinates":[%d,0]}}`, ordinal, ordinal)
+	}
+	content.WriteString(`]}`)
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	const workers = 12
+	var group sync.WaitGroup
+	errors := make(chan error, workers)
+	for worker := 0; worker < workers; worker++ {
+		group.Add(1)
+		go func(worker int) {
+			defer group.Done()
+			ctx := context.Background()
+			switch worker % 4 {
+			case 0:
+				_, err := session.Inspect(ctx)
+				errors <- err
+			case 1:
+				layer, err := session.OpenWindow(ctx, "", [4]float64{float64(worker), -1, float64(worker + 2), 1}, false)
+				if err == nil && len(layer.Features) == 0 {
+					err = fmt.Errorf("concurrent window returned no intersecting features")
+				}
+				errors <- err
+			case 2:
+				page, total, err := session.OpenAttributePage(ctx, "", worker, 2)
+				if err == nil && (total != 64 || len(page.Features) != 2) {
+					err = fmt.Errorf("concurrent page returned %d features, total %d", len(page.Features), total)
+				}
+				errors <- err
+			case 3:
+				feature, err := session.OpenFeature(ctx, "", uint64(worker+1))
+				if err == nil && feature.ID != uint64(worker+1) {
+					err = fmt.Errorf("concurrent feature lookup returned ID %d", feature.ID)
+				}
+				errors <- err
+			}
+		}(worker)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestAttributeSessionWaitForLockHonorsCancellation(t *testing.T) {
+	session := &AttributeSession{source: "locked.geojson", streamGeoJSON: true}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := session.Inspect(ctx)
+		result <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != context.Canceled {
+			t.Fatalf("Inspect error = %v; want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Inspect did not stop promptly after cancellation while waiting for session lock")
+	}
+}
+
+func TestGeoJSONPartialIndexStillQueriesTailFeatures(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "partial-index.geojson")
+	content := `{"type":"FeatureCollection","features":[` +
+		`{"type":"Feature","properties":{"name":"first"},"geometry":{"type":"Point","coordinates":[1,2]}},` +
+		`{"type":"Feature","properties":{"name":"second"},"geometry":{"type":"Point","coordinates":[3,4]}},` +
+		`{"type":"Feature","properties":{"name":"tail"},"geometry":{"type":"Point","coordinates":[30,40]}}]}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if applied, err := session.SetGeoJSONStreamIndexFeatureLimit(2); err != nil || !applied {
+		t.Fatalf("set two-entry index limit applied=%t err=%v", applied, err)
+	}
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != 3 || len(session.streamIndex) != 2 {
+		t.Fatalf("partial index overview=%#v index=%d err=%v", overviews, len(session.streamIndex), err)
+	}
+	if len(session.streamTailBlocks) != 1 || session.streamTailBlocks[0].firstOrdinal != 3 ||
+		session.streamTailBlocks[0].featureCount != 1 || !geoJSONBoundsIntersect(session.streamTailBlocks[0].bounds, [4]float64{30, 40, 30, 40}) {
+		t.Fatalf("partial-index tail blocks = %#v", session.streamTailBlocks)
+	}
+	window, err := session.OpenWindow(context.Background(), "", [4]float64{29, 39, 31, 41}, true)
+	if err != nil || len(window.Features) != 1 || window.Features[0].ID != 3 || window.Features[0].Properties["name"] != "tail" {
+		t.Fatalf("tail spatial window = %#v, %v", window.Features, err)
+	}
+	feature, err := session.OpenFeature(context.Background(), "", 3)
+	if err != nil || feature.Properties["name"] != "tail" {
+		t.Fatalf("tail feature lookup = %#v, %v", feature, err)
+	}
+	page, total, err := session.OpenAttributePage(context.Background(), "", 2, 1)
+	if err != nil || total != 3 || len(page.Features) != 1 || page.Features[0].ID != 3 || page.Features[0].Properties["name"] != "tail" {
+		t.Fatalf("tail attribute page = %#v total=%d err=%v", page.Features, total, err)
+	}
+}
+
+func TestGeoJSONTailBlocksSkipNonIntersectingRecordRanges(t *testing.T) {
+	const featureCount = 2 + 2*geoJSONTailBlockFeatureCount + 1
+	path := filepath.Join(t.TempDir(), "tail-blocks.geojson")
+	var content strings.Builder
+	content.Grow(featureCount * 90)
+	content.WriteString(`{"type":"FeatureCollection","features":[`)
+	for ordinal := 1; ordinal <= featureCount; ordinal++ {
+		if ordinal > 1 {
+			content.WriteByte(',')
+		}
+		fmt.Fprintf(&content, `{"type":"Feature","properties":{"id":%d},"geometry":{"type":"Point","coordinates":[%d,0]}}`, ordinal, ordinal)
+	}
+	content.WriteString(`]}`)
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if applied, err := session.SetGeoJSONStreamIndexFeatureLimit(2); err != nil || !applied {
+		t.Fatalf("set prefix index limit applied=%t err=%v", applied, err)
+	}
+	if _, err := session.Inspect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.streamTailBlocks) != 3 {
+		t.Fatalf("tail blocks = %d; want 3", len(session.streamTailBlocks))
+	}
+	window, err := session.OpenWindow(context.Background(), "", [4]float64{featureCount - 1, -1, featureCount, 1}, false)
+	if err != nil || len(window.Features) != 2 || window.Features[0].ID != uint64(featureCount-1) ||
+		window.Features[1].ID != uint64(featureCount) {
+		t.Fatalf("last-block window features=%#v err=%v", window.Features, err)
+	}
+	feature, err := session.OpenFeature(context.Background(), "", uint64(featureCount))
+	if err != nil || feature.ID != uint64(featureCount) || feature.Properties["id"] != float64(featureCount) {
+		t.Fatalf("last-block feature=%#v err=%v", feature, err)
+	}
+}
+
+func TestGeoJSONCollectionDoesNotReuseMissingFeatureFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-geometry.geojson")
+	content := `{"type":"FeatureCollection","features":[` +
+		`{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"first"}},` +
+		`{"type":"Feature","properties":{"name":"second"}}]}`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layer, err := (Reader{}).Open(context.Background(), path, "")
+	if err != nil || len(layer.Features) != 2 {
+		t.Fatalf("open collection = %#v, %v", layer.Features, err)
+	}
+	if layer.Features[1].Geometry != nil || layer.Features[1].Properties["name"] != "second" {
+		t.Fatalf("second feature inherited first feature data: %#v", layer.Features[1])
+	}
+}
+
+func TestGeoJSONPropertiesByteLimitRejectsBeforeDecode(t *testing.T) {
+	raw := make([]byte, maxGeoJSONPropertiesBytes+1)
+	if _, err := decodeGeoJSONProperties(raw, 17); err == nil || !strings.Contains(err.Error(), "properties exceed") {
+		t.Fatalf("oversized property error = %v; want property size limit", err)
+	}
+	if properties, err := decodeGeoJSONProperties([]byte("null"), 17); err != nil || properties != nil {
+		t.Fatalf("null properties = %#v, %v; want nil, nil", properties, err)
+	}
+}
+
+func TestGeoJSONPropertiesComplexityIsBoundedBeforeMapDecode(t *testing.T) {
+	const propertyCount = maxGeoJSONPropertyNodes/2 + 1
+	var raw strings.Builder
+	raw.Grow(propertyCount * 12)
+	raw.WriteByte('{')
+	for index := 0; index < propertyCount; index++ {
+		if index > 0 {
+			raw.WriteByte(',')
+		}
+		fmt.Fprintf(&raw, `"k%d":null`, index)
+	}
+	raw.WriteByte('}')
+	if raw.Len() <= geoJSONPropertyPreflightThreshold {
+		t.Fatalf("test properties are only %d bytes; want preflight threshold > %d", raw.Len(), geoJSONPropertyPreflightThreshold)
+	}
+	if _, err := decodeGeoJSONProperties([]byte(raw.String()), 1); err == nil || !strings.Contains(err.Error(), "node limit") {
+		t.Fatalf("over-complex properties error = %v; want node limit", err)
+	}
+
+	deep := strings.Repeat(`{"x":`, maxGeoJSONPropertyDepth+1) + "null" + strings.Repeat("}", maxGeoJSONPropertyDepth+1)
+	if _, err := decodeGeoJSONProperties([]byte(deep), 2); err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("over-depth properties error = %v; want nesting limit", err)
+	}
+}
+
+func FuzzGeoJSONPropertiesNoPanic(f *testing.F) {
+	f.Add([]byte(`{"name":"road","width":4.5}`))
+	f.Add([]byte(`{"nested":[{"a":1},null]}`))
+	f.Add([]byte("null"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > maxGeoJSONPropertiesBytes {
+			t.Skip()
+		}
+		_, _ = decodeGeoJSONProperties(raw, 1)
+	})
+}
+
+func TestGeometryWKBSizeLimitRejectsBeforeExport(t *testing.T) {
+	point, err := godal.NewGeometryFromWKT("POINT (1 2)", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := point.WKBSize(); got != 21 {
+		point.Close()
+		t.Fatalf("point WKB size = %d, want 21", got)
+	}
+	if encoded, err := point.WKBWithMaxSize(21); err != nil || len(encoded) != 21 {
+		point.Close()
+		t.Fatalf("bounded point export = %d bytes, %v", len(encoded), err)
+	}
+	if encoded, err := point.WKBWithMaxSize(20); err == nil || encoded != nil {
+		point.Close()
+		t.Fatalf("point export above 20-byte budget = %d bytes, %v", len(encoded), err)
+	}
+	point.Close()
+
+	pointCount := uint32(maxGeometryWKBBytes/16 + 1)
+	wkb := make([]byte, 9+int(pointCount)*16)
+	wkb[0] = 1                                 // little endian
+	binary.LittleEndian.PutUint32(wkb[1:5], 2) // LineString
+	binary.LittleEndian.PutUint32(wkb[5:9], pointCount)
+	line, err := godal.NewGeometryFromWKB(wkb, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer line.Close()
+	if size := line.WKBSize(); size <= maxGeometryWKBBytes {
+		t.Fatalf("large line WKB size = %d; want over %d", size, maxGeometryWKBBytes)
+	}
+	if exported, err := geometryWKBWithLimit(line, 99); err == nil || exported != nil || !strings.Contains(err.Error(), "exceeds the 8 MiB limit") {
+		t.Fatalf("oversized WKB export = %d bytes, %v; want pre-export limit error", len(exported), err)
+	}
+}
+
+func TestReaderRejectsOversizedGeoJSONMetadataWithoutGDALFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.geojson")
+	fixture := `{"type":"FeatureCollection","metadata":"` + strings.Repeat("x", maxGeoJSONMetadataBytes+1) + `","features":[]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !isGeoJSONCollection(path) {
+		t.Fatal("oversized FeatureCollection metadata must route through the bounded parser")
+	}
+	if _, err := (Reader{}).Open(context.Background(), path, ""); err == nil || !strings.Contains(err.Error(), "member value exceeds") {
+		t.Fatalf("Open oversized metadata error = %v; want bounded metadata error", err)
+	}
+}
+
+func TestSQLSpatialWindowExposesProviderFIDSeparatelyFromWindowOrdinal(t *testing.T) {
+	for _, extension := range []string{".shp", ".gpkg"} {
+		t.Run(extension, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "roads"+extension)
+			input := core.Layer{
+				Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+				Fields: []core.Field{{Name: "name", Type: core.FieldTypeText}},
+				Features: []core.Feature{
+					{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}, Properties: map[string]any{"name": "outside"}},
+					{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (128 38)"}, Properties: map[string]any{"name": "inside"}},
+				},
+			}
+			if err := (Writer{}).Write(context.Background(), path, input); err != nil {
+				t.Fatal(err)
+			}
+			dataset, err := openDataset(path, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dataset.Close()
+			filter, err := godal.NewGeometryFromWKT("POLYGON ((127.5 37.5, 128.5 37.5, 128.5 38.5, 127.5 38.5, 127.5 37.5))", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer filter.Close()
+			result, err := dataset.ExecuteSQL("SELECT FID AS gogis_fid, * FROM "+quoteSQLIdentifier("roads"), godal.SpatialFilter(filter))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result == nil {
+				t.Fatal("spatial query returned no result set")
+			}
+			defer result.Close()
+			page, err := readLayerOptions(context.Background(), result.Layer, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Features) != 1 {
+				t.Fatalf("filtered features = %d, want 1", len(page.Features))
+			}
+			wantFID := "1"
+			if extension == ".gpkg" {
+				wantFID = "2"
+			}
+			if got := fmt.Sprint(page.Features[0].Properties["gogis_fid"]); got != wantFID {
+				t.Fatalf("provider FID = %q, want %q", got, wantFID)
+			}
+			if page.Features[0].ID != 1 {
+				t.Fatalf("window-local application ID = %d, want 1", page.Features[0].ID)
+			}
+		})
+	}
+}
+
 func TestReaderOpenWindowGeometryOnlySkipsProperties(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}},{"type":"Feature","properties":{"name":"outside"},"geometry":{"type":"Point","coordinates":[128.1,38.4]}}]}`
@@ -122,6 +1094,85 @@ func TestReaderOpenWindowGeometryOnlySkipsProperties(t *testing.T) {
 	}
 	if len(layer.Features) != 1 || layer.Features[0].Properties != nil || len(layer.Fields) != 0 {
 		t.Fatalf("geometry-only window layer = %#v", layer)
+	}
+}
+
+func TestAttributeSessionOpenWindowGeometryOnlySharesDatasetSafely(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.geojson")
+	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"outside"},"geometry":{"type":"Point","coordinates":[128.1,38.4]}},{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}}]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	window, err := session.OpenWindowGeometryOnly(context.Background(), "", [4]float64{127, 37, 127.2, 37.6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(window.Features) != 1 || window.Features[0].ID != 2 || window.Features[0].Properties != nil {
+		t.Fatalf("window = %#v; want source ordinal 2 with no properties", window.Features)
+	}
+	withProperties, err := session.OpenWindow(context.Background(), "", [4]float64{127, 37, 127.2, 37.6}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withProperties.Features) != 1 || withProperties.Features[0].ID != 2 || withProperties.Features[0].Properties["name"] != "inside" {
+		t.Fatalf("window with properties = %#v", withProperties.Features)
+	}
+	page, total, err := session.OpenAttributePage(context.Background(), "", 0, 2)
+	if err != nil || total != 2 || len(page.Features) != 2 {
+		t.Fatalf("attribute page after window query: count=%d total=%d err=%v", len(page.Features), total, err)
+	}
+	if _, err := session.OpenWindowGeometryOnly(context.Background(), "", [4]float64{2, 3, 1, 4}); err == nil {
+		t.Fatal("invalid bounds were accepted")
+	}
+}
+
+func TestAttributeSessionOpenWindowLimitedFailsInsteadOfTruncating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.geojson")
+	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"first"},"geometry":{"type":"Point","coordinates":[1,1]}},{"type":"Feature","properties":{"name":"second"},"geometry":{"type":"Point","coordinates":[2,2]}}]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if _, err := session.OpenWindowLimited(context.Background(), "", [4]float64{0, 0, 3, 3}, false, 1); err == nil || !strings.Contains(err.Error(), "exceeds the limit of 1") {
+		t.Fatalf("limited window error = %v", err)
+	}
+	if _, err := session.OpenWindowLimited(context.Background(), "", [4]float64{0, 0, 3, 3}, false, -1); err == nil {
+		t.Fatal("negative window feature limit was accepted")
+	}
+	if _, err := session.OpenWindow(context.Background(), "", [4]float64{math.NaN(), 0, 3, 3}, false); err == nil || !strings.Contains(err.Error(), "coordinates must be finite") {
+		t.Fatalf("non-finite window error = %v", err)
+	}
+}
+
+func TestAttributeSessionOpenWindowWithLimitsBoundsDecodedPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "points.geojson")
+	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"first"},"geometry":{"type":"Point","coordinates":[1,1]}},{"type":"Feature","properties":{"name":"second"},"geometry":{"type":"Point","coordinates":[2,2]}}]}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if _, err := session.OpenWindowWithLimits(context.Background(), "", [4]float64{0, 0, 3, 3}, false, 0, 1); err == nil || !strings.Contains(err.Error(), "exceeds the limit of 1 bytes") {
+		t.Fatalf("decoded payload limit error = %v", err)
+	}
+	if _, err := session.OpenWindowWithLimits(context.Background(), "", [4]float64{0, 0, 3, 3}, false, 0, -1); err == nil {
+		t.Fatal("negative window byte limit was accepted")
+	}
+	layer, err := session.OpenWindowWithLimits(context.Background(), "", [4]float64{0, 0, 3, 3}, false, 0, 1024)
+	if err != nil || len(layer.Features) != 2 {
+		t.Fatalf("window within decoded payload budget: features=%d err=%v", len(layer.Features), err)
 	}
 }
 
@@ -167,6 +1218,35 @@ func TestReaderOpenAttributePageSkipsGeometry(t *testing.T) {
 	}
 	if total != 2 || len(layer.Features) != 1 || layer.Features[0].ID != 2 || layer.Features[0].Geometry != nil || layer.Features[0].Properties["name"] != "second" {
 		t.Fatalf("layer=%#v total=%d", layer, total)
+	}
+}
+
+func TestAttributePageLimitIsBounded(t *testing.T) {
+	if err := validateAttributePage(0, maxAttributePageSize); err != nil {
+		t.Fatalf("maximum supported page rejected: %v", err)
+	}
+	if err := validateAttributePage(0, maxAttributePageSize+1); err == nil {
+		t.Fatal("oversized attribute page accepted")
+	}
+	if err := validateAttributePage(int(^uint(0)>>1), 200); err != nil {
+		t.Fatalf("large offset should remain representable: %v", err)
+	}
+}
+
+func TestAppendAttributePageFeatureEnforcesAggregateByteBudget(t *testing.T) {
+	first := core.Feature{ID: 1, Properties: map[string]any{"payload": strings.Repeat("x", 64)}}
+	second := core.Feature{ID: 2, Properties: map[string]any{"payload": strings.Repeat("y", 64)}}
+	firstBytes := estimateFeaturePayloadBytes(first)
+	page := core.Layer{Features: make([]core.Feature, 0, 2)}
+	var payloadBytes int64
+	if err := appendAttributePageFeatureWithLimit(&page, first, &payloadBytes, firstBytes+1); err != nil {
+		t.Fatalf("append first feature: %v", err)
+	}
+	if err := appendAttributePageFeatureWithLimit(&page, second, &payloadBytes, firstBytes+1); err == nil || !strings.Contains(err.Error(), "attribute page exceeds") {
+		t.Fatalf("second feature error = %v; want aggregate page budget error", err)
+	}
+	if len(page.Features) != 1 || payloadBytes != firstBytes {
+		t.Fatalf("over-budget append changed page state: features=%d bytes=%d; want 1 and %d", len(page.Features), payloadBytes, firstBytes)
 	}
 }
 
@@ -300,6 +1380,64 @@ func TestReaderOpenAllGeometryOnlySkipsProperties(t *testing.T) {
 	}
 	if len(layers) != 1 || len(layers[0].Features) != 1 || layers[0].Features[0].Properties != nil {
 		t.Fatalf("layers = %#v", layers)
+	}
+}
+
+func TestWindowRejectsOversizedGPKGAttributeBeforeCopy(t *testing.T) {
+	registerDrivers()
+	path := filepath.Join(t.TempDir(), "large-attribute.gpkg")
+	dataset, err := godal.CreateVector(godal.GeoPackage, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spatialRef, err := godal.NewSpatialRef("EPSG:4326")
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	defer spatialRef.Close()
+	layer, err := dataset.CreateLayer("features", spatialRef, godal.GTPoint,
+		godal.NewFieldDefinition("payload", godal.FTString))
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	geometry, err := godal.NewGeometryFromWKT("POINT (1 1)", nil)
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	feature, err := layer.NewFeature(geometry)
+	geometry.Close()
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	feature.SetFID(-1)
+	fields := feature.Fields()
+	if err := feature.SetFieldValue(fields["payload"], strings.Repeat("x", maxMaterializedSnapshotFeatureBytes+1)); err != nil {
+		feature.Close()
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	if err := layer.CreateFeature(feature); err != nil {
+		feature.Close()
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	feature.Close()
+	if err := dataset.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	_, err = session.OpenWindowWithLimits(context.Background(), "features", [4]float64{0, 0, 2, 2}, true, 10, 16<<20)
+	if err == nil || !strings.Contains(err.Error(), "field") || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("oversized GPKG attribute error = %v", err)
 	}
 }
 

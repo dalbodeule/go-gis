@@ -4,13 +4,20 @@ package scripting
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
+	"time"
 
 	"gogis/internal/commands"
 	"gogis/internal/core"
 
 	"github.com/yuin/gopher-lua"
+)
+
+const (
+	maxRuntimeScriptBytes    = 1 << 20
+	maxRuntimeScriptDuration = 10 * time.Minute
 )
 
 // Exporter is the narrow output capability exposed to scripts.
@@ -41,11 +48,12 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter, spatial ...
 		}
 	}
 	for _, name := range []string{
-		"dofile", "loadfile", "load", "loadstring", "require", "module",
+		"dofile", "loadfile", "load", "loadstring", "require", "module", "rawset",
 		"print", "collectgarbage", "newproxy",
 	} {
 		state.SetGlobal(name, lua.LNil)
 	}
+	installBoundedLuaStringRep(state)
 	var spatialOperator commands.SpatialOperator
 	if len(spatial) > 0 {
 		spatialOperator = spatial[0]
@@ -57,9 +65,34 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter, spatial ...
 		"export_dxf":   runtime.exportDXF,
 		"spatial":      runtime.spatialOperation,
 		"filter":       runtime.filter,
+		"filter_lua":   runtime.filterLua,
 		"label":        runtime.label,
+		"label_lua":    runtime.labelLua,
 	}))
 	return runtime
+}
+
+func (r *Runtime) filterLua(state *lua.LState) int {
+	source := state.CheckString(1)
+	result := state.CheckString(2)
+	program, err := CompileLabelComposerProgram("return nil", state.CheckString(3))
+	if err != nil {
+		state.RaiseError("filter_lua: %v", err)
+		return 0
+	}
+	defer program.Close()
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err = r.service.FilterProjectLayerBy(ctx, source, result, func(ctx context.Context, feature core.Feature) (bool, error) {
+		_, matched, evaluateErr := program.Evaluate(ctx, feature.Properties)
+		return matched, evaluateErr
+	})
+	if err != nil {
+		state.RaiseError("filter_lua: %v", err)
+	}
+	return 0
 }
 
 func (r *Runtime) filter(state *lua.LState) int {
@@ -93,6 +126,39 @@ func (r *Runtime) label(state *lua.LState) int {
 	return 0
 }
 
+func (r *Runtime) labelLua(state *lua.LState) int {
+	source := state.CheckString(1)
+	result := state.CheckString(2)
+	textScript := state.CheckString(3)
+	ruleScript := ""
+	if state.Get(4) != lua.LNil {
+		ruleScript = state.CheckString(4)
+	}
+	program, err := CompileLabelComposerProgram(textScript, ruleScript)
+	if err != nil {
+		state.RaiseError("label_lua: %v", err)
+		return 0
+	}
+	defer program.Close()
+	height := float64(state.OptNumber(5, 1))
+	style := state.OptString(6, "")
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err = r.service.LabelProjectLayerWith(ctx, source, result, height, style, func(ctx context.Context, feature core.Feature) (string, error) {
+		text, matches, evaluateErr := program.Evaluate(ctx, feature.Properties)
+		if evaluateErr == nil && !matches {
+			return "", nil
+		}
+		return text, evaluateErr
+	})
+	if err != nil {
+		state.RaiseError("label_lua: %v", err)
+	}
+	return 0
+}
+
 func (r *Runtime) spatialOperation(state *lua.LState) int {
 	if r.spatial == nil {
 		state.RaiseError("spatial operator is not configured")
@@ -117,19 +183,48 @@ func (r *Runtime) spatialOperation(state *lua.LState) int {
 func (r *Runtime) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.state.Close()
+	if r.state != nil {
+		r.state.Close()
+		r.state = nil
+	}
 }
 
-// Run executes a script with a cancellation check before entry.
+// Run executes a script with caller cancellation and an internal maximum
+// duration. A shorter caller deadline takes precedence.
 func (r *Runtime) Run(ctx context.Context, script string) error {
+	return r.runWithMaximumDuration(ctx, script, maxRuntimeScriptDuration)
+}
+
+func (r *Runtime) runWithMaximumDuration(ctx context.Context, script string, maximum time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if maximum <= 0 {
+		return fmt.Errorf("Lua script execution limit must be positive")
+	}
+	if len(script) > maxRuntimeScriptBytes {
+		return fmt.Errorf("Lua script exceeds the %d-byte source limit", maxRuntimeScriptBytes)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline || time.Until(deadline) > maximum {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, maximum)
+		defer cancel()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.state == nil {
+		return fmt.Errorf("Lua runtime is closed")
+	}
 	r.runCtx = ctx
 	defer func() { r.runCtx = nil }()
-	r.state.SetContext(ctx)
+	setLuaContext(r.state, ctx)
 	defer r.state.RemoveContext()
 	return r.state.DoString(script)
 }
@@ -203,9 +298,17 @@ func luaValue(value lua.LValue) any {
 
 // RunFile executes a script file using the supplied context.
 func (r *Runtime) RunFile(ctx context.Context, path string) error {
-	script, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return err
+	}
+	defer file.Close()
+	script, err := io.ReadAll(io.LimitReader(file, maxRuntimeScriptBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(script) > maxRuntimeScriptBytes {
+		return fmt.Errorf("Lua script file exceeds the %d-byte source limit", maxRuntimeScriptBytes)
 	}
 	return r.Run(ctx, string(script))
 }

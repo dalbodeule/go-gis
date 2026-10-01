@@ -18,6 +18,37 @@ func FilterLayerByProperty(ctx context.Context, layer core.Layer, field, expecte
 	return filterLayerByProperty(ctx, layer, field, expected, true)
 }
 
+// FeaturePredicate decides whether a feature belongs in a filtered result.
+// Implementations should not mutate the supplied feature or its properties.
+type FeaturePredicate func(context.Context, core.Feature) (bool, error)
+
+// FilterLayerByPredicate returns a shallow feature view of the matches. A
+// subsequent ProjectService.AddLayer call establishes ownership by cloning
+// the selected features at the transaction boundary.
+func FilterLayerByPredicate(ctx context.Context, layer core.Layer, predicate FeaturePredicate) (core.Layer, error) {
+	if predicate == nil {
+		return core.Layer{}, errors.New("filter predicate is required")
+	}
+	result := core.Layer{
+		Name: layer.Name, CRS: layer.CRS, Editable: layer.Editable,
+		Fields:   append([]core.Field(nil), layer.Fields...),
+		Features: make([]core.Feature, 0),
+	}
+	for _, feature := range layer.Features {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		matched, err := predicate(ctx, feature)
+		if err != nil {
+			return core.Layer{}, fmt.Errorf("filter feature %d: %w", feature.ID, err)
+		}
+		if matched {
+			result.Features = append(result.Features, feature)
+		}
+	}
+	return result, nil
+}
+
 func filterLayerByProperty(ctx context.Context, layer core.Layer, field, expected string, cloneFeatures bool) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
@@ -135,6 +166,44 @@ func (s *ProjectService) FilterProjectLayer(ctx context.Context, sourceName, fie
 	// untouched, so cloning only matching features here avoids a full input
 	// snapshot and a second copy at the edit boundary.
 	result, err := filterLayerByProperty(ctx, layer, field, expected, false)
+	if err != nil {
+		return err
+	}
+	result.Name = resultName
+	if err := s.BeginEdit(); err != nil {
+		return err
+	}
+	if err := s.AddLayer(result); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	if err := s.Commit(); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	return nil
+}
+
+// FilterProjectLayerBy applies a scripted or application-defined predicate and
+// atomically adds only matching features as a new result layer.
+func (s *ProjectService) FilterProjectLayerBy(ctx context.Context, sourceName, resultName string, predicate FeaturePredicate) error {
+	resultName = strings.TrimSpace(resultName)
+	if resultName == "" {
+		return errors.New("result layer name is required")
+	}
+	var source core.Layer
+	found := false
+	for _, candidate := range s.project.Layers {
+		if candidate.Name == sourceName {
+			source = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
+	}
+	result, err := FilterLayerByPredicate(ctx, source, predicate)
 	if err != nil {
 		return err
 	}

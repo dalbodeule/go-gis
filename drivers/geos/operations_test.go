@@ -4,6 +4,7 @@ package geos
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -27,6 +28,38 @@ func TestConstrainedTrianglesRespectPolygonHole(t *testing.T) {
 	}
 	if len(triangles) == 0 || math.Abs(area-84) > 1e-8 {
 		t.Fatalf("triangles=%d, covered area=%v; want 84 (including a 4x4 hole excluded)", len(triangles), area)
+	}
+}
+
+func TestConstrainedTrianglesRejectsOverBudgetWKBBeforeGEOS(t *testing.T) {
+	pointCount := maxConstrainedTriangulationCoordinates + 1
+	wkb := make([]byte, 13+pointCount*16)
+	wkb[0] = 1
+	binary.LittleEndian.PutUint32(wkb[1:5], 3) // Polygon
+	binary.LittleEndian.PutUint32(wkb[5:9], 1) // one ring
+	binary.LittleEndian.PutUint32(wkb[9:13], uint32(pointCount))
+	_, err := NewOperator().ConstrainedTriangles(context.Background(), core.WKBGeometry{WKB: wkb})
+	if err == nil || !strings.Contains(err.Error(), "coordinate safety limit") {
+		t.Fatalf("oversized triangulation WKB error = %v, want coordinate limit", err)
+	}
+}
+
+func TestConstrainedTrianglesRejectsOverBudgetWKTBeforeGEOS(t *testing.T) {
+	wkt := "POLYGON ((" + strings.Repeat("0 0,", maxConstrainedTriangulationCoordinates+1) + "0 0))"
+	_, err := NewOperator().ConstrainedTriangles(context.Background(), core.WKTGeometry{WKT: wkt})
+	if err == nil || !strings.Contains(err.Error(), "WKT exceeds") {
+		t.Fatalf("oversized triangulation WKT error = %v, want byte limit", err)
+	}
+}
+
+func TestConstrainedTrianglesIgnoresNonPolygonGeometryWithoutGEOSRead(t *testing.T) {
+	operator := NewOperator()
+	triangles, err := operator.ConstrainedTriangles(context.Background(), core.WKBGeometry{WKB: []byte{1, 1, 0, 0, 0}})
+	if err != nil || len(triangles) != 0 {
+		t.Fatalf("non-polygon triangulation = %d triangles, err=%v; want empty result", len(triangles), err)
+	}
+	if _, err := operator.ConstrainedTriangles(context.Background(), core.WKBGeometry{WKB: []byte{1, 99, 0, 0, 0}}); err == nil {
+		t.Fatal("unsupported WKB geometry type was silently ignored")
 	}
 }
 

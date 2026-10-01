@@ -86,6 +86,24 @@ func TestHitIndexMatchesLinearHitTest(t *testing.T) {
 	}
 }
 
+func TestHitIndexFallsBackWhenAuxiliaryIndexBudgetIsExceeded(t *testing.T) {
+	features := []HitFeature{
+		{Layer: "roads", FeatureID: 1, Vertices: []Point{{X: 0, Y: 0}}},
+		{Layer: "roads", FeatureID: 2, Vertices: []Point{{X: 1, Y: 1}}},
+	}
+	index := newHitIndexWithLimit(features, 0.1, 1)
+	if !index.linear {
+		t.Fatal("oversized auxiliary index did not select linear fallback")
+	}
+	if index.cells != nil || index.indices != nil || index.next != nil || index.spans != nil {
+		t.Fatal("linear fallback retained partial grid allocations")
+	}
+	result, ok := index.HitTest(Point{X: 1, Y: 1}, 0.01)
+	if !ok || result.FeatureID != 2 {
+		t.Fatalf("linear fallback hit = %#v, ok = %v", result, ok)
+	}
+}
+
 func TestHitIndexDensePathMatchesLinearHitTest(t *testing.T) {
 	features := []HitFeature{
 		{Layer: "roads", FeatureID: 10, Vertices: []Point{{X: 0, Y: 0}, {X: 1, Y: 0}}},

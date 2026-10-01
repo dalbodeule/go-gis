@@ -21,7 +21,7 @@ Go를 주 언어로 사용한다. `internal/core`는 `Project`, `Layer`, `Featur
 검토 기준일: 2026-09-29.
 
 - `godal`은 GDAL 3.0 이상을 요구하고, CGO 호출 횟수를 줄이는 Go API를 제공한다. 다만 upstream README가 벡터와 공간참조 영역은 아직 완성도가 낮고 API가 호환성 깨지는 방향으로 바뀔 수 있다고 명시하므로, SHP/GPKG 경로를 먼저 작은 어댑터와 샘플로 고정한다.
-- `go-proj/v11`은 PROJ 9.4 이상을 요구하며 대량 좌표 변환, 오류 처리, 자동 C 메모리 관리를 제공한다. EPSG:5179/5186/4326 변환은 축 순서와 grid 데이터 여부를 별도 회귀 테스트로 고정한다.
+- `go-proj/v11`은 PROJ 9.4 이상을 요구하며 대량 좌표 변환, 오류 처리, 자동 C 메모리 관리를 제공한다. 코어/WKT의 XY는 visualization order(경위도 및 동·북 좌표)로 고정하며 geometry와 bounds 변환 모두 `NormalizeForVisualization`을 사용한다. EPSG:5179/5186의 공식 축은 북·동 순서이므로 이를 동·북 순서로 정규화하는 회귀 테스트를 둔다. QGIS 독립 control point 대조와 좌표변환 작업의 geodetic accuracy 확인은 수동 검증 항목이다.
 - `go-geos`는 GEOS의 thread-safe 재진입 API를 사용하고 GeoJSON/WKB/WKT 및 `database/sql` 연동을 제공한다. 장시간 실행 앱에서 C heap 압력이 Go runtime에 직접 보이지 않는다는 upstream 경고가 있으므로, 작업 단위별 context와 명시적 geometry 수명 관리를 적용한다.
 
 ### 사용자 인터페이스와 자동화

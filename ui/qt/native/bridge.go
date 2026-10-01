@@ -17,6 +17,10 @@ import (
 	"gogis/internal/render"
 )
 
+func nativeVertexBatchAllowed(count int) bool {
+	return count >= 0 && count <= render.MaxBatchVertices
+}
+
 // RegisterMapCanvas exposes the custom QSG-backed map item to QML.
 func RegisterMapCanvas() {
 	C.gogis_register_qml_types()
@@ -41,6 +45,11 @@ func SetVertices(vertices []render.Vertex) {
 func SetVerticesStage(vertices []render.Vertex, stage int) {
 	if len(vertices) == 0 {
 		C.gogis_set_vertices(nil, 0)
+		return
+	}
+	if !nativeVertexBatchAllowed(len(vertices)) {
+		SetRenderStatus("Render error: source vertex safety limit exceeded")
+		C.gogis_set_vertices_vertex_layout_stage(nil, 0, C.int(stage))
 		return
 	}
 	if uint64(len(vertices)) > uint64(^uint32(0)>>1) {

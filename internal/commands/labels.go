@@ -21,9 +21,60 @@ func GenerateLabels(ctx context.Context, layer core.Layer, field string, height 
 	return generateLabels(ctx, layer, field, height, style, true)
 }
 
+// GenerateLabelsWithRotation composes field labels and optionally applies a
+// numeric property as each label's DXF rotation in degrees.
+func GenerateLabelsWithRotation(ctx context.Context, layer core.Layer, field, rotationField string, height float64, style string) (core.Layer, error) {
+	result, err := GenerateLabels(ctx, layer, field, height, style)
+	if err != nil || rotationField == "" {
+		return result, err
+	}
+	for index := range result.Features {
+		feature := &result.Features[index]
+		if feature.Label == nil {
+			continue
+		}
+		value, exists := feature.Properties[rotationField]
+		if !exists {
+			return core.Layer{}, fmt.Errorf("feature %d rotation field %q is missing", feature.ID, rotationField)
+		}
+		if value == nil || strings.TrimSpace(fmt.Sprint(value)) == "" {
+			continue
+		}
+		rotation, parseErr := strconv.ParseFloat(strings.TrimSpace(fmt.Sprint(value)), 64)
+		if parseErr != nil || math.IsNaN(rotation) || math.IsInf(rotation, 0) {
+			return core.Layer{}, fmt.Errorf("feature %d rotation field %q must contain a finite number", feature.ID, rotationField)
+		}
+		feature.Label.Rotation = rotation
+	}
+	return result, nil
+}
+
 func generateLabels(ctx context.Context, layer core.Layer, field string, height float64, style string, clone bool) (core.Layer, error) {
 	if field == "" {
 		return core.Layer{}, ErrLabelFieldMissing
+	}
+	return generateLabelsWith(ctx, layer, height, style, clone, func(_ context.Context, feature core.Feature) (string, error) {
+		value, ok := feature.Properties[field]
+		if !ok || value == nil {
+			return "", nil
+		}
+		return labelText(value), nil
+	})
+}
+
+// LabelComposer derives text per feature. Returning an empty string leaves the
+// feature in the result layer but without a label.
+type LabelComposer func(context.Context, core.Feature) (string, error)
+
+// GenerateLabelsWith composes a label for each feature without dropping
+// features whose composer returns an empty string.
+func GenerateLabelsWith(ctx context.Context, layer core.Layer, height float64, style string, composer LabelComposer) (core.Layer, error) {
+	return generateLabelsWith(ctx, layer, height, style, true, composer)
+}
+
+func generateLabelsWith(ctx context.Context, layer core.Layer, height float64, style string, clone bool, composer LabelComposer) (core.Layer, error) {
+	if composer == nil {
+		return core.Layer{}, errors.New("label composer is required")
 	}
 	result := layer
 	if clone {
@@ -40,12 +91,11 @@ func generateLabels(ctx context.Context, layer core.Layer, field string, height 
 			return core.Layer{}, err
 		}
 		feature := &result.Features[index]
-		value, ok := feature.Properties[field]
-		if !ok || value == nil {
-			feature.Label = nil
-			continue
+		text, err := composer(ctx, *feature)
+		if err != nil {
+			return core.Layer{}, fmt.Errorf("feature %d: compose label: %w", feature.ID, err)
 		}
-		text := labelText(value)
+		text = strings.TrimSpace(text)
 		if text == "" {
 			feature.Label = nil
 			continue
@@ -92,6 +142,45 @@ func (s *ProjectService) LabelProjectLayer(ctx context.Context, sourceName, fiel
 		return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
 	}
 	result, err := generateLabels(ctx, layer, field, height, style, false)
+	if err != nil {
+		return err
+	}
+	result.Name = resultName
+	if err := s.BeginEdit(); err != nil {
+		return err
+	}
+	if err := s.AddLayer(result); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	if err := s.Commit(); err != nil {
+		_ = s.Rollback()
+		return err
+	}
+	return nil
+}
+
+// LabelProjectLayerWith creates a new layer with labels composed from feature
+// properties. It keeps every source feature; empty composer results are
+// intentionally unlabeled rather than filtered out.
+func (s *ProjectService) LabelProjectLayerWith(ctx context.Context, sourceName, resultName string, height float64, style string, composer LabelComposer) error {
+	resultName = strings.TrimSpace(resultName)
+	if resultName == "" {
+		return errors.New("result layer name is required")
+	}
+	var source core.Layer
+	found := false
+	for _, candidate := range s.project.Layers {
+		if candidate.Name == sourceName {
+			source = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", ErrLayerMissing, sourceName)
+	}
+	result, err := generateLabelsWith(ctx, source, height, style, false, composer)
 	if err != nil {
 		return err
 	}

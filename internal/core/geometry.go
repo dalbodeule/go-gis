@@ -116,6 +116,177 @@ func (g WKBGeometry) GeometryType() string {
 	return wkbTypeName(order.Uint32(g.WKB[1:5]))
 }
 
+// PointCount returns the number of coordinate tuples in a WKB geometry without
+// materializing point slices. It validates the full byte layout and supports
+// OGC dimensional type codes and EWKB Z/M/SRID flags.
+func (g WKBGeometry) PointCount() (int, error) {
+	counter := wkbPointCounter{data: g.WKB}
+	count, err := counter.geometry(0)
+	if err != nil {
+		return 0, err
+	}
+	if counter.offset != len(counter.data) {
+		return 0, errors.New("WKB contains trailing data")
+	}
+	return count, nil
+}
+
+type wkbPointCounter struct {
+	data     []byte
+	offset   int
+	elements int
+}
+
+func (c *wkbPointCounter) consumeElements(count uint32) error {
+	if uint64(count) > uint64(maxWKBDecodeElements-c.elements) {
+		return errors.New("WKB geometry exceeds the 1000000-element decode safety limit")
+	}
+	c.elements += int(count)
+	return nil
+}
+
+func (c *wkbPointCounter) uint32(order binary.ByteOrder) (uint32, error) {
+	if c.offset < 0 || c.offset > len(c.data)-4 {
+		return 0, errors.New("WKB is truncated")
+	}
+	value := order.Uint32(c.data[c.offset : c.offset+4])
+	c.offset += 4
+	return value, nil
+}
+
+func (c *wkbPointCounter) skipCoordinateTuples(count uint32, dimensions int) error {
+	if dimensions < 2 || dimensions > 4 {
+		return errors.New("WKB has invalid coordinate dimensions")
+	}
+	bytesPerPoint := dimensions * 8
+	if uint64(count) > uint64(len(c.data)-c.offset)/uint64(bytesPerPoint) {
+		return errors.New("WKB coordinate count exceeds available bytes")
+	}
+	if err := c.consumeElements(count); err != nil {
+		return err
+	}
+	c.offset += int(count) * bytesPerPoint
+	return nil
+}
+
+func (c *wkbPointCounter) geometry(depth int) (int, error) {
+	if depth >= 64 {
+		return 0, errors.New("WKB geometry collection nesting exceeds 64 levels")
+	}
+	if c.offset < 0 || c.offset > len(c.data)-5 {
+		return 0, errors.New("WKB geometry header is truncated")
+	}
+	var order binary.ByteOrder
+	switch c.data[c.offset] {
+	case 0:
+		order = binary.BigEndian
+	case 1:
+		order = binary.LittleEndian
+	default:
+		return 0, errors.New("WKB has invalid byte order")
+	}
+	c.offset++
+	typeCode, err := c.uint32(order)
+	if err != nil {
+		return 0, err
+	}
+	dimensions := 2
+	hasSRID := typeCode&0x20000000 != 0
+	base := typeCode & 0x0fffffff
+	if typeCode&0x80000000 != 0 {
+		dimensions++
+	}
+	if typeCode&0x40000000 != 0 {
+		dimensions++
+	}
+	if typeCode&0xe0000000 == 0 {
+		switch {
+		case base >= 3000 && base < 4000:
+			base -= 3000
+			dimensions = 4
+		case base >= 2000 && base < 3000:
+			base -= 2000
+			dimensions = 3
+		case base >= 1000 && base < 2000:
+			base -= 1000
+			dimensions = 3
+		}
+	}
+	if hasSRID {
+		if _, err := c.uint32(order); err != nil {
+			return 0, err
+		}
+	}
+	if base < 1 || base > 7 {
+		return 0, fmt.Errorf("unsupported WKB geometry type %d", base)
+	}
+	switch base {
+	case 1:
+		if err := c.skipCoordinateTuples(1, dimensions); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	case 2:
+		count, err := c.uint32(order)
+		if err != nil {
+			return 0, err
+		}
+		if err := c.skipCoordinateTuples(count, dimensions); err != nil {
+			return 0, err
+		}
+		return int(count), nil
+	case 3:
+		ringCount, err := c.uint32(order)
+		if err != nil {
+			return 0, err
+		}
+		if uint64(ringCount) > uint64(len(c.data)-c.offset)/4 {
+			return 0, errors.New("WKB ring count exceeds available bytes")
+		}
+		if err := c.consumeElements(ringCount); err != nil {
+			return 0, err
+		}
+		total := 0
+		for ring := uint32(0); ring < ringCount; ring++ {
+			count, err := c.uint32(order)
+			if err != nil {
+				return 0, err
+			}
+			if uint64(count) > uint64(int(^uint(0)>>1)-total) {
+				return 0, errors.New("WKB coordinate count overflows int")
+			}
+			if err := c.skipCoordinateTuples(count, dimensions); err != nil {
+				return 0, err
+			}
+			total += int(count)
+		}
+		return total, nil
+	default:
+		childCount, err := c.uint32(order)
+		if err != nil {
+			return 0, err
+		}
+		if uint64(childCount) > uint64(len(c.data)-c.offset)/5 {
+			return 0, errors.New("WKB child count exceeds available bytes")
+		}
+		if err := c.consumeElements(childCount); err != nil {
+			return 0, err
+		}
+		total := 0
+		for child := uint32(0); child < childCount; child++ {
+			count, err := c.geometry(depth + 1)
+			if err != nil {
+				return 0, err
+			}
+			if count > int(^uint(0)>>1)-total {
+				return 0, errors.New("WKB coordinate count overflows int")
+			}
+			total += count
+		}
+		return total, nil
+	}
+}
+
 // Parts decodes geometry components without creating a WKT representation.
 // Polygon rings remain separate parts so render hit testing does not connect
 // disjoint components or holes.
@@ -159,6 +330,8 @@ type decodedWKB struct {
 	rings    [][]WKBPoint
 	children []decodedWKB
 }
+
+const maxWKBDecodeElements = 1_000_000
 
 func (g decodedWKB) typeName() string {
 	return wkbTypeName(g.typeCode)
@@ -245,7 +418,7 @@ func (g decodedWKB) wkt() string {
 
 func decodeWKB(data []byte) (decodedWKB, error) {
 	reader := &wkbReader{data: data}
-	geometry, err := reader.geometry()
+	geometry, err := reader.geometry(0)
 	if err != nil {
 		return decodedWKB{}, err
 	}
@@ -265,7 +438,7 @@ func MapWKBXY(data []byte, mapXY func(x, y float64) (float64, float64, error)) (
 	}
 	result := append([]byte(nil), data...)
 	mapper := &wkbMapper{data: result}
-	if err := mapper.geometry(mapXY); err != nil {
+	if err := mapper.geometry(mapXY, 0); err != nil {
 		return nil, err
 	}
 	if mapper.offset != len(result) {
@@ -287,7 +460,7 @@ func MoveWKBVertex(data []byte, vertexIndex int, x, y float64) ([]byte, error) {
 	result := append([]byte(nil), data...)
 	move := &wkbVertexMove{index: vertexIndex, x: x, y: y}
 	mapper := &wkbMapper{data: result, vertexMove: move}
-	if err := mapper.geometry(nil); err != nil {
+	if err := mapper.geometry(nil, 0); err != nil {
 		return nil, err
 	}
 	if mapper.offset != len(result) {
@@ -321,7 +494,10 @@ type wkbMapper struct {
 	vertexMove *wkbVertexMove
 }
 
-func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, error)) error {
+func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, error), depth int) error {
+	if depth >= 64 {
+		return errors.New("WKB geometry collection nesting exceeds 64 levels")
+	}
 	if m.offset >= len(m.data) {
 		return errors.New("WKB is truncated")
 	}
@@ -436,7 +612,7 @@ func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, err
 			return err
 		}
 		for index := uint32(0); index < count; index++ {
-			if err := m.geometry(mapXY); err != nil {
+			if err := m.geometry(mapXY, depth+1); err != nil {
 				return err
 			}
 		}
@@ -466,12 +642,24 @@ func (m *wkbMapper) float64() (int, float64, error) {
 }
 
 type wkbReader struct {
-	data   []byte
-	offset int
-	order  binary.ByteOrder
+	data     []byte
+	offset   int
+	order    binary.ByteOrder
+	elements int
 }
 
-func (r *wkbReader) geometry() (decodedWKB, error) {
+func (r *wkbReader) consumeElements(count uint32) error {
+	if uint64(count) > uint64(maxWKBDecodeElements-r.elements) {
+		return errors.New("WKB geometry exceeds the 1000000-element decode safety limit")
+	}
+	r.elements += int(count)
+	return nil
+}
+
+func (r *wkbReader) geometry(depth int) (decodedWKB, error) {
+	if depth >= 64 {
+		return decodedWKB{}, errors.New("WKB geometry collection nesting exceeds 64 levels")
+	}
 	if r.offset >= len(r.data) {
 		return decodedWKB{}, errors.New("WKB is truncated")
 	}
@@ -517,8 +705,12 @@ func (r *wkbReader) geometry() (decodedWKB, error) {
 		}
 		return WKBPoint{X: x, Y: y}, nil
 	}
+	pointBytes := (2 + boolInt(hasZ) + boolInt(hasM)) * 8
 	switch base {
 	case 1:
+		if err := r.consumeElements(1); err != nil {
+			return decodedWKB{}, err
+		}
 		point, err := readPoint()
 		if err != nil {
 			return decodedWKB{}, err
@@ -528,7 +720,7 @@ func (r *wkbReader) geometry() (decodedWKB, error) {
 		}
 		geometry.points = []WKBPoint{point}
 	case 2:
-		points, err := r.points(readPoint)
+		points, err := r.points(readPoint, pointBytes)
 		if err != nil {
 			return decodedWKB{}, err
 		}
@@ -538,9 +730,15 @@ func (r *wkbReader) geometry() (decodedWKB, error) {
 		if err != nil {
 			return decodedWKB{}, err
 		}
+		if uint64(ringCount) > uint64(len(r.data)-r.offset)/4 {
+			return decodedWKB{}, errors.New("WKB ring count exceeds available bytes")
+		}
+		if err := r.consumeElements(ringCount); err != nil {
+			return decodedWKB{}, err
+		}
 		geometry.rings = make([][]WKBPoint, int(ringCount))
 		for index := range geometry.rings {
-			points, err := r.points(readPoint)
+			points, err := r.points(readPoint, pointBytes)
 			if err != nil {
 				return decodedWKB{}, err
 			}
@@ -551,9 +749,15 @@ func (r *wkbReader) geometry() (decodedWKB, error) {
 		if err != nil {
 			return decodedWKB{}, err
 		}
+		if uint64(count) > uint64(len(r.data)-r.offset)/5 {
+			return decodedWKB{}, errors.New("WKB child count exceeds available bytes")
+		}
+		if err := r.consumeElements(count); err != nil {
+			return decodedWKB{}, err
+		}
 		geometry.children = make([]decodedWKB, int(count))
 		for index := range geometry.children {
-			child, err := r.geometry()
+			child, err := r.geometry(depth + 1)
 			if err != nil {
 				return decodedWKB{}, err
 			}
@@ -565,9 +769,15 @@ func (r *wkbReader) geometry() (decodedWKB, error) {
 	return geometry, nil
 }
 
-func (r *wkbReader) points(readPoint func() (WKBPoint, error)) ([]WKBPoint, error) {
+func (r *wkbReader) points(readPoint func() (WKBPoint, error), pointBytes int) ([]WKBPoint, error) {
 	count, err := r.uint32()
 	if err != nil {
+		return nil, err
+	}
+	if pointBytes < 16 || uint64(count) > uint64(len(r.data)-r.offset)/uint64(pointBytes) {
+		return nil, errors.New("WKB coordinate count exceeds available bytes")
+	}
+	if err := r.consumeElements(count); err != nil {
 		return nil, err
 	}
 	points := make([]WKBPoint, int(count))

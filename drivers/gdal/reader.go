@@ -5,6 +5,7 @@ package gdal
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,9 +17,58 @@ import (
 )
 
 const maxInitialFeatureCapacity = 65536
+const maxGeoJSONFeatureMiB = 64
+const maxMaterializedSnapshotFeatures = 100_000
+const maxMaterializedSnapshotBytes = 128 << 20
+const maxMaterializedSnapshotFeatureBytes = 8 << 20
+const maxEstimatedPropertyNodes = 1 << 16
+const maxGeometryWKBBytes = maxMaterializedSnapshotFeatureBytes
+const maxAttributePageSize = 1_000
+const maxAttributePageBytes = maxMaterializedSnapshotBytes
+
+func appendAttributePageFeature(result *core.Layer, feature core.Feature, payloadBytes *int64) error {
+	return appendAttributePageFeatureWithLimit(result, feature, payloadBytes, maxAttributePageBytes)
+}
+
+func appendAttributePageFeatureWithLimit(result *core.Layer, feature core.Feature, payloadBytes *int64, maxBytes int64) error {
+	featureBytes := estimateFeaturePayloadBytes(feature)
+	if maxBytes > 0 && (*payloadBytes < 0 || *payloadBytes > maxBytes || featureBytes > maxBytes-*payloadBytes) {
+		return fmt.Errorf("attribute page exceeds the %d MiB payload limit", maxBytes>>20)
+	}
+	*payloadBytes += featureBytes
+	result.Features = append(result.Features, feature)
+	return nil
+}
+
+func validateAttributePage(offset, limit int) error {
+	if offset < 0 || limit <= 0 || limit > maxAttributePageSize {
+		return fmt.Errorf("invalid attribute page: offset=%d limit=%d (limit must be 1..%d)", offset, limit, maxAttributePageSize)
+	}
+	return nil
+}
 
 func initialFeatureCapacity(count int) int {
 	return max(0, min(count, maxInitialFeatureCapacity))
+}
+
+func validateSpatialWindow(bounds [4]float64) error {
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return fmt.Errorf("invalid spatial window: coordinates must be finite: %v", bounds)
+		}
+	}
+	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+		return fmt.Errorf("invalid spatial window: [%v %v %v %v]", bounds[0], bounds[1], bounds[2], bounds[3])
+	}
+	return nil
+}
+
+func geometryWKBWithLimit(geometry *godal.Geometry, featureID uint64) ([]byte, error) {
+	wkb, err := geometry.WKBWithMaxSize(maxGeometryWKBBytes)
+	if err != nil {
+		return nil, fmt.Errorf("feature %d geometry WKB exceeds the %d MiB limit: %w", featureID, maxGeometryWKBBytes>>20, err)
+	}
+	return wkb, nil
 }
 
 // Reader opens vector layers through GDAL/OGR. It supports any installed GDAL
@@ -28,6 +78,16 @@ func initialFeatureCapacity(count int) int {
 type Reader struct{ Encoding string }
 
 func openDataset(source, encoding string) (*godal.Dataset, error) {
+	return openDatasetWithGeoJSONLimit(source, encoding, maxGeoJSONFeatureMiB)
+}
+
+func openDatasetWithGeoJSONLimit(source, encoding string, maxFeatureMiB int) (*godal.Dataset, error) {
+	if isJSONVectorSource(source) {
+		// Bound the largest individual JSON feature that GDAL will parse. This
+		// does not cap whole-collection memory use, but prevents one malformed or
+		// unexpectedly huge feature from consuming hundreds of MiB by itself.
+		return godal.Open(source, godal.ConfigOption(fmt.Sprintf("OGR_GEOJSON_MAX_OBJ_SIZE=%d", maxFeatureMiB)))
+	}
 	if encoding == "" || !isShapefilePath(source) {
 		return godal.Open(source)
 	}
@@ -60,6 +120,9 @@ func (reader Reader) Open(ctx context.Context, source, layerName string) (core.L
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
+	if isGeoJSONStreamSource(source) {
+		return readGeoJSONSourceSnapshot(ctx, source, layerName, true)
+	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
@@ -82,7 +145,7 @@ func (reader Reader) Open(ctx context.Context, source, layerName string) (core.L
 		layer = layers[0]
 	}
 
-	return readLayer(ctx, layer)
+	return readMaterializedLayer(ctx, layer, true)
 }
 
 // OpenGeometryOnly reads layer identity, CRS, feature IDs, and geometry while
@@ -92,6 +155,9 @@ func (reader Reader) OpenGeometryOnly(ctx context.Context, source, layerName str
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
+	if isGeoJSONStreamSource(source) {
+		return readGeoJSONSourceSnapshot(ctx, source, layerName, false)
+	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
@@ -113,7 +179,7 @@ func (reader Reader) OpenGeometryOnly(ctx context.Context, source, layerName str
 		}
 		layer = layers[0]
 	}
-	return readLayerOptions(ctx, layer, false)
+	return readMaterializedLayer(ctx, layer, false)
 }
 
 // OpenFeature reads one feature by the sequential application ID assigned by
@@ -125,6 +191,9 @@ func (reader Reader) OpenFeature(ctx context.Context, source, layerName string, 
 	}
 	if err := ctx.Err(); err != nil {
 		return core.Feature{}, err
+	}
+	if isGeoJSONStreamSource(source) {
+		return openGeoJSONSourceFeature(ctx, source, layerName, featureID)
 	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
@@ -176,11 +245,14 @@ func openFeatureLayer(ctx context.Context, layer godal.Layer, featureID, nextID 
 // to preserve the reader's sequential IDs but does not decode their fields or
 // geometries.
 func (reader Reader) OpenAttributePage(ctx context.Context, source, layerName string, offset, limit int) (core.Layer, int, error) {
-	if offset < 0 || limit <= 0 {
-		return core.Layer{}, 0, fmt.Errorf("invalid attribute page: offset=%d limit=%d", offset, limit)
+	if err := validateAttributePage(offset, limit); err != nil {
+		return core.Layer{}, 0, err
 	}
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, 0, err
+	}
+	if isGeoJSONStreamSource(source) {
+		return readGeoJSONSourceAttributePage(ctx, source, layerName, offset, limit)
 	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
@@ -218,6 +290,7 @@ func openAttributePageDataset(ctx context.Context, dataset *godal.Dataset, sourc
 		Features: make([]core.Feature, 0, limit),
 	}
 	layer.ResetReading()
+	var payloadBytes int64
 	var ordinal int
 	for {
 		if err := ctx.Err(); err != nil {
@@ -232,11 +305,15 @@ func openAttributePageDataset(ctx context.Context, dataset *godal.Dataset, sourc
 			ordinal++
 			continue
 		}
-		if ordinal >= offset+limit {
+		if ordinal-offset >= limit {
 			feature.Close()
 			break
 		}
-		fields := feature.Fields()
+		fields, fieldsErr := featureFieldsWithLimit(feature)
+		if fieldsErr != nil {
+			feature.Close()
+			return core.Layer{}, 0, fmt.Errorf("read feature %d fields: %w", ordinal+1, fieldsErr)
+		}
 		if len(result.Fields) == 0 {
 			result.Fields = fieldSchema(fields)
 		}
@@ -244,7 +321,11 @@ func openAttributePageDataset(ctx context.Context, dataset *godal.Dataset, sourc
 		for name, field := range fields {
 			properties[name] = fieldValue(field)
 		}
-		result.Features = append(result.Features, core.Feature{ID: uint64(ordinal + 1), Properties: properties})
+		loaded := core.Feature{ID: uint64(ordinal + 1), Properties: properties}
+		if err := appendAttributePageFeature(&result, loaded, &payloadBytes); err != nil {
+			feature.Close()
+			return core.Layer{}, 0, fmt.Errorf("read feature %d: %w", ordinal+1, err)
+		}
 		feature.Close()
 		ordinal++
 	}
@@ -255,12 +336,16 @@ func openAttributePageDataset(ctx context.Context, dataset *godal.Dataset, sourc
 }
 
 func readAttributePageLayer(ctx context.Context, layer godal.Layer, offset, limit int) (core.Layer, error) {
+	if err := validateAttributePage(offset, limit); err != nil {
+		return core.Layer{}, err
+	}
 	result := core.Layer{
 		Name:     layer.Name(),
 		Editable: true,
 		Features: make([]core.Feature, 0, limit),
 	}
 	layer.ResetReading()
+	var payloadBytes int64
 	for index := 0; index < limit; index++ {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -269,7 +354,11 @@ func readAttributePageLayer(ctx context.Context, layer godal.Layer, offset, limi
 		if feature == nil {
 			break
 		}
-		fields := feature.Fields()
+		fields, fieldsErr := featureFieldsWithLimit(feature)
+		if fieldsErr != nil {
+			feature.Close()
+			return core.Layer{}, fmt.Errorf("read feature %d fields: %w", offset+index+1, fieldsErr)
+		}
 		if len(result.Fields) == 0 {
 			result.Fields = fieldSchema(fields)
 		}
@@ -277,7 +366,11 @@ func readAttributePageLayer(ctx context.Context, layer godal.Layer, offset, limi
 		for name, field := range fields {
 			properties[name] = fieldValue(field)
 		}
-		result.Features = append(result.Features, core.Feature{ID: uint64(offset + index + 1), Properties: properties})
+		loaded := core.Feature{ID: uint64(offset + index + 1), Properties: properties}
+		if err := appendAttributePageFeature(&result, loaded, &payloadBytes); err != nil {
+			feature.Close()
+			return core.Layer{}, fmt.Errorf("read feature %d: %w", offset+index+1, err)
+		}
 		feature.Close()
 	}
 	return result, nil
@@ -293,6 +386,7 @@ func readAttributePageLayerCursor(ctx context.Context, layer godal.Layer, offset
 		layer.ResetReading()
 		nextID = 1
 	}
+	var payloadBytes int64
 	for nextID < uint64(offset)+1 {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, nextID, err
@@ -312,7 +406,11 @@ func readAttributePageLayerCursor(ctx context.Context, layer godal.Layer, offset
 		if feature == nil {
 			break
 		}
-		fields := feature.Fields()
+		fields, fieldsErr := featureFieldsWithLimit(feature)
+		if fieldsErr != nil {
+			feature.Close()
+			return core.Layer{}, nextID, fmt.Errorf("read feature %d fields: %w", nextID, fieldsErr)
+		}
 		if len(result.Fields) == 0 {
 			if len(schema) > 0 {
 				result.Fields = append(result.Fields, schema...)
@@ -325,7 +423,11 @@ func readAttributePageLayerCursor(ctx context.Context, layer godal.Layer, offset
 		for name, field := range fields {
 			properties[name] = fieldValue(field)
 		}
-		result.Features = append(result.Features, core.Feature{ID: nextID, Properties: properties})
+		loaded := core.Feature{ID: nextID, Properties: properties}
+		if err := appendAttributePageFeature(&result, loaded, &payloadBytes); err != nil {
+			feature.Close()
+			return core.Layer{}, nextID, fmt.Errorf("read feature %d: %w", nextID, err)
+		}
 		feature.Close()
 		nextID++
 	}
@@ -347,9 +449,10 @@ func selectLayer(dataset *godal.Dataset, source, layerName string) (godal.Layer,
 	return layers[0], nil
 }
 
-// OpenWindow reads only features intersecting bounds, which is useful for
-// viewport-driven loading of large vector layers. Bounds are minX, minY,
-// maxX, maxY in the source layer's CRS.
+// OpenWindow reads features intersecting bounds, subject to the standard
+// snapshot feature and payload budgets. Use the session WithLimits API when a
+// caller needs a different explicit budget. Bounds are minX, minY, maxX, maxY
+// in the source layer's CRS.
 func (reader Reader) OpenWindow(ctx context.Context, source, layerName string, bounds [4]float64) (core.Layer, error) {
 	return reader.openWindow(ctx, source, layerName, bounds, true)
 }
@@ -362,11 +465,14 @@ func (reader Reader) OpenWindowGeometryOnly(ctx context.Context, source, layerNa
 }
 
 func (reader Reader) openWindow(ctx context.Context, source, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	if err := validateSpatialWindow(bounds); err != nil {
+		return core.Layer{}, err
+	}
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
-	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
-		return core.Layer{}, fmt.Errorf("invalid spatial window: [%v %v %v %v]", bounds[0], bounds[1], bounds[2], bounds[3])
+	if isGeoJSONStreamSource(source) {
+		return readGeoJSONSourceWindow(ctx, source, layerName, bounds, includeProperties, maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
 	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
@@ -386,17 +492,26 @@ func openWindowDataset(ctx context.Context, dataset *godal.Dataset, source, laye
 }
 
 func openWindowLayer(ctx context.Context, dataset *godal.Dataset, source string, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+	return openWindowLayerLimited(ctx, dataset, source, layer, layerName, bounds, includeProperties, maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+}
+
+func openWindowLayerLimited(ctx context.Context, dataset *godal.Dataset, source string, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
 	if layerName == "" {
 		layerName = layer.Name()
 	}
-	// GeoJSON is commonly backed by a streaming parser. For this driver,
-	// OGRSQL result-set creation can cost more than scanning the source once
-	// and asking GDAL for each feature envelope. Keep the SQL path for indexed
-	// formats such as SHP and GeoPackage.
+	// For JSON-based formats, OGRSQL result-set creation can cost more than a
+	// sequential scan with per-feature envelope checks. Keep the SQL path for
+	// indexed formats such as SHP and GeoPackage.
 	if isJSONVectorSource(source) {
-		return readWindowLayer(ctx, layer, layerName, bounds, includeProperties)
+		return readWindowLayer(ctx, layer, layerName, bounds, includeProperties, maxFeatures, maxBytes)
 	}
+	return openWindowSpatialFilterLimited(ctx, dataset, layer, layerName, bounds, includeProperties, maxFeatures, maxBytes)
+}
 
+func openWindowSpatialFilterLimited(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	if layerName == "" {
+		layerName = layer.Name()
+	}
 	filterWKT := fmt.Sprintf("POLYGON ((%[1]g %[2]g, %[3]g %[2]g, %[3]g %[4]g, %[1]g %[4]g, %[1]g %[2]g))", bounds[0], bounds[1], bounds[2], bounds[3])
 	filter, err := godal.NewGeometryFromWKT(filterWKT, nil)
 	if err != nil {
@@ -411,7 +526,7 @@ func openWindowLayer(ctx context.Context, dataset *godal.Dataset, source string,
 		return core.Layer{Name: layerName, Editable: true}, nil
 	}
 	defer resultSet.Close()
-	result, err := readLayerOptions(ctx, resultSet.Layer, includeProperties)
+	result, err := readLayerOptionsLimited(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes)
 	if err != nil {
 		return core.Layer{}, err
 	}
@@ -421,14 +536,17 @@ func openWindowLayer(ctx context.Context, dataset *godal.Dataset, source string,
 
 func isJSONVectorSource(source string) bool {
 	switch strings.ToLower(filepath.Ext(source)) {
-	case ".geojson", ".json":
+	case ".geojson", ".json", ".geojsonl", ".geojsons":
 		return true
 	default:
 		return false
 	}
 }
 
-func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
+func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	if err := validateSpatialWindow(bounds); err != nil {
+		return core.Layer{}, err
+	}
 	result := core.Layer{Name: layerName, Editable: true}
 	if spatialRef := layer.SpatialRef(); spatialRef != nil {
 		defer spatialRef.Close()
@@ -449,6 +567,7 @@ func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, b
 
 	layer.ResetReading()
 	var nextID uint64 = 1
+	var payloadBytes int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -476,9 +595,17 @@ func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, b
 				nextID++
 				return
 			}
+			if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+				featureErr = fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
+				return
+			}
 			var fields map[string]godal.Field
 			if includeProperties {
-				fields = feature.Fields()
+				fields, err = featureFieldsWithLimit(feature)
+				if err != nil {
+					featureErr = fmt.Errorf("read feature %d fields: %w", nextID, err)
+					return
+				}
 				if len(result.Fields) == 0 {
 					result.Fields = fieldSchema(fields)
 				}
@@ -488,6 +615,12 @@ func readWindowLayer(ctx context.Context, layer godal.Layer, layerName string, b
 				featureErr = readErr
 				return
 			}
+			featureBytes := estimateFeaturePayloadBytes(loaded)
+			if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
+				featureErr = fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
+				return
+			}
+			payloadBytes += featureBytes
 			result.Features = append(result.Features, loaded)
 			nextID++
 		}()
@@ -520,6 +653,13 @@ func (reader Reader) openAll(ctx context.Context, source string, includeProperti
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if isGeoJSONStreamSource(source) {
+		layer, err := readGeoJSONSourceSnapshot(ctx, source, "", includeProperties)
+		if err != nil {
+			return nil, err
+		}
+		return []core.Layer{layer}, nil
+	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
 	if err != nil {
@@ -534,12 +674,33 @@ func openAllDataset(ctx context.Context, dataset *godal.Dataset, source string, 
 	if len(layers) == 0 {
 		return nil, fmt.Errorf("dataset %q contains no vector layers", source)
 	}
-	result := make([]core.Layer, 0, len(layers))
+	knownFeatures := 0
 	for _, layer := range layers {
-		loaded, err := readLayerOptions(ctx, layer, includeProperties)
+		count, err := layer.FeatureCount()
+		if err != nil || count < 0 {
+			continue
+		}
+		if count > maxMaterializedSnapshotFeatures-knownFeatures {
+			return nil, snapshotLimitError(layer.Name(), maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+		}
+		knownFeatures += count
+	}
+	result := make([]core.Layer, 0, len(layers))
+	remainingFeatures := maxMaterializedSnapshotFeatures
+	remainingBytes := int64(maxMaterializedSnapshotBytes)
+	for _, layer := range layers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if remainingFeatures <= 0 || remainingBytes <= 0 {
+			return nil, snapshotLimitError(layer.Name(), maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+		}
+		loaded, err := readLayerOptionsLimited(ctx, layer, includeProperties, remainingFeatures, remainingBytes)
 		if err != nil {
 			return nil, err
 		}
+		remainingFeatures -= len(loaded.Features)
+		remainingBytes -= layerPayloadBytes(loaded)
 		result = append(result, loaded)
 	}
 	return result, nil
@@ -550,17 +711,49 @@ func readLayer(ctx context.Context, layer godal.Layer) (core.Layer, error) {
 }
 
 func readLayerOptions(ctx context.Context, layer godal.Layer, includeProperties bool) (core.Layer, error) {
+	return readLayerOptionsLimited(ctx, layer, includeProperties, 0, 0)
+}
+
+func readMaterializedLayer(ctx context.Context, layer godal.Layer, includeProperties bool) (core.Layer, error) {
+	if count, err := layer.FeatureCount(); err == nil && count > maxMaterializedSnapshotFeatures {
+		return core.Layer{}, snapshotLimitError(layer.Name(), maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+	}
+	return readLayerOptionsLimited(ctx, layer, includeProperties, maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+}
+
+func snapshotLimitError(layerName string, maxFeatures int, maxBytes int64) error {
+	return fmt.Errorf("layer %q exceeds the in-memory snapshot limit (%d features or %d MiB); use the read-only viewport session or an indexed source", layerName, maxFeatures, maxBytes>>20)
+}
+
+func layerPayloadBytes(layer core.Layer) int64 {
+	var total int64
+	for _, feature := range layer.Features {
+		featureBytes := estimateFeaturePayloadBytes(feature)
+		if featureBytes > maxMaterializedSnapshotBytes-total {
+			return maxMaterializedSnapshotBytes
+		}
+		total += featureBytes
+	}
+	return total
+}
+
+func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
 	result := readLayerHeader(layer)
 	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
 	// feature slice up front. Driver counts are not always trustworthy, however,
 	// and a very large reservation can exhaust memory before the first feature
 	// is read. Bound the eager reservation; append grows the slice as needed.
 	if count, countErr := layer.FeatureCount(); countErr == nil && count > 0 {
-		result.Features = make([]core.Feature, 0, initialFeatureCapacity(count))
+		capacity := initialFeatureCapacity(count)
+		if maxFeatures > 0 && capacity > maxFeatures {
+			capacity = maxFeatures
+		}
+		result.Features = make([]core.Feature, 0, capacity)
 	}
 
 	layer.ResetReading()
 	var nextID uint64 = 1
+	var payloadBytes int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
@@ -569,29 +762,124 @@ func readLayerOptions(ctx context.Context, layer godal.Layer, includeProperties 
 		if feature == nil {
 			break
 		}
+		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+			feature.Close()
+			return core.Layer{}, fmt.Errorf("feature limit of %d features exceeded", maxFeatures)
+		}
 		var featureErr error
 		func() {
 			defer feature.Close()
 			var fields map[string]godal.Field
-			if includeProperties && len(result.Fields) == 0 {
-				fields = feature.Fields()
-				result.Fields = fieldSchema(fields)
-			} else if includeProperties {
-				fields = feature.Fields()
+			if includeProperties {
+				var fieldsErr error
+				fields, fieldsErr = featureFieldsWithLimit(feature)
+				if fieldsErr != nil {
+					featureErr = fmt.Errorf("read feature %d fields: %w", nextID, fieldsErr)
+					return
+				}
+				if len(result.Fields) == 0 {
+					result.Fields = fieldSchema(fields)
+				}
 			}
 			loaded, err := readFeatureFields(feature, nextID, fields)
 			if err != nil {
 				featureErr = err
 				return
 			}
+			featureBytes := estimateFeaturePayloadBytes(loaded)
+			if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
+				featureErr = fmt.Errorf("feature payload limit of %d bytes exceeded", maxBytes)
+				return
+			}
+			payloadBytes += featureBytes
 			result.Features = append(result.Features, loaded)
 			nextID++
 		}()
 		if featureErr != nil {
-			return core.Layer{}, fmt.Errorf("read feature %d geometry: %w", nextID, featureErr)
+			return core.Layer{}, fmt.Errorf("read feature %d: %w", nextID, featureErr)
 		}
 	}
 	return result, nil
+}
+
+func estimateFeaturePayloadBytes(feature core.Feature) int64 {
+	const saturation = int64(^uint64(0) >> 1)
+	total := int64(0)
+	add := func(size int64) {
+		if size < 0 || total > saturation-size {
+			total = saturation
+			return
+		}
+		total += size
+	}
+	if geometry, ok := feature.Geometry.(core.WKBGeometry); ok {
+		add(int64(len(geometry.WKB)) + 32)
+	}
+	if len(feature.Properties) > maxEstimatedPropertyNodes {
+		add(saturation)
+		return total
+	}
+	for name, value := range feature.Properties {
+		add(int64(len(name)) + 48) // map bucket, key string header, and value slot
+		addEstimatedPropertyValue(add, value)
+	}
+	return total
+}
+
+func addEstimatedPropertyValue(add func(int64), value any) {
+	const saturation = int64(^uint64(0) >> 1)
+	values := []any{value}
+	visited := 0
+	for len(values) > 0 {
+		visited++
+		if visited > maxEstimatedPropertyNodes {
+			// The decoder normally produces acyclic property values. Still cap
+			// traversal work so a cyclic or adversarial value cannot loop forever.
+			add(saturation)
+			return
+		}
+		last := len(values) - 1
+		current := values[last]
+		values = values[:last]
+		switch current := current.(type) {
+		case nil:
+			add(8)
+		case string:
+			add(int64(len(current)) + 24)
+		case []byte:
+			add(int64(len(current)) + 24)
+		case []string:
+			if len(current) > maxEstimatedPropertyNodes-visited-len(values) {
+				add(saturation)
+				return
+			}
+			add(24 + int64(len(current))*24)
+			for _, item := range current {
+				add(int64(len(item)) + 24)
+			}
+		case []any:
+			if len(current) > maxEstimatedPropertyNodes-visited-len(values) {
+				add(saturation)
+				return
+			}
+			add(24 + int64(len(current))*16)
+			values = append(values, current...)
+		case map[string]any:
+			if len(current) > maxEstimatedPropertyNodes-visited-len(values) {
+				add(saturation)
+				return
+			}
+			add(128 + int64(len(current))*16)
+			for key, item := range current {
+				add(int64(len(key)) + 24)
+				values = append(values, item)
+			}
+		default:
+			// Scalars decoded by encoding/json occupy at least one machine word;
+			// include interface/container overhead to avoid optimistic accounting.
+			add(24)
+		}
+	}
 }
 
 func readLayerHeader(layer godal.Layer) core.Layer {
@@ -619,9 +907,17 @@ func readLayerHeader(layer godal.Layer) core.Layer {
 func readFeature(feature *godal.Feature, id uint64, includeProperties bool) (core.Feature, error) {
 	var fields map[string]godal.Field
 	if includeProperties {
-		fields = feature.Fields()
+		var err error
+		fields, err = featureFieldsWithLimit(feature)
+		if err != nil {
+			return core.Feature{}, fmt.Errorf("read feature %d fields: %w", id, err)
+		}
 	}
 	return readFeatureFields(feature, id, fields)
+}
+
+func featureFieldsWithLimit(feature *godal.Feature) (map[string]godal.Field, error) {
+	return feature.FieldsWithMaxTotalValueBytes(maxMaterializedSnapshotFeatureBytes)
 }
 
 func readFeatureFields(feature *godal.Feature, id uint64, fields map[string]godal.Field) (core.Feature, error) {
@@ -644,7 +940,7 @@ func readFeatureFieldsWithGeometry(feature *godal.Feature, id uint64, fields map
 	if geometry == nil {
 		return core.Feature{ID: id, Properties: properties}, nil
 	}
-	wkb, err := geometry.WKB()
+	wkb, err := geometryWKBWithLimit(geometry, id)
 	if err != nil {
 		return core.Feature{}, err
 	}

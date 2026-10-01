@@ -2,7 +2,11 @@
 
 업무 특화 2D 벡터 GIS 데스크톱 애플리케이션을 Go 중심으로 개발하는 저장소입니다.
 
-현재 저장소는 구현 착수를 위한 최소 뼈대입니다. 전체 목표와 MVP 범위는 [desktop-gis-codex-brief.md](desktop-gis-codex-brief.md), 기술 선택과 보류된 결정은 [기술 스택 결정 기록](docs/decisions/0001-tech-stack.md)에서 확인할 수 있습니다.
+현재 저장소에는 SHP/GeoPackage 데스크톱 로딩·렌더링·속성 편집, 공용 명령 계층,
+네이티브 GIS 드라이버, CLI 및 제한된 Lua API가 구현되어 있습니다. 전체 목표와
+남은 실제 앱 검증 항목은 [desktop-gis-codex-brief.md](desktop-gis-codex-brief.md),
+기술 선택과 보류된 결정은 [기술 스택 결정 기록](docs/decisions/0001-tech-stack.md)에서
+확인할 수 있습니다.
 
 운영체제별 Go·CGO·GDAL/PROJ/GEOS 설치와 빌드는 [빌드 가이드](docs/build.md)를 참고합니다.
 
@@ -58,6 +62,31 @@ Lua에서는 `gogis.spatial("buffer", "roads", "", "roads_buffer", 10)`처럼
   --style Korean \
   --output build/roads-labeled.dxf
 ```
+
+숫자 회전 필드가 있으면 선택적으로 `--rotation-field angle`을 추가해 DXF
+레이블 각도(도 단위)를 지정할 수 있습니다.
+
+Lua에서는 predicate filter를 순서대로 연결할 수 있습니다. 조건부 라벨링은
+일치하지 않은 피처도 결과 레이어에 보존하고 라벨만 비워 둡니다. 라벨 텍스트는
+여러 필드를 Lua식으로 조합할 수 있습니다.
+
+```lua
+gogis.filter_lua("roads", "major_roads", [[return feature.CLASS == "primary"]])
+gogis.filter_lua("major_roads", "wide_roads", [[return feature.LANES >= 4]])
+gogis.label_lua("roads", "road_labels", [[
+  return string.format("%s · %d차선", feature.NAME, feature.LANES)
+]], [[return feature.CLASS == "primary" and feature.LANES >= 4]], 2.5, "Korean")
+```
+
+파일 기반 자동화는 native 빌드의 `gis-cli script --input roads.gpkg --layer roads --script workflow.lua --output results.gpkg`를 사용할 수 있습니다. 여러 입력은 `--input`을 반복하고, 모든 벡터 레이어를 열려면 `--layer`를 생략합니다. GeoPackage 출력에는 스크립트 실행 후의 입력·중간·결과 레이어가 모두 포함되며, `--output-layer wide_roads`를 지정하면 선택한 레이어만 저장합니다. Shapefile 출력은 단일 결과를 골라야 하므로 `--output-layer`가 필수입니다.
+
+Lua 샌드박스, 실행 취소, 인자와 결과 semantics는
+[Lua API 정책](docs/implementation/lua-sandbox.md)에 문서화되어 있습니다.
+데스크톱 레이블 설정에는 별도 Lua 편집 창, 기본 문법 하이라이트, 현재
+레이어의 필드 타입 힌트, 공백 포함 필드명을 위한 인서터가 있습니다. Lua
+filter/label 경로의 benchmark 및 결과 보존 규약은
+[Lua filter/label 결정 기록](docs/decisions/0005-lua-filter-and-label-pipeline.md)을
+참고합니다.
 
 동일 스키마 레이어 병합은 `commands.MergeLayers`를 사용합니다. CRS·필드
 스키마가 다르거나 feature ID가 중복되면 명확한 오류를 반환하며, 프로젝트에

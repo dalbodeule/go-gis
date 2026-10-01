@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -47,13 +48,22 @@ type filterOptions struct {
 }
 
 type labelOptions struct {
-	input   string
-	layer   string
-	field   string
-	output  string
-	height  float64
-	style   string
-	profile string
+	input         string
+	layer         string
+	field         string
+	rotationField string
+	output        string
+	height        float64
+	style         string
+	profile       string
+}
+
+type scriptOptions struct {
+	inputs      []string
+	layers      []string
+	script      string
+	output      string
+	outputLayer string
 }
 
 type stringListFlag []string
@@ -76,12 +86,13 @@ func main() {
 
 	if *help || flag.NArg() == 0 {
 		fmt.Fprintln(os.Stdout, "gogis CLI")
-		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label]")
+		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label|script]")
 		fmt.Fprintln(os.Stdout, "       gis-cli convert --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli spatial --operation OP --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli merge --input SOURCE --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli filter --input SOURCE --field FIELD --value VALUE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli label --input SOURCE --field FIELD --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli script --input SOURCE --script FILE.lua [--output RESULT.gpkg] [--output-layer NAME]")
 		return
 	}
 
@@ -136,10 +147,50 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "script":
+		options, err := parseScriptOptions(flag.Args()[1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := runScript(context.Background(), options); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", flag.Arg(0))
 		os.Exit(2)
 	}
+}
+
+func parseScriptOptions(args []string) (scriptOptions, error) {
+	flags := flag.NewFlagSet("script", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	options := scriptOptions{}
+	var inputs, layers stringListFlag
+	flags.Var(&inputs, "input", "input SHP or GeoPackage path; repeat for each source")
+	flags.Var(&layers, "layer", "layer name; repeat once per input, or omit to load all layers")
+	flags.StringVar(&options.script, "script", "", "Lua script file")
+	flags.StringVar(&options.output, "output", "", "optional output GeoPackage or single-layer Shapefile")
+	flags.StringVar(&options.outputLayer, "output-layer", "", "write only this result layer; required for Shapefile output")
+	if err := flags.Parse(args); err != nil {
+		return scriptOptions{}, err
+	}
+	if len(inputs) == 0 || strings.TrimSpace(options.script) == "" {
+		return scriptOptions{}, fmt.Errorf("script requires at least one --input and --script")
+	}
+	if len(layers) != 0 && len(layers) != len(inputs) {
+		return scriptOptions{}, fmt.Errorf("--layer must be provided once per --input, or omitted to load all layers")
+	}
+	if strings.EqualFold(filepath.Ext(options.output), ".shp") && strings.TrimSpace(options.outputLayer) == "" {
+		return scriptOptions{}, fmt.Errorf("Shapefile output requires --output-layer")
+	}
+	if flags.NArg() != 0 {
+		return scriptOptions{}, fmt.Errorf("unexpected script arguments: %v", flags.Args())
+	}
+	options.inputs = append([]string(nil), inputs...)
+	options.layers = append([]string(nil), layers...)
+	return options, nil
 }
 
 func parseSpatialOptions(args []string) (spatialOptions, error) {
@@ -236,6 +287,7 @@ func parseLabelOptions(args []string) (labelOptions, error) {
 	flags.StringVar(&options.input, "input", "", "input SHP or GeoPackage path")
 	flags.StringVar(&options.layer, "layer", "", "input layer name")
 	flags.StringVar(&options.field, "field", "", "property field to use as label text")
+	flags.StringVar(&options.rotationField, "rotation-field", "", "optional numeric property field for label rotation in degrees")
 	flags.StringVar(&options.output, "output", "", "output DXF, GeoPackage, or SHP path")
 	flags.Float64Var(&options.height, "height", 1, "label text height")
 	flags.StringVar(&options.style, "style", "", "DXF text style")

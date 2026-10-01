@@ -45,11 +45,16 @@ TestCase {
         appWindow.language = "ko";
         compare(appWindow.tr("Layers"), "레이어");
         compare(appWindow.tr("Add vector files"), "벡터 파일 추가");
+        compare(appWindow.tr("Lua label editor"), "Lua 레이블 편집기");
+        verify(appWindow.tr("Lua field access hint").indexOf("필드 형식: %1") >= 0);
         appWindow.language = "jp";
         compare(appWindow.tr("Layers"), "レイヤー");
         compare(appWindow.tr("Add vector files"), "ベクターファイルを追加");
+        compare(appWindow.tr("Lua label editor"), "Luaラベルエディター");
+        verify(appWindow.tr("Lua field access hint").indexOf("型: %1") >= 0);
         appWindow.language = "en";
         compare(appWindow.tr("Layers"), "Layers");
+        compare(appWindow.tr("Lua label editor"), "Lua label editor");
     }
 
     function test_layerContextMenuOpensRequestedCategory() {
@@ -92,6 +97,41 @@ TestCase {
         dialog.close();
     }
 
+    function test_luaEditorHighlightsSyntaxAndSuggestsTypedFields() {
+        var dialog = findChild(appWindow, "luaEditorDialog");
+        var editor = findChild(dialog, "labelLuaField");
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(editor !== null);
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        var keywordScript = 'if feature.NAME then return "road" end';
+        editor.text = keywordScript;
+        tryVerify(function() { return editor.highlightedHTML.indexOf("road") >= 0 && editor.highlightedHTML.indexOf("#7b2cbf") >= 0 && editor.highlightedHTML.indexOf("#16803c") >= 0; });
+        verify(editor.highlightedHTML.indexOf("#7b2cbf") >= 0, "Lua keywords should be highlighted");
+        verify(editor.highlightedHTML.indexOf("#16803c") >= 0, "Lua strings should be highlighted");
+        var escapedScript = 'return feature["road<&\"name"] -- <safe>';
+        editor.text = escapedScript;
+        tryVerify(function() { return editor.highlightedHTML.indexOf("road&lt;&amp;") >= 0 && editor.highlightedHTML.indexOf("<safe>") < 0; });
+        verify(editor.highlightedHTML.indexOf("road&lt;&amp;") >= 0, "source text must be escaped before rendering as rich text");
+        verify(editor.highlightedHTML.indexOf("&quot;") >= 0, "quotes must be escaped before rendering as rich text");
+        var longBracketScript = "local value = [[<literal>]]\n--[=[ <block comment> ]=]";
+        editor.text = longBracketScript;
+        tryVerify(function() { return editor.highlightedHTML.indexOf("&lt;literal&gt;") >= 0 && editor.highlightedHTML.indexOf("&lt;block comment&gt;") >= 0; });
+        verify(editor.highlightedHTML.indexOf("#16803c") >= 0, "Lua long-bracket strings should be highlighted");
+        verify(editor.highlightedHTML.indexOf("#78838e") >= 0, "Lua long-bracket comments should be highlighted");
+        verify(editor.highlightedHTML.indexOf("&lt;literal&gt;") >= 0, "long-bracket strings must remain escaped");
+        compare(editor.lineNumberText("first\nsecond\nthird"), "1\n2\n3");
+        // Exercise highlighting close to the 64 KiB label-script source cap.
+        var longScript = "local n = 1\n".repeat(5000);
+        editor.text = longScript;
+        tryVerify(function() { return editor.highlightedHTML.length > longScript.length && editor.highlightedHTML.indexOf("local") >= 0; });
+        verify(editor.highlightedHTML.length > longScript.length, "large scripts should still be highlighted");
+        compare(editor.highlightedLineNumbers.split("\n").length, 5001);
+        viewport.attributeFieldHints = [{name: "road class", type: "text"}];
+        compare(viewport.luaFieldAccess("road class"), 'feature["road class"]');
+        dialog.close();
+    }
+
     function test_mapDragPansViewport() {
         findChild(appWindow, "layerSettingsDialog").close();
         findChild(appWindow, "attributeDialog").close();
@@ -116,6 +156,21 @@ TestCase {
         canvas.mapMetadataGeneration += 1;
         tryCompare(viewport, "dataCRS", "EPSG:3857");
         compare(Math.round(canvas.width / canvas.height * 1000) / 1000, 2);
+    }
+
+    function test_nullLabelAndHandlePayloadsBecomeEmptyLists() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var labels = findChild(appWindow, "mapLabelModel");
+        var handles = findChild(appWindow, "vertexHandleModel");
+        verify(canvas !== null);
+        verify(labels !== null);
+        verify(handles !== null);
+        canvas.layerLabelPayload = "null";
+        canvas.layerLabelGeneration += 1;
+        canvas.vertexHandlePayload = "null";
+        canvas.vertexHandleGeneration += 1;
+        tryCompare(labels, "count", 0);
+        tryCompare(handles, "count", 0);
     }
 
     function test_vertexHandleDragEmitsFeatureVertexEdit() {

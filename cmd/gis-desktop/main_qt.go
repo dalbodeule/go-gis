@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	qt "github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/qml"
@@ -19,6 +20,7 @@ import (
 	"gogis/internal/core"
 	"gogis/internal/presentation"
 	"gogis/internal/render"
+	"gogis/internal/scripting"
 	"gogis/internal/workspace"
 	"gogis/ui/qt/native"
 )
@@ -99,6 +101,17 @@ type demoRuntime struct {
 	loadCancel                  context.CancelFunc
 	loadGeneration              uint64
 	features                    []render.HitFeature
+	viewportReadOnly            bool
+	windowHits                  map[render.ChunkKey][]render.HitFeature
+	windowFeatureCounts         map[render.ChunkKey]int
+	windowFeatureIDs            map[render.ChunkKey][]uint64
+	windowVisibleFeatureCount   int
+	windowPayloadBytes          map[render.ChunkKey]int64
+	windowVisiblePayloadBytes   int64
+	windowVisibleKeys           map[render.ChunkKey]struct{}
+	windowFeatureNames          map[uint64]string
+	windowLabels                map[render.ChunkKey][]render.LayerLabel
+	nextWindowFeatureID         uint64
 	sources                     map[string]render.LayerSource
 	sourcesMu                   *sync.RWMutex
 	hitIndex                    render.HitIndex
@@ -109,6 +122,9 @@ type demoRuntime struct {
 	previewLoading              bool
 	saveDestination             string
 	readOnlySources             []vectorSourceSpec
+	readOnlyBaseLayers          []core.Layer
+	readOnlyBaseFeatures        []render.HitFeature
+	readOnlyBaseLabels          []render.LayerLabel
 	readOnlyDisplayCRS          string
 	unavailableSources          map[string]unavailableSource
 	mapExtent                   [4]float64
@@ -123,6 +139,7 @@ type demoRuntime struct {
 	attributeReady              bool
 	attributeCache              map[attributePageKey]string
 	attributeCacheOrder         []attributePageKey
+	attributeCacheBytes         int64
 	attributeGeneration         uint64
 	attributeDispatchGeneration uint64
 	attributeCancel             context.CancelFunc
@@ -201,10 +218,16 @@ func loadEmptyProject() *demoRuntime {
 
 type attributePayload struct {
 	Columns  []string              `json:"columns"`
+	Fields   []attributeFieldHint  `json:"fields"`
 	Rows     []attributePayloadRow `json:"rows"`
 	Page     int                   `json:"page"`
 	PageSize int                   `json:"pageSize"`
 	Total    int                   `json:"total"`
+}
+
+type attributeFieldHint struct {
+	Name string         `json:"name"`
+	Type core.FieldType `json:"type"`
 }
 
 type attributePayloadRow struct {
@@ -269,12 +292,71 @@ func (r *demoRuntime) publishLayerLabels() {
 	r.mu.Lock()
 	labels := append([]render.LayerLabel(nil), r.mapLabels...)
 	r.mu.Unlock()
-	payload, err := json.Marshal(labels)
+	payload, err := marshalLayerLabels(labels)
 	if err != nil {
 		native.SetLayerLabelPayload("[]")
+		native.SetRenderStatus("Label display skipped: " + err.Error())
 		return
 	}
-	native.SetLayerLabelPayload(string(payload))
+	native.SetLayerLabelPayload(payload)
+}
+
+const maxLayerLabelPayloadBytes = 8 << 20
+const maxLayerLabelCount = 20_000
+const maxLayerLabelJSONFixedBytes = 288
+
+func addJSONEscapedStringUpperBound(estimate *int64, value string, limit int64) bool {
+	for len(value) > 0 {
+		r, size := utf8.DecodeRuneInString(value)
+		value = value[size:]
+		encodedSize := int64(size)
+		switch {
+		case r == utf8.RuneError && size == 1:
+			encodedSize = 6 // encoding/json replaces invalid UTF-8 with "\\ufffd".
+		case r == '"' || r == '\\' || r == '\b' || r == '\f' || r == '\n' || r == '\r' || r == '\t':
+			encodedSize = 2
+		case r < 0x20 || r == '<' || r == '>' || r == '&' || r == '\u2028' || r == '\u2029':
+			encodedSize = 6
+		}
+		if *estimate > limit-encodedSize {
+			return false
+		}
+		*estimate += encodedSize
+	}
+	return true
+}
+
+func marshalLayerLabels(labels []render.LayerLabel) (string, error) {
+	if labels == nil {
+		labels = []render.LayerLabel{}
+	}
+	if len(labels) > maxLayerLabelCount {
+		return "", fmt.Errorf("label count exceeds the %d-label safety limit", maxLayerLabelCount)
+	}
+	// Account for JSON escaping and fixed fields before json.Marshal allocates
+	// the serialized copy. Invalid UTF-8, HTML-sensitive bytes, and controls
+	// can expand substantially in encoding/json.
+	estimated := int64(2)
+	for _, label := range labels {
+		// This covers all field names, punctuation, the uint64 ID, six finite
+		// float64 values, and the array comma for this label.
+		if estimated > int64(maxLayerLabelPayloadBytes-maxLayerLabelJSONFixedBytes) {
+			return "", fmt.Errorf("label payload exceeds the %d MiB safety limit", maxLayerLabelPayloadBytes>>20)
+		}
+		estimated += maxLayerLabelJSONFixedBytes
+		if !addJSONEscapedStringUpperBound(&estimated, label.Layer, maxLayerLabelPayloadBytes) ||
+			!addJSONEscapedStringUpperBound(&estimated, label.Text, maxLayerLabelPayloadBytes) {
+			return "", fmt.Errorf("label payload exceeds the %d MiB safety limit", maxLayerLabelPayloadBytes>>20)
+		}
+	}
+	payload, err := json.Marshal(labels)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) > maxLayerLabelPayloadBytes {
+		return "", fmt.Errorf("label payload exceeds the %d MiB safety limit", maxLayerLabelPayloadBytes>>20)
+	}
+	return string(payload), nil
 }
 
 func (r *demoRuntime) publishAttributes(layerName string) {
@@ -282,6 +364,13 @@ func (r *demoRuntime) publishAttributes(layerName string) {
 }
 
 const attributePageSize = 200
+
+func attributePageOffset(page int) (int, bool) {
+	if page < 0 || page > int(^uint(0)>>1)/attributePageSize {
+		return 0, false
+	}
+	return page * attributePageSize, true
+}
 
 func (r *demoRuntime) publishAttributesPage(layerName string, page int) {
 	r.mu.Lock()
@@ -310,6 +399,10 @@ func (r *demoRuntime) nextAttributeDispatchLocked() uint64 {
 func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int, dispatch uint64) {
 	if page < 0 {
 		page = 0
+	}
+	pageOffset, validOffset := attributePageOffset(page)
+	if !validOffset {
+		return
 	}
 	r.mu.Lock()
 	if dispatch != r.attributeDispatchGeneration {
@@ -355,16 +448,18 @@ func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int
 	var ok bool
 	var pageErr error
 	if reader != nil {
-		layer, total, pageErr = reader(requestContext, layerName, page*attributePageSize, attributePageSize)
+		layer, total, pageErr = reader(requestContext, layerName, pageOffset, attributePageSize)
 		ok = pageErr == nil
 	} else {
-		layer, total, ok = service.LayerAttributePageOwned(layerName, page*attributePageSize, attributePageSize)
+		layer, total, ok = service.LayerAttributePageOwned(layerName, pageOffset, attributePageSize)
 	}
 	if ok {
 		table := presentation.AttributeTableOwned(layer)
 		payloadModel.Columns = make([]string, len(table.Columns))
+		payloadModel.Fields = make([]attributeFieldHint, len(table.Columns))
 		for i, column := range table.Columns {
 			payloadModel.Columns[i] = column.Name
+			payloadModel.Fields[i] = attributeFieldHint{Name: column.Name, Type: column.Type}
 		}
 		payloadModel.Rows = make([]attributePayloadRow, len(table.Rows))
 		for i, row := range table.Rows {
@@ -374,7 +469,12 @@ func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int
 		payloadModel.PageSize = attributePageSize
 		payloadModel.Total = total
 	}
-	payload, marshalErr := json.Marshal(payloadModel)
+	payloadTooLarge := estimateAttributePayloadJSONBytes(payloadModel) > maxAttributePayloadJSONBytes
+	var payload []byte
+	var marshalErr error
+	if !payloadTooLarge {
+		payload, marshalErr = json.Marshal(payloadModel)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if generation != r.attributeGeneration || r.service != service {
@@ -385,6 +485,14 @@ func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int
 		if requestContext.Err() == nil {
 			native.SetRenderStatus("Attribute page failed: " + pageErr.Error())
 		}
+		return
+	}
+	if payloadTooLarge {
+		native.SetAttributePayload("[]")
+		native.SetRenderStatus(fmt.Sprintf("Attribute page exceeds the %d MiB display payload limit", maxAttributePayloadJSONBytes>>20))
+		r.attributeLayer = layerName
+		r.attributePage = page
+		r.attributeReady = true
 		return
 	}
 	if marshalErr != nil {
@@ -406,14 +514,22 @@ func (r *demoRuntime) republishAttributesAsync(layerName string) {
 	r.attributeReady = false
 	r.attributeCache = nil
 	r.attributeCacheOrder = nil
+	r.attributeCacheBytes = 0
 	dispatch := r.nextAttributeDispatchLocked()
 	r.mu.Unlock()
 	go r.publishAttributesPageDispatched(layerName, 0, dispatch)
 }
 
 const attributePayloadCacheLimit = 8
+const attributePayloadCacheByteLimit = 32 << 20
+const maxAttributePayloadJSONBytes = 16 << 20
+const maxAttributePayloadJSONNodes = 1 << 20
 
 func (r *demoRuntime) cacheAttributePayload(key attributePageKey, payload string) {
+	payloadBytes := int64(len(payload))
+	if payloadBytes > attributePayloadCacheByteLimit {
+		return
+	}
 	if r.attributeCache == nil {
 		r.attributeCache = make(map[attributePageKey]string)
 	}
@@ -422,12 +538,168 @@ func (r *demoRuntime) cacheAttributePayload(key attributePageKey, payload string
 	}
 	r.attributeCache[key] = payload
 	r.attributeCacheOrder = append(r.attributeCacheOrder, key)
-	if len(r.attributeCacheOrder) <= attributePayloadCacheLimit {
-		return
+	r.attributeCacheBytes += payloadBytes
+	for len(r.attributeCacheOrder) > attributePayloadCacheLimit || r.attributeCacheBytes > attributePayloadCacheByteLimit {
+		oldest := r.attributeCacheOrder[0]
+		oldestPayload := r.attributeCache[oldest]
+		delete(r.attributeCache, oldest)
+		r.attributeCacheBytes -= int64(len(oldestPayload))
+		r.attributeCacheOrder = r.attributeCacheOrder[1:]
 	}
-	oldest := r.attributeCacheOrder[0]
-	delete(r.attributeCache, oldest)
-	r.attributeCacheOrder = r.attributeCacheOrder[1:]
+}
+
+// estimateAttributePayloadJSONBytes conservatively bounds the encoded JSON
+// size before json.Marshal allocates its output and the Qt bridge copies it.
+func estimateAttributePayloadJSONBytes(payload attributePayload) int64 {
+	limit := int64(maxAttributePayloadJSONBytes)
+	total := int64(0)
+	add := func(size int64) bool {
+		if size < 0 || total > limit-size {
+			total = limit + 1
+			return false
+		}
+		total += size
+		return total <= limit
+	}
+	var writeString func(string) bool
+	writeString = func(value string) bool {
+		if !add(2) { // JSON quotes
+			return false
+		}
+		for len(value) > 0 {
+			runeValue, size := utf8.DecodeRuneInString(value)
+			if runeValue == utf8.RuneError && size == 1 {
+				if !add(3) { // encoding/json replaces invalid UTF-8 with U+FFFD
+					return false
+				}
+				value = value[1:]
+				continue
+			}
+			encodedSize := int64(size)
+			switch {
+			case runeValue < 0x20, runeValue == '<', runeValue == '>', runeValue == '&', runeValue == '\u2028', runeValue == '\u2029':
+				encodedSize = 6
+			case runeValue == '"' || runeValue == '\\':
+				encodedSize = 2
+			}
+			if !add(encodedSize) {
+				return false
+			}
+			value = value[size:]
+		}
+		return true
+	}
+	nodes := 0
+	var writeValue func(any, int) bool
+	writeValue = func(value any, depth int) bool {
+		nodes++
+		if nodes > maxAttributePayloadJSONNodes || depth > 64 {
+			return false
+		}
+		switch value := value.(type) {
+		case nil:
+			return add(4)
+		case bool:
+			if value {
+				return add(4)
+			}
+			return add(5)
+		case string:
+			return writeString(value)
+		case []byte:
+			encodedLength := ((int64(len(value)) + 2) / 3) * 4
+			return add(encodedLength + 2)
+		case json.Number:
+			return add(int64(len(value)))
+		case int:
+			return add(24)
+		case int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+			return add(32)
+		case []string:
+			if !add(2) {
+				return false
+			}
+			for index, item := range value {
+				if index > 0 && !add(1) {
+					return false
+				}
+				nodes++
+				if nodes > maxAttributePayloadJSONNodes || !writeString(item) {
+					return false
+				}
+			}
+			return true
+		case []any:
+			if !add(2) {
+				return false
+			}
+			for index, item := range value {
+				if index > 0 && !add(1) {
+					return false
+				}
+				if !writeValue(item, depth+1) {
+					return false
+				}
+			}
+			return true
+		case map[string]any:
+			if !add(2) {
+				return false
+			}
+			index := 0
+			for key, item := range value {
+				if index > 0 && !add(1) {
+					return false
+				}
+				if !writeString(key) || !add(1) || !writeValue(item, depth+1) {
+					return false
+				}
+				index++
+			}
+			return true
+		default:
+			return false
+		}
+	}
+
+	if !add(256) { // top-level object keys, page metadata, and punctuation
+		return limit + 1
+	}
+	for index, column := range payload.Columns {
+		if index > 0 && !add(1) {
+			return limit + 1
+		}
+		if !writeString(column) {
+			return limit + 1
+		}
+	}
+	for index, field := range payload.Fields {
+		if index > 0 && !add(1) {
+			return limit + 1
+		}
+		if !writeString(field.Name) || !writeString(string(field.Type)) || !add(32) {
+			return limit + 1
+		}
+	}
+	for index, row := range payload.Rows {
+		if index > 0 && !add(1) {
+			return limit + 1
+		}
+		if !add(64) { // row object, feature ID, and field names
+			return limit + 1
+		}
+		if !add(2) { // values object
+			return limit + 1
+		}
+		valueIndex := 0
+		for key, value := range row.Values {
+			if (valueIndex > 0 && !add(1)) || !writeString(key) || !add(1) || !writeValue(value, 0) {
+				return limit + 1
+			}
+			valueIndex++
+		}
+	}
+	return total
 }
 
 func newDemoService(features []render.HitFeature) *commands.ProjectService {
@@ -468,14 +740,28 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		}
 	}
 	r.mu.Unlock()
+	if r.viewportReadOnly {
+		planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	}
 	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)
 	keys := keyBuffer.Keys
+	chunkPlanExceeded := false
 	for _, layer := range visibility.VisibleLayers() {
-		keys = planner.VisibleKeysInto(keys, viewport, layer)
+		var withinLimit bool
+		keys, withinLimit = planner.VisibleKeysIntoLimit(keys, viewport, layer, render.MaxViewportChunkKeys)
+		if !withinLimit {
+			chunkPlanExceeded = true
+			break
+		}
+	}
+	keyBuffer.Keys = keys
+	if chunkPlanExceeded {
+		keys = nil
 	}
 	keys = visibility.FilterChunkKeysInPlace(keys)
+	scheduler.RetainOnly(keys)
 	generation := scheduler.Generation()
-	batchStore.BeginGeneration(generation, keys...)
+	batchStore.BeginGenerationWithVisible(generation, keys)
 	r.mu.Lock()
 	if r.scheduler != scheduler {
 		r.mu.Unlock()
@@ -488,6 +774,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		r.features = demoFeatures(keys, planner.ChunkSize)
 		r.hitIndex = render.HitIndex{}
 		r.hitIndexReady = false
+	} else if r.viewportReadOnly {
+		r.retainVisibleWindowChunksLocked(keys)
 	}
 	r.mu.Unlock()
 	if previousCancel != nil {
@@ -500,13 +788,18 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 			return
 		}
-		native.SetRenderStatus("No visible layers")
+		if chunkPlanExceeded {
+			native.SetRenderStatus("Render stopped: viewport exceeds the chunk-key safety limit")
+		} else {
+			native.SetRenderStatus("No visible layers")
+		}
 		batchStore.Clear()
 		native.SetVertices(nil)
 		native.RequestCanvasUpdate()
 		r.publishedRevision = batchStore.Revision()
 		native.SetSelection("", "", "", "No feature selected")
 		r.mu.Unlock()
+		r.publishLayerLabels()
 		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		return
 	}
@@ -549,6 +842,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		defer scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		results := scheduler.RequestUnique(requestContext, requestKeys, builder)
 		completed := 0
+		renderErr := ""
 		lastPublish := time.Now()
 		var publishScratch []render.Vertex
 		dirty := true // BeginGeneration may have removed now-hidden chunks.
@@ -580,7 +874,12 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		for result := range results {
 			completed++
 			setProgress(presentation.RenderProgress{Phase: "Loading", Completed: completed, Total: len(requestKeys), Cancellable: true}, completed == len(requestKeys))
-			if !batchStore.ApplyImmutable(result) {
+			applied, applyErr := batchStore.ApplyImmutableChecked(result)
+			if !applied {
+				if applyErr != nil && renderErr == "" {
+					// Keep draining so all workers release their request slots.
+					renderErr = applyErr.Error()
+				}
 				continue
 			}
 			dirty = true
@@ -591,10 +890,69 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		publishBatch()
 		if requestContext.Err() != nil {
 			setProgress(presentation.RenderProgress{Phase: "Render cancelled"}, true)
+		} else if renderErr != "" {
+			native.SetRenderStatus("Render incomplete; zoom in and try again: " + renderErr)
 		} else {
 			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(requestKeys)}, true)
 		}
+		r.publishLayerLabels()
 	}(keys, keyBuffer, scheduler)
+}
+
+// retainVisibleWindowChunksLocked drops cached feature geometry and metadata
+// once its chunk leaves the viewport. The caller must hold r.mu.
+func (r *demoRuntime) retainVisibleWindowChunksLocked(keys []render.ChunkKey) {
+	r.windowVisibleKeys = make(map[render.ChunkKey]struct{}, len(keys))
+	for _, key := range keys {
+		r.windowVisibleKeys[key] = struct{}{}
+	}
+	for key := range r.windowFeatureCounts {
+		if _, keep := r.windowVisibleKeys[key]; !keep {
+			r.removeWindowChunkLocked(key)
+		}
+	}
+	r.rebuildWindowFeaturesLocked()
+}
+
+// rebuildWindowFeaturesLocked keeps hit-test and label data bounded to the
+// same viewport chunks as rendered geometry. The caller must hold r.mu.
+func (r *demoRuntime) rebuildWindowFeaturesLocked() {
+	features := append([]render.HitFeature(nil), r.readOnlyBaseFeatures...)
+	labels := append([]render.LayerLabel(nil), r.readOnlyBaseLabels...)
+	type labelKey struct {
+		layer string
+		text  string
+		x, y  float64
+	}
+	seenLabels := make(map[labelKey]struct{})
+	for key := range r.windowVisibleKeys {
+		features = append(features, r.windowHits[key]...)
+		for _, label := range r.windowLabels[key] {
+			key := labelKey{layer: label.Layer, text: label.Text, x: label.X, y: label.Y}
+			if _, seen := seenLabels[key]; seen {
+				continue
+			}
+			seenLabels[key] = struct{}{}
+			labels = append(labels, label)
+		}
+	}
+	r.features = features
+	r.mapLabels = labels
+	r.hitIndex = render.HitIndex{}
+	r.hitIndexReady = false
+}
+
+func (r *demoRuntime) removeWindowChunkLocked(key render.ChunkKey) {
+	for _, id := range r.windowFeatureIDs[key] {
+		delete(r.windowFeatureNames, id)
+	}
+	r.windowVisibleFeatureCount -= r.windowFeatureCounts[key]
+	r.windowVisiblePayloadBytes -= r.windowPayloadBytes[key]
+	delete(r.windowFeatureCounts, key)
+	delete(r.windowPayloadBytes, key)
+	delete(r.windowHits, key)
+	delete(r.windowFeatureIDs, key)
+	delete(r.windowLabels, key)
 }
 
 func demoFeatures(keys []render.ChunkKey, chunkSize float64) []render.HitFeature {
@@ -1111,6 +1469,9 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	}
 	if err := request.Labels.Validate(); err != nil {
 		return err
+	}
+	if err := scripting.ValidateLabelComposerScripts(request.Labels.LuaScript, request.Labels.Rule); err != nil {
+		return fmt.Errorf("invalid Lua label settings: %w", err)
 	}
 	runtime.mu.Lock()
 	service := runtime.service

@@ -50,8 +50,8 @@ func (s *GeometrySession) OpenWindowGeometryOnly(ctx context.Context, layerName 
 }
 
 func (s *GeometrySession) openWindow(ctx context.Context, layerName string, bounds [4]float64, includeProperties bool) (core.Layer, error) {
-	if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
-		return core.Layer{}, fmt.Errorf("invalid spatial window: [%v %v %v %v]", bounds[0], bounds[1], bounds[2], bounds[3])
+	if err := validateSpatialWindow(bounds); err != nil {
+		return core.Layer{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err

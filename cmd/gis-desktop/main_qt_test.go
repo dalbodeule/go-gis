@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,144 @@ import (
 	"gogis/internal/render"
 	"gogis/ui/qt/native"
 )
+
+func TestMarshalLayerLabelsNormalizesNilSlice(t *testing.T) {
+	payload, err := marshalLayerLabels(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload != "[]" {
+		t.Fatalf("nil label payload = %q, want []", payload)
+	}
+}
+
+func TestAttributePayloadCacheRespectsByteAndEntryLimits(t *testing.T) {
+	runtime := &demoRuntime{}
+	first := attributePageKey{layer: "roads", page: 0}
+	second := attributePageKey{layer: "roads", page: 1}
+	runtime.cacheAttributePayload(first, strings.Repeat("a", 20<<20))
+	runtime.cacheAttributePayload(second, strings.Repeat("b", 20<<20))
+	if _, exists := runtime.attributeCache[first]; exists {
+		t.Fatal("oldest payload was retained after total byte limit was exceeded")
+	}
+	if _, exists := runtime.attributeCache[second]; !exists || runtime.attributeCacheBytes != 20<<20 {
+		t.Fatalf("cache after byte eviction has %d bytes and pages %v", runtime.attributeCacheBytes, runtime.attributeCacheOrder)
+	}
+	oversized := attributePageKey{layer: "roads", page: 2}
+	runtime.cacheAttributePayload(oversized, strings.Repeat("x", attributePayloadCacheByteLimit+1))
+	if _, exists := runtime.attributeCache[oversized]; exists || runtime.attributeCacheBytes > attributePayloadCacheByteLimit {
+		t.Fatalf("oversized payload entered cache; retained bytes=%d", runtime.attributeCacheBytes)
+	}
+	for page := 3; page < 3+attributePayloadCacheLimit; page++ {
+		runtime.cacheAttributePayload(attributePageKey{layer: "roads", page: page}, "[]")
+	}
+	if len(runtime.attributeCache) != attributePayloadCacheLimit || runtime.attributeCacheBytes > attributePayloadCacheByteLimit {
+		t.Fatalf("cache limits not enforced: entries=%d bytes=%d", len(runtime.attributeCache), runtime.attributeCacheBytes)
+	}
+}
+
+func TestEstimateAttributePayloadJSONBytesBoundsEscapedAndNestedValues(t *testing.T) {
+	payload := attributePayload{
+		Columns: []string{"name"},
+		Fields:  []attributeFieldHint{{Name: "name", Type: core.FieldTypeText}},
+		Rows: []attributePayloadRow{{FeatureID: 1, Values: map[string]any{
+			"name": "한글 <road>", "nested": []any{map[string]any{"ok": true, "count": float64(2)}},
+			"bytes": []byte{0, 1, 2}, "number": json.Number("1.234e+20"), "integer": int64(-42),
+			"list": []string{"a", "b"},
+		}}},
+	}
+	estimated := estimateAttributePayloadJSONBytes(payload)
+	if estimated > maxAttributePayloadJSONBytes {
+		t.Fatalf("ordinary nested attribute payload estimate = %d; limit=%d", estimated, maxAttributePayloadJSONBytes)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil || int64(len(encoded)) > estimated {
+		t.Fatalf("nested payload estimate=%d actual=%d marshal error=%v", estimated, len(encoded), err)
+	}
+
+	payload.Rows[0].Values["controls"] = strings.Repeat("\x01", 3<<20)
+	estimated = estimateAttributePayloadJSONBytes(payload)
+	if estimated <= maxAttributePayloadJSONBytes {
+		t.Fatalf("escaped control-character payload estimate = %d; want > %d", estimated, maxAttributePayloadJSONBytes)
+	}
+	encoded, err = json.Marshal(payload)
+	if err != nil || int64(len(encoded)) <= maxAttributePayloadJSONBytes {
+		t.Fatalf("escaped payload estimate=%d actual=%d marshal error=%v", estimated, len(encoded), err)
+	}
+}
+
+func TestMarshalLayerLabelsBoundsEscapedPayloadBeforeEncoding(t *testing.T) {
+	label := render.LayerLabel{
+		FeatureID: ^uint64(0), X: -math.MaxFloat64, Y: math.MaxFloat64,
+		Rotation: -math.MaxFloat64, HeightMM: math.MaxFloat64,
+		MinScale: -math.MaxFloat64, MaxScale: math.MaxFloat64,
+	}
+	encoded, err := json.Marshal([]render.LayerLabel{label})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded)-2 > maxLayerLabelJSONFixedBytes {
+		t.Fatalf("fixed JSON estimate %d is smaller than maximal fields %d", maxLayerLabelJSONFixedBytes, len(encoded)-2)
+	}
+	if _, err := marshalLayerLabels([]render.LayerLabel{{Text: strings.Repeat("<", maxLayerLabelPayloadBytes/6+1)}}); err == nil || !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("expanded label payload error = %v", err)
+	}
+	if _, err := marshalLayerLabels(make([]render.LayerLabel, maxLayerLabelCount+1)); err == nil || !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("label count error = %v", err)
+	}
+	if _, err := marshalLayerLabels([]render.LayerLabel{{Text: "필지 & 도로"}}); err != nil {
+		t.Fatalf("ordinary UTF-8 label rejected: %v", err)
+	}
+}
+
+func TestRetainVisibleWindowChunksReleasesOffscreenGeometry(t *testing.T) {
+	oldKey := render.ChunkKey{Layer: "parcels", ZoomBucket: 2, X: 1, Y: 1}
+	keepKey := render.ChunkKey{Layer: "parcels", ZoomBucket: 2, X: 2, Y: 1}
+	futureKey := render.ChunkKey{Layer: "parcels", ZoomBucket: 2, X: 3, Y: 1}
+	runtime := &demoRuntime{
+		windowVisibleKeys:         map[render.ChunkKey]struct{}{oldKey: {}, keepKey: {}},
+		windowFeatureCounts:       map[render.ChunkKey]int{oldKey: 1, keepKey: 2},
+		windowPayloadBytes:        map[render.ChunkKey]int64{oldKey: 10, keepKey: 20},
+		windowVisibleFeatureCount: 3,
+		windowVisiblePayloadBytes: 30,
+		windowFeatureIDs:          map[render.ChunkKey][]uint64{oldKey: {101}, keepKey: {202, 203}},
+		windowFeatureNames:        map[uint64]string{101: "offscreen", 202: "visible", 203: "visible 2"},
+		windowHits: map[render.ChunkKey][]render.HitFeature{
+			oldKey:  {{Layer: "parcels", FeatureID: 101, Vertices: []render.Point{{X: 0.1, Y: 0.1}}}},
+			keepKey: {{Layer: "parcels", FeatureID: 202, Vertices: []render.Point{{X: 0.2, Y: 0.1}}}},
+		},
+		windowLabels: map[render.ChunkKey][]render.LayerLabel{
+			oldKey:  {{Layer: "parcels", FeatureID: 101, Text: "offscreen"}},
+			keepKey: {{Layer: "parcels", FeatureID: 202, Text: "visible"}},
+		},
+	}
+
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{keepKey, futureKey})
+	runtime.mu.Unlock()
+
+	if runtime.windowVisibleFeatureCount != 2 || runtime.windowVisiblePayloadBytes != 20 {
+		t.Fatalf("retained budgets = %d features/%d bytes, want 2/20", runtime.windowVisibleFeatureCount, runtime.windowVisiblePayloadBytes)
+	}
+	if _, ok := runtime.windowFeatureNames[101]; ok || len(runtime.windowHits[oldKey]) != 0 || len(runtime.windowLabels[oldKey]) != 0 {
+		t.Fatal("offscreen hit geometry, labels, or name remained cached")
+	}
+	if len(runtime.features) != 1 || runtime.features[0].FeatureID != 202 || len(runtime.mapLabels) != 1 || runtime.mapLabels[0].Text != "visible" {
+		t.Fatalf("visible snapshot = %#v labels=%#v", runtime.features, runtime.mapLabels)
+	}
+	if _, ok := runtime.windowVisibleKeys[futureKey]; !ok {
+		t.Fatal("new viewport key was not recorded")
+	}
+}
+
+func TestAttributePageOffsetRejectsIntegerOverflow(t *testing.T) {
+	if offset, ok := attributePageOffset(3); !ok || offset != 3*attributePageSize {
+		t.Fatalf("ordinary page offset = %d, valid=%t", offset, ok)
+	}
+	if _, ok := attributePageOffset(int(^uint(0)>>1)/attributePageSize + 1); ok {
+		t.Fatal("overflowing page offset accepted")
+	}
+}
 
 func TestDesktopLanguageArgs(t *testing.T) {
 	tests := []struct {

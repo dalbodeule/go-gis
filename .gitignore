@@ -16,3 +16,4 @@
 *.gpkg-wal
 *.gpkg-shm
 *.dxf
+!testdata/ares/*.dxf

@@ -2,6 +2,7 @@ package render
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -97,13 +98,24 @@ func NewBatchStore() *BatchStore {
 // while newly visible chunks are being built. When visible is provided, chunks
 // outside the new extent are dropped while overlapping chunks are retained.
 func (s *BatchStore) BeginGeneration(generation uint64, visible ...ChunkKey) bool {
+	return s.beginGeneration(generation, len(visible) > 0, visible)
+}
+
+// BeginGenerationWithVisible switches generations using an explicit viewport
+// key list. Unlike BeginGeneration's omitted variadic list, an empty slice
+// means that no chunks remain visible and must release all retained geometry.
+func (s *BatchStore) BeginGenerationWithVisible(generation uint64, visible []ChunkKey) bool {
+	return s.beginGeneration(generation, true, visible)
+}
+
+func (s *BatchStore) beginGeneration(generation uint64, hasVisible bool, visible []ChunkKey) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if generation < s.generation {
 		return false
 	}
 	s.generation = generation
-	if len(visible) > 0 {
+	if hasVisible {
 		if sameChunkKeyOrder(s.orderedKeys, visible) {
 			return true
 		}
@@ -121,30 +133,41 @@ func (s *BatchStore) BeginGeneration(generation uint64, visible ...ChunkKey) boo
 			s.visibleEpoch = 1
 		}
 		epoch := s.visibleEpoch
-		ordered := s.orderedKeys[:0]
-		orderedVerts := s.orderedVerts[:0]
+		oldOrderedKeys := s.orderedKeys
+		oldOrderedVerts := s.orderedVerts
+		ordered := make([]ChunkKey, 0, len(visible))
+		orderedVerts := make([][]Vertex, 0, len(visible))
+		chunks := make(map[ChunkKey][]Vertex, min(len(visible), len(s.chunks)))
+		orderedIndex := make(map[ChunkKey]orderedPosition, len(visible))
+		knownKeys := make(map[ChunkKey]uint64, len(visible))
 		for _, key := range visible {
-			if s.knownKeys[key] == epoch {
+			if knownKeys[key] == epoch {
 				continue
 			}
-			s.knownKeys[key] = epoch
+			knownKeys[key] = epoch
 			ordered = append(ordered, key)
-			orderedVerts = append(orderedVerts, s.chunks[key])
-			s.orderedIndex[key] = orderedPosition{epoch: epoch, index: len(ordered) - 1}
-		}
-		for key := range s.chunks {
-			if s.knownKeys[key] != epoch {
-				s.vertexCount -= len(s.chunks[key])
-				delete(s.chunks, key)
+			vertices, exists := s.chunks[key]
+			orderedVerts = append(orderedVerts, vertices)
+			orderedIndex[key] = orderedPosition{epoch: epoch, index: len(ordered) - 1}
+			if exists {
+				chunks[key] = vertices
 			}
 		}
-		for key, marker := range s.knownKeys {
-			if marker != epoch {
-				delete(s.knownKeys, key)
-			}
+		if cap(oldOrderedKeys) > 0 {
+			clear(oldOrderedKeys[:cap(oldOrderedKeys)])
 		}
+		if cap(oldOrderedVerts) > 0 {
+			clear(oldOrderedVerts[:cap(oldOrderedVerts)])
+		}
+		s.chunks = chunks
+		s.orderedIndex = orderedIndex
+		s.knownKeys = knownKeys
 		s.orderedKeys = ordered
 		s.orderedVerts = orderedVerts
+		s.vertexCount = 0
+		for _, vertices := range chunks {
+			s.vertexCount += len(vertices)
+		}
 	}
 	return true
 }
@@ -178,32 +201,55 @@ func (s *BatchStore) Revision() uint64 {
 
 // Apply installs a result only when it belongs to the active generation.
 func (s *BatchStore) Apply(result ChunkResult) bool {
-	return s.apply(result, true)
+	applied, _ := s.apply(result, true)
+	return applied
 }
 
 // ApplyImmutable installs a result whose Vertices slice is immutable for the
 // lifetime of the batch. Scheduler/cache-backed render paths can use this to
 // avoid copying a chunk that is already owned by an immutable source.
 func (s *BatchStore) ApplyImmutable(result ChunkResult) bool {
+	applied, _ := s.apply(result, false)
+	return applied
+}
+
+// ApplyImmutableChecked installs an immutable result and reports a viewport
+// batch budget error separately from stale-generation rejection.
+func (s *BatchStore) ApplyImmutableChecked(result ChunkResult) (bool, error) {
 	return s.apply(result, false)
 }
 
-func (s *BatchStore) apply(result ChunkResult, cloneVertices bool) bool {
-	if result.Err != nil || result.Stale {
+func batchVertexCountWithinLimit(current, previous, next, limit int) bool {
+	if current < 0 || previous < 0 || next < 0 || limit < 0 || previous > current {
 		return false
+	}
+	retained := current - previous
+	return retained <= limit && next <= limit-retained
+}
+
+func (s *BatchStore) apply(result ChunkResult, cloneVertices bool) (bool, error) {
+	return s.applyWithLimit(result, cloneVertices, MaxBatchVertices)
+}
+
+func (s *BatchStore) applyWithLimit(result ChunkResult, cloneVertices bool, limit int) (bool, error) {
+	if result.Err != nil || result.Stale {
+		return false, result.Err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if result.Generation != s.generation {
-		return false
+		return false, nil
 	}
 	previousCount := len(s.chunks[result.Key])
 	vertices := result.Chunk.Vertices
+	if !batchVertexCountWithinLimit(s.vertexCount, previousCount, len(vertices), limit) {
+		return false, fmt.Errorf("viewport render batch exceeds the %d-vertex safety limit", limit)
+	}
 	if !cloneVertices {
 		if previous, exists := s.chunks[result.Key]; exists && len(previous) == len(vertices) &&
 			(len(vertices) == 0 || &previous[0] == &vertices[0]) {
-			return true
+			return true, nil
 		}
 	}
 	if cloneVertices {
@@ -220,7 +266,7 @@ func (s *BatchStore) apply(result ChunkResult, cloneVertices bool) bool {
 		s.orderedVerts = append(s.orderedVerts, vertices)
 		s.orderedIndex[result.Key] = orderedPosition{epoch: s.visibleEpoch, index: len(s.orderedKeys) - 1}
 	}
-	return true
+	return true, nil
 }
 
 // Current returns a copy so a renderer adapter cannot mutate the store while
@@ -278,13 +324,16 @@ func (s *BatchStore) Clear() {
 // work completing for an older generation is reported as stale and is never
 // inserted into the cache.
 type Scheduler struct {
-	mu          sync.RWMutex
-	generation  uint64
-	cache       map[ChunkKey]Chunk
-	stats       schedulerCounters
-	cachedPool  sync.Pool
-	requestPool sync.Pool
-	keyPool     sync.Pool
+	mu            sync.RWMutex
+	generation    uint64
+	cache         map[ChunkKey]Chunk
+	cacheVertices int
+	maxWorkers    int
+	workerSlots   chan struct{}
+	stats         schedulerCounters
+	cachedPool    sync.Pool
+	requestPool   sync.Pool
+	keyPool       sync.Pool
 }
 
 type cachedChunkSnapshot struct {
@@ -310,15 +359,45 @@ type schedulerCounters struct {
 	canceledCalls atomic.Uint64
 }
 
-// NewScheduler creates an empty chunk scheduler.
+// NewScheduler creates an empty chunk scheduler with four build workers.
 func NewScheduler() *Scheduler {
-	return &Scheduler{cache: make(map[ChunkKey]Chunk)}
+	return NewSchedulerWithMaxWorkers(4)
+}
+
+// NewSchedulerWithMaxWorkers creates a scheduler with an explicit upper bound
+// on concurrent chunk builds. Values below one become one; values above 64
+// are clamped to keep accidental configurations from spawning huge worker sets.
+func NewSchedulerWithMaxWorkers(maxWorkers int) *Scheduler {
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+	if maxWorkers > 64 {
+		maxWorkers = 64
+	}
+	return &Scheduler{
+		cache: make(map[ChunkKey]Chunk), maxWorkers: maxWorkers,
+		workerSlots: make(chan struct{}, maxWorkers),
+	}
+}
+
+// MaxWorkers reports the configured upper bound for concurrent chunk builds.
+func (s *Scheduler) MaxWorkers() int {
+	if s == nil || s.maxWorkers < 1 {
+		return 1
+	}
+	return s.maxWorkers
 }
 
 // AcquireChunkKeyBuffer returns a reusable scratch buffer for viewport
 // requests. The caller owns it until ReleaseChunkKeyBuffer and must not mutate
 // it while a scheduler request still references it.
 func (s *Scheduler) AcquireChunkKeyBuffer(minCapacity int) *ChunkKeyBuffer {
+	if minCapacity < 0 {
+		minCapacity = 0
+	}
+	if minCapacity > MaxViewportChunkKeys {
+		minCapacity = MaxViewportChunkKeys
+	}
 	value := s.keyPool.Get()
 	if value == nil {
 		return &ChunkKeyBuffer{Keys: make([]ChunkKey, 0, minCapacity)}
@@ -340,6 +419,7 @@ func (s *Scheduler) ReleaseChunkKeyBuffer(buffer *ChunkKeyBuffer) {
 	if buffer == nil {
 		return
 	}
+	clear(buffer.Keys)
 	buffer.Keys = buffer.Keys[:0]
 	s.keyPool.Put(buffer)
 }
@@ -365,11 +445,61 @@ func (s *Scheduler) AdvanceGeneration() uint64 {
 func (s *Scheduler) InvalidateLayer(layer string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key := range s.cache {
+	for key, chunk := range s.cache {
 		if key.Layer == layer {
+			s.cacheVertices -= len(chunk.Vertices)
 			delete(s.cache, key)
 		}
 	}
+}
+
+// RetainOnly drops cached chunks that are not in keys, bounding cache memory
+// to the current viewport and planner margin instead of all regions visited.
+func (s *Scheduler) RetainOnly(keys []ChunkKey) {
+	if len(keys) > MaxViewportChunkKeys {
+		s.mu.Lock()
+		s.cache = make(map[ChunkKey]Chunk)
+		s.cacheVertices = 0
+		s.mu.Unlock()
+		return
+	}
+	keep := make(map[ChunkKey]struct{}, len(keys))
+	for _, key := range keys {
+		keep[key] = struct{}{}
+	}
+	s.mu.Lock()
+	retained := make(map[ChunkKey]Chunk, min(len(keep), len(s.cache)))
+	retainedVertices := 0
+	for key := range keep {
+		if chunk, exists := s.cache[key]; exists {
+			retained[key] = chunk
+			retainedVertices += len(chunk.Vertices)
+		}
+	}
+	s.cache = retained
+	s.cacheVertices = retainedVertices
+	s.mu.Unlock()
+}
+
+// cacheChunkLocked accounts immutable geometry payload by vertex count;
+// callers hold s.mu. A rejected replacement removes the old same-key value.
+func (s *Scheduler) cacheChunkLocked(key ChunkKey, chunk Chunk, limit int) bool {
+	previousCount := 0
+	previous, previousExists := s.cache[key]
+	if previousExists {
+		previousCount = len(previous.Vertices)
+	}
+	if !batchVertexCountWithinLimit(s.cacheVertices, previousCount, len(chunk.Vertices), limit) {
+		if previousExists {
+			delete(s.cache, key)
+			s.cacheVertices -= previousCount
+		}
+		return false
+	}
+	chunk.Key = key
+	s.cache[key] = chunk
+	s.cacheVertices += len(chunk.Vertices) - previousCount
+	return true
 }
 
 // Stats returns a diagnostic snapshot without stopping in-flight workers.
@@ -395,6 +525,9 @@ func (s *Scheduler) Cached(key ChunkKey) (Chunk, bool) {
 // completion order, which allows a UI adapter to present low-latency chunks
 // before slower work finishes. The channel is always closed when all work ends.
 func (s *Scheduler) Request(ctx context.Context, keys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
+	if len(keys) > MaxViewportChunkKeys {
+		return s.rejectOversizedRequest(len(keys))
+	}
 	return s.request(ctx, uniqueChunkKeys(keys), builder)
 }
 
@@ -402,7 +535,20 @@ func (s *Scheduler) Request(ctx context.Context, keys []ChunkKey, builder ChunkB
 // already guarantee each key appears once. The planner/visibility pipeline
 // uses this path because it creates disjoint row-major keys per layer.
 func (s *Scheduler) RequestUnique(ctx context.Context, keys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
+	if len(keys) > MaxViewportChunkKeys {
+		return s.rejectOversizedRequest(len(keys))
+	}
 	return s.request(ctx, keys, builder)
+}
+
+func (s *Scheduler) rejectOversizedRequest(count int) <-chan ChunkResult {
+	results := make(chan ChunkResult, 1)
+	results <- ChunkResult{
+		Generation: s.Generation(),
+		Err:        fmt.Errorf("viewport request has %d chunk keys; safety limit is %d", count, MaxViewportChunkKeys),
+	}
+	close(results)
+	return results
 }
 
 func (s *Scheduler) request(ctx context.Context, uniqueKeys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
@@ -605,8 +751,8 @@ func (s *Scheduler) releaseRequestBuffers(buffers *schedulerRequestBuffers) {
 
 func (s *Scheduler) runMissing(ctx context.Context, requestGeneration uint64, keys []ChunkKey, builder ChunkBuilder, results chan<- ChunkResult) {
 	workers := len(keys)
-	if workers > 4 {
-		workers = 4
+	if workers > s.MaxWorkers() {
+		workers = s.MaxWorkers()
 	}
 	if workers == 0 {
 		return
@@ -622,7 +768,17 @@ func (s *Scheduler) runMissing(ctx context.Context, requestGeneration uint64, ke
 				if ctx.Err() != nil {
 					return
 				}
+				select {
+				case s.workerSlots <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				if ctx.Err() != nil {
+					<-s.workerSlots
+					return
+				}
 				s.buildChunk(ctx, requestGeneration, keys[index], builder, results)
+				<-s.workerSlots
 			}
 		}(start, end)
 	}
@@ -676,7 +832,7 @@ func (s *Scheduler) buildChunk(ctx context.Context, requestGeneration uint64, ke
 	if !stale {
 		chunk.Key = key
 		chunk.Generation = requestGeneration
-		s.cache[key] = chunk
+		s.cacheChunkLocked(key, chunk, MaxBatchVertices)
 	} else {
 		s.stats.staleResults.Add(1)
 	}

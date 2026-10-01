@@ -221,6 +221,20 @@ func TestLayerAttributePageOnlyClonesRequestedRows(t *testing.T) {
 	}
 }
 
+func TestLayerAttributePageRejectsOversizedLimit(t *testing.T) {
+	service, err := NewProjectServiceWithLayers("test", core.CRS{AuthorityCode: "EPSG:4326"}, []core.Layer{{Name: "roads", Features: []core.Feature{{ID: 1}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := service.LayerAttributePageOwned("roads", 0, maxAttributePageSize+1); ok {
+		t.Fatal("oversized attribute page accepted")
+	}
+	page, _, ok := service.LayerAttributePageOwned("roads", int(^uint(0)>>1), 200)
+	if !ok || len(page.Features) != 0 {
+		t.Fatalf("out-of-range attribute page = %#v, valid=%t; want empty page", page, ok)
+	}
+}
+
 func TestFeatureIndexBuildsOnlyRequestedLayer(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{})
 	if err := service.BeginEdit(); err != nil {

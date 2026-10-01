@@ -28,10 +28,28 @@ func (s *AttributeSession) Inspect(ctx context.Context) ([]LayerOverview, error)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if s.streamGeoJSON {
+		if s.streamIndexReady && s.streamOverviewReady {
+			if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+				return nil, err
+			}
+			return append([]LayerOverview(nil), s.streamOverview...), nil
+		}
+		result, index, tailBlocks, stamp, err := inspectGeoJSONSourceWithIndexLimitAndTailBlocks(ctx, s.source, s.streamIndexLimit)
+		if err != nil {
+			return nil, err
+		}
+		s.streamOverview = append([]LayerOverview(nil), result...)
+		s.streamIndex, s.streamTailBlocks, s.streamIndexStamp = index, tailBlocks, stamp
+		s.streamOverviewReady, s.streamIndexReady = true, true
+		return result, nil
 	}
 	if s.dataset == nil {
 		return nil, fmt.Errorf("attribute session for %q is closed", s.source)
@@ -78,10 +96,38 @@ func (s *AttributeSession) OpenGeometryPrefix(ctx context.Context, layerName str
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return core.Layer{}, err
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
+	}
+	if s.streamGeoJSON {
+		if !s.streamIndexReady {
+			overviews, index, tailBlocks, stamp, err := inspectGeoJSONSourceWithIndexLimitAndTailBlocks(ctx, s.source, s.streamIndexLimit)
+			if err != nil {
+				return core.Layer{}, err
+			}
+			s.streamOverview, s.streamIndex, s.streamTailBlocks, s.streamIndexStamp = overviews, index, tailBlocks, stamp
+			s.streamOverviewReady, s.streamIndexReady = true, true
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return core.Layer{}, err
+		}
+		if len(s.streamOverview) == 0 || (layerName != "" && layerName != s.streamOverview[0].Name) {
+			return core.Layer{}, fmt.Errorf("layer %q not found in %q", layerName, s.source)
+		}
+		layer, err := readGeoJSONSourceWindowPrefix(ctx, s.source, layerName, [4]float64{-math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, math.MaxFloat64}, false, 0, 0, limit)
+		if err != nil {
+			return core.Layer{}, err
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return core.Layer{}, err
+		}
+		layer.Name = s.streamOverview[0].Name
+		layer.CRS = s.streamOverview[0].CRS
+		return layer, nil
 	}
 	if s.dataset == nil {
 		return core.Layer{}, fmt.Errorf("attribute session for %q is closed", s.source)
@@ -104,10 +150,37 @@ func (s *AttributeSession) OpenAllGeometryPrefix(ctx context.Context, limit int)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
+	if err := s.lockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if s.streamGeoJSON {
+		if !s.streamIndexReady {
+			overviews, index, tailBlocks, stamp, err := inspectGeoJSONSourceWithIndexLimitAndTailBlocks(ctx, s.source, s.streamIndexLimit)
+			if err != nil {
+				return nil, err
+			}
+			s.streamOverview, s.streamIndex, s.streamTailBlocks, s.streamIndexStamp = overviews, index, tailBlocks, stamp
+			s.streamOverviewReady, s.streamIndexReady = true, true
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return nil, err
+		}
+		layer, err := readGeoJSONSourceWindowPrefix(ctx, s.source, "", [4]float64{-math.MaxFloat64, -math.MaxFloat64, math.MaxFloat64, math.MaxFloat64}, false, 0, 0, limit)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return nil, err
+		}
+		if len(s.streamOverview) > 0 {
+			layer.Name = s.streamOverview[0].Name
+			layer.CRS = s.streamOverview[0].CRS
+		}
+		return []core.Layer{layer}, nil
 	}
 	if s.dataset == nil {
 		return nil, fmt.Errorf("attribute session for %q is closed", s.source)

@@ -29,6 +29,12 @@ jobs:
       - name: Run portable vet
         run: go vet ./...
 
+      - name: Fuzz WKB parser for malformed geometry inputs
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GOMAXPROCS: 2
+        run: go test ./internal/render -run '^$' -fuzz '^FuzzWKBFastPathDoesNotPanic$' -fuzztime=5s -parallel=2
+
       - name: Build portable CLI with PowerShell script
         if: runner.os == 'Windows'
         shell: pwsh
@@ -70,3 +76,60 @@ jobs:
 
       - name: Build native CLI
         run: go build -tags native -o build/gis-cli-native ./cmd/gis-cli
+
+  postgis-integration:
+    name: PostGIS transaction integration
+    runs-on: ubuntu-latest
+    services:
+      postgis:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: gogis
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d gogis"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GOGIS_TEST_POSTGIS_DSN: postgres://postgres:postgres@localhost:5432/gogis?sslmode=disable
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run live PostGIS transaction test
+        run: go test ./drivers/postgis -run '^TestPostGISIntegration' -count=1 -v
+
+  vulnerability-scan:
+    name: Go vulnerability scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install GIS development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev libproj-dev libgeos-dev pkg-config
+
+      - name: Scan portable Go packages
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      - name: Scan native GIS build configuration
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -tags native ./...

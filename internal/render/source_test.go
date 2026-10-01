@@ -5,10 +5,26 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"math"
+	"strings"
 	"testing"
 
 	"gogis/internal/core"
 )
+
+func TestAppendVertexBatchWithinLimit(t *testing.T) {
+	base := []Vertex{{X: 1}, {X: 2}}
+	got, ok := AppendVertexBatchWithinLimit(base, []Vertex{{X: 3}}, 3)
+	if !ok || len(got) != 3 || got[2].X != 3 {
+		t.Fatalf("bounded append = %#v, ok=%t", got, ok)
+	}
+	unchanged, ok := AppendVertexBatchWithinLimit(got, []Vertex{{X: 4}}, 3)
+	if ok || len(unchanged) != 3 {
+		t.Fatalf("over-budget append = %#v, ok=%t; want unchanged slice and rejection", unchanged, ok)
+	}
+	if len(base) != 2 || base[1].X != 2 {
+		t.Fatalf("append modified source-owned slice: %#v", base)
+	}
+}
 
 func TestInitialRenderArenasAreBounded(t *testing.T) {
 	if got := initialPartArenaCapacity(10); got != 20 {
@@ -19,6 +35,14 @@ func TestInitialRenderArenasAreBounded(t *testing.T) {
 	}
 	if got := boundedInitialPointArenaCapacity(maxInitialPointArenaCapacity * 100); got != maxInitialPointArenaCapacity {
 		t.Fatalf("large point arena capacity = %d, want %d", got, maxInitialPointArenaCapacity)
+	}
+}
+
+func TestLayerExtentPadsProjectionPrecisionNoise(t *testing.T) {
+	bounds := paddedDegenerateExtent([4]float64{14_137_575, 4_439_000, 14_137_575 + 1e-8, 4_439_020}, "EPSG:3857")
+	spanX := bounds[2] - bounds[0]
+	if spanX < 0.014 || bounds[3]-bounds[1] != 20 {
+		t.Fatalf("precision-padded projected extent = %v", bounds)
 	}
 }
 
@@ -110,6 +134,31 @@ func TestParseWKBStandardXYFastPath(t *testing.T) {
 	}
 	if points[0] != (Point{X: 1, Y: 2}) || points[1] != (Point{X: 3, Y: 4}) {
 		t.Fatalf("parsed WKB points = %#v", points)
+	}
+}
+
+func TestNewLayerSourceRejectsInfiniteWKBCoordinates(t *testing.T) {
+	for _, geometryType := range []uint32{1, 2} {
+		wkb := []byte{1, byte(geometryType), 0, 0, 0}
+		if geometryType == 2 {
+			wkb = append(wkb, 2, 0, 0, 0)
+		}
+		point := make([]byte, 16)
+		binary.LittleEndian.PutUint64(point[:8], math.Float64bits(math.Inf(1)))
+		binary.LittleEndian.PutUint64(point[8:], math.Float64bits(1))
+		wkb = append(wkb, point...)
+		if geometryType == 2 {
+			second := make([]byte, 16)
+			binary.LittleEndian.PutUint64(second[:8], math.Float64bits(2))
+			binary.LittleEndian.PutUint64(second[8:], math.Float64bits(3))
+			wkb = append(wkb, second...)
+		}
+		_, err := NewLayerSource(core.Layer{Name: "invalid", Features: []core.Feature{{
+			ID: 7, Geometry: core.WKBGeometry{WKB: wkb},
+		}}})
+		if err == nil || !strings.Contains(err.Error(), "not finite") {
+			t.Errorf("WKB type %d infinite coordinate error = %v, want finite-coordinate rejection", geometryType, err)
+		}
 	}
 }
 
@@ -343,6 +392,56 @@ func TestNewLayerSourcesWithExtentRejectsInvalidBounds(t *testing.T) {
 	}
 }
 
+func TestNewLayerSourcesWithExtentAndChunkSizeBuildsFineGrid(t *testing.T) {
+	layer := core.Layer{Name: "points", Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (0.75 0.5)"}}}}
+	sources, _, err := NewLayerSourcesWithExtentAndChunkSize([]core.Layer{layer}, [4]float64{0, 0, 1, 1}, 0.125)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := sources["points"]
+	if source.ChunkSize != 0.125 {
+		t.Fatalf("chunk size = %v, want 0.125", source.ChunkSize)
+	}
+	chunk, err := source.Builder(context.Background(), ChunkKey{Layer: "points", X: 6, Y: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunk.Vertices) == 0 {
+		t.Fatal("fine-grid chunk (6,4) did not contain the point")
+	}
+
+	line := core.Layer{Name: "lines", Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0.5, 1 0.5)"}}}}
+	lineSources, lineHits, err := NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{line}, [4]float64{0, 0, 1, 1}, 0.125, ChunkKey{Layer: "lines", X: 6, Y: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineSource := lineSources["lines"]
+	requested, err := lineSource.Builder(context.Background(), ChunkKey{Layer: "lines", X: 6, Y: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := lineSource.Builder(context.Background(), ChunkKey{Layer: "lines", X: 5, Y: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requested.Vertices) != 2 || len(other.Vertices) != 0 {
+		t.Fatalf("target-only line vertices: requested=%d other=%d", len(requested.Vertices), len(other.Vertices))
+	}
+	if len(lineHits) != 1 || len(lineHits[0].Vertices) != 2 || lineHits[0].Vertices[1].X != 1 {
+		t.Fatalf("target-only source lost complete hit geometry: %#v", lineHits)
+	}
+}
+
+func TestFullLayerChunkSizeBoundsNormalizedGridWork(t *testing.T) {
+	layer := core.Layer{Name: "lines", Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0.5, 1 0.5)"}}}}
+	if _, _, err := NewLayerSourcesWithExtentAndChunkSize([]core.Layer{layer}, [4]float64{0, 0, 1, 1}, 1e-9); err == nil || !strings.Contains(err.Error(), "more than 256 cells per axis") {
+		t.Fatalf("tiny full-layer chunk size error = %v; want bounded-grid rejection", err)
+	}
+	if _, _, err := NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{layer}, [4]float64{0, 0, 1, 1}, 1e-9, ChunkKey{Layer: "lines", X: 0, Y: 0}); err != nil {
+		t.Fatalf("fine single-target chunk request rejected: %v", err)
+	}
+}
+
 func TestNewLayerSourcesRejectsDuplicateNames(t *testing.T) {
 	_, err := NewLayerSources([]core.Layer{{Name: "roads"}, {Name: "roads"}})
 	if err == nil {
@@ -559,6 +658,32 @@ func FuzzWKBFastPathDoesNotPanic(f *testing.F) {
 	})
 }
 
+func TestParseWKBPartsRejectsCountsLargerThanInput(t *testing.T) {
+	for _, geometryType := range []uint32{2, 3, 7} {
+		data := []byte{1, 0, 0, 0, 0}
+		binary.LittleEndian.PutUint32(data[1:], geometryType)
+		data = append(data, 0xff, 0xff, 0xff, 0xff)
+		t.Run(map[uint32]string{2: "line points", 3: "polygon rings", 7: "collection children"}[geometryType], func(t *testing.T) {
+			if _, err := parseWKBParts(data); err == nil {
+				t.Fatal("accepted a count that cannot fit in the remaining WKB")
+			}
+		})
+	}
+}
+
+func TestParseWKBPartsRejectsExcessiveGeometryNesting(t *testing.T) {
+	point := []byte{1, 1, 0, 0, 0}
+	point = append(point, make([]byte, 16)...)
+	wkb := point
+	for range maxWKBGeometryNestingDepth + 1 {
+		collection := []byte{1, 7, 0, 0, 0, 1, 0, 0, 0}
+		wkb = append(collection, wkb...)
+	}
+	if _, err := parseWKBParts(wkb); err == nil {
+		t.Fatal("accepted WKB nested beyond the configured limit")
+	}
+}
+
 func TestNewLayerSourcePreservesPolygonHoleParts(t *testing.T) {
 	source, err := NewLayerSource(core.Layer{Name: "areas", Features: []core.Feature{{
 		ID:       1,
@@ -612,5 +737,25 @@ func TestNewLayerSourceReadsSingleRingWKTPolygonFlat(t *testing.T) {
 	feature := source.Features[0]
 	if feature.Parts != nil || len(feature.Vertices) != 5 {
 		t.Fatalf("single-ring polygon representation = %#v", feature)
+	}
+}
+
+func TestLayerSourceRejectsOversizedChunkVertexPayload(t *testing.T) {
+	pointCount := MaxChunkVertices/2 + 2
+	wkb := make([]byte, 9+pointCount*16)
+	wkb[0] = 1
+	binary.LittleEndian.PutUint32(wkb[1:5], 2)
+	binary.LittleEndian.PutUint32(wkb[5:9], uint32(pointCount))
+	for index := 0; index < pointCount; index++ {
+		binary.LittleEndian.PutUint64(wkb[9+index*16:], math.Float64bits(0.5))
+		binary.LittleEndian.PutUint64(wkb[17+index*16:], math.Float64bits(0.5))
+	}
+	layer := core.Layer{Name: "dense-line", Features: []core.Feature{{ID: 1, Geometry: core.WKBGeometry{WKB: wkb}}}}
+	sources, _, err := NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{layer}, [4]float64{0, 0, 1, 1}, 1, ChunkKey{Layer: "dense-line", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sources["dense-line"].Builder(context.Background(), ChunkKey{Layer: "dense-line", X: 0, Y: 0}); err == nil || !strings.Contains(err.Error(), "vertex safety limit") {
+		t.Fatalf("oversized render chunk error = %v, want vertex safety limit", err)
 	}
 }

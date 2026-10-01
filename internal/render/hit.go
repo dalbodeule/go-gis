@@ -34,6 +34,7 @@ type HitIndex struct {
 	spans    []hitSpan
 	indices  []int32
 	next     []int32
+	linear   bool
 }
 
 type cellChain struct {
@@ -51,6 +52,11 @@ type hitSpan struct {
 
 const maxInitialHitMembershipCapacity = 1 << 20
 
+// maxHitIndexEntries bounds auxiliary grid memory independently of the
+// geometry payload. Oversized indexes fall back to allocation-free linear
+// hit testing over the already-retained features.
+const maxHitIndexEntries = 1 << 20
+
 func initialHitMembershipCapacity(featureCount int) int {
 	if featureCount <= 0 {
 		return 0
@@ -64,8 +70,15 @@ func initialHitMembershipCapacity(featureCount int) int {
 // NewHitIndex builds a uniform-grid index. A non-positive cell size uses a
 // conservative default suitable for normalized layer coordinates.
 func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
+	return newHitIndexWithLimit(features, cellSize, maxHitIndexEntries)
+}
+
+func newHitIndexWithLimit(features []HitFeature, cellSize float64, maxEntries int) HitIndex {
 	if cellSize <= 0 {
 		cellSize = 0.25
+	}
+	if maxEntries < 0 {
+		maxEntries = 0
 	}
 	// Normalized vector layers usually distribute several features per cell.
 	// Reserve a modest fraction up front to avoid repeated map growth without
@@ -76,19 +89,28 @@ func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
 		// slice is therefore safe to retain under the documented no-mutation
 		// contract and avoids copying every feature during lazy index build.
 		features: features,
-		cells:    make(map[[2]int]cellChain, len(features)/8+1),
+		cells:    make(map[[2]int]cellChain, min(len(features)/8+1, maxEntries)),
 	}
 	// A typical normalized line touches one or two cells. Reserve that common
 	// membership count up front; unusual long segments can still grow these
 	// slices safely through append.
-	initialCapacity := initialHitMembershipCapacity(len(features))
+	initialCapacity := min(initialHitMembershipCapacity(len(features)), maxEntries)
 	index.indices = make([]int32, 0, initialCapacity)
 	index.next = make([]int32, 0, initialCapacity)
+	index.spans = make([]hitSpan, 0, min(len(features)/16, maxEntries))
+	tooLarge := false
 	// Append memberships to one flat array and link them per cell. Index the
 	// cells actually crossed by each part instead of the feature bounding box;
 	// a long diagonal would otherwise register every cell in its rectangle.
 	for featureIndex, feature := range index.features {
 		addCell := func(key [2]int) {
+			if tooLarge {
+				return
+			}
+			if len(index.indices)+len(index.spans) >= maxEntries {
+				tooLarge = true
+				return
+			}
 			chain, exists := index.cells[key]
 			if !exists {
 				chain.head = -1
@@ -106,6 +128,13 @@ func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
 			index.cells[key] = chain
 		}
 		addSpan := func(horizontal bool, fixedCell, minCell, maxCell int) {
+			if tooLarge {
+				return
+			}
+			if len(index.indices)+len(index.spans) >= maxEntries {
+				tooLarge = true
+				return
+			}
 			index.spans = append(index.spans, hitSpan{
 				featureIndex: int32(featureIndex),
 				fixedCell:    fixedCell,
@@ -121,6 +150,16 @@ func NewHitIndex(features []HitFeature, cellSize float64) HitIndex {
 		} else {
 			addHitPartCells(feature.Vertices, index.cellSize, addCell, addSpan)
 		}
+		if tooLarge {
+			break
+		}
+	}
+	if tooLarge {
+		index.cells = nil
+		index.spans = nil
+		index.indices = nil
+		index.next = nil
+		index.linear = true
 	}
 	return index
 }
@@ -269,6 +308,9 @@ func (i HitIndex) HitTestVisibleFunc(point Point, tolerance float64, visible fun
 func (i HitIndex) hitTest(point Point, tolerance float64, visible func(string) bool) (HitResult, bool) {
 	if tolerance < 0 || i.cellSize <= 0 || len(i.features) == 0 {
 		return HitResult{}, false
+	}
+	if i.linear {
+		return i.hitAllFeatures(point, tolerance, visible)
 	}
 	minCellX := int(math.Floor((point.X - tolerance) / i.cellSize))
 	maxCellX := int(math.Floor((point.X + tolerance) / i.cellSize))

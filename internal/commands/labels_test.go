@@ -33,6 +33,37 @@ func TestGenerateLabelsUsesRepresentativeGeometryPositions(t *testing.T) {
 	}
 }
 
+func TestGenerateLabelsWithRotationField(t *testing.T) {
+	layer := core.Layer{Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "road", "angle": 30}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (3 4)"}, Properties: map[string]any{"name": "building", "angle": 0}},
+	}}
+	result, err := GenerateLabelsWithRotation(context.Background(), layer, "name", "angle", 2.5, "Korean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Features[0].Label.Rotation; got != 30 {
+		t.Fatalf("first label rotation = %v, want 30", got)
+	}
+	if got := result.Features[1].Label.Rotation; got != 0 {
+		t.Fatalf("second label rotation = %v, want 0", got)
+	}
+	if layer.Features[0].Label != nil {
+		t.Fatal("rotation label generation mutated the source")
+	}
+}
+
+func TestGenerateLabelsWithRotationRejectsInvalidFieldValues(t *testing.T) {
+	for _, value := range []any{"sideways", math.Inf(1), "NaN"} {
+		layer := core.Layer{Features: []core.Feature{{
+			ID: 7, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "road", "angle": value},
+		}}}
+		if _, err := GenerateLabelsWithRotation(context.Background(), layer, "name", "angle", 1, ""); err == nil {
+			t.Errorf("invalid rotation %v was accepted", value)
+		}
+	}
+}
+
 func TestGenerateLabelsHandlesMissingFieldAndCancellation(t *testing.T) {
 	layer := core.Layer{Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (0 0)"}}}}
 	if _, err := GenerateLabels(context.Background(), layer, "", 1, ""); !errors.Is(err, ErrLabelFieldMissing) {

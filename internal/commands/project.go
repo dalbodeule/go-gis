@@ -18,6 +18,8 @@ var (
 	ErrNoLayers      = errors.New("project has no layers")
 )
 
+const maxAttributePageSize = 1_000
+
 // ProjectService owns project edits independently from any user interface.
 type ProjectService struct {
 	project             *core.Project
@@ -266,7 +268,7 @@ func (s *ProjectService) layerAttributePage(name string, offset, limit int, clon
 	if offset < 0 {
 		offset = 0
 	}
-	if limit <= 0 {
+	if limit <= 0 || limit > maxAttributePageSize {
 		return core.Layer{}, 0, false
 	}
 	for _, layer := range s.project.Layers {
@@ -277,8 +279,10 @@ func (s *ProjectService) layerAttributePage(name string, offset, limit int, clon
 		if offset > total {
 			offset = total
 		}
-		end := offset + limit
-		if end > total {
+		end := total
+		if limit <= total-offset {
+			end = offset + limit
+		} else {
 			end = total
 		}
 		result := core.Layer{Name: layer.Name, CRS: layer.CRS, Editable: layer.Editable, Fields: append([]core.Field(nil), layer.Fields...)}

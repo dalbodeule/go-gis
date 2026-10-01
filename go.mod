@@ -12,6 +12,8 @@ require (
 	golang.org/x/text v0.29.0
 )
 
+replace github.com/airbusgeo/godal => ./third_party/godal
+
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

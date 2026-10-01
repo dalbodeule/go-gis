@@ -65,11 +65,42 @@ func TestParseFilterOptions(t *testing.T) {
 }
 
 func TestParseLabelOptions(t *testing.T) {
-	options, err := parseLabelOptions([]string{"--input", "roads.gpkg", "--field", "name", "--output", "roads.dxf", "--height", "2.5", "--style", "Korean"})
+	options, err := parseLabelOptions([]string{"--input", "roads.gpkg", "--field", "name", "--rotation-field", "angle", "--output", "roads.dxf", "--height", "2.5", "--style", "Korean"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.height != 2.5 || options.style != "Korean" {
+	if options.height != 2.5 || options.style != "Korean" || options.rotationField != "angle" {
 		t.Fatalf("unexpected label options: %#v", options)
+	}
+}
+
+func TestParseScriptOptions(t *testing.T) {
+	options, err := parseScriptOptions([]string{
+		"--input", "roads.gpkg", "--layer", "roads",
+		"--input", "parcels.gpkg", "--layer", "parcels",
+		"--script", "workflow.lua", "--output", "result.gpkg", "--output-layer", "wide_roads",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(options.inputs) != 2 || len(options.layers) != 2 || options.script != "workflow.lua" || options.output != "result.gpkg" || options.outputLayer != "wide_roads" {
+		t.Fatalf("unexpected script options: %#v", options)
+	}
+}
+
+func TestParseScriptOptionsRequiresLayerCountToMatchInputs(t *testing.T) {
+	if _, err := parseScriptOptions([]string{"--input", "roads.gpkg", "--input", "parcels.gpkg", "--layer", "roads", "--script", "workflow.lua"}); err == nil {
+		t.Fatal("mismatched --layer count was accepted")
+	}
+}
+
+func TestParseScriptOptionsRequiresOutputLayerForShapefile(t *testing.T) {
+	args := []string{"--input", "roads.gpkg", "--script", "workflow.lua", "--output", "result.shp"}
+	if _, err := parseScriptOptions(args); err == nil {
+		t.Fatal("Shapefile output without --output-layer was accepted")
+	}
+	args = append(args, "--output-layer", "major_roads")
+	if _, err := parseScriptOptions(args); err != nil {
+		t.Fatalf("Shapefile output with --output-layer was rejected: %v", err)
 	}
 }

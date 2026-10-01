@@ -1255,3 +1255,631 @@ Windows 실제 파일의 지연과 메모리는 별도로 검증해야 한다.
 이미 있는 원본 CRS 기준 `OpenWindow`/retained geometry session을 UI의 비동기
 viewport 로딩·캐시에 연결하고, 포맷별 spatial filter/인덱스 효과를 확인해야
 한다. Windows 이식 후 동일 benchmark와 실제 파일의 시작·pan 지연을 재측정한다.
+
+## 극단적 축소에서의 viewport 작업 상한
+
+대용량 SHP 표시 크래시 보고서를 검토했다. macOS crash report 상단 분류는
+`EXC_CRASH (SIGABRT)`이며 crashed thread는 `CVDisplayLink`의 `runtime.raise_trampoline`
+경로다. 같은 report의 별도 QSGRenderThread는 snapshot 시점에 `updatePaintNode` 내부
+vertex-conversion lambda를 실행 중이지만, 그 thread는 crash thread가 아니며 해당 report에
+그 thread의 fault address/register state는 없다. 따라서 renderer null write나 OOM으로
+귀속할 수 없고, 첨부 실행 파일과 현재 소스의 binary identity도 검증되지 않았다.
+별도로 코드 점검 중 `ChunkPlanner`가 zoom 0.0001에서 0.25 단위 chunk를 데이터
+extent와 무관하게 열거하면 약 1.6 billion keys까지 만들 수 있는 결정적 메모리
+위험을 확인했다. 실제 layer source의 좌표는 unit square로 정규화되므로,
+데이터 렌더러는 `[-margin, 1/chunkSize+margin]`에 해당하는 tile로 검색을
+제한한다. 일반 planner에도 유효하지 않은 viewport 거부와 최대 65,536개 key
+상한을 두어 정수 overflow 및 비정상 할당을 막는다. 극단 축소·범위 밖 이동·NaN
+viewport 회귀 테스트를 추가했다. 이는 보고된 SIGABRT의 확정 원인이라는 뜻은
+아니며, 실제 세종 SHP 재현 및 국가 규모 자료 검증은 별도 확인이 필요하다.
+
+로컬 세종 도근점/연속지적도 SHP를 native read-only 로더에 함께 넣는 일회성
+재현 테스트에서는 219,986개 피처가 로드됐고 약 6.40초, Go 누적 할당 3,931 MiB,
+GC 후 heap 488 MiB가 관찰됐다. Go heap profile에서 `attachPolygonFillGeometry`가
+누적 할당의 약 85%를 차지했다. 폴리곤 fill mesh를 만들 때 레이어 색을 매 정점마다
+다시 디코드하던 일을 1회 계산으로 바꾸고, 타일별 정점 slice를 예상 크기로
+예약했으며, 단순 convex 단일 외곽 ring은 GEOS 호출 없이 fan triangulation을
+사용한다. 같은 데이터 재실행은 약 5.73초, 누적 할당 2,128 MiB, GC 후 heap
+485 MiB로 측정됐다. 이어 simple Polygon의 닫힌 ring에 대해 삼각형 수 추정치를
+`3*(pointCount-3)`로 좁혀 fill buffer를 예약했다. 최종 동일 데이터 재실행은
+약 5.73초, 누적 할당 2,093 MiB, GC 후 heap 449 MiB, 해당 테스트 프로세스의
+max RSS 1,091 MiB였다(초기 실행의 3,931 MiB/488 MiB/max RSS 1,544 MiB 대비
+누적 할당 약 47%, post-GC heap 약 8% 감소). 10K convex polygon 재현 benchmark는
+buffer estimate 조정 전 3.02 MB/op·약 257 ns/feature에서 조정 후 1.31 MB/op·약
+270 ns/feature로 바뀌었고 allocations/op은 56으로 같았다. 이는 개발 호스트의
+일회성 데이터 재현과 synthetic benchmark이며, macOS SIGABRT의 원인을 입증하거나
+Qt 화면 렌더와 국가 규모 데이터의 메모리 안전성을 보증하지 않는다. 복잡한 ring,
+holes, multipart는 기존 GEOS constrained triangulation 경로를 유지한다.
+
+이 synthetic 회귀 기준은 `go test -tags 'qt native' ./cmd/gis-desktop -run '^$'
+-bench '^BenchmarkAttachPolygonFill10KConvex$' -benchmem`으로 재측정할 수 있다.
+
+## Read-only desktop viewport의 GDAL window 연결
+
+알려진 CRS 및 유효한 bounds를 가진 read-only sources는 이제 전체 geometry snapshot
+대신 renderer chunk마다 원본 CRS의 retained `AttributeSession.OpenWindowWithLimits`를
+호출한다. 표시 CRS와 다르면 PROJ densified bounds로 질의하고 반환 geometry를 표시 CRS로
+변환한다. 시작 시 ProjectService에는 metadata/schema만 두고, 화면에 필요한 chunk만
+렌더링한다. spatial result ID가 source 전체 ordinal과 같다고 가정하지 않고 chunk별
+새 runtime ID를 배정한다. 선택 피처 이름은 해당 window 결과에서 보관한 문자열로
+응답한다. viewport 변경 때 비가시 scheduler cache, hit geometry, feature-name 및
+label cache를 제거한다.
+
+방어 상한은 chunk 하나당 20,000 피처/32 MiB, 현재 viewport hit-test snapshot 전체
+100,000 피처/128 MiB다. GDAL reader는 각 geometry를 WKB로 바꾸고 속성을 매핑한 뒤,
+누적 WKB/property 추정값을 확인해 상한 안에 있는 feature만 result slice에 보관한다.
+렌더러가 조회 완료 후 별도 계산하는 레이블 payload도 chunk 예산에 포함한다.
+일반 렌더는 scheduler worker 4개를 유지하지만 window-backed read-only renderer는
+worker를 최대 2개로 제한해 chunk별 일시 payload 예산이 기본 worker pool에서 네 배로
+중첩되지 않도록 한다. 추가 확인에서 이 worker 상한이 viewport `Request`마다 적용되어 이전
+요청의 취소 지연 builder와 새 요청의 builder가 동시에 실행될 수 있음을 발견했다. worker permit을
+Scheduler 단위로 공유해 겹친 요청 전체가 설정된 상한을 넘지 않도록 하고, 취소 지연 builder를
+포함한 두 요청의 동시 실행 테스트를 추가했다. runtime 교체는 새 Scheduler를 만들기 때문에,
+read-only chunk의 조회/PROJ 변환/GEOS 작업은 앱 차원의 2-slot context semaphore도 공유한다.
+이 gate는 이전 runtime의 취소 지연 작업과 새 runtime의 작업이 합쳐져 설정을 초과하지 않게 한다.
+이 동시성 제한은 per-window heap budget이나 총 RSS 상한과 같지는 않다.
+또한 read-only polygon window는 GEOS constrained triangulation 전에 총 입력 coordinate 수를
+250,000개로 제한한다. 상한 초과 시 chunk 오류를 돌려 triangle slice와 fill mesh를 만들지
+않는다. 이 count는 source decode 이후 적용되며 단일 WKB 변환의 순간 메모리 또는 GEOS가
+좌표당 사용하는 native memory를 byte 단위로 제한하는 것은 아니다.
+상한 초과 시 데이터 일부를 조용히 생략하지 않고 해당 chunk 렌더 요청에 오류를
+반환하며 확대 후 재요청하도록 상태를 표시한다. 이 상한은 WKB/property byte 수나 Qt
+GPU 메모리를 추정하는 경계일 뿐 정확한 RSS 상한이 아니다. 특히 단일 피처는 OGR이 읽고
+WKB로 직렬화한 뒤 예산을 검사하므로, 지나치게 큰 한 피처의 순간 할당을 사전 차단하지는
+못한다. GeoJSON streaming scan은 범위 filter를 위해 파일 전체를 읽을 수 있어
+처리시간 역시 파일 크기에 비례한다. CRS 또는 bounds가 없어 window query가 불가능한
+read-only layer는 전체 geometry fallback을 하지 않고 `--source-crs` 지정 또는 dataset
+metadata 수정 안내와 함께 로드를 거부한다. editable 경로는 사용자가 명시적으로 선택한
+경우 기존 전체 로드를 유지한다. 전국 자료와 실제 GUI pan/zoom 및 RSS 검증 전까지 이 변경을
+OOM 안전성 보증으로 해석하지 않는다.
+
+### 1M GeoJSON viewport 전략 비교와 남은 RSS 위험
+
+2026-10-01 Apple M3에서 GDAL GeoJSON의 window 전략을 동일한 synthetic
+1,000,000 Point FeatureCollection으로 비교했다. 파일 open, `FeatureCount`,
+`Bounds`, 이후 동일한 1/16 extent window query를 수행하고 독립 프로세스의
+peak RSS를 측정했다. 두 전략 모두 window에서 3,969 feature를 반환했다.
+
+| 전략 | 전체 시간 | Go allocations | RSS 이후 open/metadata | 프로세스 peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `NextFeature` + envelope 검사 | 2.99 s | 76.2 MB / 4.05M allocs | 2,625 MiB | 5,244 MiB |
+| OGR SQL `SpatialFilter` | 4.55 s | 3.88 MB / 59.6K allocs | 2,625 MiB | 6,905 MiB |
+
+따라서 SQL 경로의 낮은 Go heap allocation은 native GDAL/OGR RSS를 대변하지
+않으며, 이 벤치에서는 더 느리고 peak RSS도 약 1.6 GiB 높았다. JSON 입력의
+현재 envelope scan 경로는 유지하지만, 1M GeoJSON을 안전하게 로드한다고 볼 수는
+없다. 특히 GDAL open/metadata 단계부터 RSS가 2.6 GiB, window scan 중 peak가
+5.1 GiB를 넘었다. 기존 per-window feature/byte 한도는 결과 slice 크기만 제한하고
+OGR 내부의 전체 파일 파싱·feature iteration 메모리는 제한하지 못한다.
+
+실행 가능한 회귀 benchmark는
+`go test -tags native ./drivers/gdal -run '^$' -bench
+'^BenchmarkGDALGeoJSONWindow(Envelope|SpatialFilter)1M$' -benchmem -benchtime=1x`
+이며, 두 case는 별도 프로세스에서 실행해야 process peak RSS가 서로 오염되지
+않는다. 이 결과는 다음 단계에서 표준 GeoJSON의 진짜 streaming/indexed reader 또는
+프로세스 수준의 제한/격리 전략을 구현·검증해야 함을 보여준다. 파일 크기 기반의
+임의 거부만으로 이를 해결했다고 간주하지 않는다.
+
+#### 데스크톱 read-only의 bounded streaming/index
+
+위 결과를 반영해 표준 `.geojson`/`.json` FeatureCollection의 GDAL 세션 경로를
+증분 JSON parser로 교체했다. object 경계를 직접 스캔하면서 단일 feature가 64 MiB를
+넘으면 추가 버퍼 할당 전에 중단한다. feature 한 건의 geometry bbox는 타입별 좌표
+배열로 계산하고, 속성 map은 화면 window 또는 요청한 속성 페이지에 포함되는 경우만
+생성한다. 각 top-level metadata key/value는 bounded decoder로 최대 1 MiB까지만 읽고,
+초과/손상된 FeatureCollection이 GDAL fallback을 타지 않고 명시적으로 거부되게 한다.
+선택된 feature의 properties JSON은 `map[string]any`로 decode하기 전에 8 MiB로
+제한해 단일 attribute payload의 메모리 확장을 묶는다. 첫 metadata scan은 feature의 byte
+offset/length와 bbox를 in-memory index로 보관해 이후 viewport query가 matching feature만
+`ReadAt`한다. 속성 페이지/선택 feature도
+index를 사용한다. source 파일 크기 또는 mtime이 index 이후 달라지면 오래된 offset을
+사용하지 않고 reload 오류를 반환한다. 최대 1M feature까지 index를 보관하고, 그보다
+큰 데이터는 memory index를 버리고 bounded sequential scan으로 fallback한다. 따라서 1M
+feature까지는 viewport index를 유지하고, 그 초과 시 index 메모리를 제한한다. 이 fallback은
+메모리 증가를 제한하지만 pan/zoom 성능은 느려질 수 있다.
+
+Apple M3에서 동일한 synthetic 1M Point FeatureCollection의 실제 데스크톱 read-only
+loader benchmark를 `-benchtime=1x`로 재측정했다. index 적용 전 streaming scan은 약
+3.91 s/op, 첫 window 1.26 s, peak RSS 64.5 MiB였고, index 적용 후 두 회차는 약
+1.45–1.46 s/op, 첫 window 23.5–26.1 ms, peak RSS 272–294 MiB였다. 후자의 retained Go heap은 약 61.4 MiB,
+visible window는 3,969 feature/0.177 MiB였다. GDAL 전체 FeatureCollection 경로의 약
+5.2 GiB peak와 비교하면 RSS가 크게 낮아졌고, 첫 window query도 빨라졌다. 대신 메모리
+index가 약 61 MiB의 retained heap을 사용하고 전체 프로세스 peak는 상승한다. 2M 초과
+fallback, 복잡한 polygon, 실제 세종 SHP, 전국 데이터, 장시간 반복 pan/zoom 및 Windows/
+Linux에서의 RSS는 별도 검증 대상이다. 이 결과는 합성 Point 입력의 desktop read-only
+경로 증거이며 모든 GDAL `Reader.Open`/editable-large 전체 snapshot이 안전하다는 뜻은
+아니다. 재현 명령은 `go test -tags 'qt native' ./cmd/gis-desktop -run '^$' -bench
+'^BenchmarkDesktopReadOnlyLoadGeoJSON1M$' -benchmem -benchtime=1x -count=1`이다.
+
+후속 메모리 점검에서 feature index 항목의 필드 정렬을 조정해 크기를 최대 48 byte로
+제한했다(이전 배치에서는 56 byte). 이는 index의 이론상 retained payload를 항목당 8 byte
+줄이지만, GC heap/RSS 개선 폭은 재벤치마크 전까지 측정값으로 간주하지 않는다.
+
+이후 같은 Apple M3 1M benchmark를 한 차례 재실행한 결과는 1.211 s/op, 첫 window 28.30 ms,
+process peak RSS 226.0 MiB, retained heap 49.22 MiB/op, 273,039,024 B/op 및 1,079,819
+allocs/op였다. 직전 측정보다 retained heap은 약 12 MiB 낮지만 단일 run과 변동 가능한 RSS라
+성능 개선의 확정치로 일반화하지 않는다. 재현 명령은 위와 같으며 `CGO_CXXFLAGS=-std=c++17`
+을 지정해야 Qt native 의존성이 빌드된다.
+
+properties 사전 제한 이후의 추가 1M Point run은 1.225 s/op, 첫 window 26.82 ms, peak RSS
+225.5 MiB, retained heap 49.22 MiB/op였다. 이는 상한 검증 추가로 기존 1M 경로의 처리시간이나
+메모리가 유의하게 나빠지지 않았음을 확인하는 단일 재실행이다.
+
+Top-level metadata bounded parser 변경 후 1M Point run은 1.217 s/op, 첫 window 28.62 ms,
+peak RSS 225.3 MiB, retained heap 49.23 MiB/op였다. 단일 실행이므로 앞선 결과와의 미세한
+차이는 parser 비용 또는 실제 성능 변화로 해석하지 않는다. 전체 `scripts/verify.sh`도 통과했다.
+
+Native WKB preflight 추가 후 `-count=3` 1M benchmark는 1.198–1.207 s/op, 첫 window
+14.86–29.61 ms, retained heap 49.23 MiB/op였다. Peak RSS 225.4–281.7 MiB는 run마다 크게
+흔들려 유의미한 RSS 회귀 판정에는 사용할 수 없다. 앞선 1.217 s 1회 결과와 비교하면 처리
+시간의 지속적인 악화는 관찰되지 않았지만, first-window latency 변동이 커 반복 측정이 더
+필요하다. 직전의 1.73–2.31 s 단일 runs는 재현되지 않아 시스템 변동성 outlier로 분류한다.
+
+WKB 렌더 좌표의 유한성 검증을 extent 집계 경로에 추가한 뒤 Apple M3에서 동일한 1M
+GeoJSON benchmark를 다시 실행했다. 한 번의 결과는 1.225 s/op, 첫 window 28.55 ms,
+process peak RSS 212.9 MiB, retained heap 49.23 MiB/op, 272,899,504 B/op 및 1,079,862
+allocs/op이었다. 직전 기준과 비슷한 범위이며 단일 실행이므로 미세한 차이를 회귀/개선으로
+판정하지 않는다. 3,969 visible feature와 0.1772 MiB payload가 생성됐다.
+
+GDAL의 64-bit `GIntBig` feature count를 바인딩에서 32-bit C `int`로 좁히던 변환도
+제거했다. Go `int` 범위를 벗어나는 값이나 음수 오류 센티널은 이제 잘못된 layer size로
+전달하지 않고 오류가 된다. 이는 32-bit 빌드 및 극대형 layer의 정책 판단을 방어하며,
+일반 1M dataset의 동작 경로는 바꾸지 않는다.
+
+### 화면 줌에 따른 read-only 청크 세분화
+
+실제 세종시 SHP로 수행한 window-loader 회귀 테스트에서 연속지적도는 0.25
+정규화 단위의 기본 청크와 bucket 1–3에서도 일부 창이 20,000 피처 제한을
+넘었다. 고정 청크 크기라면 더 확대해도 같은 공간창을 재조회하므로 이 자료를
+안전하게 볼 방법이 없었다. 이에 read-only 렌더링은 zoom bucket `b`에 대해
+`0.25 / 2^min(max(b, 0), 10)` 청크 크기를 사용한다. 타일 크기는 chunk key의
+zoom bucket에서 재구성되어 비동기 빌더에서도 planner의 가변 상태에 의존하지 않는다.
+공용 source builder와 폴리곤 fill tessellation도 임의 청크 크기를 처리하고, 기본
+4×4 그리드로 고정됐던 경계 클램프를 제거했다. 청크마다 20,000 feature/32 MiB,
+viewport 전체 100,000 feature/128 MiB 상한은 유지하며 초과 데이터는 생략하지 않는다.
+
+macOS 개발 호스트의 opt-in 회귀 테스트에서 연속지적도는 bucket 0–3의 일부 창에서
+상한에 걸렸지만 bucket 4의 첫 유효 창에서 8,962 피처와 735,647 vertex를 생성했다.
+도근점은 bucket 0에서 11,969 피처 청크를 읽었다. 이는 실제 SHP의 window-query와
+Go geometry/render-source 경로 검증이며, 사용자 GUI의 패닝/줌 반응성, Qt/GPU 메모리,
+최대 RSS 또는 전국 자료의 안전성을 증명하지 않는다. 대형 단일 피처, 예상치보다 큰
+GEOS triangulation 출력, CRS 없는 입력 및 전체 범위가 한 화면에 들어오는 초기 줌은
+별도 검증 대상으로 남긴다.
+
+후속으로 read-only window의 렌더 source는 요청된 chunk 하나에 대해서만 line/point
+vertices를 생성하며, 선분은 해당 셀에 직접 clip한다. 폴리곤 fill도 요청 셀의 삼각형
+부분만 보관한다. hit-test 용 feature geometry는 선택과 식별을 위해 window 전체를
+유지하므로 그 비용은 앞의 feature/byte budget에 계속 포함된다. 실제 세종 테스트의
+첫 bucket-4 셀에는 반환 피처가 모두 해당 셀에 모여 있어 vertex 총량은 여전히 컸다.
+이 변경은 청크 밖 정점의 중복 생성과 장거리 선의 전 셀 순회를 줄이는 것이며, 단일
+복잡 geometry의 GEOS triangulation 자체에 대한 별도 상한은 아직 없다.
+
+2026-10-01 Apple M3에서 desktop read-only loader를 `-benchmem -benchtime=1s
+-count=1`로 재측정했다. 10K synthetic GeoJSON load는 19.65 ms, 50K load는
+88.78 ms였다. 50K read-only preview 경로는 198.2 ms/op, 첫 preview callback까지
+113.1 ms, 647 KB/op 및 14,159 allocs/op이었다. 처음에는 preview용 세션을 닫고
+windowed runtime이 같은 파일을 다시 열었다. preview와 viewport runtime이 하나의
+`AttributeSession`을 소유권 이전 방식으로 공유하도록 바꾸어 재개방/재파싱을
+제거했다. 동일 호스트의 후속 `-benchtime=1s -count=3` 결과는 89.4–93.5 ms/op,
+첫 callback까지 88.8–92.9 ms, 647 KB/op, 14,152–14,152 allocs/op이다. 단일 회차
+초기값과 반복 3회 후속값의 비교이므로 방향성만 참고하며, 실제 SHP의 공간 인덱스,
+Qt frame presentation, 세종 데이터 GUI 반응성과는 구분한다. GUI pan/zoom과 peak
+RSS 측정은 사용자 후속 검증 목록에 남아 있다.
+
+## PROJ visualization axis-order 회귀 및 성능 확인
+
+EPSG:5179/5186의 authority axis order는 Northing/Easting이지만 core/WKT와
+GDAL/지도 좌표 계약은 XY=Easting/Northing이다. Geometry 변환은 기존에 source/target이
+EPSG:4326인지 여부만 수동 보정하고 projected target axis는 그대로 반환해, 해당 두
+projected CRS에서 geometry 좌표가 bounds의 visualization-normalized 좌표와
+뒤바뀌었다. `Transform`/`TransformLayers`/`TransformBounds`가 공유하는 pipeline을
+`NormalizeForVisualization`으로 만들고 WKT/WKB 모두 XY visualization order로
+변환하도록 통일했다. EPSG:4326 `POINT (127 37)` 회귀는 EPSG:5179
+`(955511.809285, 1889174.174347)`, EPSG:5186 `(200000, 489012.955691)`을
+검사하며, degenerate point bounds가 geometry 좌표와 2 cm 안에서 일치하는지도
+검증한다. 이 tolerance는 현재 PROJ operation의 수치 회귀 기준이며 datum의 실제
+정확도 보증은 아니다. 독립 QGIS 비교는 사용자 후속 확인으로 남겼다.
+
+수정 후 Apple M3 native WKB 10K 변환 benchmark를 `-benchmem -benchtime=1s
+-count=3`으로 실행했다:
+
+| Geometry | Time / 10K | Bytes / 10K | Allocations / 10K |
+| --- | ---: | ---: | ---: |
+| Point | 0.768–0.771 ms | 1.264 MB | 10,010 |
+| 2-point LineString | 1.230–1.237 ms | 2.063 MB | 10,013 |
+| 5-point Polygon | 2.447–2.505 ms | 4.074 MB | 10,017 |
+
+이 값은 axis-order 수정 후 성능 기준이다. 이전 기록의 WKB point 약 0.84 ms와
+비교해 눈에 띄는 저하는 관찰되지 않았지만, benchmark run 조건이 완전히 같지 않으므로
+이를 수정에 따른 성능 향상으로 해석하지 않는다. `go test -tags native
+./drivers/proj` 및 저장소 전체 검증이 통과했다.
+
+## Materialized snapshot 상한
+
+viewport 기반 read-only FeatureCollection 로딩은 streaming/index 경로를 사용하지만,
+공용 `Reader.Open`/`OpenAll` API와 편집용 snapshot은 core layer 전체를 메모리에
+보관한다. 이 경로들이 대용량 파일에서 OOM으로 프로세스를 종료시키지 않도록
+feature 100,000개 또는 추정 payload 128 MiB 중 먼저 도달하는 지점에서 중단한다.
+GeoJSON FeatureCollection은 먼저 bounded streaming scan으로 개수와 구조를 확인한
+뒤 snapshot 허용량 안에서만 materialize하며, 일반 GDAL layer도 FeatureCount를
+사전 확인하고 읽기 중 누적량을 제한한다. 이 제한은 read-only viewport session의
+별도 가상화/index budget에는 적용하지 않는다. 한도를 넘는 데이터는 일반 snapshot
+API에서 명시적으로 오류를 내므로, UI/호출자가 viewport session 또는 indexed source를
+사용하도록 안내한다. GeoJSON snapshot은 materialization 전 단일 feature 원문도
+8 MiB로 제한한다. 이는 좌표/property 파싱 전에 큰 JSON object가 메모리를 급증시키는
+것을 막기 위한 snapshot 전용 제한이며, viewport streaming 경로는 기존 64 MiB per-feature
+scanner 한도를 유지한다. property payload 예산은 중첩 object/array의 key, container 및
+값 비용까지 재귀적으로 포함한다. `TestReaderOpenRejectsOversizedGeoJSONSnapshot`은
+100,001개 feature 입력, `TestGeoJSONSnapshotRejectsOversizedSingleFeatureBeforeGeometryDecode`
+는 단일 oversized feature가 materialize 전에 거부되는지 확인한다.
+
+추가 검토에서 같은 snapshot 한도가 일반 `Reader` 진입점에는 적용되지만, 재사용
+`AttributeSession.OpenAllGeometryOnly` 및 `OpenGeometryOnly`의 GeoJSON 경로는 제한 없는
+window scan을 사용하고 GDAL 단일-layer 경로는 unbounded reader를 호출하던 누락을 찾았다.
+세션 geometry-only API를 모두 기존 100,000 feature/128 MiB snapshot 경계에 연결했다.
+100,001-point GeoJSON 회귀 테스트가 두 세션 API 모두 snapshot-limit 오류를 반환하는 것을
+확인했으며 `go test -tags native ./drivers/gdal`이 통과했다. 실제 viewport rendering은
+세션 snapshot 대신 bounded spatial-window API를 사용하므로 이 변경은 대용량 자료를
+전체 materialize하지 않고, 비-windowed 전체 snapshot을 명확히 거부한다.
+
+Spatial window 입력 검증도 finite 좌표를 요구하도록 강화했다. 기존 순서 비교는 NaN을
+거부하지 않아 envelope 교차 판정에서 비교 결과가 모두 false가 되고, 의도한 공간 필터가
+사실상 전체 feature를 통과시키는 입력이 될 수 있었다. Reader와 재사용 세션은 데이터셋을
+열거나 읽기 전에 NaN/±Inf 및 역전된 bounds를 거부하며, 회귀 테스트에서 NaN이 source open
+보다 먼저 실패하는 것을 확인한다.
+
+WKB materialization 직전에는 로컬 godal 패치의 `WKBWithMaxSize`를 사용해 정확한 OGR WKB
+크기를 native 코드에서 계산하고, 출력용 `malloc` 전에 8 MiB 초과 geometry를 거부한다.
+기존 `WKB()` API는 그대로 두고 bounded export API를 추가했으며, 일반 GDAL reader와 GeoJSON
+stream 경로가 모두 이 상한을 공유한다. 회귀 테스트는 8 MiB보다 큰 LineString을 native
+geometry로 만든 뒤 export 결과 buffer 없이 상한 오류를 받는지 확인한다. 로컬 패치는
+`third_party/godal`에 upstream v0.0.18 Apache-2.0 저작권/라이선스와 비교용 README를 유지한다.
+
+또한 `Reader.OpenWindow`, `AttributeSession.OpenWindow`, `GeometrySession.OpenWindow`의 기본
+호출에 100,000 feature/128 MiB 예산을 연결했다. 이전에는 기본 convenience API가 두 제한을
+모두 해제해 넓은 window가 백만 feature를 한 번에 보관할 수 있었다. 한도 초과는 truncation
+대신 오류이며, `OpenWindowWithLimits`로 명시한 0 값은 기존처럼 해당 예산을 해제한다.
+100,001-point 회귀 fixture로 AttributeSession과 Reader geometry-only 기본 경로 모두 오류를
+내는지 검증한다.
+
+대용량 입력과 별개로 속성 페이지 API가 호출자 지정 `limit`을 slice capacity로
+사용하던 점도 allocation DoS/정수 overflow 경로가 될 수 있었다. GDAL reader/session과
+project attribute API는 페이지 크기를 최대 1,000행으로 제한하며, desktop page index를
+offset으로 바꾸기 전에 곱셈 overflow를 검사한다. 페이지 끝 계산은 `offset+limit`을
+먼저 수행하지 않도록 고쳤다. 일반/최대/초과 limit 및 `MaxInt` page offset 회귀 테스트를
+추가했다.
+
+Apple M3에서 별도 1회 실행한 synthetic 1,000,000-point FeatureCollection desktop
+read-only benchmark는 약 1.49 s load, 260 MiB process peak RSS, 61.36 MiB retained
+Go heap, 67.8 ms first viewport window(3,969 features)를 기록했다. 같은 데이터의
+streaming-only window query는 약 1.40 s, 50.4 MiB peak RSS였다. 이는 synthetic point
+fixture의 한 번 실행한 수치이며 복잡한 실측 cadastral geometry, Qt frame latency,
+대한민국 전역 데이터의 상한 보증으로 일반화하지 않는다.
+
+## Qt scene-graph buffer 실패 방어
+
+첨부 crash report 상단은 `EXC_CRASH (SIGABRT)`이며 실제 crashed thread는
+`CVDisplayLink`다. 해당 thread의 native stack은 `runtime.raise_trampoline`에서
+`raise(SIGABRT)`로 끝나고 Go panic 원인 문구나 OOM/jetsam 표시는 없다. 같은 report의
+별도 `QSGRenderThread` stack은 snapshot 시점에
+`GoGISMapCanvas::updatePaintNode`의 vertex-conversion lambda 안에 있지만, 그 thread는
+crashed thread로 표시되지 않았고 crash register state/fault address도 제공되지 않는다.
+그러므로 이 자료만으로 renderer의 null write, invalid-memory access 또는 OOM을 결론 내릴
+수 없다. 첨부 실행 파일과 현재 checkout binary identity도 확인되지 않았다.
+
+별도 코드 검토에서는 renderer의 geometry allocation 경로에 명시적 정점 상한과 allocation
+반환 pointer 검사가 부족한 것을 확인해 예방 방어를 추가했다. 이 수정은 합리적인 안전성
+강화지만 SIGABRT 원인을 특정하거나 해당 crash를 재현·해결했다는 증거는 아니다.
+
+Go→C++ 입력 batch도 최대 4,194,304 source vertices(약 80 MiB native copy)로
+제한해 Qt scene graph가 변환하기도 전에 C++ vector가 임의로 커지지 않도록 했다.
+초과 batch는 이전 native batch를 해제하고 오류 상태를 전달한다. scene-graph output은
+최대 8,388,608 vertex(최대 96 MiB `ColoredPoint2D` vertex storage)로 제한하고,
+Qt API의 `int` 표현한도도 유지한다. 할당 이후 null pointer를
+검사하고, 각 write에서 index를 output capacity와 비교하며, 생성 개수와 사전 계산치가
+다르면 geometry를 비우고 오류 상태를 보고한다. 초과 시 전체 프로세스가 거대한
+scene-graph allocation을 시도하지 않고 해당 render batch를 거부한다. `build.sh
+all-native`, `go test -tags 'qt native' ./cmd/gis-desktop`, QML tests 및 실제 세종
+read-only source integration은 통과했지만, native bridge vertex-boundary test만으로 C++
+allocator failure injection이 되지는 않으며 사용자 GUI의
+동일 scene-graph crash 재현은 아직 수행하지 않았다.
+
+입력 feature/WKB 예산 뒤에 남아 있던 Go 렌더 확장도 chunk당 최대 2,097,152 `render.Vertex`
+(약 40 MiB)를 넘지 않도록 제한했다. line/point source builder는 정확한 preallocation hint가
+상한을 넘으면 초과 chunk를 만들지 않고 그 chunk build 시 명시적 오류를 반환한다.
+polygon fill은 capacity estimate, 실제 triangle append, stroke+fill 결합 결과에서 같은
+상한을 확인하므로 부분 mesh를 BatchStore/Qt로 publish하지 않는다. WKB LineString 회귀는
+한 chunk 안에 1,048,578개 좌표를 넣어 cap을 넘겼을 때 bounded error가 나는지 검사한다.
+실제 세종 read-only 테스트의 735,647 vertex chunk는 새 상한 안에서 여전히 통과했다.
+
+chunk별 상한만으로는 편집 가능한 전체 데이터에서 화면 밖 모든 cell의 `fillByCell` mesh가
+누적될 수 있어 충분하지 않다. materialized 프로젝트 전체의 polygon fill mesh 합계에도
+8,388,608 `render.Vertex` capacity slot(명목상 약 160 MiB) 상한을 두고, capacity estimate의
+합을 slice 할당 전에 검사하며 실제 triangle append 때 각 backing array의 capacity 증가도
+누적 검증한다. 길이뿐 아니라 두 배 growth에 따른 spare capacity도 예산에 포함한다. 각
+`LayerSource`가 자기 fill 정점 길이와 capacity를 보유하므로 레이어 재빌드 시 기존 다른
+레이어의 사용량도 프로젝트 budget에서 차감한다. budget 초과 시 전체 mesh 준비를 명시적 오류로 중단하며 부분 mesh는 source로
+publish하지 않는다. 작은 예산으로 두 번째 레이어가 잔여량을 넘는 테스트가 통과했다. 이
+제한은 retained Go mesh를 제한하지만, GEOS가 하나의 feature를 triangulate하는 동안 만드는
+임시 native/result geometry의 정확한 byte 상한은 아니다.
+
+단일 feature의 GEOS triangulation 진입에도 complexity gate를 추가했다. WKB 입력은 최대
+8 MiB, WKB structural decoder budget은 좌표·ring·child 합계 1,000,000 elements이며,
+triangulation 대상 WKB는 coordinate tuple 최대 250,000개로 추가 제한한다. WKT 입력은
+1,000,000 bytes까지 허용하고, 반환하는 Go `Triangle` 결과도 최대 250,000개다. WKB
+`PointCount`는 이전에 좌표만 세어 작은 payload의 빈 ring/child 집합이 비용 제한을
+우회하던 점을 수정해 같은 구조 요소 budget을 검증한다. 과한 입력은 GEOS parse/triangulation
+전에 명시적으로 거부한다. 이 상한은 입력 복잡도와 Go 결과 보유량을 제한하는 것이며 GEOS
+native allocator의 정확한 byte quota 또는 전체 프로세스 RSS 상한은 아니다. 회귀 테스트는
+초과 WKB/WKT와 1,000,001 empty ring 입력이 bounded error를 내는지 확인한다.
+새 project-accounting 경로의 동일 10K convex synthetic benchmark는 Apple M3에서 1회
+실행당 약 2.97 ms, 297 ns/feature, 1.32 MB/op, 62 allocs/op이었다. 직전 기록의
+1.31 MB/op·270 ns/feature·56 allocs/op와 비교하면 계수 bookkeeping 비용이 보이지만,
+각 결과는 단일 실행이며 변동과 코드 경로 차이를 포함하므로 회귀 크기로 확정하지 않는다.
+
+## 반복 viewport 이동 시 렌더 캐시 회수
+
+반복 패닝 경로를 다시 살펴보니 viewport 밖 chunk는 map에서 지우고 있었지만 Go map의
+bucket 배열은 그대로 남을 수 있었고, `orderedVerts`의 잘린 backing array도 이전 chunk의
+vertex slice를 계속 참조할 수 있었다. 방문한 공간 셀 수가 누적되면 현재 화면에 보이지
+않는 geometry가 메모리에 남을 수 있는 구조였다. viewport 갱신 때 보이는 키만으로
+`BatchStore`의 map/index를 재구성하고, 이전 ordered-slice backing arrays의 모든 포인터를
+clear한다. Scheduler cache도 같은 방식으로 보이는 chunk만 새 map에 담아 교체한다.
+명시적인 빈 viewport는 모든 chunk와 geometry 참조를 비운다. 기존 variadic API에서
+visible 인수를 생략하는 동작은 호환성을 위해 그대로 유지하고, 화면 갱신 호출부는
+빈 목록과 생략을 구분하는 명시적 API를 사용한다.
+
+회귀 테스트는 100개의 서로 다른 viewport key로 이동하면서 BatchStore/Scheduler의
+논리적 엔트리 수가 현재 화면 범위에 머무는지, truncate한 slice 뒤의 geometry 참조가
+clear되는지, 빈 viewport에서 모두 비워지는지 확인한다. `go test -race ./internal/render`
+및 전체 `scripts/verify.sh`가 통과했다. 실제 세종 SHP 통합 테스트도 재실행해 연속지적도
+첫 유효 bucket-4 창(8,962 features, 735,647 vertices), 도근점(1 feature, 2 vertices),
+결합 프로세스 peak RSS 155 MiB를 확인했다. RSS는 단일 테스트 프로세스 측정이며 GUI/GPU
+전체 메모리나 전국 자료의 상한 보증은 아니다.
+
+## Flatten 전 viewport vertex 총량 상한
+
+chunk별 vertex cap과 C++ input cap만으로는 충분하지 않았다. 여러 청크 각각은 허용량
+이내여도 `BatchStore.CurrentIntoVersion`이 화면 전체 vertex를 하나의 Go slice로 먼저
+평탄화하므로 native bridge의 4,194,304 vertex 검사에 도달하기 전에 큰 임시 allocation이
+가능했다. `render.MaxBatchVertices`를 Go/native 공통 계약으로 두고 BatchStore가 chunk
+적용 시 교체를 반영한 viewport 총량을 먼저 검사한다. 초과 청크는 기존 batch를 변경하지
+않고 명시적 오류를 반환하며, Qt 렌더 진행 상태에도 incomplete/error로 전달한다.
+같은 키의 chunk 교체는 이전 vertex 수를 차감한 뒤 검사해 정상적인 갱신을 허용한다.
+
+회귀 테스트는 작은 테스트 한도를 사용해 기존 chunk를 보존한 채 aggregate 초과를 거부하고,
+동일 키 교체는 한도 안에서 처리되는지 확인한다. native bridge는 Go 상수 경계를 직접
+사용한다. C++ scene-graph input guard도 동일한 4,194,304 값으로 유지한다.
+
+추가로 layer마다 따로 적용되던 65,536 chunk planner cap은 다중 layer 화면에서 합산
+상한이 아니어서, 매우 많은 visible layer가 key slice/dedup map을 크게 만들 수 있었다.
+`VisibleKeysIntoLimit`가 레이어를 합친 총량을 사전 검사하며, desktop은 viewport당 최대
+65,536 key를 넘으면 이전 request를 취소하고 과도한 계획을 실행하지 않는다. 모든 desktop
+렌더 경로에서 각 viewport 갱신 시 Scheduler cache를 visible keys로 교체해, read-only가
+아닌 일반 materialized-source 렌더에서도 과거 패닝 chunk를 계속 보유하지 않는다. Scheduler의
+`Request`/`RequestUnique`도 같은 입력 상한을 builder 실행 전 검사한다. 재사용 key buffer는
+수용량을 상한으로 제한하고 반환 시 layer-string 참조를 clear한다. planner overflow,
+oversized scheduler request, key-buffer capacity/reference 정리 회귀 테스트를 추가했다.
+
+Scheduler chunk cache도 key 수만 제한하면 고밀도 창에서 큰 geometry payload가 누적될 수
+있으므로, 저장하는 immutable vertex의 총량을 viewport batch와 같은 4,194,304개로 제한한다.
+동일 키 replacement, viewport `RetainOnly`, layer invalidation 모두 vertex accounting을
+갱신하며 상한을 넘는 결과는 cache하지 않는다. rejected replacement의 예전 key 결과도
+제거해 낡은 geometry가 재사용되지 않도록 했다.
+
+## 1M GeoJSON Point bbox scanner 최적화
+
+Apple M3의 1M GeoJSON desktop loader가 약 5.08M allocation / 448 MB cumulative allocation을
+기록해 profile 경로를 조사했다. Go 1.27 설치에는 `go tool pprof`가 포함되지 않아 CPU/heap
+profile을 직접 분석할 수 없었지만, 코드 inspection상 모든 Point geometry bbox 계산이
+`json.Unmarshal`로 매 feature마다 좌표 slice tree를 materialize하고 있었다. 보편적인
+compact 2D Point를 위한 lexical fast path를 추가해 nested slice 할당을 제거했고, 다른
+geometry, 3D Point, escaped member name과 fast-path에 확신이 없는 입력은 기존 validating
+decoder로 fallback한다. malformed/trailing JSON, geometry collection, 표준 nesting 및
+3D fallback 회귀 테스트를 추가했다.
+
+같은 Apple M3의 `BenchmarkGeoJSONGeometryBoundsPoint -benchmem -benchtime=200ms -count=3`
+결과는 기존 방식 503–511 ns/op, 120 B/op, 5 allocs/op에서 285–286 ns/op, 16 B/op,
+1 alloc/op으로 바뀌었다. 동일 1x desktop 1M synthetic benchmark도 약 1.44 s에서 1.21 s,
+448 MB/5.08M allocations에서 336 MB/1.08M allocations로 감소했고, 관측 peak RSS는
+273.5 MiB에서 226.7 MiB였다. 두 RSS 측정은 한 번 실행이라 변동성이 있으며, synthetic
+point 자료에 한정된다. 복잡 polygon, Qt/GPU frame latency와 전국 실자료 안전성의 증거는
+아니다.
+
+복잡한 line/polygon의 metadata bbox 계산도 이전에는 JSON 좌표를 전부 다중 중첩 Go slice로
+decode했다. 이제 token-stream traversal로 bbox만 계산하고 Feature/GeometryCollection당
+최대 1,000,000 coordinate position에서 명시적으로 중단한다. 이는 인덱스 구축 중 큰 단일
+geometry가 coordinate-slice overhead로 RSS를 급증시키는 것을 막으며, 상한 초과 geometry는
+부분 범위로 조용히 생략하지 않고 dataset scan 오류로 거부한다. 1M Point loader를 다시
+실행했을 때 allocation은 336 MB/1.08M 수준으로 유지됐다. 단일 실행 peak RSS는 252 MiB로
+앞의 226.7 MiB와 달라, process high-water mark 비교는 반복 실행 없이는 확정적인 향상으로
+해석하지 않는다.
+
+## GeoJSONSeq 1M bounded streaming
+
+이전 `.geojsonl`/GeoJSONSeq import가 GDAL의 전체 sequence 경로에서 peak RSS 약 7.5 GiB를
+보인 문제를 줄이기 위해, newline-delimited 또는 RFC 8142 record-separator 형식을 한 record씩
+검증·처리하는 bounded reader를 추가했다. 단일 record는 기존 64 MiB feature 상한을 넘을 수
+없고, viewport 결과·properties page·선택 feature는 각각 제한된 양만 materialize한다. 인덱스는
+최대 1M record로 제한하며 원본 파일의 크기·수정 시각 stamp가 바뀌면 재사용하지 않는다.
+정의되지 않은 여러 Feature를 한 줄에 이어 붙이는 형식은 지원하지 않는다.
+
+Apple M3에서 `BenchmarkDesktopReadOnlyLoadGeoJSONSeq1M -benchmem -benchtime=1x`는 1,000,000
+feature, 약 809 ms/op, 첫 viewport window 약 25.4 ms, process peak RSS 226.1 MiB,
+retained heap 49.2 MiB, cumulative allocation 343.8 MB/3.08M allocations로 측정됐다.
+같은 synthetic benchmark는 이전에 GDAL sequence 경로에서 약 7.5 GiB peak RSS를 기록했다.
+따라서 관측 peak는 크게 낮아졌지만, 전체 scan의 CPU/allocation 비용은 존재하며 RSS는 단일
+실행의 process high-water mark다. 이 결과는 synthetic GeoJSONSeq Point 데이터에 한정되고,
+복잡한 geometry, 다른 OS, 전국 SHP/GeoPackage, 전체 편집 모드나 Qt/GPU 자원 사용의 상한을
+보증하지 않는다.
+
+2026-10-01 현재 checkout에서 GeoJSON FeatureCollection과 GeoJSONSeq 1M desktop loader를
+각각 다시 1회 측정했다. FeatureCollection은 1.245 s, 첫 viewport 27.4 ms, process peak RSS
+201.5 MiB, retained heap 49.23 MiB, cumulative allocation 344.8 MB/3.08M allocations였고,
+GeoJSONSeq는 0.786 s, 첫 viewport 15.0 ms, process peak RSS 237.9 MiB, retained heap
+49.23 MiB, cumulative allocation 343.8 MB/3.08M allocations였다. 이전 GeoJSONSeq 단일 실행의
+peak RSS 226.1 MiB와 차이가 있으므로 RSS 값은 안정된 상한이나 성능 회귀로 단정하지 않는다.
+Go heap/allocation은 두 형식에서 유사하지만 process RSS에는 GDAL/native runtime 및 allocator
+영향도 포함된다. 두 입력 모두 synthetic point fixture이며 실제 세종 polygon GUI 렌더링의
+안전성 증거가 아니다.
+
+전체 레이어 렌더 API는 임의의 `chunkSize`를 받아 normalized unit square 전체를 순회하므로,
+매우 작은 양수 chunk size 하나만으로도 지나치게 많은 격자 셀을 열거할 수 있었다. 전체 격자를
+구축하는 호출에는 축당 최대 256셀(최대 65,536셀) 제한을 적용하고, 더 세밀한 값은 입력을
+거부한다. 반면 화면에서 요청한 단일 청크만 만드는 viewport 경로는 전체 격자를 순회하지
+않으므로 이 제한을 적용하지 않는다. 회귀 테스트는 전체 레이어의 1e-9 chunk size가 거부되고
+같은 크기의 단일 청크 요청은 허용되는지 확인한다.
+
+Lua label 비활성 조건의 반복 이동 스트레스 테스트 `GOGIS_TEST_REPEATED_VIEWPORT_1M=1`은
+동일한 Apple M3에서
+1M GeoJSON FeatureCollection의 128 viewport 이동을 완료했다. 총 1,952 feature hit,
+process peak RSS 198 MiB, 실행 시간 약 1.72초였고 매 이동 후 viewport key/chunk/feature/payload
+카운터 상한도 통과했다. 이는 synthetic Point fixture에서 cache가 과거 viewport를 계속 붙들지
+않는다는 근거이며, 연속지적도급 복잡 polygon, GPU scene graph, 실제 GUI 상호작용의 검증은 아니다.
+
+GeoJSONSeq 레코드 경계에 대한 별도 Go fuzz target은 잘린 JSON, 임의 바이트, LF/RS 조합을
+포함해 30초 동안 약 19,500개 입력을 실행했고 panic/crash 없이 통과했다. 이는 parser 입력
+안전성의 일부 검증이며, 64 MiB 상한까지의 worst-case 메모리/시간 측정이나 GDAL/C++ 경계
+fuzzing을 대체하지 않는다.
+
+1M GeoJSON read-only viewport stress test를 Lua label rule `return feature.name`이 활성화된
+상태로도 128회 패닝했다. 1,952 visible feature와 동일 수의 Lua label을 계산했고, peak RSS는
+약 193 MiB, 실행은 1.71초였다. 각 이동 후에도 viewport key/chunk/feature/payload 상한을
+통과했다. 이 시험은 전체 1M label evaluation이 아니라 1M 데이터에서 반복된 visible-window
+label 작업을 검증한다. 별도 scripting benchmark는 1M composer evaluations를 1.42초에
+수행했지만 geometry, label object, Qt/GPU 비용은 포함하지 않는다.
+
+## 1M GeoPackage / Shapefile viewport 비교
+
+Apple M3에서 동일한 synthetic 1M Point population을 GeoPackage RTree 및 Shapefile QIX로
+변환한 후 실제 read-only desktop loader를 한 번씩 측정했다. GeoPackage는 첫 viewport 약
+7.7 ms, isolated loader child peak RSS 69 MiB였고, QIX Shapefile은 약 9.4 ms / 82 MiB였다.
+같은 Shapefile에서 `.qix`를 제외하면 첫 viewport는 약 102 ms로 약 11배 느렸으며 child peak
+RSS는 82 MiB였다. 전체 timed loader는 각각 약 13 ms, 16 ms, 108 ms였다. 측정은 fixture
+generation을 제외하고 loader를 timed region에서 실행하며, 각 수치는 단일 실행이다. 따라서
+대형 SHP의 권장 운영 조건으로 `.qix` sidecar 존재 여부를 확인하고, 없을 때는 성능이 저하될
+수 있음을 UI/문서에서 안내할 근거가 된다. `.qix` 생성 자체의 비용과 실제 세종 polygon 자료는
+이 synthetic point benchmark로 검증된 것이 아니다.
+
+## 손상된 WKB의 메모리/재귀 상한
+
+보안 점검 중 WKB `PointCount()`의 안전성 검사가 `Parts()`/`WKT()` 디코더와 좌표 mapper에는
+적용되지 않는 경로를 발견했다. 작은 payload의 ring/child/point count를 그대로 slice 길이로
+쓰거나 깊게 중첩된 GeometryCollection을 재귀 처리할 수 있었다. 디코더는 이제 byte length로
+count를 사전 검증하고, 재귀 깊이를 64로 제한하며, 하나의 geometry decode에서 ring/child/point
+요소 총량을 1,000,000으로 제한한다. `MapWKBXY`와 `MoveWKBVertex`에도 같은 재귀 깊이 상한을
+적용했다. 4GB claim count, 65단계 collection, 1,000,001 empty ring 회귀 입력은 큰 할당 전에
+오류로 거부되며, 일반 core/render 테스트와 WKB decoder fuzz 검증을 실행했다.
+
+GeoJSON geometry 검사에서는 GeometryCollection 자식들을 `[]json.RawMessage`로 만들기 전에
+token-stream preflight를 수행해 전체 컬렉션 자식 수를 최대 100,000개로 제한한다. Point/일반
+좌표 geometry는 기존 빠른 경로를 유지하며, GeoJSON의 합법적인 `\\u` 이스케이프된 type 값도
+preflight 탐지를 우회하지 않도록 한다. 좌표 1,000,000개 및 GeometryCollection 깊이 64 상한과
+함께 대형 단일 피처의 OGR geometry allocation 증폭을 제한한다. escaped type과 100,001개 빈
+child 회귀 입력이 배열 materialization 전에 오류 처리되는 native 테스트가 통과했다.
+
+## 중첩 feature 속성의 메모리 추정 순회 제한
+
+GDAL feature의 payload 크기를 합산하는 경로가 `[]any`/`map[string]any`를 재귀적으로
+순회했다. 깊은 값은 Go stack을 불필요하게 키울 수 있고, 순환 참조가 유입되면 무한 순회할 수
+있어 반복형 순회로 바꾸고 최대 1,048,576개 property node에서 포화 추정치로 중단한다.
+50,000단계 nesting과 순환 map 회귀 테스트가 native GDAL 테스트에서 통과했다. 일반 GDAL
+디코더가 순환 map을 생성한다는 뜻은 아니며, 이 방어는 payload accounting 경계가 임의 깊이와
+비정상 object graph에 취약하지 않도록 한다.
+
+## 속성 페이지 aggregate payload 상한
+
+페이지당 feature 수(최대 1,000)와 feature당 속성 크기(최대 8 MiB)만 제한하던 경로는 최악의
+경우 페이지 하나에 수 GiB를 누적할 수 있었다. GeoJSON/GeoJSONSeq indexed·streaming 경로와
+OGR SQL/fallback/cursor 페이지 경로 모두 feature를 결과에 추가하기 전에 추정 payload를 누적하고,
+페이지 전체가 128 MiB를 넘으면 오류를 반환한다. 기존 per-feature cap은 그대로 유지해 단일 값
+복사량도 제한한다. 누적 byte budget을 초과하면 초과 feature를 결과에 추가하지 않는 단위 테스트와
+각 reader 경로의 기존 attribute-page 회귀 테스트가 통과한다.
+
+속성 JSON은 8 MiB 이내라도 아주 많은 짧은 object key/value가 map metadata를 수십 배로 늘릴 수
+있다. 일반적인 작은 속성 payload에는 비용을 더하지 않도록 큰 JSON 또는 깊은 구조만 `json.Unmarshal`
+전에 token-stream으로 검사하고, key/value/container를 합쳐 최대 100,000 node와 최대 128 nesting
+depth로 제한한다. 50,001개 key 및 과도한 nesting fixture는 map materialization 전에 거부된다.
+
+속성표 페이지 캐시도 개수만 제한하면 페이지당 payload 상한(128 MiB) 때문에 이론상 1 GiB 이상을
+유지할 수 있었다. 캐시를 최대 8개 및 총 32 MiB로 제한하고, 개별 payload가 byte cap보다 크면
+캐시에 보관하지 않으며, 합산 초과 시 오래된 항목부터 제거한다. 큰 페이지도 한 번 표시할 수는
+있지만 이전 큰 페이지가 계속 쌓이지 않도록 하는 보호다. 페이지를 JSON으로 만들기 전에는
+HTML/control-character escaping 확장과 nested value 구조를 포함한 보수적 크기 추정을 수행하고,
+16 MiB 초과 시 `json.Marshal` 및 Qt bridge 복사를 건너뛴다. 따라서 단일 페이지 직렬화 과정도
+큰 escape expansion으로 C++/QML 쪽 복사본이 급증하지 않게 제한한다.
+
+## Read-only window 속성 payload 계량
+
+read-only viewport의 runtime payload 검사가 최상위 문자열/바이트 값만 세어 중첩 JSON
+배열·객체의 실제 크기를 누락했다. 속성별 추정도 반복형 node-budget 순회로 바꿔 중첩
+컨테이너를 계량하고, 65,536 node 초과 또는 payload budget 초과 시 포화값을 반환한다.
+대형 nested string과 순환 map 테스트가 통과한다. GDAL reader의 별도 제한을 대체하지 않고,
+runtime 경계에서 driver가 달라도 같은 payload budget이 적용되도록 하는 방어다.
+
+추가 검토에서 property 추정기가 순회 횟수만 제한하고 `[]any`/map의 전체 자식을 작업 slice에
+한 번에 추가할 수 있음을 확인했다. 최대 pending node 수도 65,536으로 제한하고 초과 시 즉시
+포화값을 반환하도록 해, 거대한 폭의 컨테이너를 추정하는 과정에서 임시 작업 메모리가 급증하지
+않게 했다. wide slice/string-slice/map 테스트와 race 테스트를 추가했다.
+
+## GeoJSON spatial index 상한 초과 시 partial-index tail scan
+
+GeoJSON FeatureCollection과 GeoJSONSeq는 최대 1,000,000개 offset/bounds entry를 메모리에
+유지한다. 이전에는 다음 feature에서 cap을 넘으면 prefix index까지 버리고 이후 viewport마다
+전체 파일을 재파싱했다. Apple M3 단일 실행에서 1,000,001-feature GeoJSON의 첫 창이 1,099 ms,
+loader가 3.434 s였다. 이제 bounded prefix를 유지하고, index에 없는 suffix만 순차 파싱한다.
+GeoJSONSeq는 newline/RS record 경계에서 같은 방법으로 suffix를 스캔한다. Tail의 feature ID는
+prefix 길이 뒤의 원본 순번을 유지하며, feature 조회/attribute page가 index 밖이면 정확성을 위해
+streaming fallback을 사용한다.
+
+Suffix 순차 스캔은 viewport가 tail과 거의 겹치지 않아도 tail 길이에 비례하는 비용이 남는다.
+이를 줄이기 위해 tail을 최대 4,096 feature 단위의 연속 byte-range block으로 나누고 각 블록의
+feature bounds union을 저장한다. viewport bounds와 교차하지 않는 블록은 파일에서 읽지 않는다.
+요약 블록 수는 32,768개로 제한하고, cap 초과 시 인접 블록을 계층적으로 합쳐 메모리를 제한한다.
+상세 prefix index는 항목 수뿐 아니라 Go slice의 backing-array capacity도 설정된 feature cap을
+넘지 않도록 용량 증가를 직접 제어한다. 따라서 마지막 성장 단계의 자동 capacity over-allocation이
+인덱스 메모리 예산을 초과하지 않는다.
+FeatureCollection과 GeoJSONSeq 각각에서 비교차 블록을 건너뛰고 마지막 블록의 ID/offset을
+검증하는 회귀 테스트를 추가했다.
+
+회귀 테스트는 partial index가 있는 두 포맷의 tail window와 tail feature/attribute lookup을
+검증한다. 재측정에서 1,000,001-feature GeoJSON 첫 창은 26.07 ms(전체 1.252 s, process peak
+RSS 232.6 MiB), GeoJSONSeq 첫 창은 26.32 ms(전체 0.792 s, peak RSS 164.8 MiB)였다. 이는
+각각 단일 synthetic Point 실행이다. Prefix index 자체는 1M entry로 제한되며, 이 cap 이후의
+suffix는 bounded spatial block summary를 이용해 비교차 범위를 건너뛴다. 다만 넓은 viewport,
+공간적으로 뒤섞인 feature 순서, 또는 block summary cap으로 합쳐진 범위가 많으면 더 많은 tail을
+읽는다. 메모리/CPU 상한이나 10M 이상 데이터의 응답성 보장은 아니다.
+
+1,000,000 prefix + 100,000 tail synthetic Point benchmark는 Apple M3 단일 실행에서 검사 1.369 s,
+첫 window 30.59 ms, process peak RSS 222.8 MiB, retained heap 49.2 MiB를 보였다. 이는 공간적으로
+연속된 입력에서 block skip 경로가 동작하는 증거이지, 반복 실행 통계나 무작위/대한민국 전역 자료의
+성능 보장은 아니다.
+
+인덱스 cap 이후 `OpenFeature`도 전체 파일을 처음부터 스캔하던 경로를 tail block의 ordinal 이진
+탐색으로 바꿨다. 요청한 feature가 속한 block만 읽어 최대 4,096 tail feature를 훑고, 마지막
+feature에서는 block byte end도 검증한다. Apple M3 1.1M GeoJSON(1M prefix +100K tail)의 마지막
+피처 반복 lookup은 3회 실행 묶음에서 1.43–1.72 ms/op, 1.05 MB/op, 27 allocs/op였다. Source
+inspection은 benchmark timed region 밖이다. 이 수치는 warm local file cache 환경이며, 첫 검사나
+실제 storage latency를 포함하지 않는다.
+
+같은 1.1M 규모에서 tail 입력 순서를 결정적 affine 순열로 섞는 benchmark도 추가했다. Apple M3
+3회 실행에서 첫 window는 130.9–140.4 ms, 전체 load/index는 1.465–1.516 s, GC 후 retained heap은
+49.3 MiB였다. 무작위 tail에서는 각 4,096-feature block의 bbox가 넓은 영역을 덮어 비교차 block을
+적게 건너뛰므로 정렬 데이터보다 첫 window가 약 4배 느렸다. RSS 값(232.9–263.5 MiB)은 한 Go
+benchmark 프로세스에서 세 반복을 수행하며 `getrusage` peak가 누적된 수치여서 반복별 독립 peak로
+해석하면 안 된다. 이 결과는 대략 1.1M 입력의 처리 가능성을 보여줄 뿐, 10M 이상이나 넓은 viewport의
+latency 보장은 아니다.
+
+별도 새 프로세스에서 shuffled benchmark를 한 번 더 실행했을 때 전체 1.478 s, 첫 window 141.0 ms,
+process peak RSS 212.3 MiB, retained heap 49.3 MiB였다. 앞의 반복 실행 값보다 peak RSS가 낮아,
+그 RSS 차이는 반복마다 누적되는 Go/native allocator의 resident pages와 peak 계측 특성의 영향을 받는다.
+
+같은 partial-index source에서 128회 viewport 이동을 한 stress test도 추가했다.
+1,000,001 Point feature, 1,952 total hit/label, 1.65 s, process peak RSS 194 MiB로 통과했고
+각 move 뒤 이전 window cache 제거 및 viewport budget을 검사했다. 재현 명령과 반복측정/GUI 한계는
+`docs/verification/deferred-user-validation.md`에 남긴다.
+
+인덱스의 source stamp는 크기와 수정시각뿐 아니라 OS 파일 identity도 비교한다. 따라서 같은
+크기·시각을 보존한 atomic replacement가 기존 byte offset index를 새 파일에 재사용하지 못한다.
+동일한 inode를 직접 수정하면서 크기와 수정시각까지 의도적으로 보존하는 상황은 일반 파일 API
+stamp만으로 탐지할 수 없으므로, 읽기 전후의 stamp 검증을 유지하고 reload 오류를 반환한다.

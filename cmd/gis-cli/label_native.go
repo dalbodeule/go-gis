@@ -18,7 +18,7 @@ func runLabel(ctx context.Context, options labelOptions) error {
 	if err != nil {
 		return err
 	}
-	result, err := commands.GenerateLabels(ctx, layer, options.field, options.height, options.style)
+	result, err := commands.GenerateLabelsWithRotation(ctx, layer, options.field, options.rotationField, options.height, options.style)
 	if err != nil {
 		return err
 	}

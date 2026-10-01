@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gogis/drivers/gdal"
 	geosdriver "gogis/drivers/geos"
@@ -27,7 +28,39 @@ import (
 type readOnlyLayerBinding struct {
 	session    *gdal.AttributeSession
 	sourceName string
+	layer      core.Layer
+	sourceCRS  string
 }
+
+type contextSemaphore struct {
+	permits chan struct{}
+}
+
+func newContextSemaphore(limit int) *contextSemaphore {
+	if limit < 1 {
+		limit = 1
+	}
+	return &contextSemaphore{permits: make(chan struct{}, limit)}
+}
+
+func (semaphore *contextSemaphore) acquire(ctx context.Context) (func(), error) {
+	select {
+	case semaphore.permits <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-semaphore.permits
+			return nil, err
+		}
+		var once sync.Once
+		return func() { once.Do(func() { <-semaphore.permits }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Runtime replacement may leave canceled GEOS/native work winding down while
+// the new runtime starts. Share this gate across runtimes so their per-runtime
+// worker limits cannot multiply the large temporary window allocations.
+var readOnlyWindowBuildSemaphore = newContextSemaphore(2)
 
 func loadRuntime(args []string) *demoRuntime {
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
@@ -119,12 +152,16 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 		loadAsReadOnly := readOnly
 		largeReadOnly := false
 		featureCount := 0
+		var inspectionSession *gdal.AttributeSession
 		if !loadAsReadOnly && savePath == "" && !r.allowLargeEditable {
 			native.SetRenderStatus("Loading: checking feature count")
 			var inspectErr error
-			featureCount, largeReadOnly, inspectErr = inspectSourceFeatureCount(loadContext, []vectorSourceSpec{{Path: input}})
+			featureCount, largeReadOnly, inspectionSession, inspectErr = inspectSingleSourceFeatureCount(loadContext, vectorSourceSpec{Path: input})
 			if inspectErr != nil {
 				if loadContext.Err() != nil {
+					if inspectionSession != nil {
+						_ = inspectionSession.Close()
+					}
 					return
 				}
 				largeReadOnly = true
@@ -132,13 +169,17 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 			loadAsReadOnly = shouldOpenLargeDatasetReadOnly(featureCount, largeReadOnly, r.allowLargeEditable)
 			largeReadOnly = loadAsReadOnly
 		}
+		if !loadAsReadOnly && inspectionSession != nil {
+			_ = inspectionSession.Close()
+			inspectionSession = nil
+		}
 		var onPreview func(*demoRuntime)
 		if loadAsReadOnly && savePath == "" && os.Getenv("GOGIS_DISABLE_PREVIEW") != "1" {
 			onPreview = func(preview *demoRuntime) {
 				r.replaceWithPreview(preview, generation)
 			}
 		}
-		next, err := loadDataRuntimeModeContextWithPreview(loadContext, input, layerName, sourceCRS, targetCRS, savePath, loadAsReadOnly, onPreview)
+		next, err := loadDataRuntimeModeContextWithPreviewAndSession(loadContext, input, layerName, sourceCRS, targetCRS, savePath, loadAsReadOnly, onPreview, inspectionSession)
 		r.mu.Lock()
 		current := generation == r.loadGeneration
 		if current && err != nil {
@@ -164,9 +205,9 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 
 func largeDatasetReadOnlyStatus(featureCount int) string {
 	if featureCount < largeDatasetReadOnlyThreshold {
-		return "Dataset size unavailable; opened read-only to limit memory; use --editable-large to edit"
+		return "Dataset size unavailable; opened read-only to limit memory"
 	}
-	return fmt.Sprintf("Dataset has at least %d features; opened read-only to limit memory. Use --editable-large to edit", featureCount)
+	return fmt.Sprintf("Dataset has at least %d features; opened read-only to limit memory", featureCount)
 }
 
 func loadDataRuntime(input, layerName, sourceCRS, targetCRS, savePath string) (*demoRuntime, error) {
@@ -182,10 +223,48 @@ func loadDataRuntimeModeContext(ctx context.Context, input, layerName, sourceCRS
 }
 
 func loadDataRuntimeModeContextWithPreview(ctx context.Context, input, layerName, sourceCRS, targetCRS, savePath string, readOnly bool, onPreview func(*demoRuntime)) (*demoRuntime, error) {
-	return loadDataRuntimeModeContextWithEncoding(ctx, input, layerName, sourceCRS, targetCRS, savePath, "", readOnly, onPreview)
+	return loadDataRuntimeModeContextWithPreviewAndSession(ctx, input, layerName, sourceCRS, targetCRS, savePath, readOnly, onPreview, nil)
+}
+
+func loadDataRuntimeModeContextWithPreviewAndSession(ctx context.Context, input, layerName, sourceCRS, targetCRS, savePath string, readOnly bool, onPreview func(*demoRuntime), initialSession *gdal.AttributeSession) (*demoRuntime, error) {
+	return loadDataRuntimeModeContextWithEncodingAndSession(ctx, input, layerName, sourceCRS, targetCRS, savePath, "", readOnly, onPreview, initialSession)
 }
 
 func loadDataRuntimeModeContextWithEncoding(ctx context.Context, input, layerName, sourceCRS, targetCRS, savePath, encoding string, readOnly bool, onPreview func(*demoRuntime)) (*demoRuntime, error) {
+	return loadDataRuntimeModeContextWithEncodingAndSession(ctx, input, layerName, sourceCRS, targetCRS, savePath, encoding, readOnly, onPreview, nil)
+}
+
+func loadDataRuntimeModeContextWithEncodingAndSession(ctx context.Context, input, layerName, sourceCRS, targetCRS, savePath, encoding string, readOnly bool, onPreview func(*demoRuntime), initialSession *gdal.AttributeSession) (_ *demoRuntime, resultErr error) {
+	defer func() {
+		if initialSession != nil {
+			_ = initialSession.Close()
+		}
+	}()
+	if readOnly && savePath == "" {
+		// Reuse the inspection/preview dataset for metadata and subsequent
+		// viewport queries. Reopening a large GeoJSON source repeats GDAL's
+		// source scan and can raise peak memory during load.
+		if initialSession == nil {
+			var sessionErr error
+			initialSession, sessionErr = gdal.OpenAttributeSession(input, encoding)
+			if sessionErr != nil {
+				initialSession = nil
+			}
+		}
+		if initialSession != nil {
+			if onPreview != nil {
+				tryReadOnlyPreview(ctx, initialSession, layerName, sourceCRS, targetCRS, input, encoding, onPreview)
+			}
+			sessionForWindowedLoad := initialSession
+			initialSession = nil // ownership transfers to the windowed loader
+			windowed, ok, err := tryLoadWindowedReadOnlyRuntimeWithSession(ctx, []vectorSourceSpec{{
+				Path: input, LayerName: layerName, SourceCRS: sourceCRS, Encoding: encoding,
+			}}, targetCRS, sessionForWindowedLoad)
+			if err != nil || ok {
+				return windowed, err
+			}
+		}
+	}
 	var layers []core.Layer
 	var err error
 	var attributeSession *gdal.AttributeSession
@@ -254,6 +333,46 @@ const largeDatasetReadOnlyThreshold = 100000
 
 func shouldOpenLargeDatasetReadOnly(featureCount int, unknownCount, allowEditable bool) bool {
 	return !allowEditable && (unknownCount || featureCount >= largeDatasetReadOnlyThreshold)
+}
+
+// inspectSingleSourceFeatureCount retains the opened dataset session when its
+// feature count indicates a read-only load, avoiding another native dataset
+// open between the safety check and the windowed runtime.
+func inspectSingleSourceFeatureCount(ctx context.Context, source vectorSourceSpec) (int, bool, *gdal.AttributeSession, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, nil, err
+	}
+	session, err := gdal.OpenAttributeSession(source.Path, source.Encoding)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	overviews, err := session.Inspect(ctx)
+	if err != nil {
+		_ = session.Close()
+		return 0, false, nil, err
+	}
+	total := 0
+	unknownCount := false
+	for _, overview := range overviews {
+		if source.LayerName != "" && source.LayerName != overview.Name {
+			continue
+		}
+		if overview.FeatureCount < 0 {
+			unknownCount = true
+			continue
+		}
+		if overview.FeatureCount >= largeDatasetReadOnlyThreshold-total {
+			return largeDatasetReadOnlyThreshold, true, session, nil
+		}
+		total += overview.FeatureCount
+	}
+	if shouldOpenLargeDatasetReadOnly(total, unknownCount, false) {
+		return total, unknownCount, session, nil
+	}
+	if err := session.Close(); err != nil {
+		return total, unknownCount, nil, err
+	}
+	return total, unknownCount, nil, nil
 }
 
 func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) (int, bool, error) {
@@ -388,8 +507,15 @@ func tryReadOnlyPreview(ctx context.Context, session *gdal.AttributeSession, lay
 }
 
 func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, displayCRS string) (*demoRuntime, error) {
+	return loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, displayCRS, nil, nil)
+}
+
+func loadReadOnlyDataRuntimeWithBaseLayers(ctx context.Context, sources []vectorSourceSpec, displayCRS string, baseLayers []core.Layer, baseExtent *[4]float64) (*demoRuntime, error) {
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("at least one vector source is required")
+	}
+	if runtime, ok, err := tryLoadWindowedReadOnlyRuntimeWithBaseLayers(ctx, sources, displayCRS, baseLayers, baseExtent); err != nil || ok {
+		return runtime, err
 	}
 	sessions := make([]*gdal.AttributeSession, 0, len(sources))
 	closeSessions := func() {
@@ -403,10 +529,22 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 			closeSessions()
 		}
 	}()
-	layers := make([]core.Layer, 0, len(sources))
+	layers := append([]core.Layer(nil), baseLayers...)
 	bindings := make(map[string]readOnlyLayerBinding)
-	usedNames := make(map[string]bool)
+	usedNames := make(map[string]bool, len(baseLayers)+len(sources))
+	for _, layer := range baseLayers {
+		usedNames[strings.ToLower(layer.Name)] = true
+	}
 	unavailable := make(map[string]unavailableSource)
+	materializedFeatures, materializedBytes := 0, int64(0)
+	var err error
+	for _, layer := range baseLayers {
+		materializedFeatures, materializedBytes, err = accumulateMaterializedRuntimeLayerUsage(
+			materializedFeatures, materializedBytes, layer, maxDesktopMaterializedFeatures, maxDesktopMaterializedBytes)
+		if err != nil {
+			return nil, fmt.Errorf("read-only base project: %w", err)
+		}
+	}
 	keepUnavailable := func(source vectorSourceSpec, sourceErr error) {
 		layer := unavailableWorkspaceLayer(source)
 		layers = append(layers, layer)
@@ -465,6 +603,11 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 			return nil, err
 		}
 		for _, layer := range opened {
+			materializedFeatures, materializedBytes, err = accumulateMaterializedRuntimeLayerUsage(
+				materializedFeatures, materializedBytes, layer, maxDesktopMaterializedFeatures, maxDesktopMaterializedBytes)
+			if err != nil {
+				return nil, fmt.Errorf("read-only materialized fallback for %q: %w", source.Path, err)
+			}
 			sourceLayerName := layer.Name
 			layer.SourcePath = source.Path
 			layer.SourceLayerName = sourceLayerName
@@ -488,7 +631,7 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 				layer.Labels = source.Labels
 			}
 			layer = layer.WithDefaultPresentation()
-			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: sourceLayerName}
+			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: sourceLayerName, layer: layer, sourceCRS: layer.SourceCRS}
 			layers = append(layers, layer)
 		}
 	}
@@ -497,6 +640,11 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 		return nil, err
 	}
 	runtime.attributePageReader = func(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
+		for _, baseLayer := range baseLayers {
+			if baseLayer.Name == layerName {
+				return inMemoryLayerAttributePage(baseLayer, offset, limit)
+			}
+		}
 		if _, missing := unavailable[layerName]; missing {
 			layer, ok := runtime.service.LayerProperties(layerName)
 			if !ok {
@@ -511,6 +659,16 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 		return binding.session.OpenAttributePage(ctx, binding.sourceName, offset, limit)
 	}
 	runtime.attributeFeatureReader = func(ctx context.Context, layerName string, featureID uint64) (core.Feature, error) {
+		for _, baseLayer := range baseLayers {
+			if baseLayer.Name == layerName {
+				for _, feature := range baseLayer.Features {
+					if feature.ID == featureID {
+						return feature, nil
+					}
+				}
+				return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+			}
+		}
 		binding, ok := bindings[layerName]
 		if !ok {
 			return core.Feature{}, fmt.Errorf("layer %q not found", layerName)
@@ -519,10 +677,662 @@ func loadReadOnlyDataRuntime(ctx context.Context, sources []vectorSourceSpec, di
 	}
 	runtime.closeAttributeSource = closeSessions
 	runtime.readOnlySources = append([]vectorSourceSpec(nil), sources...)
+	runtime.readOnlyBaseLayers = baseLayers
 	runtime.readOnlyDisplayCRS = runtime.mapCRS
 	runtime.unavailableSources = unavailable
 	loaded = true
 	return runtime, nil
+}
+
+func inMemoryLayerAttributePage(layer core.Layer, offset, limit int) (core.Layer, int, error) {
+	if offset < 0 || limit <= 0 || limit > 1_000 {
+		return core.Layer{}, 0, fmt.Errorf("invalid attribute page: offset=%d limit=%d", offset, limit)
+	}
+	total := len(layer.Features)
+	if offset >= total {
+		layer.Features = nil
+		return layer, total, nil
+	}
+	end := offset + min(limit, total-offset)
+	layer.Features = layer.Features[offset:end]
+	return layer, total, nil
+}
+
+// tryLoadWindowedReadOnlyRuntime keeps only layer metadata resident and queries
+// feature geometry for the requested render chunks. It is intentionally used
+// only when every participating layer has a known CRS and extent. Different
+// source CRSs are transformed into one display CRS while only each requested
+// source window is resident.
+func tryLoadWindowedReadOnlyRuntime(ctx context.Context, sources []vectorSourceSpec, displayCRS string) (*demoRuntime, bool, error) {
+	return tryLoadWindowedReadOnlyRuntimeWithSession(ctx, sources, displayCRS, nil)
+}
+
+// tryLoadWindowedReadOnlyRuntimeWithSession optionally takes ownership of an
+// already-open dataset session. This lets the large-file preview and the
+// steady-state window renderer share one GDAL dataset without exposing GDAL
+// handles outside the read-only runtime lifecycle.
+func tryLoadWindowedReadOnlyRuntimeWithSession(ctx context.Context, sources []vectorSourceSpec, displayCRS string, initialSession *gdal.AttributeSession) (*demoRuntime, bool, error) {
+	return tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx, sources, displayCRS, nil, nil, initialSession)
+}
+
+func tryLoadWindowedReadOnlyRuntimeWithBaseLayers(ctx context.Context, sources []vectorSourceSpec, displayCRS string, baseLayers []core.Layer, baseExtent *[4]float64) (*demoRuntime, bool, error) {
+	return tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx, sources, displayCRS, baseLayers, baseExtent, nil)
+}
+
+func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context, sources []vectorSourceSpec, displayCRS string, baseLayers []core.Layer, baseExtent *[4]float64, initialSession *gdal.AttributeSession) (*demoRuntime, bool, error) {
+	if len(sources) == 0 {
+		if initialSession != nil {
+			_ = initialSession.Close()
+		}
+		return nil, false, nil
+	}
+	sessions := make([]*gdal.AttributeSession, 0, len(sources))
+	defer func() {
+		if initialSession != nil {
+			_ = initialSession.Close()
+		}
+	}()
+	closeSessions := func() {
+		for _, session := range sessions {
+			_ = session.Close()
+		}
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			closeSessions()
+		}
+	}()
+	layers := append([]core.Layer(nil), baseLayers...)
+	bindings := make(map[string]readOnlyLayerBinding)
+	unavailable := make(map[string]unavailableSource)
+	usedNames := make(map[string]bool, len(baseLayers))
+	var extent [4]float64
+	hasExtent := false
+	targetCRS := strings.TrimSpace(displayCRS)
+	if baseExtent != nil {
+		extent, hasExtent = *baseExtent, true
+	}
+	for _, layer := range baseLayers {
+		usedNames[strings.ToLower(layer.Name)] = true
+		if targetCRS == "" {
+			targetCRS = layer.CRS.AuthorityCode
+		}
+	}
+	remainingGeoJSONIndexFeatures := maxDesktopGeoJSONIndexFeatures
+	addUnavailable := func(source vectorSourceSpec, reason error) {
+		layer := unavailableWorkspaceLayer(source)
+		if source.Name != "" {
+			layer.Name = source.Name
+		}
+		if source.DisplayName != "" {
+			layer.DisplayName = source.DisplayName
+		}
+		layers = append(layers, layer.WithDefaultPresentation())
+		usedNames[strings.ToLower(layer.Name)] = true
+		unavailable[layer.Name] = unavailableSource{
+			Path: source.Path, LayerName: source.LayerName, Encoding: source.Encoding, Reason: reason.Error(),
+		}
+	}
+	for sourceIndex, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return nil, true, err
+		}
+		if source.AllowUnavailable {
+			if _, statErr := os.Stat(source.Path); statErr != nil {
+				addUnavailable(source, fmt.Errorf("source %q is unavailable: %w", source.Path, statErr))
+				continue
+			}
+		}
+		var session *gdal.AttributeSession
+		var err error
+		if sourceIndex == 0 && initialSession != nil {
+			session, initialSession = initialSession, nil
+		} else {
+			session, err = gdal.OpenAttributeSession(source.Path, source.Encoding)
+		}
+		if err != nil {
+			if source.AllowUnavailable {
+				addUnavailable(source, fmt.Errorf("open %q: %w", source.Path, err))
+				continue
+			}
+			return nil, true, fmt.Errorf("open %q: %w", source.Path, err)
+		}
+		sessions = append(sessions, session)
+		indexLimit := min(remainingGeoJSONIndexFeatures, 1_000_000)
+		streamIndexApplied, err := session.SetGeoJSONStreamIndexFeatureLimit(indexLimit)
+		if err != nil {
+			return nil, true, fmt.Errorf("configure source index for %q: %w", source.Path, err)
+		}
+		overviews, err := session.Inspect(ctx)
+		if err != nil {
+			if source.AllowUnavailable {
+				_ = session.Close()
+				sessions = sessions[:len(sessions)-1]
+				addUnavailable(source, fmt.Errorf("inspect %q: %w", source.Path, err))
+				continue
+			}
+			return nil, true, fmt.Errorf("inspect %q: %w", source.Path, err)
+		}
+		if streamIndexApplied && len(overviews) == 1 && overviews[0].FeatureCount >= 0 && overviews[0].FeatureCount <= indexLimit {
+			remainingGeoJSONIndexFeatures -= overviews[0].FeatureCount
+		}
+		selected := overviews[:0]
+		for _, overview := range overviews {
+			if source.LayerName == "" || strings.EqualFold(source.LayerName, overview.Name) {
+				selected = append(selected, overview)
+			}
+		}
+		if len(selected) == 0 {
+			if source.AllowUnavailable {
+				_ = session.Close()
+				sessions = sessions[:len(sessions)-1]
+				addUnavailable(source, fmt.Errorf("layer %q not found in %q", source.LayerName, source.Path))
+				continue
+			}
+			return nil, true, fmt.Errorf("layer %q not found in %q", source.LayerName, source.Path)
+		}
+		for _, overview := range selected {
+			sourceCRS := overview.CRS.AuthorityCode
+			if source.SourceCRS != "" {
+				sourceCRS = source.SourceCRS
+			} else if sourceCRS == "" {
+				sourceCRS = source.FallbackCRS
+			}
+			if metadataErr := validateReadOnlyWindowMetadata(overview.Name, sourceCRS, overview.HasBounds); metadataErr != nil {
+				return nil, true, metadataErr
+			}
+			if targetCRS == "" {
+				targetCRS = sourceCRS
+			}
+			targetBounds := overview.Bounds
+			if !strings.EqualFold(sourceCRS, targetCRS) {
+				targetBounds, err = (proj.Transformer{}).TransformBounds(ctx,
+					core.CRS{AuthorityCode: sourceCRS}, core.CRS{AuthorityCode: targetCRS}, overview.Bounds)
+				if err != nil {
+					return nil, true, fmt.Errorf("transform extent for %q from %s to %s: %w", overview.Name, sourceCRS, targetCRS, err)
+				}
+			}
+			if !hasExtent {
+				extent = targetBounds
+				hasExtent = true
+			} else {
+				extent[0] = math.Min(extent[0], targetBounds[0])
+				extent[1] = math.Min(extent[1], targetBounds[1])
+				extent[2] = math.Max(extent[2], targetBounds[2])
+				extent[3] = math.Max(extent[3], targetBounds[3])
+			}
+			page, _, err := session.OpenAttributePage(ctx, overview.Name, 0, 1)
+			if err != nil {
+				return nil, true, fmt.Errorf("read schema for %q: %w", overview.Name, err)
+			}
+			layer := core.Layer{
+				Name: overview.Name, Fields: page.Fields, SourcePath: source.Path,
+				SourceLayerName: overview.Name, SourceEncoding: source.Encoding,
+				SourceCRS: sourceCRS, CRS: core.CRS{AuthorityCode: targetCRS},
+				Visible:     source.Visible == nil || *source.Visible,
+				DisplayName: source.DisplayName, Style: source.Style, Labels: source.Labels,
+			}
+			if source.Name != "" {
+				layer.Name = source.Name
+			} else {
+				layer.Name = uniqueImportedLayerName(layer.Name, source.Path, usedNames)
+			}
+			if source.Style == (core.LayerStyle{}) {
+				layer.Style = core.DefaultLayerStyle()
+			}
+			if source.Labels == (core.LabelSettings{}) {
+				layer.Labels = core.DefaultLabelSettings()
+			}
+			layer = layer.WithDefaultPresentation()
+			layers = append(layers, layer)
+			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: overview.Name, layer: layer, sourceCRS: sourceCRS}
+		}
+	}
+	if !hasExtent {
+		return nil, false, nil
+	}
+	for index := range layers {
+		if layers[index].CRS.AuthorityCode == "" {
+			layers[index].CRS = core.CRS{AuthorityCode: targetCRS}
+		}
+	}
+	runtime, err := buildDataRuntime(ctx, layers, "", "", targetCRS, "", "", true, nil, &extent)
+	if err != nil {
+		return nil, true, err
+	}
+	runtime.viewportReadOnly = true
+	// Each window can spend its entire decoded-payload budget and run GEOS
+	// triangulation. Limit concurrency so per-window temporary allocations do
+	// not multiply across the scheduler's normal worker pool.
+	runtime.scheduler = render.NewSchedulerWithMaxWorkers(2)
+	runtime.windowHits = make(map[render.ChunkKey][]render.HitFeature)
+	runtime.windowFeatureCounts = make(map[render.ChunkKey]int)
+	runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
+	runtime.windowPayloadBytes = make(map[render.ChunkKey]int64)
+	runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{})
+	runtime.windowFeatureNames = make(map[uint64]string)
+	runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
+	runtime.unavailableSources = unavailable
+	runtime.readOnlyBaseLayers = append([]core.Layer(nil), baseLayers...)
+	runtime.readOnlyBaseFeatures = append([]render.HitFeature(nil), runtime.features...)
+	runtime.readOnlyBaseLabels = append([]render.LayerLabel(nil), runtime.mapLabels...)
+	runtime.windowVisibleFeatureCount = len(runtime.readOnlyBaseFeatures)
+	for _, layer := range baseLayers {
+		runtime.windowVisiblePayloadBytes += estimateReadOnlyWindowPayloadBytes(layer)
+		for _, feature := range layer.Features {
+			if feature.ID > runtime.nextWindowFeatureID {
+				runtime.nextWindowFeatureID = feature.ID
+			}
+		}
+	}
+	for _, label := range runtime.readOnlyBaseLabels {
+		runtime.windowVisiblePayloadBytes += int64(len(label.Text) + 64)
+	}
+	runtime.attributePageReader = func(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
+		for _, layer := range baseLayers {
+			if layer.Name == layerName {
+				return inMemoryLayerAttributePage(layer, offset, limit)
+			}
+		}
+		binding, ok := bindings[layerName]
+		if !ok {
+			return core.Layer{}, 0, fmt.Errorf("layer %q not found", layerName)
+		}
+		return binding.session.OpenAttributePage(ctx, binding.sourceName, offset, limit)
+	}
+	runtime.attributeFeatureReader = func(_ context.Context, layerName string, featureID uint64) (core.Feature, error) {
+		for _, layer := range baseLayers {
+			if layer.Name == layerName {
+				for _, feature := range layer.Features {
+					if feature.ID == featureID {
+						return feature, nil
+					}
+				}
+				return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+			}
+		}
+		runtime.mu.Lock()
+		name, ok := runtime.windowFeatureNames[featureID]
+		runtime.mu.Unlock()
+		if !ok {
+			return core.Feature{}, fmt.Errorf("feature %d is outside the current render window", featureID)
+		}
+		return core.Feature{ID: featureID, Properties: map[string]any{"name": name}}, nil
+	}
+	baseBuilder := runtime.builder
+	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+		if _, isWindowLayer := bindings[key.Layer]; !isWindowLayer {
+			if _, missing := unavailable[key.Layer]; !missing && baseBuilder != nil {
+				return baseBuilder(ctx, key)
+			}
+		}
+		binding, ok := bindings[key.Layer]
+		if !ok {
+			if _, missing := unavailable[key.Layer]; missing {
+				return render.Chunk{Key: key}, nil
+			}
+			return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
+		}
+		releaseWindowSlot, err := readOnlyWindowBuildSemaphore.acquire(ctx)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+		defer releaseWindowSlot()
+		chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
+		queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
+		if !ok {
+			return render.Chunk{Key: key}, nil
+		}
+		if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+			queryBounds, err = (proj.Transformer{}).TransformBounds(ctx,
+				binding.layer.CRS, core.CRS{AuthorityCode: binding.sourceCRS}, queryBounds)
+			if err != nil {
+				return render.Chunk{}, fmt.Errorf("transform query bounds for %s: %w", key.Layer, err)
+			}
+		}
+		// Properties are needed for label expressions and for the selected
+		// feature's display name. The layer snapshot is chunk-scoped and dropped
+		// after vertex generation; the runtime retains only the small name map.
+		window, err := binding.session.OpenWindowWithLimits(ctx, binding.sourceName, queryBounds, true,
+			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+		if err != nil {
+			return render.Chunk{}, fmt.Errorf("query %s window: %w", key.Layer, err)
+		}
+		if err := validateReadOnlyWindowPolygonVertexBudget(window, maxReadOnlyWindowPolygonVertices); err != nil {
+			return render.Chunk{}, err
+		}
+		window.Name, window.CRS = binding.layer.Name, core.CRS{AuthorityCode: binding.sourceCRS}
+		window.Fields, window.Style, window.Labels = binding.layer.Fields, binding.layer.Style, binding.layer.Labels
+		if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+			window, err = (proj.Transformer{}).Transform(ctx,
+				core.CRS{AuthorityCode: binding.sourceCRS}, binding.layer.CRS, window)
+			if err != nil {
+				return render.Chunk{}, fmt.Errorf("transform %s window: %w", key.Layer, err)
+			}
+		}
+		if len(window.Features) == 0 {
+			runtime.mu.Lock()
+			runtime.removeWindowChunkLocked(key)
+			runtime.rebuildWindowFeaturesLocked()
+			runtime.mu.Unlock()
+			return render.Chunk{Key: key}, nil
+		}
+		payloadBytes := estimateReadOnlyWindowPayloadBytes(window)
+		if payloadBytes > maxReadOnlyWindowBytes {
+			return render.Chunk{}, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
+		}
+		window = window.WithDefaultPresentation()
+		featureNames := make(map[uint64]string, len(window.Features))
+		runtime.mu.Lock()
+		for index := range window.Features {
+			runtime.nextWindowFeatureID++
+			window.Features[index].ID = runtime.nextWindowFeatureID
+			name := fmt.Sprint(window.Features[index].Properties["name"])
+			if name == "<nil>" || name == "" {
+				name = fmt.Sprintf("%s feature #%d", key.Layer, runtime.nextWindowFeatureID)
+			}
+			featureNames[runtime.nextWindowFeatureID] = name
+		}
+		runtime.mu.Unlock()
+		if err := prepareLayerLabels(ctx, []core.Layer{window}); err != nil {
+			return render.Chunk{}, err
+		}
+		newSources, hits, err := render.NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{window}, runtime.mapExtent, chunkSize, key)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+		for _, label := range newSources[key.Layer].Labels {
+			if payloadBytes > maxReadOnlyWindowBytes-int64(len(label.Text)+64) {
+				return render.Chunk{}, fmt.Errorf("spatial window labels exceed the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
+			}
+			payloadBytes += int64(len(label.Text) + 64)
+		}
+		if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{window}, newSources, &key); err != nil {
+			return render.Chunk{}, err
+		}
+		runtime.mu.Lock()
+		for index := range window.Features {
+			if index < len(hits) {
+				hits[index].FeatureID = window.Features[index].ID
+			}
+		}
+		if _, visible := runtime.windowVisibleKeys[key]; visible {
+			runtime.removeWindowChunkLocked(key)
+			if runtime.windowVisibleFeatureCount+len(window.Features) > maxReadOnlyVisibleFeatures {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+			}
+			if runtime.windowVisiblePayloadBytes+payloadBytes > maxReadOnlyVisibleBytes {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
+			}
+			runtime.windowVisibleFeatureCount += len(window.Features)
+			runtime.windowVisiblePayloadBytes += payloadBytes
+			runtime.windowFeatureCounts[key] = len(window.Features)
+			runtime.windowPayloadBytes[key] = payloadBytes
+			for id, name := range featureNames {
+				runtime.windowFeatureNames[id] = name
+			}
+			ids := make([]uint64, 0, len(featureNames))
+			for id := range featureNames {
+				ids = append(ids, id)
+			}
+			runtime.windowFeatureIDs[key] = ids
+			if len(hits) > 0 {
+				runtime.windowHits[key] = hits
+			}
+			if len(newSources[key.Layer].Labels) > 0 {
+				runtime.windowLabels[key] = newSources[key.Layer].Labels
+			}
+			runtime.rebuildWindowFeaturesLocked()
+		}
+		runtime.mu.Unlock()
+		return newSources[key.Layer].Builder(ctx, key)
+	}
+	runtime.closeAttributeSource = closeSessions
+	runtime.readOnlySources = append([]vectorSourceSpec(nil), sources...)
+	runtime.readOnlyDisplayCRS = targetCRS
+	keep = true
+	return runtime, true, nil
+}
+
+func validateReadOnlyWindowMetadata(layerName, sourceCRS string, hasBounds bool) error {
+	if strings.TrimSpace(sourceCRS) == "" || !hasBounds {
+		return fmt.Errorf("layer %q cannot be safely opened read-only: viewport rendering requires a declared source CRS and valid extent; refusing a full-geometry fallback (specify --source-crs or repair the dataset metadata)", layerName)
+	}
+	return nil
+}
+
+const (
+	// Bounds the transient Go geometry/property snapshot for a single chunk.
+	maxReadOnlyWindowFeatures = 20_000
+	// Bounds polygon coordinate complexity before GEOS triangulation in a
+	// window-backed read-only render.
+	maxReadOnlyWindowPolygonVertices = 250_000
+	// Bounds retained hit-test geometry across the active viewport. When a view
+	// exceeds this cap the affected chunk fails visibly and users can zoom in.
+	maxReadOnlyVisibleFeatures = 100_000
+	maxReadOnlyWindowBytes     = 32 << 20
+	maxReadOnlyVisibleBytes    = 128 << 20
+	// Bounds all retained polygon fill meshes in a materialized desktop project
+	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
+	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
+	maxDesktopGeoJSONIndexFeatures = 2_000_000
+	maxDesktopMaterializedFeatures = 1_000_000
+	maxDesktopMaterializedBytes    = 256 << 20
+)
+
+func readOnlyWindowChunkSize(zoomBucket int) float64 {
+	if zoomBucket <= 0 {
+		return 0.25
+	}
+	if zoomBucket > 10 {
+		zoomBucket = 10
+	}
+	return math.Ldexp(0.25, -zoomBucket)
+}
+
+func readOnlyWindowZoomBucket(zoom float64) int {
+	if math.IsNaN(zoom) || math.IsInf(zoom, 0) || zoom <= 1 {
+		return 0
+	}
+	bucket := int(math.Floor(math.Log2(zoom)))
+	if bucket > 10 {
+		return 10
+	}
+	return bucket
+}
+
+func estimateMaterializedRuntimeLayerBytes(layer core.Layer) int64 {
+	const saturation = int64(maxDesktopMaterializedBytes) + 1
+	total := int64(0)
+	add := func(size int64) {
+		if size < 0 || total > saturation-size {
+			total = saturation
+			return
+		}
+		total += size
+	}
+	var addValue func(any, int)
+	addValue = func(value any, depth int) {
+		if total >= saturation {
+			return
+		}
+		if depth >= 64 {
+			add(saturation)
+			return
+		}
+		switch value := value.(type) {
+		case nil:
+			add(8)
+		case string:
+			add(int64(len(value)) + 24)
+		case []byte:
+			add(int64(len(value)) + 24)
+		case []string:
+			add(24 + int64(len(value))*24)
+			for _, item := range value {
+				add(int64(len(item)) + 24)
+			}
+		case []any:
+			add(24 + int64(len(value))*16)
+			for _, item := range value {
+				addValue(item, depth+1)
+			}
+		case map[string]any:
+			add(128 + int64(len(value))*16)
+			for key, item := range value {
+				add(int64(len(key)) + 24)
+				addValue(item, depth+1)
+			}
+		default:
+			add(16)
+		}
+	}
+	add(int64(len(layer.Name)) + int64(len(layer.Fields))*64 + 128)
+	for _, feature := range layer.Features {
+		add(128)
+		switch geometry := feature.Geometry.(type) {
+		case core.WKBGeometry:
+			add(int64(len(geometry.WKB)) + 32)
+		case core.WKTGeometry:
+			add(int64(len(geometry.WKT)) + 32)
+		case nil:
+		default:
+			add(saturation)
+		}
+		for name, value := range feature.Properties {
+			add(int64(len(name)) + 48)
+			addValue(value, 0)
+		}
+		if feature.Label != nil {
+			add(int64(len(feature.Label.Text)) + 32)
+		}
+	}
+	return total
+}
+
+func accumulateMaterializedRuntimeLayerUsage(currentFeatures int, currentBytes int64, layer core.Layer, maxFeatures int, maxBytes int64) (int, int64, error) {
+	if currentFeatures < 0 || currentBytes < 0 || maxFeatures < 0 || maxBytes < 0 {
+		return currentFeatures, currentBytes, fmt.Errorf("materialized project budgets must not be negative")
+	}
+	if len(layer.Features) > maxFeatures-currentFeatures {
+		return currentFeatures, currentBytes, fmt.Errorf("materialized project exceeds the %d-feature safety limit; use read-only viewport loading or remove sources", maxFeatures)
+	}
+	layerBytes := estimateMaterializedRuntimeLayerBytes(layer)
+	if layerBytes > maxBytes-currentBytes {
+		return currentFeatures, currentBytes, fmt.Errorf("materialized project exceeds the %d MiB payload safety limit; use read-only viewport loading or remove sources", maxBytes>>20)
+	}
+	return currentFeatures + len(layer.Features), currentBytes + layerBytes, nil
+}
+
+func estimateReadOnlyWindowPayloadBytes(layer core.Layer) int64 {
+	const saturation = int64(maxReadOnlyWindowBytes) + 1
+	var total int64
+	add := func(size int) bool {
+		if size < 0 || total > saturation-int64(size) {
+			total = saturation
+			return false
+		}
+		total += int64(size)
+		return total <= maxReadOnlyWindowBytes
+	}
+	for _, feature := range layer.Features {
+		switch geometry := feature.Geometry.(type) {
+		case core.WKBGeometry:
+			if !add(len(geometry.WKB)) {
+				return saturation
+			}
+		case core.WKTGeometry:
+			if !add(len(geometry.WKT)) {
+				return saturation
+			}
+		case nil:
+		default:
+			return saturation
+		}
+		for name, value := range feature.Properties {
+			if !add(len(name)) || !add(16) {
+				return saturation
+			}
+			if !addReadOnlyPropertyEstimate(value, add) {
+				return saturation
+			}
+		}
+	}
+	return total
+}
+
+func addReadOnlyPropertyEstimate(value any, add func(int) bool) bool {
+	const maxPropertyNodes = 1 << 20
+	values := []any{value}
+	visited := 0
+	for len(values) > 0 {
+		visited++
+		if visited > maxPropertyNodes {
+			return add(maxReadOnlyWindowBytes + 1)
+		}
+		last := len(values) - 1
+		current := values[last]
+		values = values[:last]
+		switch current := current.(type) {
+		case nil:
+			if !add(8) {
+				return false
+			}
+		case string:
+			if !add(len(current)) || !add(24) {
+				return false
+			}
+		case []byte:
+			if !add(len(current)) || !add(24) {
+				return false
+			}
+		case []string:
+			if !add(24 + len(current)*24) {
+				return false
+			}
+			for _, item := range current {
+				if !add(len(item) + 24) {
+					return false
+				}
+			}
+		case []any:
+			if !add(24 + len(current)*16) {
+				return false
+			}
+			values = append(values, current...)
+		case map[string]any:
+			if !add(128 + len(current)*16) {
+				return false
+			}
+			for key, item := range current {
+				if !add(len(key) + 24) {
+					return false
+				}
+				values = append(values, item)
+			}
+		default:
+			if !add(24) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func renderChunkBounds(extent [4]float64, size float64, key render.ChunkKey) ([4]float64, bool) {
+	if size <= 0 || extent[0] >= extent[2] || extent[1] >= extent[3] {
+		return [4]float64{}, false
+	}
+	x0, y0 := math.Max(0, float64(key.X)*size), math.Max(0, float64(key.Y)*size)
+	x1, y1 := math.Min(1, float64(key.X+1)*size), math.Min(1, float64(key.Y+1)*size)
+	if x0 >= x1 || y0 >= y1 {
+		return [4]float64{}, false
+	}
+	spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
+	return [4]float64{extent[0] + x0*spanX, extent[1] + y0*spanY, extent[0] + x1*spanX, extent[1] + y1*spanY}, true
 }
 
 func unavailableWorkspaceLayer(source vectorSourceSpec) core.Layer {
@@ -599,6 +1409,11 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		}
 	}
 	planner := render.NewChunkPlanner()
+	// LayerSource normalizes data-backed feature coordinates to the unit square.
+	// Bound viewport planning to that domain so extreme zoom-out never allocates
+	// keys for an arbitrarily large empty world.
+	planner.Domain = [4]float64{0, 0, 1, 1}
+	planner.HasDomain = true
 	if len(layers) > 0 {
 		planner.ChunkSize = sources[layers[0].Name].ChunkSize
 	}
@@ -738,10 +1553,17 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 	if err != nil {
 		return err
 	}
-	if err := attachPolygonFillGeometry(context.Background(), []core.Layer{layer}, newSources); err != nil {
+	updatedSources := make(map[string]render.LayerSource)
+	r.sourcesMu.RLock()
+	for name, source := range r.sources {
+		updatedSources[name] = source
+	}
+	r.sourcesMu.RUnlock()
+	updatedSources[layerName] = newSources[layerName]
+	if err := attachPolygonFillGeometry(context.Background(), []core.Layer{layer}, updatedSources); err != nil {
 		return err
 	}
-	source := newSources[layerName]
+	source := updatedSources[layerName]
 	r.sourcesMu.Lock()
 	r.sources[layerName] = source
 	r.sourcesMu.Unlock()
@@ -771,6 +1593,34 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 }
 
 func attachPolygonFillGeometry(ctx context.Context, layers []core.Layer, sources map[string]render.LayerSource) error {
+	return attachPolygonFillGeometryWithLimit(ctx, layers, sources, nil, maxDesktopPolygonFillVertices)
+}
+
+func attachPolygonFillGeometryForChunk(ctx context.Context, layers []core.Layer, sources map[string]render.LayerSource, target *render.ChunkKey) error {
+	return attachPolygonFillGeometryWithLimit(ctx, layers, sources, target, maxDesktopPolygonFillVertices)
+}
+
+func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer, sources map[string]render.LayerSource, target *render.ChunkKey, maxProjectVertices int) error {
+	if maxProjectVertices < 0 {
+		return fmt.Errorf("polygon fill project vertex budget must not be negative")
+	}
+	building := make(map[string]bool, len(layers))
+	for _, layer := range layers {
+		building[layer.Name] = true
+	}
+	existingCapacity := 0
+	for name, source := range sources {
+		if building[name] {
+			continue
+		}
+		if source.PolygonFillCapacity < 0 || source.PolygonFillCapacity > maxProjectVertices-existingCapacity {
+			return fmt.Errorf("existing polygon fill geometry exceeds the %d-vertex project safety limit", maxProjectVertices)
+		}
+		existingCapacity += source.PolygonFillCapacity
+	}
+	remainingCapacity := maxProjectVertices - existingCapacity
+	generatedCapacity := 0
+	generatedVertices := 0
 	for _, layer := range layers {
 		isPolygonLayer := false
 		for _, feature := range layer.Features {
@@ -791,14 +1641,62 @@ func attachPolygonFillGeometry(ctx context.Context, layers []core.Layer, sources
 		if spanX <= 0 || spanY <= 0 {
 			continue
 		}
+		if target != nil {
+			if err := validateReadOnlyPolygonVertexBudget(layer, source, maxReadOnlyWindowPolygonVertices); err != nil {
+				return err
+			}
+		}
 		fillByCell := make(map[[2]int][]render.Vertex)
+		fillColor := render.ColorForPolygonFill(layer.Style)
+		fillCapacities := estimatePolygonFillCapacities(layer, source, target)
+		estimatedVertices := 0
+		for _, capacity := range fillCapacities {
+			if capacity > render.MaxChunkVertices {
+				return fmt.Errorf("polygon fill for layer %q exceeds the %d-vertex chunk limit", layer.Name, render.MaxChunkVertices)
+			}
+			if capacity < 0 || capacity > remainingCapacity-generatedCapacity-estimatedVertices {
+				return fmt.Errorf("polygon fill for layer %q exceeds the %d-vertex project safety limit", layer.Name, maxProjectVertices)
+			}
+			estimatedVertices += capacity
+		}
+		for cell, capacity := range fillCapacities {
+			if capacity > 0 {
+				fillByCell[cell] = make([]render.Vertex, 0, capacity)
+			}
+		}
+		generatedCapacity += estimatedVertices
+		capacityBeforeLayer := generatedCapacity - estimatedVertices
+		verticesBeforeLayer := generatedVertices
 		operator := geosdriver.NewOperator()
-		for _, feature := range layer.Features {
+		fillVertexLimitExceeded := false
+		for featureIndex, feature := range layer.Features {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if feature.Geometry == nil || !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
 				continue
+			}
+			if strings.EqualFold(feature.Geometry.GeometryType(), "POLYGON") && featureIndex < len(source.Features) {
+				parts := source.Features[featureIndex].Parts
+				var exterior []render.Point
+				if len(parts) == 0 {
+					exterior = source.Features[featureIndex].Vertices
+				} else if len(parts) == 1 {
+					exterior = parts[0]
+				}
+				if len(exterior) > 0 && appendConvexPolygonTriangles(exterior, func(triangle [3]render.Point) {
+					if !fillVertexLimitExceeded && !appendPolygonFillTriangle(
+						fillByCell, triangle, fillColor, source.ChunkSize, target, render.MaxChunkVertices,
+						&generatedVertices, remainingCapacity,
+						&generatedCapacity, remainingCapacity) {
+						fillVertexLimitExceeded = true
+					}
+				}) {
+					if fillVertexLimitExceeded {
+						return fmt.Errorf("polygon fill for layer %q exceeds the %d-vertex chunk limit", layer.Name, render.MaxChunkVertices)
+					}
+					continue
+				}
 			}
 			triangles, err := operator.ConstrainedTriangles(ctx, feature.Geometry)
 			if err != nil {
@@ -806,31 +1704,18 @@ func attachPolygonFillGeometry(ctx context.Context, layers []core.Layer, sources
 			}
 			for _, triangle := range triangles {
 				var normalized [3]render.Point
-				minX, minY := math.Inf(1), math.Inf(1)
-				maxX, maxY := math.Inf(-1), math.Inf(-1)
 				for index, point := range triangle {
 					normalized[index] = render.Point{X: (point[0] - bounds[0]) / spanX, Y: (point[1] - bounds[1]) / spanY}
-					minX, minY = math.Min(minX, normalized[index].X), math.Min(minY, normalized[index].Y)
-					maxX, maxY = math.Max(maxX, normalized[index].X), math.Max(maxY, normalized[index].Y)
 				}
-				const chunkSize = 0.25
-				firstX, lastX := max(0, int(math.Floor(minX/chunkSize))), min(3, int(math.Floor(maxX/chunkSize)))
-				firstY, lastY := max(0, int(math.Floor(minY/chunkSize))), min(3, int(math.Floor(maxY/chunkSize)))
-				for cellY := firstY; cellY <= lastY; cellY++ {
-					for cellX := firstX; cellX <= lastX; cellX++ {
-						clipped := render.ClipTriangleToRect(normalized,
-							float64(cellX)*chunkSize, float64(cellY)*chunkSize,
-							float64(cellX+1)*chunkSize, float64(cellY+1)*chunkSize)
-						for _, part := range clipped {
-							vertices := fillByCell[[2]int{cellX, cellY}]
-							for _, point := range part {
-								vertices = append(vertices, render.Vertex{X: float32(point.X), Y: float32(point.Y),
-									Color: render.ColorForPolygonFill(layer.Style), Kind: render.VertexFill})
-							}
-							fillByCell[[2]int{cellX, cellY}] = vertices
-						}
-					}
+				if !appendPolygonFillTriangle(fillByCell, normalized, fillColor, source.ChunkSize, target,
+					render.MaxChunkVertices, &generatedVertices, remainingCapacity,
+					&generatedCapacity, remainingCapacity) {
+					fillVertexLimitExceeded = true
+					break
 				}
+			}
+			if fillVertexLimitExceeded {
+				return fmt.Errorf("polygon fill for layer %q exceeds the %d-vertex chunk limit", layer.Name, render.MaxChunkVertices)
 			}
 		}
 		baseBuilder := source.Builder
@@ -843,41 +1728,353 @@ func attachPolygonFillGeometry(ctx context.Context, layers []core.Layer, sources
 			if len(fill) == 0 {
 				return chunk, nil
 			}
+			if len(chunk.Vertices) > render.MaxChunkVertices || len(fill) > render.MaxChunkVertices-len(chunk.Vertices) {
+				return render.Chunk{}, fmt.Errorf("render chunk exceeds the %d-vertex safety limit", render.MaxChunkVertices)
+			}
 			vertices := make([]render.Vertex, 0, len(fill)+len(chunk.Vertices))
 			vertices = append(vertices, fill...)
 			vertices = append(vertices, chunk.Vertices...)
 			chunk.Vertices = vertices
 			return chunk, nil
 		}
+		source.PolygonFillVertices = generatedVertices - verticesBeforeLayer
+		source.PolygonFillCapacity = generatedCapacity - capacityBeforeLayer
 		sources[layer.Name] = source
 	}
 	return nil
 }
 
+func estimatePolygonFillCapacities(layer core.Layer, source render.LayerSource, target *render.ChunkKey) map[[2]int]int {
+	capacities := make(map[[2]int]int)
+	chunkSize := source.ChunkSize
+	if chunkSize <= 0 || chunkSize > 1 || math.IsNaN(chunkSize) || math.IsInf(chunkSize, 0) {
+		return capacities
+	}
+	maxCell := int(math.Ceil(1/chunkSize)) - 1
+	for featureIndex, feature := range layer.Features {
+		if feature.Geometry == nil || featureIndex >= len(source.Features) ||
+			!strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+			continue
+		}
+		points := source.Features[featureIndex].Vertices
+		if len(points) == 0 || len(points) > int(^uint(0)>>1)/3 {
+			continue
+		}
+		minX, minY := math.Inf(1), math.Inf(1)
+		maxX, maxY := math.Inf(-1), math.Inf(-1)
+		for _, point := range points {
+			minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+			maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+		}
+		firstX, lastX := max(0, int(math.Floor(minX/chunkSize))), min(maxCell, int(math.Floor(maxX/chunkSize)))
+		firstY, lastY := max(0, int(math.Floor(minY/chunkSize))), min(maxCell, int(math.Floor(maxY/chunkSize)))
+		if target != nil {
+			firstX, lastX = max(firstX, target.X), min(lastX, target.X)
+			firstY, lastY = max(firstY, target.Y), min(lastY, target.Y)
+		}
+		if firstX > lastX || firstY > lastY {
+			continue
+		}
+		cellCount := (lastX - firstX + 1) * (lastY - firstY + 1)
+		triangleEstimate := len(points)
+		if strings.EqualFold(feature.Geometry.GeometryType(), "POLYGON") {
+			ringCount := len(source.Features[featureIndex].Parts)
+			if ringCount == 0 {
+				ringCount = 1
+			}
+			triangleEstimate = max(1, len(points)+ringCount-4)
+		}
+		if triangleEstimate > int(^uint(0)>>1)/3 {
+			continue
+		}
+		estimate := triangleEstimate * 3
+		perCell, remainder := estimate/cellCount, estimate%cellCount
+		for cellY := firstY; cellY <= lastY; cellY++ {
+			for cellX := firstX; cellX <= lastX; cellX++ {
+				capacity := perCell
+				if remainder > 0 {
+					capacity++
+					remainder--
+				}
+				capacities[[2]int{cellX, cellY}] += capacity
+			}
+		}
+	}
+	return capacities
+}
+
+func validateReadOnlyPolygonVertexBudget(layer core.Layer, source render.LayerSource, maxVertices int) error {
+	if maxVertices <= 0 {
+		return nil
+	}
+	vertices := 0
+	for index, feature := range layer.Features {
+		if feature.Geometry == nil || index >= len(source.Features) ||
+			!strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+			continue
+		}
+		count := len(source.Features[index].Vertices)
+		if count > maxVertices-vertices {
+			return fmt.Errorf("read-only polygon window exceeds the %d-vertex triangulation safety limit", maxVertices)
+		}
+		vertices += count
+	}
+	return nil
+}
+
+// validateReadOnlyWindowPolygonVertexBudget checks polygon WKB directly,
+// before label placement or fill triangulation can invoke GEOS. PointCount is
+// a non-allocating structural scan, so the guard itself does not materialize
+// decoded coordinate arrays.
+func validateReadOnlyWindowPolygonVertexBudget(layer core.Layer, maxVertices int) error {
+	if maxVertices <= 0 {
+		return nil
+	}
+	vertices := 0
+	for _, feature := range layer.Features {
+		if feature.Geometry == nil || !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+			continue
+		}
+		geometry, ok := feature.Geometry.(core.WKBGeometry)
+		if !ok {
+			return fmt.Errorf("read-only polygon feature %d has unsupported geometry encoding %T", feature.ID, feature.Geometry)
+		}
+		count, err := geometry.PointCount()
+		if err != nil {
+			return fmt.Errorf("read-only polygon feature %d has invalid WKB: %w", feature.ID, err)
+		}
+		if count > maxVertices-vertices {
+			return fmt.Errorf("read-only polygon window exceeds the %d-vertex triangulation safety limit", maxVertices)
+		}
+		vertices += count
+	}
+	return nil
+}
+
+func appendConvexPolygonTriangles(ring []render.Point, emit func([3]render.Point)) bool {
+	count := len(ring)
+	if count > 1 && ring[0] == ring[count-1] {
+		count--
+	}
+	if count < 3 {
+		return false
+	}
+	sign := 0.0
+	for index := 0; index < count; index++ {
+		a, b, c := ring[index], ring[(index+1)%count], ring[(index+2)%count]
+		cross := (b.X-a.X)*(c.Y-b.Y) - (b.Y-a.Y)*(c.X-b.X)
+		if math.Abs(cross) <= 1e-14 {
+			continue
+		}
+		if sign == 0 {
+			sign = cross
+		} else if sign*cross < 0 {
+			return false
+		}
+	}
+	if sign == 0 {
+		return false
+	}
+	for index := 1; index+1 < count; index++ {
+		triangle := [3]render.Point{ring[0], ring[index], ring[index+1]}
+		area2 := (triangle[1].X-triangle[0].X)*(triangle[2].Y-triangle[0].Y) -
+			(triangle[2].X-triangle[0].X)*(triangle[1].Y-triangle[0].Y)
+		if math.Abs(area2) > 1e-14 {
+			emit(triangle)
+		}
+	}
+	return true
+}
+
+func appendPolygonFillTriangle(fillByCell map[[2]int][]render.Vertex, triangle [3]render.Point, color uint32, chunkSize float64, target *render.ChunkKey, maxVertices int, totalVertices *int, maxTotalVertices int, totalCapacity *int, maxTotalCapacity int) bool {
+	minX, minY := math.Inf(1), math.Inf(1)
+	maxX, maxY := math.Inf(-1), math.Inf(-1)
+	for _, point := range triangle {
+		minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+		maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+	}
+	if chunkSize <= 0 || chunkSize > 1 || math.IsNaN(chunkSize) || math.IsInf(chunkSize, 0) {
+		return true
+	}
+	maxCell := int(math.Ceil(1/chunkSize)) - 1
+	firstX, lastX := max(0, int(math.Floor(minX/chunkSize))), min(maxCell, int(math.Floor(maxX/chunkSize)))
+	firstY, lastY := max(0, int(math.Floor(minY/chunkSize))), min(maxCell, int(math.Floor(maxY/chunkSize)))
+	if target != nil {
+		firstX, lastX = max(firstX, target.X), min(lastX, target.X)
+		firstY, lastY = max(firstY, target.Y), min(lastY, target.Y)
+	}
+	for cellY := firstY; cellY <= lastY; cellY++ {
+		for cellX := firstX; cellX <= lastX; cellX++ {
+			minCellX, minCellY := float64(cellX)*chunkSize, float64(cellY)*chunkSize
+			maxCellX, maxCellY := float64(cellX+1)*chunkSize, float64(cellY+1)*chunkSize
+			cellKey := [2]int{cellX, cellY}
+			vertices := fillByCell[cellKey]
+			fullyInside := true
+			for _, point := range triangle {
+				if point.X < minCellX || point.X > maxCellX || point.Y < minCellY || point.Y > maxCellY {
+					fullyInside = false
+					break
+				}
+			}
+			if fullyInside {
+				if totalVertices == nil || *totalVertices > maxTotalVertices || 3 > maxTotalVertices-*totalVertices {
+					return false
+				}
+				var ok bool
+				vertices, ok = appendPolygonFillPointsWithinProjectBudget(
+					vertices, triangle[:], color, maxVertices, totalCapacity, maxTotalCapacity)
+				if !ok {
+					return false
+				}
+				fillByCell[cellKey] = vertices
+				*totalVertices += 3
+				continue
+			}
+			for _, part := range render.ClipTriangleToRect(triangle, minCellX, minCellY, maxCellX, maxCellY) {
+				if totalVertices == nil || *totalVertices > maxTotalVertices || len(part) > maxTotalVertices-*totalVertices {
+					return false
+				}
+				var ok bool
+				vertices, ok = appendPolygonFillPointsWithinProjectBudget(
+					vertices, part[:], color, maxVertices, totalCapacity, maxTotalCapacity)
+				if !ok {
+					return false
+				}
+				*totalVertices += len(part)
+			}
+			fillByCell[cellKey] = vertices
+		}
+	}
+	return true
+}
+
+func appendPolygonFillPointsWithinProjectBudget(current []render.Vertex, points []render.Point, color uint32, maxChunkCapacity int, totalCapacity *int, maxTotalCapacity int) ([]render.Vertex, bool) {
+	if totalCapacity == nil || *totalCapacity < cap(current) || *totalCapacity > maxTotalCapacity {
+		return current, false
+	}
+	if len(current) > maxChunkCapacity || len(points) > maxChunkCapacity-len(current) {
+		return current, false
+	}
+	needed := len(current) + len(points)
+	if needed > cap(current) {
+		available := maxTotalCapacity - (*totalCapacity - cap(current))
+		newCapacity := cap(current) * 2
+		if newCapacity < needed {
+			newCapacity = needed
+		}
+		if newCapacity > maxChunkCapacity {
+			newCapacity = maxChunkCapacity
+		}
+		if newCapacity > available {
+			newCapacity = available
+		}
+		if newCapacity < needed {
+			return current, false
+		}
+		grown := make([]render.Vertex, len(current), newCapacity)
+		copy(grown, current)
+		*totalCapacity += newCapacity - cap(current)
+		current = grown
+	}
+	for _, point := range points {
+		current = append(current, render.Vertex{X: float32(point.X), Y: float32(point.Y), Color: color, Kind: render.VertexFill})
+	}
+	return current, true
+}
+
+func appendPolygonFillPoints(current []render.Vertex, points []render.Point, color uint32, limit int) ([]render.Vertex, bool) {
+	if limit < 0 || len(current) > limit || len(points) > limit-len(current) {
+		return current, false
+	}
+	needed := len(current) + len(points)
+	if needed > cap(current) {
+		newCapacity := cap(current) * 2
+		if newCapacity < needed {
+			newCapacity = needed
+		}
+		if newCapacity > limit {
+			newCapacity = limit
+		}
+		grown := make([]render.Vertex, len(current), newCapacity)
+		copy(grown, current)
+		current = grown
+	}
+	for _, point := range points {
+		current = append(current, render.Vertex{X: float32(point.X), Y: float32(point.Y), Color: color, Kind: render.VertexFill})
+	}
+	return current, true
+}
+
+const maxLabelScriptExecutionDuration = 10 * time.Minute
+const maxPreparedLabelTextBytes = 128 << 20
+const maxPreparedLabelTextPerFeature = 64 << 10
+
 func prepareLayerLabels(ctx context.Context, layers []core.Layer) error {
+	return prepareLayerLabelsWithMaximumDuration(ctx, layers, maxLabelScriptExecutionDuration)
+}
+
+func prepareLayerLabelsWithMaximumDuration(ctx context.Context, layers []core.Layer, maximum time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hasLua := false
+	for _, layer := range layers {
+		if layer.Labels.Enabled && (strings.TrimSpace(layer.Labels.LuaScript) != "" || strings.TrimSpace(layer.Labels.Rule) != "") {
+			hasLua = true
+			break
+		}
+	}
+	if hasLua {
+		if maximum <= 0 {
+			return fmt.Errorf("label Lua execution limit must be positive")
+		}
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > maximum {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, maximum)
+			defer cancel()
+		}
+	}
+	return prepareLayerLabelsCore(ctx, layers)
+}
+
+func prepareLayerLabelsCore(ctx context.Context, layers []core.Layer) error {
+	return prepareLayerLabelsCoreWithBudget(ctx, layers, maxPreparedLabelTextBytes, maxPreparedLabelTextPerFeature)
+}
+
+func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, maxTotalBytes, maxFeatureBytes int64) error {
+	if maxTotalBytes < 0 || maxFeatureBytes < 0 {
+		return fmt.Errorf("label text budgets must not be negative")
+	}
+	var totalLabelBytes int64
+	for _, layer := range layers {
+		for _, feature := range layer.Features {
+			if feature.Label == nil {
+				continue
+			}
+			if int64(len(feature.Label.Text)) > maxTotalBytes-totalLabelBytes {
+				return fmt.Errorf("existing label text exceeds the %d-byte project safety limit", maxTotalBytes)
+			}
+			totalLabelBytes += int64(len(feature.Label.Text))
+		}
+	}
 	for layerIndex := range layers {
 		settings := layers[layerIndex].Labels
 		if !settings.Enabled || len(layers[layerIndex].Features) == 0 {
 			continue
 		}
-		var textProgram, ruleProgram *scripting.LabelProgram
+		textScript := strings.TrimSpace(settings.LuaScript)
+		ruleScript := strings.TrimSpace(settings.Rule)
+		var composer *scripting.LabelComposerProgram
 		var err error
-		if strings.TrimSpace(settings.LuaScript) != "" {
-			textProgram, err = scripting.CompileLabelProgram(settings.LuaScript)
-			if err != nil {
-				return fmt.Errorf("layer %q label script: %w", layers[layerIndex].Name, err)
+		if textScript != "" || ruleScript != "" {
+			if textScript == "" {
+				textScript = "return nil"
 			}
-			defer textProgram.Close()
-		}
-		if strings.TrimSpace(settings.Rule) != "" {
-			ruleProgram, err = scripting.CompileLabelProgram(settings.Rule)
+			composer, err = scripting.CompileLabelComposerProgram(textScript, ruleScript)
 			if err != nil {
-				if textProgram != nil {
-					textProgram.Close()
-				}
-				return fmt.Errorf("layer %q label rule: %w", layers[layerIndex].Name, err)
+				return fmt.Errorf("layer %q label composer: %w", layers[layerIndex].Name, err)
 			}
-			defer ruleProgram.Close()
+			defer composer.Close()
 		}
 		var geometryOperator *geosdriver.Operator
 		for featureIndex := range layers[layerIndex].Features {
@@ -885,19 +2082,24 @@ func prepareLayerLabels(ctx context.Context, layers []core.Layer) error {
 				return err
 			}
 			feature := &layers[layerIndex].Features[featureIndex]
-			if ruleProgram != nil {
-				visible, evalErr := ruleProgram.EvaluateRule(ctx, feature.Properties)
-				if evalErr != nil {
-					return fmt.Errorf("layer %q feature %d label rule: %w", layers[layerIndex].Name, feature.ID, evalErr)
+			if feature.Label != nil {
+				totalLabelBytes -= int64(len(feature.Label.Text))
+				feature.Label = nil
+			}
+			var text string
+			if composer != nil {
+				var visible bool
+				text, visible, err = composer.Evaluate(ctx, feature.Properties)
+				if err != nil {
+					return fmt.Errorf("layer %q feature %d label expression: %w", layers[layerIndex].Name, feature.ID, err)
 				}
 				if !visible {
 					feature.Label = nil
 					continue
 				}
-			}
-			var text string
-			if textProgram != nil {
-				text, err = textProgram.EvaluateText(ctx, feature.Properties)
+				if strings.TrimSpace(settings.LuaScript) == "" {
+					text, err = core.EvaluateLabelTemplate(settings.Expression, feature.Properties)
+				}
 			} else {
 				text, err = core.EvaluateLabelTemplate(settings.Expression, feature.Properties)
 			}
@@ -907,6 +2109,13 @@ func prepareLayerLabels(ctx context.Context, layers []core.Layer) error {
 			if text == "" {
 				feature.Label = nil
 				continue
+			}
+			textBytes := int64(len(text))
+			if textBytes > maxFeatureBytes {
+				return fmt.Errorf("layer %q feature %d label exceeds the %d-byte safety limit", layers[layerIndex].Name, feature.ID, maxFeatureBytes)
+			}
+			if textBytes > maxTotalBytes-totalLabelBytes {
+				return fmt.Errorf("prepared label text exceeds the %d-byte project safety limit", maxTotalBytes)
 			}
 			label := core.Label{Text: text, Height: settings.HeightMM}
 			if feature.Geometry != nil && strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
@@ -937,6 +2146,7 @@ func prepareLayerLabels(ctx context.Context, layers []core.Layer) error {
 			}
 			label.Rotation = rotation
 			feature.Label = &label
+			totalLabelBytes += textBytes
 		}
 	}
 	return nil
@@ -980,8 +2190,12 @@ func loadDataRuntimeFiles(ctx context.Context, paths []string, baseLayers []core
 }
 
 func loadDataRuntimeFilesWithLargePolicy(ctx context.Context, paths []string, baseLayers []core.Layer, saveDestination string, allowLargeEditable bool) (*demoRuntime, bool, int, error) {
+	return loadDataRuntimeFilesWithLargePolicyAndBaseExtent(ctx, paths, baseLayers, saveDestination, allowLargeEditable, nil)
+}
+
+func loadDataRuntimeFilesWithLargePolicyAndBaseExtent(ctx context.Context, paths []string, baseLayers []core.Layer, saveDestination string, allowLargeEditable bool, baseExtent *[4]float64) (*demoRuntime, bool, int, error) {
 	featureCount := 0
-	if len(baseLayers) == 0 && saveDestination == "" && !allowLargeEditable {
+	if saveDestination == "" && !allowLargeEditable {
 		sources := make([]vectorSourceSpec, len(paths))
 		for index, path := range paths {
 			sources[index] = vectorSourceSpec{Path: path}
@@ -995,6 +2209,13 @@ func loadDataRuntimeFilesWithLargePolicy(ctx context.Context, paths []string, ba
 			unknownCount = true
 		}
 		if shouldOpenLargeDatasetReadOnly(featureCount, unknownCount, allowLargeEditable) {
+			if len(baseLayers) > 0 {
+				if baseExtent == nil {
+					return nil, false, featureCount, fmt.Errorf("cannot transition existing layers to read-only loading without a valid current map extent")
+				}
+				runtime, err := loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, "", baseLayers, baseExtent)
+				return runtime, true, featureCount, err
+			}
 			runtime, err := loadReadOnlyDataRuntime(ctx, sources, "")
 			return runtime, true, featureCount, err
 		}
@@ -1014,7 +2235,14 @@ func loadDataRuntimeSourcesWithCRS(ctx context.Context, sources []vectorSourceSp
 	layers := make([]core.Layer, 0, len(baseLayers)+len(sources))
 	usedNames := make(map[string]bool, len(baseLayers)+len(sources))
 	unavailable := make(map[string]unavailableSource)
+	materializedFeatures, materializedBytes := 0, int64(0)
 	for _, layer := range baseLayers {
+		var budgetErr error
+		materializedFeatures, materializedBytes, budgetErr = accumulateMaterializedRuntimeLayerUsage(
+			materializedFeatures, materializedBytes, layer, maxDesktopMaterializedFeatures, maxDesktopMaterializedBytes)
+		if budgetErr != nil {
+			return nil, fmt.Errorf("base project: %w", budgetErr)
+		}
 		layers = append(layers, layer)
 		usedNames[strings.ToLower(layer.Name)] = true
 	}
@@ -1078,6 +2306,11 @@ func loadDataRuntimeSourcesWithCRS(ctx context.Context, sources []vectorSourceSp
 			return nil, err
 		}
 		for layerIndex, layer := range opened {
+			materializedFeatures, materializedBytes, err = accumulateMaterializedRuntimeLayerUsage(
+				materializedFeatures, materializedBytes, layer, maxDesktopMaterializedFeatures, maxDesktopMaterializedBytes)
+			if err != nil {
+				return nil, fmt.Errorf("read %q: %w", path, err)
+			}
 			sourceLayerName := layer.Name
 			if source.LayerName != "" {
 				sourceLayerName = source.LayerName
@@ -1238,6 +2471,11 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 	saveDestination := r.saveDestination
 	readOnlySources := append([]vectorSourceSpec(nil), r.readOnlySources...)
 	displayCRS := r.readOnlyDisplayCRS
+	if displayCRS == "" {
+		displayCRS = r.mapCRS
+	}
+	baseExtent := r.mapExtent
+	readOnlyBaseLayers := append([]core.Layer(nil), r.readOnlyBaseLayers...)
 	previousVisibility := make(map[string]bool)
 	if appendLayers {
 		previousVisibility = make(map[string]bool, len(r.visibleLayers))
@@ -1319,13 +2557,13 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 		largeReadOnly := false
 		featureCount := 0
 		if readOnly {
-			next, err = loadReadOnlyDataRuntime(loadContext, readOnlySources, displayCRS)
+			next, err = loadReadOnlyDataRuntimeWithBaseLayers(loadContext, readOnlySources, displayCRS, readOnlyBaseLayers, &baseExtent)
 		} else {
 			if !appendLayers && saveDestination == "" && !r.allowLargeEditable {
 				native.SetRenderStatus("Loading: checking feature count")
 			}
-			next, largeReadOnly, featureCount, err = loadDataRuntimeFilesWithLargePolicy(
-				loadContext, paths, baseLayers, saveDestination, r.allowLargeEditable)
+			next, largeReadOnly, featureCount, err = loadDataRuntimeFilesWithLargePolicyAndBaseExtent(
+				loadContext, paths, baseLayers, saveDestination, r.allowLargeEditable, &baseExtent)
 		}
 		r.mu.Lock()
 		current := generation == r.loadGeneration
@@ -1565,6 +2803,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.attributeReady = false
 	r.attributeCache = nil
 	r.attributeCacheOrder = nil
+	r.attributeCacheBytes = 0
 	r.featureNameCacheLayer = ""
 	r.featureNameCacheID = 0
 	r.featureNameCacheValue = ""
