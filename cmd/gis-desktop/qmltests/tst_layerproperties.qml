@@ -41,12 +41,127 @@ TestCase {
         compare(viewport.localPathFromUrl("/data/My Roads.shp"), "/data/My Roads.shp");
     }
 
+    function test_translationsCoverSelectedLanguages() {
+        appWindow.language = "ko";
+        compare(appWindow.tr("Layers"), "레이어");
+        compare(appWindow.tr("Add vector files"), "벡터 파일 추가");
+        appWindow.language = "jp";
+        compare(appWindow.tr("Layers"), "レイヤー");
+        compare(appWindow.tr("Add vector files"), "ベクターファイルを追加");
+        appWindow.language = "en";
+        compare(appWindow.tr("Layers"), "Layers");
+    }
+
+    function test_layerContextMenuOpensRequestedCategory() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var viewport = findChild(appWindow, "mapViewport");
+        var menu = findChild(appWindow, "layerContextMenu");
+        var dialog = findChild(appWindow, "layerSettingsDialog");
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        tryCompare(layerModel, "count", 1);
+        var layerDelegate = findChild(appWindow, "layerList").itemAtIndex(0);
+        verify(layerDelegate !== null);
+        var contextMouseArea = findChild(appWindow, "layerContextMouseArea");
+        verify(contextMouseArea !== null);
+        verify(contextMouseArea.width > 0 && contextMouseArea.height > 0);
+        viewport.activeLayer = "";
+        tryCompare(menu, "visible", false);
+        mouseClick(contextMouseArea, contextMouseArea.width / 2, contextMouseArea.height / 2, Qt.RightButton);
+        tryCompare(viewport, "activeLayer", "roads");
+        compare(menu.targetLayerName, "roads");
+        menu.popup();
+        tryCompare(menu, "visible", true);
+        compare(menu.targetLayerName, "roads");
+        mouseClick(findChild(appWindow, "layerContextSymbology"));
+        tryCompare(dialog, "visible", true);
+        compare(dialog.targetLayerName, "roads");
+        compare(dialog.activeCategory, "symbology");
+        dialog.close();
+    }
+
+    function test_aboutDialogShowsBuildInformation() {
+        var button = findChild(appWindow, "aboutButton");
+        var dialog = findChild(appWindow, "aboutDialog");
+        verify(button !== null);
+        mouseClick(button);
+        tryCompare(dialog, "visible", true);
+        verify(findChild(dialog, "aboutVersionValue").text.length > 0);
+        verify(findChild(dialog, "aboutBuildValue").text.length > 0);
+        verify(findChild(dialog, "aboutRuntimeValue").text.indexOf("Go") === 0);
+        dialog.close();
+    }
+
+    function test_mapDragPansViewport() {
+        findChild(appWindow, "layerSettingsDialog").close();
+        findChild(appWindow, "attributeDialog").close();
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var mouseArea = findChild(appWindow, "mapMouseArea");
+        var layerModel = findChild(appWindow, "layerModel");
+        canvas.layerTreePayload = "[]";
+        wait(100);
+        tryCompare(layerModel, "count", 0);
+        verify(mouseArea !== null);
+        var beforeX = viewport.panX;
+        var beforeY = viewport.panY;
+        mouseDrag(mouseArea, mouseArea.width / 2, mouseArea.height / 2, 40, 25);
+        verify(Math.abs(viewport.panX - beforeX) > 1 || Math.abs(viewport.panY - beforeY) > 1);
+    }
+
+    function test_mapCanvasPreservesCoordinateAspectRatio() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        canvas.mapMetadataPayload = JSON.stringify({bounds: [0, 0, 200, 100], crs: "EPSG:3857"});
+        canvas.mapMetadataGeneration += 1;
+        tryCompare(viewport, "dataCRS", "EPSG:3857");
+        compare(Math.round(canvas.width / canvas.height * 1000) / 1000, 2);
+    }
+
+    function test_vertexHandleDragEmitsFeatureVertexEdit() {
+        findChild(appWindow, "layerSettingsDialog").close();
+        findChild(appWindow, "attributeDialog").close();
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var toggle = findChild(appWindow, "toggleVertexEditButton");
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        tryCompare(layerModel, "count", 1);
+        canvas.vertexHandlePayload = JSON.stringify([{x: 0.5, y: 0.5, vertexIndex: 3}]);
+        canvas.vertexHandleGeneration += 1;
+        var repeater = findChild(appWindow, "vertexHandleRepeater");
+        verify(repeater !== null);
+        tryCompare(repeater, "count", 1);
+        verify(toggle.enabled);
+        toggle.click();
+        tryCompare(appWindow, "vertexEditMode", true);
+        var handle = repeater.itemAt(0);
+        verify(handle !== null);
+        var dragArea = handle.dragArea;
+        verify(dragArea !== null);
+        verify(dragArea.enabled && dragArea.visible);
+        verify(handle.visible);
+        var eventTarget = appWindow.contentItem;
+        var start = handle.mapToItem(eventTarget, handle.width / 2, handle.height / 2);
+        mousePress(eventTarget, start.x, start.y);
+        tryCompare(dragArea, "pressed", true);
+        mouseMove(eventTarget, start.x + 24, start.y - 16, 100);
+        mouseRelease(eventTarget, start.x + 24, start.y - 16);
+        compare(canvas.editAction, "moveVertex");
+        var edit = JSON.parse(canvas.editValue);
+        compare(edit.vertexIndex, 3);
+        verify(isFinite(edit.x) && isFinite(edit.y));
+        verify(Math.abs(edit.x - 0.5) > 0.001 || Math.abs(edit.y - 0.5) > 0.001);
+    }
+
     function test_applySubmitsLayerSettings() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var renderStatus = findChild(appWindow, "renderStatusLabel");
         var loadIndicator = findChild(appWindow, "loadBusyIndicator");
         var layerModel = findChild(appWindow, "layerModel");
         var dialog = findChild(appWindow, "layerSettingsDialog");
+        var attributesDialog = findChild(appWindow, "attributeDialog");
+        var viewport = findChild(appWindow, "mapViewport");
+        var openAttributesButton = findChild(appWindow, "openAttributesButton");
         var displayName = findChild(appWindow, "displayNameField");
         var sourcePath = findChild(appWindow, "sourcePathField");
         var sourceLayer = findChild(appWindow, "sourceLayerField");
@@ -63,6 +178,9 @@ TestCase {
         var labelExpression = findChild(appWindow, "labelExpressionField");
         var labelRule = findChild(appWindow, "labelRuleField");
         var labelLua = findChild(appWindow, "labelLuaField");
+        var luaDialog = findChild(appWindow, "luaEditorDialog");
+        var luaOpenButton = findChild(appWindow, "openLuaEditorButton");
+        var labelRuleEditor = findChild(appWindow, "labelRuleEditor");
         var labelPlacement = findChild(appWindow, "labelPlacementField");
         var labelRotation = findChild(appWindow, "labelRotationField");
         var labelHeight = findChild(appWindow, "labelHeightField");
@@ -73,8 +191,12 @@ TestCase {
         verify(renderStatus !== null);
         verify(loadIndicator !== null);
         verify(layerModel !== null);
+        compare(layerModel.count, 0, "new projects should start without demo layers");
         verify(canvas.logicalPixelsPerMm > 0);
         verify(dialog !== null);
+        verify(attributesDialog !== null);
+        verify(viewport !== null);
+        verify(openAttributesButton !== null);
         verify(displayName !== null);
         verify(sourcePath !== null);
         verify(sourceLayer !== null);
@@ -91,6 +213,9 @@ TestCase {
         verify(labelExpression !== null);
         verify(labelRule !== null);
         verify(labelLua !== null);
+        verify(luaDialog !== null);
+        verify(luaOpenButton !== null);
+        verify(labelRuleEditor !== null);
         verify(labelPlacement !== null);
         verify(labelRotation !== null);
         verify(labelHeight !== null);
@@ -127,38 +252,54 @@ TestCase {
             }
         ]);
         tryCompare(layerModel, "count", 1);
-        dialog.open();
+        viewport.showLayerContextMenu("roads");
+        var contextMenu = findChild(appWindow, "layerContextMenu");
+        tryCompare(contextMenu, "visible", true);
+        contextMenu.dismiss();
+        mouseClick(openAttributesButton);
+        tryCompare(attributesDialog, "visible", true);
+        attributesDialog.close();
+        viewport.openLayerPropertiesForCategory("roads", "general");
         tryCompare(dialog, "visible", true);
         wait(300);
         compare(dialog.targetLayerName, "roads");
         compare(displayName.text, "Named roads");
+        dialog.activeCategory = "source";
         compare(sourcePath.text, "/data/roads.shp");
         compare(sourceLayer.text, "roads");
         compare(sourceEncoding.editText, "EUC-KR");
         compare(visible.checked, true);
         compare(sourceChangeWarning.visible, false);
+        dialog.activeCategory = "symbology";
         compare(pointColor.text, "#112233");
         compare(pointSize.text, "2.4");
         compare(lineColor.text, "#445566");
         compare(lineWidth.text, "0.8");
         compare(polygonColor.text, "#778899");
         compare(fillOpacity.text, "0.4");
+        dialog.activeCategory = "labels";
         compare(labelsEnabled.checked, true);
         compare(labelExpression.text, "${label}");
         compare(labelRule.text, "return feature.visible == true");
+        luaDialog.open();
+        tryCompare(luaDialog, "visible", true);
+        compare(labelRuleEditor.text, "return feature.visible == true");
         compare(labelLua.text, "return feature.label");
         compare(labelPlacement.currentIndex, 1);
         compare(labelRotation.text, "angle");
         compare(labelHeight.text, "2");
         compare(labelMinScale.text, "500");
         compare(labelMaxScale.text, "25000");
+        dialog.activeCategory = "general";
         displayName.text = "Renamed roads";
+        dialog.activeCategory = "source";
         sourcePath.text = "/tmp/roads.shp";
         sourceLayer.text = "roads_internal";
         sourceEncoding.editText = "CP949";
         compare(sourceChangeWarning.visible, true);
         verify(sourceChangeWarning.text.indexOf("Save unsaved feature edits") >= 0);
         visible.checked = false;
+        dialog.activeCategory = "symbology";
         pointColor.text = "#aabbcc";
         pointSize.text = "3.2";
         lineColor.text = "#010203";
@@ -166,9 +307,14 @@ TestCase {
         polygonColor.text = "#123456";
         fillOpacity.text = "0.6";
         labelsEnabled.checked = true;
+        dialog.activeCategory = "labels";
         labelExpression.text = "${name}";
-        labelRule.text = "return feature.active == true";
+        labelRuleEditor.text = "return feature.active == true";
         labelLua.text = "return feature.name";
+        var luaOkButton = luaDialog.standardButton(Dialog.Ok);
+        verify(luaOkButton !== null);
+        mouseClick(luaOkButton);
+        tryCompare(luaDialog, "visible", false);
         labelPlacement.currentIndex = 2;
         labelRotation.text = "angle";
         labelHeight.text = "3";

@@ -14,6 +14,29 @@ ApplicationWindow {
     minimumHeight: 640
     title: "GoGIS — Milestone B prototype"
     color: "#f4f6f8"
+    property bool vertexEditMode: false
+    property string language: typeof appLanguage === "undefined" ? "en" : appLanguage
+    property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
+    property string runtimeText: typeof appRuntime === "undefined" ? "Go runtime" : appRuntime
+    property string buildTargetText: typeof appBuildTarget === "undefined" ? "desktop" : appBuildTarget
+    property var translations: ({
+        en: ({"Add vector files": "Add vector files", "Open workspace": "Open workspace", "Attributes": "Attributes", "Edit vertices": "Edit vertices", "Finish vertex edit": "Finish vertex edit", "Save GeoPackage": "Save GeoPackage", "Save workspace": "Save workspace", "About GoGIS": "About GoGIS", "Layers": "Layers", "No layers yet": "No layers yet", "Add vector files or open a workspace to begin.": "Add vector files or open a workspace to begin.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "Drag to pan · Scroll to zoom · Click a feature to inspect", "General": "General", "Data source": "Data source", "Symbology": "Symbology", "Labels and expressions": "Labels and expressions", "Layer properties": "Layer properties", "Version": "Version", "Build": "Build", "Runtime": "Runtime", "License": "License", "Close": "Close", "Layer": "Layer", "Layer visible": "Layer visible", "Browse…": "Browse…", "Layer in source": "Layer in source", "Shapefile encoding": "Shapefile encoding", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator", "Display rule — return true to show this feature's label": "Display rule — return true to show this feature's label", "Label text — return string, number, or nil": "Label text — return string, number, or nil", "Insert label example": "Insert label example", "Insert rule example": "Insert rule example", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties"}),
+        ko: ({"Add vector files": "벡터 파일 추가", "Open workspace": "작업공간 열기", "Attributes": "속성 테이블", "Edit vertices": "정점 편집", "Finish vertex edit": "정점 편집 종료", "Save GeoPackage": "GeoPackage 저장", "Save workspace": "작업공간 저장", "About GoGIS": "GoGIS 정보", "Layers": "레이어", "No layers yet": "레이어가 없습니다", "Add vector files or open a workspace to begin.": "벡터 파일을 추가하거나 작업공간을 열어 시작하세요.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "드래그: 이동 · 휠: 확대/축소 · 피처 클릭: 정보 확인", "General": "일반", "Data source": "데이터 원본", "Symbology": "심볼로지", "Labels and expressions": "레이블 및 표현식", "Layer properties": "레이어 속성", "Version": "버전", "Build": "빌드", "Runtime": "실행 환경", "License": "라이선스", "Close": "닫기", "Layer": "레이어", "Layer visible": "레이어 표시", "Browse…": "찾아보기…", "Layer in source": "원본 내부 레이어", "Shapefile encoding": "Shapefile 인코딩", "Point color": "점 색상", "Point size (mm)": "점 크기 (mm)", "Line color": "선 색상", "Line width (mm)": "선 두께 (mm)", "Polygon color": "폴리곤 색상", "Fill opacity (0–1)": "채우기 불투명도 (0–1)", "Show labels": "레이블 표시", "Label field / template": "레이블 필드 / 템플릿", "Placement": "배치", "Rotation field (optional)": "회전 필드 (선택)", "Text height (mm)": "글자 높이 (mm)", "Minimum scale denominator": "최소 축척 분모", "Maximum scale denominator": "최대 축척 분모", "Display rule — return true to show this feature's label": "표시 규칙 — 레이블 표시 시 true 반환", "Label text — return string, number, or nil": "레이블 문자열 — 문자열, 숫자 또는 nil 반환", "Insert label example": "레이블 예제 삽입", "Insert rule example": "규칙 예제 삽입", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "스크립트는 피처마다 실행됩니다. 읽기 전용 `feature` 테이블로 속성에 접근합니다. 공백이 있는 필드는 feature[\"필드 이름\"] 형식을 사용하세요.", "Layer settings": "레이어 설정", "Source path": "원본 경로", "Data properties": "데이터 속성"}),
+        jp: ({"Add vector files": "ベクターファイルを追加", "Open workspace": "ワークスペースを開く", "Attributes": "属性テーブル", "Edit vertices": "頂点を編集", "Finish vertex edit": "頂点編集を終了", "Save GeoPackage": "GeoPackageを保存", "Save workspace": "ワークスペースを保存", "About GoGIS": "GoGISについて", "Layers": "レイヤー", "No layers yet": "レイヤーがありません", "Add vector files or open a workspace to begin.": "ベクターファイルを追加するか、ワークスペースを開いてください。", "Drag to pan · Scroll to zoom · Click a feature to inspect": "ドラッグ: 移動 · ホイール: 拡大/縮小 · 地物をクリック: 情報表示", "General": "一般", "Data source": "データソース", "Symbology": "シンボロジ", "Labels and expressions": "ラベルと式", "Layer properties": "レイヤーのプロパティ", "Version": "バージョン", "Build": "ビルド", "Runtime": "ランタイム", "License": "ライセンス", "Close": "閉じる", "Layer": "レイヤー", "Layer visible": "レイヤーを表示", "Browse…": "参照…", "Layer in source": "ソース内レイヤー", "Shapefile encoding": "Shapefileの文字コード", "Point color": "ポイント色", "Point size (mm)": "ポイントサイズ (mm)", "Line color": "ライン色", "Line width (mm)": "ライン幅 (mm)", "Polygon color": "ポリゴン色", "Fill opacity (0–1)": "塗りの不透明度 (0–1)", "Show labels": "ラベルを表示", "Label field / template": "ラベルフィールド / テンプレート", "Placement": "配置", "Rotation field (optional)": "回転フィールド (任意)", "Text height (mm)": "文字の高さ (mm)", "Minimum scale denominator": "最小縮尺分母", "Maximum scale denominator": "最大縮尺分母", "Display rule — return true to show this feature's label": "表示ルール — ラベル表示時にtrueを返す", "Label text — return string, number, or nil": "ラベル文字列 — 文字列、数値、またはnilを返す", "Insert label example": "ラベル例を挿入", "Insert rule example": "ルール例を挿入", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "スクリプトは地物ごとに実行されます。読み取り専用の`feature`テーブルから属性を参照できます。空白を含むフィールド名はfeature[\"フィールド名\"]を使用します。", "Layer settings": "レイヤー設定", "Source path": "ソースパス", "Data properties": "データ属性"})
+    })
+    property var translationOverrides: ({
+        en: ({"Desktop GIS": "Desktop GIS", "Layer properties": "Layer properties", "Select original layer source": "Select original layer source", "Add vector files as layers": "Add vector files as layers", "Save GoGIS workspace": "Save GoGIS workspace", "Open GoGIS workspace": "Open GoGIS workspace", "Drop SHP, GeoPackage, or GeoJSON": "Drop SHP, GeoPackage, or GeoJSON", "Display name": "Display name", "Original source path": "Original source path", "Internal layer name": "Internal layer name", "Auto encoding": "Auto encoding", "Selected feature": "Selected feature", "Feature name": "Feature name", "Save": "Save", "Cancel": "Cancel", "Previous": "Previous", "Next": "Next", "No attribute records in this layer": "No attribute records in this layer", "X coordinate": "X coordinate", "Y coordinate": "Y coordinate", "Go": "Go", "Cancel loading/render": "Cancel loading/render", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator"}),
+        ko: ({"Desktop GIS": "데스크톱 GIS", "Layer properties": "레이어 속성", "Select original layer source": "레이어 원본 선택", "Add vector files as layers": "벡터 파일을 레이어로 추가", "Save GoGIS workspace": "GoGIS 작업공간 저장", "Open GoGIS workspace": "GoGIS 작업공간 열기", "Drop SHP, GeoPackage, or GeoJSON": "SHP, GeoPackage 또는 GeoJSON 파일을 놓으세요", "Display name": "표시 이름", "Original source path": "원본 경로", "Internal layer name": "내부 레이어 이름", "Auto encoding": "인코딩 자동 감지", "Selected feature": "선택한 피처", "Feature name": "피처 이름", "Save": "저장", "Cancel": "취소", "Previous": "이전", "Next": "다음", "No attribute records in this layer": "이 레이어에 속성 레코드가 없습니다", "X coordinate": "X 좌표", "Y coordinate": "Y 좌표", "Go": "이동", "Cancel loading/render": "불러오기/렌더링 취소", "Layer settings": "레이어 설정", "Source path": "원본 경로", "Data properties": "데이터 속성", "Point color": "점 색상", "Point size (mm)": "점 크기 (mm)", "Line color": "선 색상", "Line width (mm)": "선 두께 (mm)", "Polygon color": "폴리곤 색상", "Fill opacity (0–1)": "채우기 불투명도 (0–1)", "Show labels": "레이블 표시", "Label field / template": "레이블 필드 / 템플릿", "Placement": "배치", "Rotation field (optional)": "회전 필드 (선택)", "Text height (mm)": "글자 높이 (mm)", "Minimum scale denominator": "최소 축척 분모", "Maximum scale denominator": "최대 축척 분모"}),
+        jp: ({"Desktop GIS": "デスクトップGIS", "Layer properties": "レイヤーのプロパティ", "Select original layer source": "レイヤーソースを選択", "Add vector files as layers": "ベクターファイルをレイヤーとして追加", "Save GoGIS workspace": "GoGISワークスペースを保存", "Open GoGIS workspace": "GoGISワークスペースを開く", "Drop SHP, GeoPackage, or GeoJSON": "SHP、GeoPackage、GeoJSONをドロップ", "Display name": "表示名", "Original source path": "元のソースパス", "Internal layer name": "内部レイヤー名", "Auto encoding": "文字コードを自動判定", "Selected feature": "選択地物", "Feature name": "地物名", "Save": "保存", "Cancel": "キャンセル", "Previous": "前へ", "Next": "次へ", "No attribute records in this layer": "このレイヤーに属性レコードはありません", "X coordinate": "X座標", "Y coordinate": "Y座標", "Go": "移動", "Cancel loading/render": "読み込み/描画をキャンセル", "Layer settings": "レイヤー設定", "Source path": "ソースパス", "Data properties": "データ属性", "Point color": "ポイント色", "Point size (mm)": "ポイントサイズ (mm)", "Line color": "ライン色", "Line width (mm)": "ライン幅 (mm)", "Polygon color": "ポリゴン色", "Fill opacity (0–1)": "塗りの不透明度 (0–1)", "Show labels": "ラベルを表示", "Label field / template": "ラベルフィールド / テンプレート", "Placement": "配置", "Rotation field (optional)": "回転フィールド (任意)", "Text height (mm)": "文字の高さ (mm)", "Minimum scale denominator": "最小縮尺分母", "Maximum scale denominator": "最大縮尺分母"})
+    })
+
+    function tr(key) {
+        var override = translationOverrides[language] || translationOverrides.en;
+        if (override[key] !== undefined)
+            return override[key];
+        var dictionary = translations[language] || translations.en;
+        return dictionary[key] || translations.en[key] || key;
+    }
 
     header: ToolBar {
         RowLayout {
@@ -26,32 +49,72 @@ ApplicationWindow {
                 font.pixelSize: 18
             }
             Label {
-                text: "Milestone B / Qt Quick"
+                text: rootWindow.tr("Desktop GIS")
                 color: "#65717d"
             }
             Item {
                 Layout.fillWidth: true
             }
             Button {
-                text: "Add vector files"
+                text: rootWindow.tr("Add vector files")
                 onClicked: fileDialog.open()
             }
             Button {
-                text: "Open workspace"
+                text: rootWindow.tr("Open workspace")
                 onClicked: workspaceOpenDialog.open()
             }
             Button {
-                text: "Save GeoPackage"
+                objectName: "openAttributesButton"
+                text: rootWindow.tr("Attributes")
+                enabled: layerModel.count > 0
+                onClicked: attributeDialog.open()
+            }
+            Button {
+                objectName: "toggleVertexEditButton"
+                text: rootWindow.vertexEditMode ? "Finish vertex edit" : "Edit vertices"
+                enabled: layerModel.count > 0 && vertexHandleModel.count > 0
+                onClicked: rootWindow.vertexEditMode = !rootWindow.vertexEditMode
+            }
+            Button {
+                text: rootWindow.tr("Save GeoPackage")
                 onClicked: saveDialog.open()
             }
             Button {
-                text: "Save workspace"
+                text: rootWindow.tr("Save workspace")
                 onClicked: workspaceDialog.open()
             }
-            Label {
-                text: "QSGGeometryNode: active demo batch"
-                color: "#65717d"
+            Button {
+                objectName: "aboutButton"
+                text: rootWindow.tr("About GoGIS")
+                onClicked: aboutDialog.open()
             }
+        }
+    }
+
+    Menu {
+        id: layerContextMenu
+        objectName: "layerContextMenu"
+        closePolicy: Popup.CloseOnEscape
+        property string targetLayerName: ""
+        MenuItem {
+            objectName: "layerContextGeneral"
+            text: rootWindow.tr("General")
+            onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "general")
+        }
+        MenuItem {
+            objectName: "layerContextDataSource"
+            text: rootWindow.tr("Data source")
+            onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "source")
+        }
+        MenuItem {
+            objectName: "layerContextSymbology"
+            text: rootWindow.tr("Symbology")
+            onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "symbology")
+        }
+        MenuItem {
+            objectName: "layerContextLabels"
+            text: rootWindow.tr("Labels and expressions")
+            onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "labels")
         }
     }
 
@@ -65,30 +128,20 @@ ApplicationWindow {
             ColumnLayout {
                 anchors.fill: parent
                 Label {
-                    text: "Layers"
+                    text: rootWindow.tr("Layers")
                     font.bold: true
                 }
                 ListView {
                     id: layerList
+                    objectName: "layerList"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     model: ListModel {
                         id: layerModel
                         objectName: "layerModel"
-                        ListElement {
-                            name: "roads"
-                            layerVisible: true
-                        }
-                        ListElement {
-                            name: "buildings"
-                            layerVisible: true
-                        }
-                        ListElement {
-                            name: "labels"
-                            layerVisible: true
-                        }
                     }
                     delegate: CheckDelegate {
+                        objectName: "layerDelegate_" + name
                         width: ListView.view.width
                         text: (model.sourceError ? "⚠ " : "") + (typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName)
                         checked: layerVisible
@@ -97,6 +150,17 @@ ApplicationWindow {
                             mapViewport.syncLayerVisibility();
                         }
                         onClicked: mapViewport.selectLayer(name)
+                    }
+                    MouseArea {
+                        objectName: "layerContextMouseArea"
+                        anchors.fill: parent
+                        z: 10
+                        acceptedButtons: Qt.RightButton
+                        onClicked: {
+                            var index = layerList.indexAt(mouse.x, mouse.y + layerList.contentY);
+                            if (index >= 0)
+                                mapViewport.showLayerContextMenu(layerModel.get(index).name);
+                        }
                     }
                 }
             }
@@ -140,6 +204,7 @@ ApplicationWindow {
                 property int attributePageSize: 0
                 property int attributeTotal: 0
                 property int layerLabelGenerationSeen: -1
+                property int vertexHandleGenerationSeen: -1
                 property string renderStatus: "Ready"
 
                 ListModel {
@@ -147,6 +212,9 @@ ApplicationWindow {
                 }
                 ListModel {
                     id: mapLabelModel
+                }
+                ListModel {
+                    id: vertexHandleModel
                 }
 
                 function anyLayerVisible() {
@@ -169,13 +237,41 @@ ApplicationWindow {
                     }
                 }
 
+                function openLayerPropertiesForCategory(name, category) {
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        if (layerModel.get(i).name === name) {
+                            selectLayer(name);
+                            layerSettingsDialog.targetLayerName = name;
+                            layerSettingsDialog.activeCategory = category;
+                            layerSettingsDialog.open();
+                            return;
+                        }
+                    }
+                }
+
+                function showLayerContextMenu(name) {
+                    if (findLayerIndex(name) < 0)
+                        return;
+                    selectLayer(name);
+                    layerContextMenu.targetLayerName = name;
+                    layerContextMenu.popup();
+                }
+
+                function findLayerIndex(name) {
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        if (layerModel.get(i).name === name)
+                            return i;
+                    }
+                    return -1;
+                }
+
                 function currentMapCoordinate() {
                     if (!cursorValid || mapCanvas.width <= 0 || mapCanvas.height <= 0)
                         return "—";
                     var bounds = dataBounds;
                     var zoom = Math.max(0.0001, mapZoom);
-                    var nx = 0.5 + (cursorX - mapCanvas.width / 2 - panX) / (mapCanvas.width * zoom);
-                    var ny = 0.5 - (cursorY - mapCanvas.height / 2 - panY) / (mapCanvas.height * zoom);
+                    var nx = 0.5 + (cursorX - mapCanvas.x - mapCanvas.width / 2) / (mapCanvas.width * zoom);
+                    var ny = 0.5 - (cursorY - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * zoom);
                     var x = bounds[0] + nx * (bounds[2] - bounds[0]);
                     var y = bounds[1] + ny * (bounds[3] - bounds[1]);
                     var digits = dataCRS.toUpperCase() === "EPSG:4326" ? 6 : 2;
@@ -268,8 +364,18 @@ ApplicationWindow {
                 MapCanvas {
                     id: mapCanvas
                     objectName: "goGisMapCanvas"
-                    anchors.fill: parent
-                    clip: true
+                    property real mapAspectRatio: {
+                        var bounds = mapViewport.dataBounds;
+                        var spanX = bounds[2] - bounds[0];
+                        var spanY = bounds[3] - bounds[1];
+                        return spanX > 0 && spanY > 0 ? spanX / spanY : 1;
+                    }
+                    property real viewportPanX: mapViewport.panX
+                    property real viewportPanY: mapViewport.panY
+                    width: Math.min(parent.width, parent.height * mapAspectRatio)
+                    height: Math.min(parent.height, parent.width / mapAspectRatio)
+                    x: (parent.width - width) / 2 + mapViewport.panX
+                    y: (parent.height - height) / 2 + mapViewport.panY
                     property real clickX: 0
                     property real clickY: 0
                     property int clickGeneration: 0
@@ -292,6 +398,8 @@ ApplicationWindow {
                     property int layerSettingsGeneration: 0
                     property string layerLabelPayload: "[]"
                     property int layerLabelGeneration: 0
+                    property string vertexHandlePayload: "[]"
+                    property int vertexHandleGeneration: 0
                     property string activeLayer: ""
                     property int activeLayerGeneration: 0
                     property string renderStatus: "Ready"
@@ -302,8 +410,6 @@ ApplicationWindow {
                     property int loadGeneration: 0
                     property string savePath: ""
                     property int saveGeneration: 0
-                    x: mapViewport.panX
-                    y: mapViewport.panY
                     scale: mapViewport.mapZoom
                     transformOrigin: Item.Center
                     visible: mapViewport.anyLayerVisible()
@@ -337,6 +443,61 @@ ApplicationWindow {
                     }
                 }
 
+                Repeater {
+                    objectName: "vertexHandleRepeater"
+                    z: 15
+                    model: vertexHandleModel
+                    delegate: Rectangle {
+                        id: vertexHandle
+                        property alias dragArea: vertexMouseArea
+                        objectName: "vertexHandle_" + model.vertexIndex
+                        z: 20
+                        width: 12
+                        height: 12
+                        radius: 6
+                        x: mapCanvas.x + mapCanvas.width / 2 + (model.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2
+                        y: mapCanvas.y + mapCanvas.height / 2 - (model.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2
+                        color: "#fff"
+                        border.color: "#145da0"
+                        border.width: 2
+                        visible: rootWindow.vertexEditMode
+                        MouseArea {
+                            id: vertexMouseArea
+                            objectName: "vertexDragArea_" + model.vertexIndex
+                            anchors.fill: parent
+                            enabled: rootWindow.vertexEditMode
+                            cursorShape: Qt.SizeAllCursor
+                            property real startPointerX: 0
+                            property real startPointerY: 0
+                            property real startHandleX: 0
+                            property real startHandleY: 0
+                            onPressed: function (mouse) {
+                                var point = mapToItem(mapViewport, mouse.x, mouse.y);
+                                startPointerX = point.x;
+                                startPointerY = point.y;
+                                startHandleX = vertexHandle.x;
+                                startHandleY = vertexHandle.y;
+                            }
+                            onPositionChanged: function (mouse) {
+                                if (!pressed)
+                                    return;
+                                var point = mapToItem(mapViewport, mouse.x, mouse.y);
+                                vertexHandle.x = startHandleX + point.x - startPointerX;
+                                vertexHandle.y = startHandleY + point.y - startPointerY;
+                            }
+                            function submitVertexEdit() {
+                                var nx = 0.5 + (vertexHandle.x + vertexHandle.width / 2 - mapCanvas.x - mapCanvas.width / 2) / (mapCanvas.width * mapCanvas.scale);
+                                var ny = 0.5 - (vertexHandle.y + vertexHandle.height / 2 - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * mapCanvas.scale);
+                                var bounds = mapViewport.dataBounds;
+                                mapCanvas.editAction = "moveVertex";
+                                mapCanvas.editValue = JSON.stringify({vertexIndex: model.vertexIndex, x: bounds[0] + nx * (bounds[2] - bounds[0]), y: bounds[1] + ny * (bounds[3] - bounds[1])});
+                                mapCanvas.editGeneration += 1;
+                            }
+                            onReleased: submitVertexEdit()
+                        }
+                    }
+                }
+
                 Component.onCompleted: mapViewport.syncLayerVisibility()
 
                 DropArea {
@@ -355,7 +516,7 @@ ApplicationWindow {
                     Label {
                         anchors.centerIn: parent
                         visible: parent.containsDrag
-                        text: "Drop SHP, GeoPackage, or GeoJSON"
+                        text: rootWindow.tr("Drop SHP, GeoPackage, or GeoJSON")
                         color: "#1f4e79"
                         font.bold: true
                     }
@@ -400,7 +561,9 @@ ApplicationWindow {
 
                 MouseArea {
                     id: mapMouseArea
+                    objectName: "mapMouseArea"
                     anchors.fill: parent
+                    z: 5
                     hoverEnabled: true
                     property real lastX: 0
                     property real lastY: 0
@@ -424,14 +587,22 @@ ApplicationWindow {
                     onExited: mapViewport.cursorValid = false
                     onWheel: function (wheel) {
                         var factor = wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15;
-                        mapViewport.mapZoom = Math.max(0.25, Math.min(8.0, mapViewport.mapZoom * factor));
+                        var oldZoom = mapViewport.mapZoom;
+                        var newZoom = Math.max(0.25, Math.min(8.0, oldZoom * factor));
+                        var normalizedX = 0.5 + (wheel.x - mapCanvas.x - mapCanvas.width / 2) / (mapCanvas.width * oldZoom);
+                        var normalizedY = 0.5 - (wheel.y - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * oldZoom);
+                        var baseX = (mapViewport.width - mapCanvas.width) / 2;
+                        var baseY = (mapViewport.height - mapCanvas.height) / 2;
+                        mapViewport.mapZoom = newZoom;
+                        mapViewport.panX = wheel.x - baseX - mapCanvas.width / 2 - (normalizedX - 0.5) * mapCanvas.width * newZoom;
+                        mapViewport.panY = wheel.y - baseY - mapCanvas.height / 2 + (normalizedY - 0.5) * mapCanvas.height * newZoom;
                         mapViewport.viewportGeneration += 1;
                     }
                     onClicked: function (mouse) {
                         if (!mapViewport.mapZoom)
                             return;
-                        mapCanvas.clickX = mouse.x;
-                        mapCanvas.clickY = mouse.y;
+                        mapCanvas.clickX = mouse.x - mapCanvas.x;
+                        mapCanvas.clickY = mouse.y - mapCanvas.y;
                         mapCanvas.clickGeneration += 1;
                     }
                 }
@@ -501,6 +672,13 @@ ApplicationWindow {
                             for (var labelIndex = 0; labelIndex < labels.length; ++labelIndex)
                                 mapLabelModel.append(labels[labelIndex]);
                         }
+                        if (mapCanvas.vertexHandleGeneration !== mapViewport.vertexHandleGenerationSeen) {
+                            mapViewport.vertexHandleGenerationSeen = mapCanvas.vertexHandleGeneration;
+                            vertexHandleModel.clear();
+                            var handles = JSON.parse(mapCanvas.vertexHandlePayload || "[]");
+                            for (var handleIndex = 0; handleIndex < handles.length; ++handleIndex)
+                                vertexHandleModel.append(handles[handleIndex]);
+                        }
                         if (mapCanvas.mapMetadataGeneration !== mapViewport.mapMetadataGenerationSeen) {
                             mapViewport.mapMetadataGenerationSeen = mapCanvas.mapMetadataGeneration;
                             var metadata = ({});
@@ -547,30 +725,73 @@ ApplicationWindow {
                     anchors.left: parent.left
                     anchors.bottom: parent.bottom
                     anchors.margins: 10
-                    text: "Pan: drag · Zoom: wheel"
+                    text: rootWindow.tr("Drag to pan · Scroll to zoom · Click a feature to inspect")
                     color: "#65717d"
+                }
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    visible: layerModel.count === 0
+                    spacing: 8
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: rootWindow.tr("No layers yet")
+                        font.pixelSize: 22
+                        font.bold: true
+                        color: "#45515c"
+                    }
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: rootWindow.tr("Add vector files or open a workspace to begin.")
+                        color: "#65717d"
+                    }
+                    Button {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: rootWindow.tr("Add vector files")
+                        onClicked: fileDialog.open()
+                    }
                 }
             }
         }
+    }
 
-        Frame {
-            SplitView.preferredWidth: 260
-            Layout.fillHeight: true
-            ColumnLayout {
-                anchors.fill: parent
-                RowLayout {
-                    Layout.fillWidth: true
-                    Label {
-                        text: "Layer attributes"
-                        font.bold: true
-                        Layout.fillWidth: true
-                    }
-                    Button {
-                        text: "Layer properties"
-                        enabled: layerModel.count > 0
-                        onClicked: layerSettingsDialog.open()
-                    }
-                }
+    Dialog {
+        id: aboutDialog
+        objectName: "aboutDialog"
+        modal: true
+        title: rootWindow.tr("About GoGIS")
+        width: Math.min(460, rootWindow.width - 48)
+        standardButtons: Dialog.Close
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                text: "GoGIS"
+                font.pixelSize: 22
+                font.bold: true
+            }
+            GridLayout {
+                columns: 2
+                Label { text: rootWindow.tr("Version") }
+                Label { objectName: "aboutVersionValue"; text: rootWindow.versionText }
+                Label { text: rootWindow.tr("Build") }
+                Label { objectName: "aboutBuildValue"; text: rootWindow.buildTargetText }
+                Label { text: rootWindow.tr("Runtime") }
+                Label { objectName: "aboutRuntimeValue"; text: rootWindow.runtimeText }
+                Label { text: rootWindow.tr("License") }
+                Label { text: "MIT" }
+            }
+        }
+    }
+
+    Dialog {
+        id: attributeDialog
+        objectName: "attributeDialog"
+        modal: true
+        title: rootWindow.tr("Attributes") + " — " + mapViewport.activeLayer
+        width: Math.min(780, rootWindow.width - 48)
+        height: Math.min(680, rootWindow.height - 80)
+        standardButtons: Dialog.Close
+        contentItem: ColumnLayout {
+            spacing: 8
                 Flickable {
                     Layout.fillWidth: true
                     Layout.preferredHeight: attributeLayerTabs.implicitHeight
@@ -590,7 +811,7 @@ ApplicationWindow {
                     }
                 }
                 Label {
-                    text: "Selected feature"
+                    text: rootWindow.tr("Selected feature")
                     font.bold: true
                     visible: mapViewport.selectedFeature !== ""
                 }
@@ -604,7 +825,7 @@ ApplicationWindow {
                     id: propertyEditor
                     Layout.fillWidth: true
                     visible: mapViewport.selectedFeature !== ""
-                    placeholderText: "Feature name"
+                    placeholderText: rootWindow.tr("Feature name")
                     text: mapViewport.editorValue
                     onTextChanged: if (activeFocus)
                         mapViewport.editorValue = text
@@ -612,7 +833,7 @@ ApplicationWindow {
                 RowLayout {
                     visible: mapViewport.selectedFeature !== ""
                     Button {
-                        text: "Save"
+                        text: rootWindow.tr("Save")
                         onClicked: {
                             mapCanvas.editAction = "commit";
                             mapCanvas.editValue = mapViewport.editorValue;
@@ -620,7 +841,7 @@ ApplicationWindow {
                         }
                     }
                     Button {
-                        text: "Cancel"
+                        text: rootWindow.tr("Cancel")
                         onClicked: {
                             mapCanvas.editAction = "rollback";
                             mapCanvas.editValue = "";
@@ -659,7 +880,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     visible: mapViewport.attributeTotal > mapViewport.attributePageSize && mapViewport.attributePageSize > 0
                     Button {
-                        text: "Previous"
+                        text: rootWindow.tr("Previous")
                         enabled: mapViewport.attributePage > 0
                         onClicked: mapViewport.requestAttributePage(mapViewport.attributePage - 1)
                     }
@@ -669,7 +890,7 @@ ApplicationWindow {
                         horizontalAlignment: Text.AlignHCenter
                     }
                     Button {
-                        text: "Next"
+                        text: rootWindow.tr("Next")
                         enabled: mapViewport.attributePage + 1 < Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize)
                         onClicked: mapViewport.requestAttributePage(mapViewport.attributePage + 1)
                     }
@@ -730,15 +951,12 @@ ApplicationWindow {
                 Label {
                     Layout.fillWidth: true
                     visible: layerModel.count > 0 && mapViewport.attributeTotal === 0
-                    text: "No attribute records in this layer"
+                    text: rootWindow.tr("No attribute records in this layer")
                     color: "#65717d"
                     horizontalAlignment: Text.AlignHCenter
                     padding: 16
                 }
-                Item {
-                    Layout.fillHeight: true
-                }
-            }
+                Item { Layout.fillHeight: true }
         }
     }
 
@@ -765,16 +983,16 @@ ApplicationWindow {
             TextField {
                 id: coordinateXInput
                 Layout.preferredWidth: 115
-                placeholderText: "X coordinate"
+                placeholderText: rootWindow.tr("X coordinate")
             }
             TextField {
                 id: coordinateYInput
                 Layout.preferredWidth: 115
-                placeholderText: "Y coordinate"
+                placeholderText: rootWindow.tr("Y coordinate")
                 onAccepted: mapViewport.goToCoordinate()
             }
             Button {
-                text: "Go"
+                text: rootWindow.tr("Go")
                 onClicked: mapViewport.goToCoordinate()
             }
             Label {
@@ -782,7 +1000,7 @@ ApplicationWindow {
                 color: "#65717d"
             }
             Button {
-                text: "Cancel loading/render"
+                text: rootWindow.tr("Cancel loading/render")
                 enabled: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
                 onClicked: mapCanvas.cancelGeneration += 1
             }
@@ -804,14 +1022,16 @@ ApplicationWindow {
         id: layerSettingsDialog
         objectName: "layerSettingsDialog"
         modal: true
-        title: "Layer properties"
-        width: 500
+        title: rootWindow.tr("Layer properties") + " — " + targetLayerName
+        width: 620
         height: Math.max(320, Math.min(760, rootWindow.height - 120))
         standardButtons: Dialog.Apply | Dialog.Cancel
         property string targetLayerName: ""
         property string originalSourcePath: ""
         property string originalSourceLayerName: ""
         property string originalSourceEncoding: ""
+        property string labelLuaSource: ""
+        property string activeCategory: "general"
 
         function loadLayer() {
             if (layerModel.count === 0)
@@ -845,7 +1065,7 @@ ApplicationWindow {
             labelMinScaleField.text = String(labels.minScale || "");
             labelMaxScaleField.text = String(labels.maxScale || "");
             labelRuleField.text = labels.rule || "";
-            labelLuaField.text = labels.luaScript || "";
+            labelLuaSource = labels.luaScript || "";
         }
 
         function submitLayer() {
@@ -876,7 +1096,7 @@ ApplicationWindow {
                 labels: {
                     enabled: labelsEnabledField.checked,
                     expression: labelExpressionField.text,
-                    luaScript: labelLuaField.text,
+                    luaScript: labelLuaSource,
                     placement: ["center", "center-rotated", "free-angle"][labelPlacementField.currentIndex],
                     rotationField: labelRotationField.text,
                     heightMm: Number(labelHeightField.text),
@@ -901,56 +1121,85 @@ ApplicationWindow {
             ColumnLayout {
                 width: parent.width
                 spacing: 8
+                TabBar {
+                    id: layerCategoryTabs
+                    objectName: "layerCategoryTabs"
+                    Layout.fillWidth: true
+                    currentIndex: Math.max(0, ["general", "source", "symbology", "labels"].indexOf(layerSettingsDialog.activeCategory))
+                    onCurrentIndexChanged: {
+                        if (currentIndex >= 0)
+                            layerSettingsDialog.activeCategory = ["general", "source", "symbology", "labels"][currentIndex];
+                    }
+                    TabButton { text: rootWindow.tr("General") }
+                    TabButton { text: rootWindow.tr("Data source") }
+                    TabButton { text: rootWindow.tr("Symbology") }
+                    TabButton { text: rootWindow.tr("Labels and expressions") }
+                }
                 Label {
-                    text: "Project layer"
+                    text: rootWindow.tr("General")
                     font.bold: true
+                    visible: layerSettingsDialog.activeCategory === "general"
                 }
                 TextField {
                     id: displayNameField
                     objectName: "displayNameField"
                     Layout.fillWidth: true
-                    placeholderText: "Display name"
+                    placeholderText: rootWindow.tr("Display name")
+                    visible: layerSettingsDialog.activeCategory === "general"
+                }
+                CheckBox {
+                    id: visibleField
+                    objectName: "visibleField"
+                    text: rootWindow.tr("Layer visible")
+                    visible: layerSettingsDialog.activeCategory === "general"
+                }
+                Label {
+                    text: rootWindow.tr("Data source")
+                    font.bold: true
+                    visible: layerSettingsDialog.activeCategory === "source"
                 }
                 RowLayout {
                     Layout.fillWidth: true
+                    visible: layerSettingsDialog.activeCategory === "source"
                     TextField {
                         id: sourcePathField
                         objectName: "sourcePathField"
                         Layout.fillWidth: true
-                        placeholderText: "Original source path"
+                        placeholderText: rootWindow.tr("Original source path")
                     }
                     Button {
-                        text: "Browse…"
+                        text: rootWindow.tr("Browse…")
                         onClicked: relinkFileDialog.open()
                     }
                 }
                 Label {
                     id: sourceStatusLabel
                     Layout.fillWidth: true
-                    visible: text !== ""
                     color: "#b45309"
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
+                    visible: layerSettingsDialog.activeCategory === "source" && text !== ""
                 }
                 RowLayout {
                     Layout.fillWidth: true
+                    visible: layerSettingsDialog.activeCategory === "source"
                     ColumnLayout {
                         Layout.fillWidth: true
                         Label {
-                            text: "Layer in source"
+                            text: rootWindow.tr("Layer in source")
                             color: "#65717d"
                         }
                         TextField {
                             id: sourceLayerField
                             objectName: "sourceLayerField"
                             Layout.fillWidth: true
-                            placeholderText: "Internal layer name"
+                            placeholderText: rootWindow.tr("Internal layer name")
                         }
                     }
                     ColumnLayout {
                         Layout.preferredWidth: 180
                         Label {
-                            text: "Shapefile encoding"
+                            text: rootWindow.tr("Shapefile encoding")
                             color: "#65717d"
                         }
                         ComboBox {
@@ -959,34 +1208,31 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             editable: true
                             model: ["", "UTF-8", "CP949", "EUC-KR", "ISO-8859-1"]
-                            displayText: currentText === "" ? "Auto encoding" : currentText
+                    displayText: currentText === "" ? rootWindow.tr("Auto encoding") : currentText
                         }
                     }
                 }
                 Label {
                     objectName: "sourceChangeWarning"
                     Layout.fillWidth: true
-                    visible: sourcePathField.text.trim() !== layerSettingsDialog.originalSourcePath || sourceLayerField.text.trim() !== layerSettingsDialog.originalSourceLayerName || sourceEncodingField.editText.trim() !== layerSettingsDialog.originalSourceEncoding
+                    visible: layerSettingsDialog.activeCategory === "source" && (sourcePathField.text.trim() !== layerSettingsDialog.originalSourcePath || sourceLayerField.text.trim() !== layerSettingsDialog.originalSourceLayerName || sourceEncodingField.editText.trim() !== layerSettingsDialog.originalSourceEncoding)
                     text: "Changing the source path, internal layer, or encoding reloads this layer. Save unsaved feature edits in it first."
                     color: "#9a6700"
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
                 }
-                CheckBox {
-                    id: visibleField
-                    objectName: "visibleField"
-                    text: "Layer visible"
-                }
                 Label {
-                    text: "Symbol"
+                    text: rootWindow.tr("Symbology")
                     font.bold: true
                     topPadding: 8
+                    visible: layerSettingsDialog.activeCategory === "symbology"
                 }
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
+                    visible: layerSettingsDialog.activeCategory === "symbology"
                     Label {
-                        text: "Point color"
+                        text: rootWindow.tr("Point color")
                     }
                     TextField {
                         id: pointColorField
@@ -994,7 +1240,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                     Label {
-                        text: "Point size (mm)"
+                        text: rootWindow.tr("Point size (mm)")
                     }
                     TextField {
                         id: pointSizeField
@@ -1003,7 +1249,7 @@ ApplicationWindow {
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                     }
                     Label {
-                        text: "Line color"
+                        text: rootWindow.tr("Line color")
                     }
                     TextField {
                         id: lineColorField
@@ -1011,7 +1257,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                     Label {
-                        text: "Line width (mm)"
+                        text: rootWindow.tr("Line width (mm)")
                     }
                     TextField {
                         id: lineWidthField
@@ -1020,7 +1266,7 @@ ApplicationWindow {
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                     }
                     Label {
-                        text: "Polygon color"
+                        text: rootWindow.tr("Polygon color")
                     }
                     TextField {
                         id: polygonColorField
@@ -1028,7 +1274,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                     Label {
-                        text: "Fill opacity (0–1)"
+                        text: rootWindow.tr("Fill opacity (0–1)")
                     }
                     TextField {
                         id: fillOpacityField
@@ -1038,28 +1284,33 @@ ApplicationWindow {
                     }
                 }
                 Label {
-                    text: "Labels"
+                    text: rootWindow.tr("Labels and expressions")
                     font.bold: true
                     topPadding: 8
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 CheckBox {
                     id: labelsEnabledField
                     objectName: "labelsEnabledField"
-                    text: "Show labels"
+                    text: rootWindow.tr("Show labels")
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 Label {
-                    text: "Label field / template"
+                    text: rootWindow.tr("Label field / template")
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 TextField {
                     id: labelExpressionField
                     objectName: "labelExpressionField"
                     Layout.fillWidth: true
                     placeholderText: "e.g. ${name}"
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 RowLayout {
                     Layout.fillWidth: true
+                    visible: layerSettingsDialog.activeCategory === "labels"
                     Label {
-                        text: "Placement"
+                        text: rootWindow.tr("Placement")
                     }
                     ComboBox {
                         id: labelPlacementField
@@ -1072,13 +1323,15 @@ ApplicationWindow {
                     id: labelRotationField
                     objectName: "labelRotationField"
                     Layout.fillWidth: true
-                    placeholderText: "Rotation field (optional)"
+                    placeholderText: rootWindow.tr("Rotation field (optional)")
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
+                    visible: layerSettingsDialog.activeCategory === "labels"
                     Label {
-                        text: "Text height (mm)"
+                        text: rootWindow.tr("Text height (mm)")
                     }
                     TextField {
                         id: labelHeightField
@@ -1087,7 +1340,7 @@ ApplicationWindow {
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                     }
                     Label {
-                        text: "Minimum scale denominator"
+                        text: rootWindow.tr("Minimum scale denominator")
                     }
                     TextField {
                         id: labelMinScaleField
@@ -1096,7 +1349,7 @@ ApplicationWindow {
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                     }
                     Label {
-                        text: "Maximum scale denominator"
+                        text: rootWindow.tr("Maximum scale denominator")
                     }
                     TextField {
                         id: labelMaxScaleField
@@ -1106,26 +1359,106 @@ ApplicationWindow {
                     }
                 }
                 Label {
-                    text: "Label display rule (Lua expression returning true/false)"
+                    text: "Label display rule (Lua; return true/false)"
                     wrapMode: Text.WordWrap
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 TextField {
                     id: labelRuleField
                     objectName: "labelRuleField"
                     Layout.fillWidth: true
-                    placeholderText: "e.g. return feature.class == \"primary\""
+                    placeholderText: "e.g. return feature.CLASS == \"primary\""
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 Label {
-                    text: "Lua label script (return a string using feature properties)"
+                    text: "Lua label script (return text using feature fields)"
                     wrapMode: Text.WordWrap
+                    visible: layerSettingsDialog.activeCategory === "labels"
                 }
-                TextArea {
-                    id: labelLuaField
-                    objectName: "labelLuaField"
+                Label {
                     Layout.fillWidth: true
-                    Layout.preferredHeight: 120
-                    placeholderText: "Return a label string from feature properties"
-                    wrapMode: TextEdit.Wrap
+                    text: "Available fields: " + (mapViewport.attributeColumns.length ? mapViewport.attributeColumns.join(", ") : "open the attribute table to inspect the layer schema")
+                    color: "#65717d"
+                    wrapMode: Text.WordWrap
+                    visible: layerSettingsDialog.activeCategory === "labels"
+                }
+                Button {
+                    objectName: "openLuaEditorButton"
+                    text: "Open Lua editor and examples…"
+                    Layout.fillWidth: true
+                    onClicked: luaEditorDialog.open()
+                    visible: layerSettingsDialog.activeCategory === "labels"
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: luaEditorDialog
+        objectName: "luaEditorDialog"
+        modal: true
+        title: rootWindow.tr("Lua label editor") + " — " + layerSettingsDialog.targetLayerName
+        width: Math.min(760, rootWindow.width - 64)
+        height: Math.min(680, rootWindow.height - 80)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onOpened: {
+            labelRuleEditor.text = labelRuleField.text;
+            labelLuaField.text = layerSettingsDialog.labelLuaSource;
+        }
+        onAccepted: {
+            labelRuleField.text = labelRuleEditor.text;
+            layerSettingsDialog.labelLuaSource = labelLuaField.text;
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.tr("Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.")
+                wrapMode: Text.WordWrap
+                color: "#45515c"
+            }
+            Label {
+                text: "Available fields: " + (mapViewport.attributeColumns.length ? mapViewport.attributeColumns.join(", ") : "none loaded")
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+            }
+            Label {
+                text: rootWindow.tr("Display rule — return true to show this feature's label")
+                font.bold: true
+            }
+            TextArea {
+                id: labelRuleEditor
+                objectName: "labelRuleEditor"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 100
+                placeholderText: "return feature.CLASS == \"primary\""
+                wrapMode: TextEdit.Wrap
+            }
+            Label {
+                text: rootWindow.tr("Label text — return string, number, or nil")
+                font.bold: true
+            }
+            TextArea {
+                id: labelLuaField
+                objectName: "labelLuaField"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                placeholderText: "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                font.family: "monospace"
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label { Layout.fillWidth: true }
+                Button {
+                    text: rootWindow.tr("Insert label example")
+                    onClicked: labelLuaField.text = "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
+                }
+                Button {
+                    text: rootWindow.tr("Insert rule example")
+                    onClicked: labelRuleEditor.text = "return feature.CLASS == \"primary\""
                 }
             }
         }
@@ -1133,7 +1466,7 @@ ApplicationWindow {
 
     Platform.FileDialog {
         id: fileDialog
-        title: "Add vector files as layers"
+        title: rootWindow.tr("Add vector files as layers")
         fileMode: Platform.FileDialog.OpenFiles
         nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json)", "All files (*)"]
         onAccepted: mapViewport.requestLoadFiles(files)
@@ -1155,7 +1488,7 @@ ApplicationWindow {
 
     Platform.FileDialog {
         id: workspaceDialog
-        title: "Save GoGIS workspace"
+        title: rootWindow.tr("Save GoGIS workspace")
         fileMode: Platform.FileDialog.SaveFile
         nameFilters: ["GoGIS workspace (*.gogis)"]
         onAccepted: {
@@ -1169,7 +1502,7 @@ ApplicationWindow {
 
     Platform.FileDialog {
         id: workspaceOpenDialog
-        title: "Open GoGIS workspace"
+        title: rootWindow.tr("Open GoGIS workspace")
         fileMode: Platform.FileDialog.OpenFile
         nameFilters: ["GoGIS workspace (*.gogis)"]
         onAccepted: mapViewport.requestLoad(file)
@@ -1177,7 +1510,7 @@ ApplicationWindow {
 
     Platform.FileDialog {
         id: relinkFileDialog
-        title: "Select original layer source"
+        title: rootWindow.tr("Select original layer source")
         fileMode: Platform.FileDialog.OpenFile
         nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json)", "All files (*)"]
         onAccepted: sourcePathField.text = mapViewport.localPathFromUrl(file)

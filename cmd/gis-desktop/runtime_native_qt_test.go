@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -21,6 +22,58 @@ import (
 
 	"github.com/airbusgeo/godal"
 )
+
+func TestMoveSelectedVertexUpdatesProjectAndRenderSource(t *testing.T) {
+	wkb := make([]byte, 1+4+4+4*8)
+	wkb[0] = 1
+	binary.LittleEndian.PutUint32(wkb[1:5], 2)
+	binary.LittleEndian.PutUint32(wkb[5:9], 2)
+	for index, value := range []float64{0, 0, 10, 10} {
+		binary.LittleEndian.PutUint64(wkb[9+index*8:], math.Float64bits(value))
+	}
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
+		Name: "roads", Editable: true,
+		Features: []core.Feature{{ID: 42, Geometry: core.WKBGeometry{WKB: wkb}}},
+	}}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedLayer := ""
+	runtime.persist = func(_ context.Context, layerName string) error {
+		persistedLayer = layerName
+		return nil
+	}
+	runtime.selected = render.HitResult{Layer: "roads", FeatureID: 42}
+	if err := runtime.moveSelectedVertex(runtime.selected, `{"vertexIndex":1,"x":8,"y":9}`); err != nil {
+		t.Fatal(err)
+	}
+	geometry, ok := runtime.service.FeatureGeometry("roads", 42)
+	if !ok {
+		t.Fatal("edited feature geometry not found")
+	}
+	parts, err := geometry.(core.WKBGeometry).Parts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 1 || parts[0][1] != (core.WKBPoint{X: 8, Y: 9}) {
+		t.Fatalf("committed feature geometry = %#v", parts)
+	}
+	found := false
+	for _, feature := range runtime.features {
+		if feature.Layer == "roads" && feature.FeatureID == 42 {
+			if len(feature.Vertices) != 2 || feature.Vertices[1] != (render.Point{X: 0.8, Y: 0.9}) {
+				t.Fatalf("rebuilt hit-test geometry = %#v", feature.Vertices)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("edited feature was not published to render hit-test source")
+	}
+	if persistedLayer != "roads" {
+		t.Fatalf("persisted layer = %q, want roads", persistedLayer)
+	}
+}
 
 func TestUniqueSourcePathsRemovesRepeatedFiles(t *testing.T) {
 	directory := t.TempDir()
@@ -425,6 +478,18 @@ func TestWorkspaceViewNormalizesPanAndZoom(t *testing.T) {
 	runtime := &demoRuntime{workspaceView: &got}
 	if viewport := runtimeInitialViewport(runtime); viewport.Center != (render.Point{X: want.CenterX, Y: want.CenterY}) || viewport.Zoom != want.Zoom {
 		t.Fatalf("restored initial viewport = %+v, want center (%v, %v) zoom %v", viewport, want.CenterX, want.CenterY, want.Zoom)
+	}
+}
+
+func TestPreserveMapWorldViewAcrossExpandedLayerExtent(t *testing.T) {
+	view := preserveMapWorldView(
+		native.Viewport{PanX: 50, PanY: 25, Zoom: 2, Width: 200, Height: 100},
+		[4]float64{0, 0, 100, 100},
+		[4]float64{-100, -100, 300, 200},
+		"roads",
+	)
+	if view == nil || math.Abs(view.CenterX-0.34375) > 1e-9 || math.Abs(view.CenterY-0.5416666666666666) > 1e-9 || view.Zoom != 2 || view.ActiveLayer != "roads" {
+		t.Fatalf("preserved world view = %+v", view)
 	}
 }
 

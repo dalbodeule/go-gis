@@ -23,6 +23,8 @@ Item {
     property int layerSettingsGeneration: 0
     property string layerLabelPayload: "[]"
     property int layerLabelGeneration: 0
+    property string vertexHandlePayload: "[]"
+    property int vertexHandleGeneration: 0
     property string activeLayer: ""
     property int activeLayerGeneration: 0
     property string renderStatus: "Ready"

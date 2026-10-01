@@ -9,7 +9,7 @@ import (
 )
 
 func loadRuntime(_ []string) *demoRuntime {
-	return loadDemoChunk()
+	return loadEmptyProject()
 }
 
 func startInitialDataLoad(_ *demoRuntime, _ []string) {}
@@ -26,4 +26,8 @@ func (r *demoRuntime) saveDataset(destination string) {
 
 func (r *demoRuntime) reloadLayerWithSettings(_ layerSettingsRequest, _ bool, _, _ string) error {
 	return fmt.Errorf("relinking layer sources requires the native GDAL build")
+}
+
+func (r *demoRuntime) rebuildEditedLayer(_ string) error {
+	return fmt.Errorf("geometry editing requires the native GDAL build")
 }

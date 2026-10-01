@@ -73,6 +73,9 @@ std::atomic<unsigned long long> g_layer_tree_generation{0};
 std::mutex g_layer_label_mutex;
 std::string g_layer_label_payload;
 std::atomic<unsigned long long> g_layer_label_generation{0};
+std::mutex g_vertex_handle_mutex;
+std::string g_vertex_handle_payload = "[]";
+std::atomic<unsigned long long> g_vertex_handle_generation{0};
 std::mutex g_active_layer_mutex;
 std::string g_active_layer;
 std::atomic<unsigned long long> g_active_layer_generation{0};
@@ -149,8 +152,10 @@ void trace_load_event(const char* event, int stage, size_t vertex_count) {
 }
 
 void update_viewport_snapshot(const QQuickItem* item) {
-    g_pan_x.store(item->x(), std::memory_order_relaxed);
-    g_pan_y.store(item->y(), std::memory_order_relaxed);
+    const QVariant pan_x = item->property("viewportPanX");
+    const QVariant pan_y = item->property("viewportPanY");
+    g_pan_x.store(pan_x.isValid() ? pan_x.toDouble() : item->x(), std::memory_order_relaxed);
+    g_pan_y.store(pan_y.isValid() ? pan_y.toDouble() : item->y(), std::memory_order_relaxed);
     g_zoom.store(item->scale(), std::memory_order_relaxed);
     g_width.store(item->width(), std::memory_order_relaxed);
     g_height.store(item->height(), std::memory_order_relaxed);
@@ -244,6 +249,14 @@ public:
                 setProperty("layerLabelPayload", QString::fromStdString(g_layer_label_payload));
                 setProperty("layerLabelGeneration", QVariant::fromValue<qulonglong>(label_generation));
                 layer_label_generation_ = label_generation;
+            }
+
+            const auto vertex_handle_generation = g_vertex_handle_generation.load(std::memory_order_relaxed);
+            if (vertex_handle_generation != vertex_handle_generation_) {
+                std::lock_guard<std::mutex> lock(g_vertex_handle_mutex);
+                setProperty("vertexHandlePayload", QString::fromStdString(g_vertex_handle_payload));
+                setProperty("vertexHandleGeneration", QVariant::fromValue<qulonglong>(vertex_handle_generation));
+                vertex_handle_generation_ = vertex_handle_generation;
             }
 
             const auto render_status_generation = g_render_status_generation.load(std::memory_order_relaxed);
@@ -477,6 +490,7 @@ private:
     unsigned long long attribute_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;
     unsigned long long layer_label_generation_ = 0;
+    unsigned long long vertex_handle_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
     unsigned long long map_metadata_generation_ = 0;
     unsigned long long rendered_generation_ = 0;
@@ -688,6 +702,14 @@ extern "C" void gogis_set_layer_label_payload(const char* payload) {
         g_layer_label_payload = payload != nullptr ? payload : "[]";
     }
     g_layer_label_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_vertex_handle_payload(const char* payload) {
+    {
+        std::lock_guard<std::mutex> lock(g_vertex_handle_mutex);
+        g_vertex_handle_payload = payload != nullptr ? payload : "[]";
+    }
+    g_vertex_handle_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 extern "C" unsigned long long gogis_active_layer_generation(void) {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -28,18 +29,56 @@ import (
 //go:embed qml/Main.qml
 var mainQML []byte
 
+var appVersion = "0.1.0-dev"
+
 func main() {
-	qt.NewQApplication(os.Args)
+	language, qtArgs := desktopLanguageArgs(os.Args)
+	qt.NewQApplication(qtArgs)
 	// Keep the event loop responsive while GDAL opens and snapshots a large
-	// dataset. The demo runtime is a lightweight first frame and is replaced
-	// by the native loader after QML is ready.
-	runtime := loadDemoChunk()
+	// dataset. Start from an empty project and replace it after QML is ready.
+	runtime := loadEmptyProject()
 	native.RegisterMapCanvas()
 	engine := qml.NewQQmlApplicationEngine()
+	rootContext := engine.RootContext()
+	for name, value := range map[string]string{
+		"appLanguage":    language,
+		"appVersion":     appVersion,
+		"appRuntime":     goruntime.Version(),
+		"appBuildTarget": goruntime.GOOS + "/" + goruntime.GOARCH,
+	} {
+		variant := qt.NewQVariant14(value)
+		rootContext.SetContextProperty2(name, variant)
+		variant.Delete()
+	}
 	engine.LoadData(mainQML)
 	startViewportSync(runtime)
 	startInitialDataLoad(runtime, os.Args)
 	qt.QApplication_Exec()
+}
+
+func desktopLanguageArgs(args []string) (string, []string) {
+	language := "en"
+	qtArgs := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		if strings.HasPrefix(arg, "--lang=") {
+			value = strings.TrimSpace(strings.TrimPrefix(arg, "--lang="))
+		} else if arg == "--lang" && i+1 < len(args) {
+			i++
+			value = strings.TrimSpace(args[i])
+		} else {
+			qtArgs = append(qtArgs, arg)
+			continue
+		}
+		switch strings.ToLower(value) {
+		case "ko", "en":
+			language = strings.ToLower(value)
+		case "jp", "ja":
+			language = "jp"
+		}
+	}
+	return language, qtArgs
 }
 
 type demoRuntime struct {
@@ -60,6 +99,8 @@ type demoRuntime struct {
 	loadCancel                  context.CancelFunc
 	loadGeneration              uint64
 	features                    []render.HitFeature
+	sources                     map[string]render.LayerSource
+	sourcesMu                   *sync.RWMutex
 	hitIndex                    render.HitIndex
 	hitIndexReady               bool
 	service                     *commands.ProjectService
@@ -137,6 +178,27 @@ func loadDemoChunk() *demoRuntime {
 	return runtime
 }
 
+func loadEmptyProject() *demoRuntime {
+	runtime := &demoRuntime{
+		scheduler:          render.NewScheduler(),
+		batchStore:         render.NewBatchStore(),
+		planner:            render.NewChunkPlanner(),
+		visibility:         render.NewLayerVisibility(),
+		visibleLayers:      make(map[string]bool),
+		layerStyles:        make(map[string]core.LayerStyle),
+		baseLayerStyles:    make(map[string]core.LayerStyle),
+		layerGeometryTypes: make(map[string]string),
+		layerStyleMu:       &sync.RWMutex{},
+		service:            commands.NewProjectService("Untitled", core.CRS{}),
+		builder: func(context.Context, render.ChunkKey) (render.Chunk, error) {
+			return render.Chunk{}, nil
+		},
+	}
+	runtime.publishLayerTree()
+	runtime.publishAttributes("")
+	return runtime
+}
+
 type attributePayload struct {
 	Columns  []string              `json:"columns"`
 	Rows     []attributePayloadRow `json:"rows"`
@@ -204,7 +266,10 @@ func (r *demoRuntime) publishLayerTree() {
 }
 
 func (r *demoRuntime) publishLayerLabels() {
-	payload, err := json.Marshal(r.mapLabels)
+	r.mu.Lock()
+	labels := append([]render.LayerLabel(nil), r.mapLabels...)
+	r.mu.Unlock()
+	payload, err := json.Marshal(labels)
 	if err != nil {
 		native.SetLayerLabelPayload("[]")
 		return
@@ -590,6 +655,7 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 		r.mu.Unlock()
 		native.SetSelection("", "", "", "No feature selected")
 		native.SetAttributePayload("[]")
+		native.SetVertexHandlePayload("[]")
 		return
 	}
 	ensureFeature(serviceSnapshot, readOnlySnapshot, result, features)
@@ -625,6 +691,7 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 		native.SetSelection(result.Layer, label, cachedName, "Selected for inspection")
 	}
 	r.mu.Unlock()
+	r.publishVertexHandles(result, features, readOnly)
 	r.publishAttributesPageAsync(result.Layer, 0)
 	if readOnly {
 		if lookupContext != nil {
@@ -638,6 +705,50 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 		native.SetSelection(result.Layer, label, name, "Selected for inspection")
 	}
 	r.mu.Unlock()
+}
+
+func (r *demoRuntime) publishVertexHandles(selected render.HitResult, features []render.HitFeature, readOnly bool) {
+	r.mu.Lock()
+	service := r.service
+	r.mu.Unlock()
+	if readOnly || service == nil || !service.LayerEditable(selected.Layer) {
+		native.SetVertexHandlePayload("[]")
+		return
+	}
+	type handle struct {
+		X           float64 `json:"x"`
+		Y           float64 `json:"y"`
+		VertexIndex int     `json:"vertexIndex"`
+	}
+	const maxVertexHandles = 10000
+	handles := make([]handle, 0)
+	for _, feature := range features {
+		if feature.Layer != selected.Layer || feature.FeatureID != selected.FeatureID {
+			continue
+		}
+		appendPart := func(points []render.Point) {
+			for _, point := range points {
+				if len(handles) >= maxVertexHandles {
+					return
+				}
+				handles = append(handles, handle{X: point.X, Y: point.Y, VertexIndex: len(handles)})
+			}
+		}
+		if len(feature.Parts) == 0 {
+			appendPart(feature.Vertices)
+		} else {
+			for _, part := range feature.Parts {
+				appendPart(part)
+			}
+		}
+		break
+	}
+	payload, err := json.Marshal(handles)
+	if err != nil {
+		native.SetVertexHandlePayload("[]")
+		return
+	}
+	native.SetVertexHandlePayload(string(payload))
 }
 
 func (r *demoRuntime) finishReadOnlySelectionName(ctx context.Context, generation uint64, service *commands.ProjectService, reader func(context.Context, string, uint64) (core.Feature, error), selected render.HitResult, label string) {
@@ -705,6 +816,14 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), name, "Read-only mode")
 		return
 	}
+	if event.Action == "moveVertex" {
+		if err := r.moveSelectedVertex(selected, event.Value); err != nil {
+			native.SetRenderStatus("Vertex edit failed: " + err.Error())
+			return
+		}
+		native.SetRenderStatus("Vertex moved")
+		return
+	}
 	if event.Action == "rollback" {
 		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), r.featureName(selected.Layer, selected.FeatureID), "Edit cancelled")
 		return
@@ -735,6 +854,55 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		return
 	}
 	native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, "Property saved in memory")
+}
+
+func (r *demoRuntime) moveSelectedVertex(selected render.HitResult, value string) error {
+	var request struct {
+		VertexIndex int     `json:"vertexIndex"`
+		X           float64 `json:"x"`
+		Y           float64 `json:"y"`
+	}
+	if err := json.Unmarshal([]byte(value), &request); err != nil {
+		return fmt.Errorf("invalid vertex edit: %w", err)
+	}
+	r.mu.Lock()
+	service := r.service
+	readOnly := r.readOnly
+	r.mu.Unlock()
+	if service == nil || readOnly || !service.LayerEditable(selected.Layer) {
+		return fmt.Errorf("layer %q is not editable", selected.Layer)
+	}
+	geometry, ok := service.FeatureGeometry(selected.Layer, selected.FeatureID)
+	if !ok {
+		return fmt.Errorf("selected feature geometry is unavailable")
+	}
+	wkb, ok := geometry.(core.WKBGeometry)
+	if !ok {
+		return fmt.Errorf("vertex editing requires WKB geometry, got %T", geometry)
+	}
+	moved, err := core.MoveWKBVertex(wkb.WKB, request.VertexIndex, request.X, request.Y)
+	if err != nil {
+		return err
+	}
+	if err := service.BeginEdit(); err != nil {
+		return err
+	}
+	if err := service.SetFeatureGeometry(selected.Layer, selected.FeatureID, core.WKBGeometry{WKB: moved}); err != nil {
+		_ = service.Rollback()
+		return err
+	}
+	if err := service.Commit(); err != nil {
+		return err
+	}
+	if err := r.rebuildEditedLayer(selected.Layer); err != nil {
+		return fmt.Errorf("geometry changed in memory but render refresh failed: %w", err)
+	}
+	if r.persist != nil {
+		if err := r.persist(context.Background(), selected.Layer); err != nil {
+			return fmt.Errorf("geometry changed in memory but save failed: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *demoRuntime) featureName(layerName string, featureID uint64) string {

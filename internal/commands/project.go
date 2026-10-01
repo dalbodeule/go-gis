@@ -205,6 +205,33 @@ func (s *ProjectService) ProjectLayersExcept(excludedName string) []core.Layer {
 	return result
 }
 
+// ProjectLayerRenderSnapshot copies layer metadata and feature headers while
+// sharing immutable geometry/property snapshots. Render preparation may update
+// the copied Feature.Label pointers, but callers must not mutate geometries or
+// property maps. This avoids duplicating every WKB when rebuilding one layer.
+func (s *ProjectService) ProjectLayerRenderSnapshot(name string) (core.Layer, bool) {
+	for _, layer := range s.project.Layers {
+		if layer.Name != name {
+			continue
+		}
+		result := layer
+		result.Fields = append([]core.Field(nil), layer.Fields...)
+		result.Features = append([]core.Feature(nil), layer.Features...)
+		return result, true
+	}
+	return core.Layer{}, false
+}
+
+// LayerEditable reports whether a layer is enabled for geometry edits.
+func (s *ProjectService) LayerEditable(name string) bool {
+	for _, layer := range s.project.Layers {
+		if layer.Name == name {
+			return layer.Editable
+		}
+	}
+	return false
+}
+
 // LayerAttributes returns a detached layer snapshot containing only schema
 // and properties. Geometry is intentionally omitted for attribute-table paths.
 func (s *ProjectService) LayerAttributes(name string) (core.Layer, bool) {
@@ -294,6 +321,30 @@ func (s *ProjectService) FeatureProperty(layerName string, featureID uint64, pro
 		}
 		value, ok := layer.Features[featureIndex].Properties[propertyName]
 		return value, ok
+	}
+	return nil, false
+}
+
+// FeatureGeometry returns a detached geometry snapshot for editor and renderer
+// consumers. The caller may safely retain it across a subsequent edit.
+func (s *ProjectService) FeatureGeometry(layerName string, featureID uint64) (core.Geometry, bool) {
+	for _, layer := range s.project.Layers {
+		if layer.Name != layerName {
+			continue
+		}
+		index, ok := s.featureIndexForLayer(layerName)
+		if !ok {
+			return nil, false
+		}
+		featureIndex, ok := index[featureID]
+		if !ok || featureIndex >= len(layer.Features) {
+			return nil, false
+		}
+		geometry := layer.Features[featureIndex].Geometry
+		if geometry == nil {
+			return nil, false
+		}
+		return geometry.Clone(), true
 	}
 	return nil, false
 }
@@ -480,6 +531,36 @@ func (s *ProjectService) SetFeatureProperty(layerName string, featureID uint64, 
 			}
 		}
 		return fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+	}
+	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
+}
+
+// SetFeatureGeometry replaces one feature's geometry within the active edit.
+// The supplied geometry is cloned so failed transactions and caller mutation
+// cannot alter the committed snapshot.
+func (s *ProjectService) SetFeatureGeometry(layerName string, featureID uint64, geometry core.Geometry) error {
+	if s.draft == nil {
+		return ErrEditNotActive
+	}
+	if geometry == nil {
+		return errors.New("feature geometry is required")
+	}
+	for layerIndex := range s.draft.Layers {
+		layer := &s.draft.Layers[layerIndex]
+		if layer.Name != layerName {
+			continue
+		}
+		if !layer.Editable {
+			return fmt.Errorf("layer %q is not editable", layerName)
+		}
+		index, indexed := s.featureIndexForLayer(layerName)
+		featureIndex, exists := index[featureID]
+		if !indexed || !exists || featureIndex >= len(layer.Features) || layer.Features[featureIndex].ID != featureID {
+			return fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+		}
+		s.ensureDraftFeatureSlice(layerIndex)
+		s.draft.Layers[layerIndex].Features[featureIndex].Geometry = geometry.Clone()
+		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
 }

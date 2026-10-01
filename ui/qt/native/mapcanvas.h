@@ -68,6 +68,7 @@ int gogis_attribute_page(void);
 // Publishes a JSON layer-tree payload for the QML layer model.
 void gogis_set_layer_tree_payload(const char* payload);
 void gogis_set_layer_label_payload(const char* payload);
+void gogis_set_vertex_handle_payload(const char* payload);
 
 // Reads the latest QML-selected layer name.
 unsigned long long gogis_active_layer_generation(void);

@@ -81,6 +81,58 @@ func TestMapWKBXYPreservesBinaryGeometryAndMetadata(t *testing.T) {
 	}
 }
 
+func TestMoveWKBVertexCopiesGeometryAndValidatesIndex(t *testing.T) {
+	data := make([]byte, 1+4+4+6*8)
+	data[0] = 1
+	binary.LittleEndian.PutUint32(data[1:5], 2)
+	binary.LittleEndian.PutUint32(data[5:9], 3)
+	for index, value := range []float64{1, 2, 3, 4, 5, 6} {
+		binary.LittleEndian.PutUint64(data[9+index*8:], math.Float64bits(value))
+	}
+	moved, err := MoveWKBVertex(data, 1, 30, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) == string(moved) {
+		t.Fatal("moving a vertex did not change the WKB copy")
+	}
+	if points, err := (WKBGeometry{WKB: moved}).Parts(); err != nil || len(points) != 1 || len(points[0]) != 3 || points[0][1] != (WKBPoint{X: 30, Y: 40}) {
+		t.Fatalf("moved geometry parts = %#v, err=%v", points, err)
+	}
+	if points, err := (WKBGeometry{WKB: data}).Parts(); err != nil || points[0][1] != (WKBPoint{X: 3, Y: 4}) {
+		t.Fatalf("MoveWKBVertex mutated source geometry: %#v, err=%v", points, err)
+	}
+	if _, err := MoveWKBVertex(data, 3, 1, 1); err == nil {
+		t.Fatal("out-of-range vertex index was accepted")
+	}
+	if _, err := MoveWKBVertex(data, 0, math.NaN(), 1); err == nil {
+		t.Fatal("non-finite coordinate was accepted")
+	}
+}
+
+func TestMoveWKBPolygonClosureVertexMovesBothRingEndpoints(t *testing.T) {
+	points := []float64{0, 0, 10, 0, 10, 10, 0, 0}
+	data := make([]byte, 1+4+4+4+len(points)*8)
+	data[0] = 1
+	binary.LittleEndian.PutUint32(data[1:5], 3)
+	binary.LittleEndian.PutUint32(data[5:9], 1)
+	binary.LittleEndian.PutUint32(data[9:13], 4)
+	for index, value := range points {
+		binary.LittleEndian.PutUint64(data[13+index*8:], math.Float64bits(value))
+	}
+	moved, err := MoveWKBVertex(data, 0, -2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rings, err := (WKBGeometry{WKB: moved}).Parts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rings) != 1 || rings[0][0] != (WKBPoint{X: -2, Y: 3}) || rings[0][len(rings[0])-1] != rings[0][0] {
+		t.Fatalf("moved polygon ring endpoints = %#v", rings)
+	}
+}
+
 func BenchmarkWKTGeometryType100K(b *testing.B) {
 	geometry := WKTGeometry{WKT: "linestring (0 0, 1 1)"}
 	b.ReportAllocs()

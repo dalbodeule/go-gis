@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,46 @@ import (
 	"gogis/internal/render"
 	"gogis/ui/qt/native"
 )
+
+func TestDesktopLanguageArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "default", args: []string{"gis-desktop", "--verbose"}, want: "en"},
+		{name: "Korean equals form", args: []string{"gis-desktop", "--lang=ko"}, want: "ko"},
+		{name: "English separate form", args: []string{"gis-desktop", "--lang", "en"}, want: "en"},
+		{name: "Japanese alias", args: []string{"gis-desktop", "--lang=ja"}, want: "jp"},
+		{name: "unknown falls back", args: []string{"gis-desktop", "--lang=fr"}, want: "en"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, qtArgs := desktopLanguageArgs(test.args)
+			if got != test.want {
+				t.Fatalf("language = %q, want %q", got, test.want)
+			}
+			for _, arg := range qtArgs {
+				if arg == "--lang" || strings.HasPrefix(arg, "--lang=") {
+					t.Fatalf("language option leaked into Qt arguments: %q", arg)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadEmptyProjectStartsWithoutLayersOrFeatures(t *testing.T) {
+	runtime := loadEmptyProject()
+	if runtime.service == nil {
+		t.Fatal("empty project has no project service")
+	}
+	if names := runtime.service.LayerNames(); len(names) != 0 {
+		t.Fatalf("empty project layers = %v, want none", names)
+	}
+	if len(runtime.features) != 0 {
+		t.Fatalf("empty project render features = %d, want none", len(runtime.features))
+	}
+}
 
 func TestReadOnlySelectionNameLookupDoesNotBlockClick(t *testing.T) {
 	runtime := &demoRuntime{

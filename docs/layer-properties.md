@@ -1,8 +1,22 @@
 # Layer properties and workspaces
 
 Build the native desktop application with `./scripts/build.sh desktop-native`,
-then launch `./build/gogis-desktop-native`. The layer properties dialog is
-available from the attributes pane after loading vector data.
+then launch `./build/gogis-desktop-native`. The desktop opens an empty project.
+Use **Add vector files** or **Open workspace** to begin. Right-click a layer in
+the layer list to open its category menu; choosing General, Data source,
+Symbology, or Labels and expressions opens the corresponding page in the layer
+properties dialog. **Attributes** opens a focused table for the active layer.
+On the map, drag blank space to pan, scroll to zoom around the cursor, and click
+a feature to inspect it. The displayed map viewport preserves the data extent's
+aspect ratio so horizontal and vertical map units use the same screen scale.
+Appending another layer keeps the current map center and zoom while expanding
+the combined extent. Start the desktop in Korean or Japanese with
+`./build/gogis-desktop-native --lang=ko` or `--lang=jp`; English is the default.
+The **About GoGIS** window shows version, runtime, build target, and license.
+For an editable layer, select a feature, choose **Edit vertices**,
+and drag a vertex handle. The edit is applied to the layer and saved to its
+configured destination; read-only layers do not expose vertex handles. To limit
+UI overhead on complex features, at most 10,000 handles are shown per feature.
 
 ## Layer source and project name
 
@@ -42,9 +56,12 @@ Placement modes are:
 - **Free angle**: uses the selected rotation field when set; otherwise line
   labels follow the local line angle, while other geometries remain unrotated.
 
-The optional Lua label script replaces the property template and must return a
+The **Open Lua editor and examples…** dialog shows the active layer's field
+names and provides separate editors for the optional Lua label script and
+display rule. The script replaces the property template and must return a
 string, number, or `nil`. The optional display rule runs first and must return a
-boolean. Both scripts read attributes through `feature`, for example:
+boolean. Both scripts read attributes through the read-only `feature` table,
+for example:
 
 ```lua
 return string.format("%s (%s)", feature.name, feature.class)

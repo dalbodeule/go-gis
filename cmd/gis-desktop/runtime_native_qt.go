@@ -33,7 +33,7 @@ func loadRuntime(args []string) *demoRuntime {
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
 	savePath := desktopSavePath(args)
 	if input == "" {
-		return loadDemoChunk()
+		return loadEmptyProject()
 	}
 	var runtime *demoRuntime
 	var err error
@@ -44,7 +44,7 @@ func loadRuntime(args []string) *demoRuntime {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "GoGIS: unable to load %q: %v\n", input, err)
-		return loadDemoChunk()
+		return loadEmptyProject()
 	}
 	runtime.refresh(context.Background(), runtimeInitialViewport(runtime))
 	runtime.publishMapMetadata()
@@ -637,6 +637,8 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		layerStyleMu:       layerStyleMu,
 		mapLabels:          mapLabels,
 		features:           features,
+		sources:            sources,
+		sourcesMu:          &sync.RWMutex{},
 		service:            loadedService,
 		dataMode:           true,
 		readOnly:           readOnly,
@@ -658,7 +660,9 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		runtime.layerGeometryTypes[layer.Name] = geometryType
 	}
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+		runtime.sourcesMu.RLock()
 		source, ok := sources[key.Layer]
+		runtime.sourcesMu.RUnlock()
 		if !ok {
 			return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
 		}
@@ -713,6 +717,57 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		}
 	}
 	return runtime, nil
+}
+
+func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
+	r.mu.Lock()
+	service := r.service
+	bounds := r.mapExtent
+	r.mu.Unlock()
+	if service == nil || r.sourcesMu == nil {
+		return fmt.Errorf("render sources are unavailable")
+	}
+	layer, ok := service.ProjectLayerRenderSnapshot(layerName)
+	if !ok {
+		return fmt.Errorf("layer %q was not found", layerName)
+	}
+	if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
+		return err
+	}
+	newSources, newFeatures, err := render.NewLayerSourcesWithExtent([]core.Layer{layer}, bounds)
+	if err != nil {
+		return err
+	}
+	if err := attachPolygonFillGeometry(context.Background(), []core.Layer{layer}, newSources); err != nil {
+		return err
+	}
+	source := newSources[layerName]
+	r.sourcesMu.Lock()
+	r.sources[layerName] = source
+	r.sourcesMu.Unlock()
+	r.mu.Lock()
+	features := make([]render.HitFeature, 0, len(r.features)-len(source.Features)+len(newFeatures))
+	for _, feature := range r.features {
+		if feature.Layer != layerName {
+			features = append(features, feature)
+		}
+	}
+	features = append(features, newFeatures...)
+	r.features = features
+	r.hitIndexReady = false
+	labels := make([]render.LayerLabel, 0)
+	r.sourcesMu.RLock()
+	for _, current := range r.sources {
+		labels = append(labels, current.Labels...)
+	}
+	r.sourcesMu.RUnlock()
+	r.mapLabels = labels
+	selected := r.selected
+	r.mu.Unlock()
+	r.publishLayerLabels()
+	r.refreshCurrentViewport()
+	r.publishVertexHandles(selected, newFeatures, false)
+	return nil
 }
 
 func attachPolygonFillGeometry(ctx context.Context, layers []core.Layer, sources map[string]render.LayerSource) error {
@@ -1288,6 +1343,14 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			native.SetRenderStatus("Open failed: " + err.Error())
 			return
 		}
+		if appendLayers {
+			r.mu.Lock()
+			oldExtent := r.mapExtent
+			r.mu.Unlock()
+			oldView := native.CurrentViewport()
+			activeLayer := native.CurrentActiveLayer()
+			next.workspaceView = preserveMapWorldView(oldView, oldExtent, next.mapExtent, activeLayer)
+		}
 		for name, visible := range previousVisibility {
 			if _, exists := next.visibleLayers[name]; exists {
 				next.visibleLayers[name] = visible
@@ -1299,6 +1362,20 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			native.SetRenderStatus(largeDatasetReadOnlyStatus(featureCount))
 		}
 	}()
+}
+
+func preserveMapWorldView(view native.Viewport, oldExtent, newExtent [4]float64, activeLayer string) *workspace.ViewState {
+	oldView := workspaceViewFromViewport(view, activeLayer)
+	oldSpanX, oldSpanY := oldExtent[2]-oldExtent[0], oldExtent[3]-oldExtent[1]
+	newSpanX, newSpanY := newExtent[2]-newExtent[0], newExtent[3]-newExtent[1]
+	if oldSpanX <= 0 || oldSpanY <= 0 || newSpanX <= 0 || newSpanY <= 0 {
+		return &oldView
+	}
+	worldX := oldExtent[0] + oldView.CenterX*oldSpanX
+	worldY := oldExtent[1] + oldView.CenterY*oldSpanY
+	oldView.CenterX = (worldX - newExtent[0]) / newSpanX
+	oldView.CenterY = (worldY - newExtent[1]) / newSpanY
+	return &oldView
 }
 
 func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveDestination string) (*demoRuntime, error) {

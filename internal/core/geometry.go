@@ -274,10 +274,51 @@ func MapWKBXY(data []byte, mapXY func(x, y float64) (float64, float64, error)) (
 	return result, nil
 }
 
+// MoveWKBVertex returns a copy of a WKB geometry with the zero-based XY
+// vertex at vertexIndex moved to x,y. Empty (NaN) points are not counted.
+// Additional ordinates and EWKB metadata are preserved by MapWKBXY.
+func MoveWKBVertex(data []byte, vertexIndex int, x, y float64) ([]byte, error) {
+	if vertexIndex < 0 {
+		return nil, errors.New("vertex index must not be negative")
+	}
+	if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+		return nil, errors.New("vertex coordinates must be finite")
+	}
+	result := append([]byte(nil), data...)
+	move := &wkbVertexMove{index: vertexIndex, x: x, y: y}
+	mapper := &wkbMapper{data: result, vertexMove: move}
+	if err := mapper.geometry(nil); err != nil {
+		return nil, err
+	}
+	if mapper.offset != len(result) {
+		return nil, errors.New("WKB has trailing bytes")
+	}
+	if !move.found {
+		return nil, fmt.Errorf("vertex index %d is out of range", vertexIndex)
+	}
+	return result, nil
+}
+
+type wkbVertexCoordinate struct {
+	xOffset int
+	yOffset int
+	x       float64
+	y       float64
+}
+
+type wkbVertexMove struct {
+	index  int
+	x      float64
+	y      float64
+	found  bool
+	coords []wkbVertexCoordinate
+}
+
 type wkbMapper struct {
-	data   []byte
-	offset int
-	order  binary.ByteOrder
+	data       []byte
+	offset     int
+	order      binary.ByteOrder
+	vertexMove *wkbVertexMove
 }
 
 func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, error)) error {
@@ -326,9 +367,19 @@ func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, err
 		if math.IsNaN(x) || math.IsNaN(y) {
 			return nil
 		}
-		mappedX, mappedY, err := mapXY(x, y)
-		if err != nil {
-			return err
+		mappedX, mappedY := x, y
+		if m.vertexMove != nil {
+			pointIndex := len(m.vertexMove.coords)
+			m.vertexMove.coords = append(m.vertexMove.coords, wkbVertexCoordinate{xOffset: xOffset, yOffset: yOffset, x: x, y: y})
+			if pointIndex == m.vertexMove.index {
+				mappedX, mappedY = m.vertexMove.x, m.vertexMove.y
+				m.vertexMove.found = true
+			}
+		} else {
+			mappedX, mappedY, err = mapXY(x, y)
+			if err != nil {
+				return err
+			}
 		}
 		m.order.PutUint64(m.data[xOffset:xOffset+8], math.Float64bits(mappedX))
 		m.order.PutUint64(m.data[yOffset:yOffset+8], math.Float64bits(mappedY))
@@ -357,8 +408,25 @@ func (m *wkbMapper) geometry(mapXY func(float64, float64) (float64, float64, err
 			return err
 		}
 		for index := uint32(0); index < ringCount; index++ {
+			ringStart := 0
+			if m.vertexMove != nil {
+				ringStart = len(m.vertexMove.coords)
+			}
 			if err := readPoints(); err != nil {
 				return err
+			}
+			if m.vertexMove != nil {
+				ringEnd := len(m.vertexMove.coords)
+				if ringEnd-ringStart > 1 {
+					first, last := m.vertexMove.coords[ringStart], m.vertexMove.coords[ringEnd-1]
+					if first.x == last.x && first.y == last.y &&
+						(m.vertexMove.index == ringStart || m.vertexMove.index == ringEnd-1) {
+						for _, point := range []wkbVertexCoordinate{first, last} {
+							m.order.PutUint64(m.data[point.xOffset:point.xOffset+8], math.Float64bits(m.vertexMove.x))
+							m.order.PutUint64(m.data[point.yOffset:point.yOffset+8], math.Float64bits(m.vertexMove.y))
+						}
+					}
+				}
 			}
 		}
 		return nil

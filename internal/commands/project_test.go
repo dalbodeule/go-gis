@@ -80,6 +80,45 @@ func TestProjectEditCommitAndRollback(t *testing.T) {
 	}
 }
 
+func TestSetFeatureGeometryCommitAndRollbackAreIsolated(t *testing.T) {
+	original := core.WKBGeometry{WKB: []byte{1, 2, 3}}
+	service, err := NewProjectServiceWithLayers("loaded", core.CRS{}, []core.Layer{{
+		Name: "roads", Editable: true, Features: []core.Feature{{ID: 1, Geometry: original}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := core.WKTGeometry{WKT: "POINT (4 5)"}
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetFeatureGeometry("roads", 1, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.project.Layers[0].Features[0].Geometry.GeometryType(); got != "" {
+		t.Fatalf("rollback geometry type = %q, want original malformed WKB", got)
+	}
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetFeatureGeometry("roads", 1, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	geometry, ok := service.FeatureGeometry("roads", 1)
+	if !ok || geometry.GeometryType() != "POINT" {
+		t.Fatalf("committed geometry = %v, %v", geometry, ok)
+	}
+	if err := service.SetFeatureGeometry("roads", 1, replacement); !errors.Is(err, ErrEditNotActive) {
+		t.Fatalf("geometry change outside transaction error = %v", err)
+	}
+}
+
 func TestRepeatedDraftPropertyEditsRemainRollbackSafe(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{})
 	if err := service.BeginEdit(); err != nil {

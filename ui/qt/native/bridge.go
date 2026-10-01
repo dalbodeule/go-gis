@@ -199,6 +199,14 @@ func SetLayerLabelPayload(payload string) {
 	C.gogis_set_layer_label_payload(cPayload)
 }
 
+// SetVertexHandlePayload publishes normalized editable vertices for the
+// currently selected feature.
+func SetVertexHandlePayload(payload string) {
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_vertex_handle_payload(cPayload)
+}
+
 // ActiveLayerGeneration returns the latest QML layer selection generation.
 func ActiveLayerGeneration() uint64 {
 	return uint64(C.gogis_active_layer_generation())
