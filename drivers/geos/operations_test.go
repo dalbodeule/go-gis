@@ -68,6 +68,93 @@ func TestSimplifyForDisplayReducesGeometryWithoutMutatingSource(t *testing.T) {
 	}
 }
 
+func TestDissolvePolygonBoundariesForDisplayDropsSharedParcelEdge(t *testing.T) {
+	geosContext := geoslib.NewContext()
+	left, err := geosContext.NewGeomFromWKT("POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := geosContext.NewGeomFromWKT("POLYGON ((2 0, 4 0, 4 2, 2 2, 2 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := core.Layer{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{
+		{ID: 1, Geometry: core.WKBGeometry{WKB: left.ToWKB()}},
+		{ID: 2, Geometry: core.WKBGeometry{WKB: right.ToWKB()}},
+	}}
+	left.Destroy()
+	right.Destroy()
+	result, err := NewOperator().DissolvePolygonBoundariesForDisplay(context.Background(), layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Features) != 1 || result.Features[0].Geometry == nil {
+		t.Fatalf("dissolved display features = %#v, want one coverage-boundary geometry", result.Features)
+	}
+	boundaryWKB, ok := result.Features[0].Geometry.(core.WKBGeometry)
+	if !ok {
+		t.Fatalf("boundary geometry type = %T, want WKBGeometry", result.Features[0].Geometry)
+	}
+	boundary, err := geosContext.NewGeomFromWKB(boundaryWKB.WKB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer boundary.Destroy()
+	if got := boundary.Length(); math.Abs(got-12) > 1e-9 {
+		t.Fatalf("dissolved boundary length = %v, want 12 (shared edge excluded)", got)
+	}
+	if len(layer.Features) != 2 {
+		t.Fatalf("source layer was mutated to %d features", len(layer.Features))
+	}
+}
+
+func TestOverviewUnionGridRespectsCRSUnits(t *testing.T) {
+	for _, test := range []struct {
+		crs  string
+		want float64
+	}{{"EPSG:5186", 0.1}, {"EPSG:4326", 1e-6}, {"EPSG:4258", 1e-6}, {"LOCAL:unknown", 0}} {
+		if got := overviewUnionGridSize(test.crs); got != test.want {
+			t.Errorf("overview union grid for %s = %g, want %g", test.crs, got, test.want)
+		}
+	}
+}
+
+func TestDissolvePolygonBoundariesForDisplaySnapsSubDecimeterSeams(t *testing.T) {
+	ctx := geoslib.NewContext()
+	left, err := ctx.NewGeomFromWKT("POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := ctx.NewGeomFromWKT("POLYGON ((2.04 0, 4 0, 4 2, 2.04 2, 2.04 0))")
+	if err != nil {
+		left.Destroy()
+		t.Fatal(err)
+	}
+	layer := core.Layer{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{
+		{ID: 1, Geometry: core.WKBGeometry{WKB: left.ToWKB()}},
+		{ID: 2, Geometry: core.WKBGeometry{WKB: right.ToWKB()}},
+	}}
+	left.Destroy()
+	right.Destroy()
+
+	result, err := NewOperator().DissolvePolygonBoundariesForDisplay(context.Background(), layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundaryWKB := result.Features[0].Geometry.(core.WKBGeometry)
+	boundary, err := ctx.NewGeomFromWKB(boundaryWKB.WKB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer boundary.Destroy()
+	if got := boundary.Length(); math.Abs(got-12) > 1e-9 {
+		t.Fatalf("overview boundary length = %v, want 12 after snapping the 4 cm seam", got)
+	}
+	if len(layer.Features) != 2 {
+		t.Fatal("overview dissolve mutated the source layer")
+	}
+}
+
 func TestConstrainedTrianglesRejectsOverBudgetWKBBeforeGEOS(t *testing.T) {
 	pointCount := maxConstrainedTriangulationCoordinates + 1
 	wkb := make([]byte, 13+pointCount*16)

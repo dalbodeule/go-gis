@@ -32,9 +32,9 @@ const MaxChunkVertices = 2 * 1024 * 1024
 
 // MaxBatchVertices bounds the flattened viewport payload before adapters copy
 // it into native memory. Qt can expand each source vertex into as many as three
-// scene-graph vertices; the native scene-graph limit is 8 Mi vertices, so this
-// budget leaves headroom and prevents Qt from dropping the entire geometry batch.
-const MaxBatchVertices = 2_500_000
+// scene-graph vertices. The 8 Mi source budget allows municipality-wide parcel
+// networks while keeping a strict bound on all native copies and GPU geometry.
+const MaxBatchVertices = 8 * 1024 * 1024
 
 // maxFullLayerChunkGridAxis bounds work when a builder prepares every
 // normalized cell. Single-target viewport builders do not use this full-grid
@@ -112,7 +112,7 @@ func NewLayerSource(layer core.Layer) (LayerSource, error) {
 	}
 	bounds := paddedDegenerateExtent([4]float64{minX, minY, maxX, maxY}, layer.CRS.AuthorityCode)
 	minX, minY, maxX, maxY = bounds[0], bounds[1], bounds[2], bounds[3]
-	return newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, 0.25, nil, nil), nil
+	return newLayerSource(layer, parsed, lineFlags, minX, minY, maxX, maxY, 0.25, nil, nil, false), nil
 }
 
 // NewLayerSources creates sources using one common extent. This is required
@@ -168,6 +168,17 @@ func NewLayerSourcesWithExtentAndChunkSize(layers []core.Layer, bounds [4]float6
 // for target.X/target.Y. Hit-test geometry still covers every feature returned
 // by the caller's spatial query.
 func NewLayerSourcesWithExtentAndChunkSizeForChunk(layers []core.Layer, bounds [4]float64, chunkSize float64, target ChunkKey) (map[string]LayerSource, []HitFeature, error) {
+	return newLayerSourcesWithExtentAndChunkSizeForChunk(layers, bounds, chunkSize, target, false)
+}
+
+// NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines collapses
+// shared polygon edges in an outline-only overview batch without dropping any
+// source feature. Exact-detail source generation remains unchanged.
+func NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(layers []core.Layer, bounds [4]float64, chunkSize float64, target ChunkKey) (map[string]LayerSource, []HitFeature, error) {
+	return newLayerSourcesWithExtentAndChunkSizeForChunk(layers, bounds, chunkSize, target, true)
+}
+
+func newLayerSourcesWithExtentAndChunkSizeForChunk(layers []core.Layer, bounds [4]float64, chunkSize float64, target ChunkKey, deduplicatePolygonEdges bool) (map[string]LayerSource, []HitFeature, error) {
 	if math.IsNaN(chunkSize) || math.IsInf(chunkSize, 0) || chunkSize <= 0 || chunkSize > 1 {
 		return nil, nil, fmt.Errorf("invalid render chunk size %v", chunkSize)
 	}
@@ -180,10 +191,14 @@ func NewLayerSourcesWithExtentAndChunkSizeForChunk(layers []core.Layer, bounds [
 		return nil, nil, fmt.Errorf("invalid source extent %v", bounds)
 	}
 	targetCell := [2]int{target.X, target.Y}
-	return newLayerSourcesWithFeatures(layers, &bounds, chunkSize, &targetCell)
+	return newLayerSourcesWithFeaturesOptions(layers, &bounds, chunkSize, &targetCell, deduplicatePolygonEdges)
 }
 
 func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64, chunkSize float64, target *[2]int) (map[string]LayerSource, []HitFeature, error) {
+	return newLayerSourcesWithFeaturesOptions(layers, bounds, chunkSize, target, false)
+}
+
+func newLayerSourcesWithFeaturesOptions(layers []core.Layer, bounds *[4]float64, chunkSize float64, target *[2]int, deduplicatePolygonEdges bool) (map[string]LayerSource, []HitFeature, error) {
 	if target == nil && 1/chunkSize > maxFullLayerChunkGridAxis {
 		return nil, nil, fmt.Errorf("full-layer render chunk size creates more than %d cells per axis", maxFullLayerChunkGridAxis)
 	}
@@ -230,7 +245,7 @@ func newLayerSourcesWithFeatures(layers []core.Layer, bounds *[4]float64, chunkS
 	featureOffset := 0
 	for index, layer := range layers {
 		featureEnd := featureOffset + len(layer.Features)
-		source := newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, chunkSize, features[featureOffset:featureEnd:featureEnd], target)
+		source := newLayerSource(layer, parsed[index], lineFlags[index], minX, minY, maxX, maxY, chunkSize, features[featureOffset:featureEnd:featureEnd], target, deduplicatePolygonEdges)
 		source.Extent = [4]float64{minX, minY, maxX, maxY}
 		sources[layer.Name] = source
 		featureOffset = featureEnd
@@ -834,7 +849,7 @@ func countSegmentVertices(start, end Point, chunkSize float64, counts map[[2]int
 	}
 }
 
-func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []bool, minX, minY, maxX, maxY, chunkSize float64, features []HitFeature, target *[2]int) LayerSource {
+func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []bool, minX, minY, maxX, maxY, chunkSize float64, features []HitFeature, target *[2]int, deduplicatePolygonEdges bool) LayerSource {
 	if len(layer.Features) == 0 {
 		return LayerSource{ChunkSize: chunkSize, Builder: emptyChunkBuilder()}
 	}
@@ -968,6 +983,33 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		}
 		chunkVertices[key] = chunk
 	}
+	seenPolygonEdges := make(map[[4]uint64]struct{})
+	var deduplicateFeatureEdges bool
+	appendOutlineSegment := func(key [2]int, start, end Point) {
+		if deduplicatePolygonEdges && deduplicateFeatureEdges {
+			if start.X == 0 {
+				start.X = 0
+			}
+			if start.Y == 0 {
+				start.Y = 0
+			}
+			if end.X == 0 {
+				end.X = 0
+			}
+			if end.Y == 0 {
+				end.Y = 0
+			}
+			if end.X < start.X || (end.X == start.X && end.Y < start.Y) {
+				start, end = end, start
+			}
+			segment := [4]uint64{math.Float64bits(start.X), math.Float64bits(start.Y), math.Float64bits(end.X), math.Float64bits(end.Y)}
+			if _, exists := seenPolygonEdges[segment]; exists {
+				return
+			}
+			seenPolygonEdges[segment] = struct{}{}
+		}
+		appendChunkVertices(key, newLineVertex(start, style.LineWidthMM), newLineVertex(end, style.LineWidthMM))
+	}
 	// Multipart geometries retain their disjoint Parts view while the flattened
 	// hit-test view shares one layer-owned arena instead of allocating once per
 	// feature.
@@ -992,7 +1034,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 			cellMaxX, cellMaxY := cellMinX+chunkSize, cellMinY+chunkSize
 			clippedStart, clippedEnd, visible := clipSegmentToRect(start, end, cellMinX, cellMinY, cellMaxX, cellMaxY)
 			if visible {
-				appendChunkVertices(*target, newLineVertex(clippedStart, style.LineWidthMM), newLineVertex(clippedEnd, style.LineWidthMM))
+				appendOutlineSegment(*target, clippedStart, clippedEnd)
 			}
 			return
 		}
@@ -1002,9 +1044,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		endCellY := int(math.Floor(end.Y / chunkSize))
 		if startCellX == endCellX && startCellY == endCellY {
 			key := [2]int{startCellX, startCellY}
-			appendChunkVertices(key,
-				newLineVertex(start, style.LineWidthMM),
-				newLineVertex(end, style.LineWidthMM))
+			appendOutlineSegment(key, start, end)
 			return
 		}
 		if start.Y == end.Y {
@@ -1024,9 +1064,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				if reverse {
 					first, second = second, first
 				}
-				appendChunkVertices([2]int{cellX, startCellY},
-					newLineVertex(first, style.LineWidthMM),
-					newLineVertex(second, style.LineWidthMM))
+				appendOutlineSegment([2]int{cellX, startCellY}, first, second)
 			}
 			return
 		}
@@ -1047,9 +1085,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				if reverse {
 					first, second = second, first
 				}
-				appendChunkVertices([2]int{startCellX, cellY},
-					newLineVertex(first, style.LineWidthMM),
-					newLineVertex(second, style.LineWidthMM))
+				appendOutlineSegment([2]int{startCellX, cellY}, first, second)
 			}
 			return
 		}
@@ -1066,13 +1102,12 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 					continue
 				}
 				key := [2]int{cellX, cellY}
-				appendChunkVertices(key,
-					newLineVertex(clippedStart, style.LineWidthMM),
-					newLineVertex(clippedEnd, style.LineWidthMM))
+				appendOutlineSegment(key, clippedStart, clippedEnd)
 			}
 		}
 	}
 	for index, feature := range layer.Features {
+		deduplicateFeatureEdges = deduplicatePolygonEdges && !lineFlags[index]
 		// parseLayerPoints owns this storage, so normalize its coordinate
 		// slices in place instead of allocating a second point slice per part.
 		geometry := &parsed[index]

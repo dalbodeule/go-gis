@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -28,10 +29,57 @@ import (
 )
 
 type readOnlyLayerBinding struct {
-	session    *gdal.AttributeSession
-	sourceName string
-	layer      core.Layer
-	sourceCRS  string
+	session      *gdal.AttributeSession
+	sourceName   string
+	layer        core.Layer
+	sourceCRS    string
+	featureCount int
+}
+
+func prepareAutomaticShapefileIndex(ctx context.Context, source vectorSourceSpec, layerName string,
+	featureCount int, session *gdal.AttributeSession) (*gdal.AttributeSession, string, bool, error) {
+	policy := activeShapefileIndexPolicy
+	if policy.threshold <= 0 || policy.location == "off" || featureCount < policy.threshold ||
+		!strings.EqualFold(filepath.Ext(source.Path), ".shp") {
+		return session, source.Path, false, nil
+	}
+	if gdal.HasShapefileSpatialIndex(source.Path) {
+		return session, source.Path, false, nil
+	}
+	if policy.location == "cache" {
+		indexedPath, created, err := gdal.PrepareIndexedShapefileCache(ctx, source.Path, layerName)
+		if err != nil {
+			return session, source.Path, false, err
+		}
+		if filepath.Clean(indexedPath) == filepath.Clean(source.Path) {
+			return session, source.Path, created, nil
+		}
+		indexedSession, err := gdal.OpenAttributeSession(indexedPath, source.Encoding)
+		if err != nil {
+			return session, source.Path, false, fmt.Errorf("open indexed cache %q: %w", indexedPath, err)
+		}
+		_ = session.Close()
+		return indexedSession, indexedPath, created, nil
+	}
+	if policy.location != "source" {
+		return session, source.Path, false, fmt.Errorf("unsupported spatial-index location %q", policy.location)
+	}
+	if closeErr := session.Close(); closeErr != nil {
+		fallback, reopenErr := gdal.OpenAttributeSession(source.Path, source.Encoding)
+		if reopenErr != nil {
+			return nil, source.Path, false, errors.Join(closeErr, reopenErr)
+		}
+		return fallback, source.Path, false, fmt.Errorf("close source before QIX creation: %w", closeErr)
+	}
+	indexErr := gdal.CreateShapefileSpatialIndex(ctx, source.Path, layerName)
+	indexedSession, openErr := gdal.OpenAttributeSession(source.Path, source.Encoding)
+	if openErr != nil {
+		return nil, source.Path, false, errors.Join(indexErr, openErr)
+	}
+	if indexErr != nil {
+		return indexedSession, source.Path, false, indexErr
+	}
+	return indexedSession, source.Path, true, nil
 }
 
 type contextSemaphore struct {
@@ -197,6 +245,9 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 		if err != nil {
 			native.SetRenderStatus("Open failed: " + err.Error())
 			return
+		}
+		if next.workspaceView == nil {
+			next.workspaceView = initialFitWorkspaceView(next, native.CurrentViewport())
 		}
 		r.replaceWithLoaded(next, generation)
 		if largeReadOnly {
@@ -639,7 +690,10 @@ func loadReadOnlyDataRuntimeWithBaseLayers(ctx context.Context, sources []vector
 				layer.Labels = source.Labels
 			}
 			layer = layer.WithDefaultPresentation()
-			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: sourceLayerName, layer: layer, sourceCRS: layer.SourceCRS}
+			bindings[layer.Name] = readOnlyLayerBinding{
+				session: session, sourceName: sourceLayerName, layer: layer,
+				sourceCRS: layer.SourceCRS, featureCount: len(layer.Features),
+			}
 			layers = append(layers, layer)
 		}
 	}
@@ -768,6 +822,8 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	usedNames := make(map[string]bool, len(baseLayers))
 	var extent [4]float64
 	hasExtent := false
+	var preferredExtent [4]float64
+	hasPreferredExtent := false
 	targetCRS := strings.TrimSpace(displayCRS)
 	if baseExtent != nil {
 		extent, hasExtent = *baseExtent, true
@@ -854,6 +910,36 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			}
 			return nil, true, fmt.Errorf("layer %q not found in %q", source.LayerName, source.Path)
 		}
+		indexFeatureCount := 0
+		for _, overview := range selected {
+			indexFeatureCount = max(indexFeatureCount, overview.FeatureCount)
+		}
+		if activeShapefileIndexPolicy.threshold > 0 && activeShapefileIndexPolicy.location != "off" &&
+			indexFeatureCount >= activeShapefileIndexPolicy.threshold && strings.EqualFold(filepath.Ext(source.Path), ".shp") {
+			previousSession := session
+			indexedSession, indexedPath, created, indexErr := prepareAutomaticShapefileIndex(
+				ctx, source, selected[0].Name, indexFeatureCount, session)
+			if indexedSession != previousSession {
+				if indexedSession == nil {
+					return nil, true, fmt.Errorf("prepare spatial index for %q: no usable GDAL session", source.Path)
+				}
+				session = indexedSession
+				sessions[len(sessions)-1] = indexedSession
+			}
+			if indexErr != nil {
+				if ctx.Err() != nil {
+					return nil, true, ctx.Err()
+				}
+				native.RecordDiagnostic("spatial-index", fmt.Sprintf(
+					"index preparation failed for %s; using original source: %v", source.Path, indexErr))
+			} else if created {
+				native.RecordDiagnostic("spatial-index", fmt.Sprintf(
+					"created QIX index for %s (%d features); data source: %s", source.Path, indexFeatureCount, indexedPath))
+			} else {
+				native.RecordDiagnostic("spatial-index", fmt.Sprintf(
+					"using QIX index for %s (%d features); data source: %s", source.Path, indexFeatureCount, indexedPath))
+			}
+		}
 		for _, overview := range selected {
 			sourceCRS := overview.CRS.AuthorityCode
 			if source.SourceCRS != "" {
@@ -884,6 +970,9 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				extent[2] = math.Max(extent[2], targetBounds[2])
 				extent[3] = math.Max(extent[3], targetBounds[3])
 			}
+			if !isPointGeometryType(overview.GeometryType) {
+				preferredExtent, hasPreferredExtent = mergeExtent(preferredExtent, hasPreferredExtent, targetBounds)
+			}
 			page, _, err := session.OpenAttributePage(ctx, overview.Name, 0, 1)
 			if err != nil {
 				return nil, true, fmt.Errorf("read schema for %q: %w", overview.Name, err)
@@ -908,7 +997,10 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			}
 			layer = layer.WithDefaultPresentation()
 			layers = append(layers, layer)
-			bindings[layer.Name] = readOnlyLayerBinding{session: session, sourceName: overview.Name, layer: layer, sourceCRS: sourceCRS}
+			bindings[layer.Name] = readOnlyLayerBinding{
+				session: session, sourceName: overview.Name, layer: layer,
+				sourceCRS: sourceCRS, featureCount: overview.FeatureCount,
+			}
 			layerBounds[layer.Name] = targetBounds
 			layerGeometryTypes[layer.Name] = overview.GeometryType
 		}
@@ -929,10 +1021,20 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	for name, layerBounds := range layerBounds {
 		runtime.layerBounds[name] = layerBounds
 	}
+	for name, binding := range bindings {
+		runtime.layerFeatureCounts[name] = binding.featureCount
+	}
 	for name, geometryType := range layerGeometryTypes {
 		if geometryType != "" {
 			runtime.layerGeometryTypes[name] = geometryType
 		}
+	}
+	if hasPreferredExtent {
+		runtime.mapFitExtent = preferredExtent
+	} else if baseExtent != nil {
+		runtime.mapFitExtent = *baseExtent
+	} else {
+		runtime.mapFitExtent = extent
 	}
 	// Each window can spend its entire decoded-payload budget and run GEOS
 	// triangulation. Limit concurrency so per-window temporary allocations do
@@ -1022,6 +1124,10 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			return render.Chunk{}, err
 		}
 		defer releaseWindowSlot()
+		// Properties are needed for label expressions and for the selected
+		// feature's display name. The layer snapshot is chunk-scoped and dropped
+		// after vertex generation; the runtime retains only the small name map.
+		lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
 		chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
 		queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
 		if !ok {
@@ -1034,11 +1140,18 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				return render.Chunk{}, fmt.Errorf("transform query bounds for %s: %w", key.Layer, err)
 			}
 		}
-		// Properties are needed for label expressions and for the selected
-		// feature's display name. The layer snapshot is chunk-scoped and dropped
-		// after vertex generation; the runtime retains only the small name map.
-		overviewStride := readOnlyOverviewStride(key.ZoomBucket)
-		overview := overviewStride > 1
+		overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
+		forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
+		overview := lodBucket <= 1 || forceOverview
+		// Keep parcel edges in the normal overview. Dissolving every polygon
+		// removes the very network users need to inspect at city scale. Reserve
+		// the coverage-only boundary for an explicit budget retry.
+		polygonOverview := forceOverview && isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
+		if polygonOverview {
+			// The boundary dissolve removes interior parcel edges without dropping
+			// source features, preserving the complete outer coverage perimeter.
+			overviewStride = 1
+		}
 		window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
 			return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, !overview,
 				maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
@@ -1048,19 +1161,27 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		}
 		if overview {
 			window = sampleReadOnlyOverviewFeatures(window, overviewStride)
+			if polygonOverview {
+				window, err = geosdriver.NewOperator().DissolvePolygonBoundariesForDisplay(ctx, window)
+				if err != nil {
+					return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon boundaries for %s: %w", key.Layer, err)
+				}
+			}
 		}
-		outlineOnly := false
-		polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
-		polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
-		if polygonErr != nil {
-			return render.Chunk{}, polygonErr
-		}
-		if polygonVertices > maxReadOnlyWindowPolygonVertices {
-			// Keep rendering a dense tile's outlines when constrained triangulation
-			// would exceed its separate GEOS safety budget. The total window WKB,
-			// vertex batch, and native renderer limits still apply.
-			outlineOnly = true
-			native.RecordDiagnostic("render", fmt.Sprintf("outline-only layer=%s chunk=%v polygon_vertices=%d", key.Layer, key, polygonVertices))
+		outlineOnly := overview
+		if !outlineOnly {
+			polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
+			polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
+			if polygonErr != nil {
+				return render.Chunk{}, polygonErr
+			}
+			if polygonVertices > maxReadOnlyWindowPolygonVertices {
+				// Keep rendering a dense tile's outlines when constrained triangulation
+				// would exceed its separate GEOS safety budget. The total window WKB,
+				// vertex batch, and native renderer limits still apply.
+				outlineOnly = true
+				native.RecordDiagnostic("render", fmt.Sprintf("outline-only layer=%s chunk=%v polygon_vertices=%d", key.Layer, key, polygonVertices))
+			}
 		}
 		window.Name, window.CRS = binding.layer.Name, core.CRS{AuthorityCode: binding.sourceCRS}
 		window.Fields, window.Style, window.Labels = binding.layer.Fields, binding.layer.Style, binding.layer.Labels
@@ -1103,11 +1224,13 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			}
 		}
 		displayWindow := window
-		if key.ZoomBucket <= -2 {
-			width := runtime.mapExtent[2] - runtime.mapExtent[0]
-			height := runtime.mapExtent[3] - runtime.mapExtent[1]
-			zoomBucket := max(-10, min(10, key.ZoomBucket))
-			tolerance := math.Max(width, height) * 0.0005 / math.Ldexp(1, zoomBucket)
+		if key.ZoomBucket <= 1 || overview {
+			tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, lodBucket)
+			if forceOverview {
+				// A viewport-wide safety retry may simplify the dissolved boundary
+				// more aggressively; the original geometries remain available on zoom-in.
+				tolerance *= 4
+			}
 			if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
 				displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
 				if err != nil {
@@ -1115,7 +1238,16 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				}
 			}
 		}
-		newSources, hits, err := render.NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
+		var newSources map[string]render.LayerSource
+		var hits []render.HitFeature
+		if overview {
+			newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
+				[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
+			hits = nil // Overview geometry is generalized and has no feature hit target.
+		} else {
+			newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunk(
+				[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
+		}
 		if err != nil {
 			return render.Chunk{}, err
 		}
@@ -1194,8 +1326,11 @@ const (
 	// Bounds retained hit-test geometry across the active viewport. When a view
 	// exceeds this cap the affected chunk fails visibly and users can zoom in.
 	maxReadOnlyVisibleFeatures = 50_000
-	maxReadOnlyWindowBytes     = 32 << 20
-	maxReadOnlyVisibleBytes    = 32 << 20
+	// Keep enough geometry-only features to preserve the parcel network in a
+	// citywide overview. Polygon fills are omitted at this scale, so outlines
+	// consume a fraction of the full-detail vertex budget.
+	maxReadOnlyWindowBytes  = 32 << 20
+	maxReadOnlyVisibleBytes = 32 << 20
 	// Bounds all retained polygon fill meshes in a materialized desktop project
 	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
 	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
@@ -1204,47 +1339,32 @@ const (
 	maxDesktopMaterializedBytes    = 256 << 20
 )
 
-func readOnlyWindowChunkSize(zoomBucket int) float64 {
-	// Coarse overviews use larger windows to avoid thousands of tiny GDAL
-	// requests. Zooming in progressively selects 1/32, 1/64, then 1/128 cells.
+func isPolygonOverviewLayer(geometryType string) bool {
+	return strings.Contains(strings.ToUpper(geometryType), "POLYGON")
+}
+
+func readOnlyOverviewSimplificationTolerance(extent [4]float64, zoomBucket int) float64 {
+	width := extent[2] - extent[0]
+	height := extent[3] - extent[1]
 	zoomBucket = max(-10, min(10, zoomBucket))
-	return math.Max(0.0078125, math.Ldexp(0.03125, -max(0, zoomBucket)))
+	// A slightly subpixel tolerance keeps the citywide perimeter recognizable
+	// while bounding the complete viewport payload. Zooming in halves it at each
+	// LOD step so cadastral detail returns progressively.
+	return math.Max(width, height) * 0.00015 / math.Ldexp(1, zoomBucket)
 }
 
-func readOnlyWindowZoomBucket(zoom float64) int {
-	if math.IsNaN(zoom) || math.IsInf(zoom, 0) {
-		return 0
-	}
-	if zoom <= 0 {
-		return -10
-	}
-	bucket := int(math.Floor(math.Log2(zoom)))
-	if bucket < -10 {
-		return -10
-	}
-	if bucket > 10 {
-		return 10
-	}
-	return bucket
-}
-
-// readOnlyOverviewStride selects a bounded, deterministic display sample.
-// The source remains untouched and exact feature interaction resumes on zoom-in.
-func readOnlyOverviewStride(zoomBucket int) int {
-	if zoomBucket >= 2 {
-		return 1
-	}
-	shift := max(1, min(8, 2-zoomBucket))
-	return 1 << shift
-}
-
+// sampleReadOnlyOverviewFeatures keeps a deterministic overview sample without
+// mutating the source. Full feature interaction resumes on zoom-in.
 func sampleReadOnlyOverviewFeatures(layer core.Layer, stride int) core.Layer {
 	if stride <= 1 || len(layer.Features) <= 1 {
 		return layer
 	}
 	features := layer.Features[:0]
-	for _, feature := range layer.Features {
-		if feature.ID%uint64(stride) == 0 {
+	for index, feature := range layer.Features {
+		// Source FIDs may be sparse or clustered by import order. Sampling the
+		// returned window by ordinal gives a stable, even spread through the
+		// driver's query result instead of biasing on FID modulo arithmetic.
+		if index%stride == stride-1 {
 			features = append(features, feature)
 		}
 	}
@@ -1654,6 +1774,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		planner.ChunkSize = sources[layers[0].Name].ChunkSize
 	}
 	mapExtent := [4]float64{0, 0, 1, 1}
+	mapFitExtent := mapExtent
 	mapCRS := ""
 	if len(layers) > 0 {
 		mapExtent = sources[layers[0].Name].Extent
@@ -1686,6 +1807,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		baseLayerStyles:    make(map[string]core.LayerStyle, len(layers)),
 		layerGeometryTypes: make(map[string]string, len(layers)),
 		layerBounds:        make(map[string][4]float64, len(layers)),
+		layerFeatureCounts: make(map[string]int, len(layers)),
 		layerStyleMu:       layerStyleMu,
 		mapLabels:          mapLabels,
 		features:           features,
@@ -1695,6 +1817,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		dataMode:           true,
 		readOnly:           readOnly,
 		mapExtent:          mapExtent,
+		mapFitExtent:       mapFitExtent,
 		mapCRS:             mapCRS,
 		saveDestination:    savePath,
 	}
@@ -1710,12 +1833,14 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		runtime.layerStyles[layer.Name] = style
 		runtime.baseLayerStyles[layer.Name] = style
 		runtime.layerGeometryTypes[layer.Name] = geometryType
+		runtime.layerFeatureCounts[layer.Name] = len(layer.Features)
 		if source, ok := sources[layer.Name]; ok {
 			if layerBounds, ok := layerSourceBounds(source); ok {
 				runtime.layerBounds[layer.Name] = layerBounds
 			}
 		}
 	}
+	runtime.mapFitExtent = preferredMapFitExtent(runtime.mapExtent, runtime.layerBounds, runtime.layerGeometryTypes)
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
 		runtime.sourcesMu.RLock()
 		source, ok := sources[key.Layer]
@@ -2448,7 +2573,8 @@ func configureRuntimePersistence(runtime *demoRuntime, destination string) {
 
 func (r *demoRuntime) publishMapMetadata() {
 	r.mu.Lock()
-	crs, extent, savedView := r.mapCRS, r.mapExtent, r.workspaceView
+	crs, extent, fitExtent, savedView := r.mapCRS, r.mapExtent, r.mapFitExtent, r.workspaceView
+	hasLayers := r.service != nil && len(r.service.LayerNames()) > 0
 	r.mu.Unlock()
 	var view *native.MapViewState
 	if savedView != nil {
@@ -2457,7 +2583,7 @@ func (r *demoRuntime) publishMapMetadata() {
 			Zoom: savedView.Zoom, ActiveLayer: savedView.ActiveLayer,
 		}
 	}
-	native.SetMapMetadataWithView(crs, extent, view)
+	native.SetMapMetadataWithLayerPresence(crs, extent, fitExtent, view, hasLayers)
 }
 
 func loadDataRuntimeFiles(ctx context.Context, paths []string, baseLayers []core.Layer, saveDestination string) (*demoRuntime, error) {
@@ -2724,6 +2850,183 @@ func workspaceViewFromViewport(view native.Viewport, activeLayer string) workspa
 	return workspace.ViewState{CenterX: centerX, CenterY: centerY, Zoom: zoom, ActiveLayer: activeLayer}
 }
 
+// installInMemoryAttributeReaders keeps rebuilt layers independent of any
+// source path: editable features may have unsaved attribute changes, and
+// read-only base layers may never have had a source file at all.
+func installInMemoryAttributeReaders(runtime *demoRuntime, layers []core.Layer) {
+	runtime.attributePageReader = func(_ context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
+		page, total, ok := runtime.service.LayerAttributePageOwned(layerName, offset, limit)
+		if !ok {
+			return core.Layer{}, 0, fmt.Errorf("layer %q not found", layerName)
+		}
+		return page, total, nil
+	}
+	runtime.attributeFeatureReader = func(_ context.Context, layerName string, featureID uint64) (core.Feature, error) {
+		for _, layer := range layers {
+			if layer.Name != layerName {
+				continue
+			}
+			for _, feature := range layer.Features {
+				if feature.ID == featureID {
+					return feature, nil
+				}
+			}
+			break
+		}
+		return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+	}
+}
+
+// startRemoveLayer changes only the in-memory project. Source datasets are
+// never deleted; rebuilding the remaining sources also recalculates their
+// normalized render extent without retaining the removed layer's geometry.
+func (r *demoRuntime) startRemoveLayer(name string) error {
+	r.mu.Lock()
+	if r.loadCancel != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("wait for the current layer load to finish")
+	}
+	service := r.service
+	if service == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("no project is loaded")
+	}
+	properties := service.ProjectLayerProperties()
+	found := false
+	for _, layer := range properties {
+		if layer.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		r.mu.Unlock()
+		return fmt.Errorf("layer %q was not found", name)
+	}
+	readOnly := r.readOnly
+	crs := r.mapCRS
+	oldExtent := r.mapExtent
+	pendingView := r.workspaceView
+	saveDestination := r.saveDestination
+	projectName, projectCRS := service.ProjectInfo()
+	baseLayers := append([]core.Layer(nil), r.readOnlyBaseLayers...)
+	visibility := make(map[string]bool, len(r.visibleLayers))
+	for layerName, visible := range r.visibleLayers {
+		visibility[layerName] = visible
+	}
+	var editableLayers []core.Layer
+	if !readOnly {
+		for _, layer := range service.ProjectRenderSnapshot().Layers {
+			if layer.Name != name {
+				editableLayers = append(editableLayers, layer)
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.loadCancel = cancel
+	r.loadGeneration++
+	generation := r.loadGeneration
+	r.mu.Unlock()
+
+	go func() {
+		var next *demoRuntime
+		var err error
+		remainingName := ""
+		for _, layer := range properties {
+			if layer.Name != name {
+				remainingName = layer.Name
+				break
+			}
+		}
+		if remainingName == "" {
+			next = newEmptyProjectRuntime()
+		} else if readOnly {
+			retainedBase := make([]core.Layer, 0, len(baseLayers))
+			for _, layer := range baseLayers {
+				if layer.Name != name {
+					retainedBase = append(retainedBase, layer)
+				}
+			}
+			sources := make([]vectorSourceSpec, 0, len(properties))
+			for _, layer := range properties {
+				if layer.Name == name || layer.SourcePath == "" {
+					continue
+				}
+				visible := visibility[layer.Name]
+				sources = append(sources, vectorSourceSpec{
+					Path: layer.SourcePath, LayerName: layer.SourceLayerName,
+					Encoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
+					Name: layer.Name, DisplayName: layer.DisplayName, Visible: &visible,
+					Style: layer.Style, Labels: layer.Labels, AllowUnavailable: true,
+				})
+			}
+			if len(sources) == 0 {
+				next, err = buildDataRuntime(ctx, retainedBase, "", "", crs, "", "", true, nil, nil)
+				if err == nil {
+					next.readOnlyBaseLayers = retainedBase
+					next.readOnlyDisplayCRS = crs
+					installInMemoryAttributeReaders(next, retainedBase)
+				}
+			} else {
+				next, err = loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, crs, retainedBase, nil)
+			}
+		} else {
+			next, err = buildDataRuntime(ctx, editableLayers, "", "", crs, "", "", false, nil, nil)
+			if err == nil {
+				installInMemoryAttributeReaders(next, editableLayers)
+				// Editable selection reads current properties from the service;
+				// a captured feature snapshot would become stale after edits.
+				next.attributeFeatureReader = nil
+				if saveDestination != "" {
+					configureRuntimePersistence(next, saveDestination)
+				}
+			}
+		}
+		if err != nil {
+			r.mu.Lock()
+			if generation == r.loadGeneration {
+				r.loadCancel = nil
+			}
+			r.mu.Unlock()
+			if ctx.Err() == nil {
+				native.SetRenderStatus("Remove layer failed: " + err.Error())
+			}
+			return
+		}
+		if err = ctx.Err(); err != nil {
+			if next.closeAttributeSource != nil {
+				next.closeAttributeSource()
+			}
+			return
+		}
+		next.service.SetProjectInfo(projectName, projectCRS)
+		for layerName, visible := range visibility {
+			if layerName != name {
+				if _, exists := next.visibleLayers[layerName]; exists {
+					next.visibleLayers[layerName] = visible
+					next.visibility.Set(layerName, visible)
+				}
+			}
+		}
+		if remainingName != "" {
+			activeLayer := native.CurrentActiveLayer()
+			if activeLayer == name {
+				activeLayer = remainingName
+			}
+			oldView := native.CurrentViewport()
+			metadataPending := native.AppliedMapMetadataGeneration() < native.MapMetadataGeneration()
+			if pendingView != nil && (metadataPending || viewportCanvasAspectIsStale(oldView, oldExtent, crs)) {
+				next.workspaceView = preserveSavedMapWorldView(*pendingView, oldView, oldExtent, next.mapExtent, crs, activeLayer)
+			} else {
+				next.workspaceView = preserveMapWorldViewCRS(oldView, oldExtent, next.mapExtent, crs, activeLayer)
+			}
+		}
+		r.replaceWithLoaded(next, generation)
+		native.SetRenderStatus("Layer removed: " + name)
+	}()
+	return nil
+}
+
 func (r *demoRuntime) startDataLoadPaths(paths []string) {
 	if len(paths) == 1 && isWorkspacePath(paths[0]) {
 		r.startWorkspaceLoad(paths[0])
@@ -2736,8 +3039,10 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 	}
 	r.mu.Lock()
 	if r.loadCancel != nil {
+		r.pendingLoadBatches = append(r.pendingLoadBatches, paths)
+		queued := len(r.pendingLoadBatches)
 		r.mu.Unlock()
-		native.SetRenderStatus("A file load is already in progress")
+		native.SetRenderStatus(fmt.Sprintf("Loading in progress; %d selection(s) queued", queued))
 		return
 	}
 	loadContext, cancel := context.WithCancel(context.Background())
@@ -2787,6 +3092,7 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			}
 			r.mu.Unlock()
 			native.SetRenderStatus("Selected source is already loaded")
+			r.startQueuedDataLoadPaths()
 			return
 		}
 		// Snapshot only layer/feature headers after filtering duplicate paths.
@@ -2802,6 +3108,7 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 		}
 		r.mu.Unlock()
 		native.SetRenderStatus("Cannot add files until the read-only source is ready")
+		r.startQueuedDataLoadPaths()
 		return
 	}
 	if readOnly {
@@ -2824,6 +3131,7 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			}
 			r.mu.Unlock()
 			native.SetRenderStatus("Selected source is already loaded")
+			r.startQueuedDataLoadPaths()
 			return
 		}
 		for _, path := range paths {
@@ -2859,15 +3167,25 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 		}
 		if err != nil {
 			native.SetRenderStatus("Open failed: " + err.Error())
+			r.startQueuedDataLoadPaths()
 			return
 		}
 		if appendLayers {
 			r.mu.Lock()
 			oldExtent := r.mapExtent
+			oldCRS := r.mapCRS
+			pendingView := r.workspaceView
 			r.mu.Unlock()
 			oldView := native.CurrentViewport()
 			activeLayer := native.CurrentActiveLayer()
-			next.workspaceView = preserveMapWorldView(oldView, oldExtent, next.mapExtent, activeLayer)
+			metadataPending := native.AppliedMapMetadataGeneration() < native.MapMetadataGeneration()
+			if pendingView != nil && (metadataPending || viewportCanvasAspectIsStale(oldView, oldExtent, oldCRS)) {
+				next.workspaceView = preserveSavedMapWorldView(*pendingView, oldView, oldExtent, next.mapExtent, oldCRS, activeLayer)
+			} else {
+				next.workspaceView = preserveMapWorldViewCRS(oldView, oldExtent, next.mapExtent, oldCRS, activeLayer)
+			}
+		} else if next.workspaceView == nil {
+			next.workspaceView = initialFitWorkspaceView(next, native.CurrentViewport())
 		}
 		for name, visible := range previousVisibility {
 			if _, exists := next.visibleLayers[name]; exists {
@@ -2882,7 +3200,111 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 	}()
 }
 
+// startQueuedDataLoadPaths serializes rapid file selections after the active
+// load has published its new project state. Keeping selections separate means
+// one invalid file does not prevent a later, valid selection from loading.
+func (r *demoRuntime) startQueuedDataLoadPaths() {
+	r.mu.Lock()
+	if r.loadCancel != nil || len(r.pendingLoadBatches) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	paths := r.pendingLoadBatches[0]
+	r.pendingLoadBatches = r.pendingLoadBatches[1:]
+	r.mu.Unlock()
+	r.startDataLoadPaths(paths)
+}
+
 func preserveMapWorldView(view native.Viewport, oldExtent, newExtent [4]float64, activeLayer string) *workspace.ViewState {
+	return preserveMapWorldViewCRS(view, oldExtent, newExtent, "", activeLayer)
+}
+
+// initialFitWorkspaceView establishes an authoritative view before the first
+// metadata publication reaches QML. Without it, another quickly added layer
+// can only see the empty canvas snapshot and derive an unrelated scale.
+func initialFitWorkspaceView(runtime *demoRuntime, viewport native.Viewport) *workspace.ViewState {
+	if runtime == nil || runtime.service == nil || viewport.ViewportWidth <= 0 || viewport.ViewportHeight <= 0 {
+		return nil
+	}
+	names := runtime.service.LayerNames()
+	if len(names) == 0 {
+		return nil
+	}
+	data, fit := runtime.mapExtent, runtime.mapFitExtent
+	spanX, spanY := data[2]-data[0], data[3]-data[1]
+	fitX, fitY := fit[2]-fit[0], fit[3]-fit[1]
+	if spanX <= 0 || spanY <= 0 || fitX <= 0 || fitY <= 0 {
+		return nil
+	}
+	aspect := extentAspectMeters(data, runtime.mapCRS)
+	canvasWidth := math.Min(viewport.ViewportWidth, viewport.ViewportHeight*aspect)
+	canvasHeight := math.Min(viewport.ViewportHeight, viewport.ViewportWidth/aspect)
+	if canvasWidth <= 0 || canvasHeight <= 0 {
+		return nil
+	}
+	zoom := 0.9 * math.Min(viewport.ViewportWidth/(canvasWidth*fitX/spanX),
+		viewport.ViewportHeight/(canvasHeight*fitY/spanY))
+	if zoom <= 0 || math.IsNaN(zoom) || math.IsInf(zoom, 0) {
+		return nil
+	}
+	return &workspace.ViewState{
+		CenterX:     ((fit[0]+fit[2])/2 - data[0]) / spanX,
+		CenterY:     ((fit[1]+fit[3])/2 - data[1]) / spanY,
+		Zoom:        zoom,
+		ActiveLayer: names[0],
+	}
+}
+
+func extentAspectMeters(extent [4]float64, crs string) float64 {
+	spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
+	if spanX <= 0 || spanY <= 0 {
+		return 1
+	}
+	aspect := spanX / spanY
+	if strings.EqualFold(crs, "EPSG:4326") {
+		aspect *= metersPerMapUnitX(extent, crs) / 111319.49
+	}
+	return aspect
+}
+
+func metersPerMapUnitX(extent [4]float64, crs string) float64 {
+	if !strings.EqualFold(crs, "EPSG:4326") {
+		return 1
+	}
+	latitude := (extent[1] + extent[3]) / 2
+	return 111319.49 * math.Max(0.01, math.Cos(latitude*math.Pi/180))
+}
+
+func viewportCanvasAspectIsStale(view native.Viewport, extent [4]float64, crs string) bool {
+	if view.Width <= 0 || view.Height <= 0 {
+		return false
+	}
+	want := extentAspectMeters(extent, crs)
+	return math.Abs(view.Width/view.Height/want-1) > 0.02
+}
+
+func preserveSavedMapWorldView(saved workspace.ViewState, view native.Viewport, oldExtent, newExtent [4]float64, crs, activeLayer string) *workspace.ViewState {
+	oldSpanX, oldSpanY := oldExtent[2]-oldExtent[0], oldExtent[3]-oldExtent[1]
+	newSpanX, newSpanY := newExtent[2]-newExtent[0], newExtent[3]-newExtent[1]
+	if oldSpanX <= 0 || oldSpanY <= 0 || newSpanX <= 0 || newSpanY <= 0 || view.ViewportWidth <= 0 || view.ViewportHeight <= 0 || saved.Zoom <= 0 {
+		return &saved
+	}
+	oldWidth := math.Min(view.ViewportWidth, view.ViewportHeight*extentAspectMeters(oldExtent, crs))
+	newWidth := math.Min(view.ViewportWidth, view.ViewportHeight*extentAspectMeters(newExtent, crs))
+	if oldWidth <= 0 || newWidth <= 0 {
+		return &saved
+	}
+	worldX := oldExtent[0] + saved.CenterX*oldSpanX
+	worldY := oldExtent[1] + saved.CenterY*(oldExtent[3]-oldExtent[1])
+	saved.CenterX = (worldX - newExtent[0]) / newSpanX
+	saved.CenterY = (worldY - newExtent[1]) / newSpanY
+	oldMetersPerPixel := oldSpanX * metersPerMapUnitX(oldExtent, crs) / (oldWidth * saved.Zoom)
+	saved.Zoom = newSpanX * metersPerMapUnitX(newExtent, crs) / (newWidth * oldMetersPerPixel)
+	saved.ActiveLayer = activeLayer
+	return &saved
+}
+
+func preserveMapWorldViewCRS(view native.Viewport, oldExtent, newExtent [4]float64, crs, activeLayer string) *workspace.ViewState {
 	oldView := workspaceViewFromViewport(view, activeLayer)
 	oldSpanX, oldSpanY := oldExtent[2]-oldExtent[0], oldExtent[3]-oldExtent[1]
 	newSpanX, newSpanY := newExtent[2]-newExtent[0], newExtent[3]-newExtent[1]
@@ -2893,7 +3315,71 @@ func preserveMapWorldView(view native.Viewport, oldExtent, newExtent [4]float64,
 	worldY := oldExtent[1] + oldView.CenterY*oldSpanY
 	oldView.CenterX = (worldX - newExtent[0]) / newSpanX
 	oldView.CenterY = (worldY - newExtent[1]) / newSpanY
+	if view.Width > 0 && view.Height > 0 && view.ViewportWidth > 0 && view.ViewportHeight > 0 {
+		// QML sizes the map item to the aspect ratio of the entire data
+		// extent. An outlier can therefore change the canvas dimensions even
+		// when the parent window has not changed. Preserve map units per
+		// screen pixel using the dimensions that the new canvas will have.
+		oldUnitsPerPixel := oldSpanX * metersPerMapUnitX(oldExtent, crs) / (view.Width * oldView.Zoom)
+		newCanvasWidth := math.Min(view.ViewportWidth, view.ViewportHeight*extentAspectMeters(newExtent, crs))
+		if oldUnitsPerPixel > 0 && newCanvasWidth > 0 &&
+			!math.IsInf(oldUnitsPerPixel, 0) && !math.IsNaN(oldUnitsPerPixel) &&
+			!math.IsInf(newCanvasWidth, 0) && !math.IsNaN(newCanvasWidth) {
+			zoom := newSpanX * metersPerMapUnitX(newExtent, crs) / (newCanvasWidth * oldUnitsPerPixel)
+			if zoom > 0 && !math.IsInf(zoom, 0) && !math.IsNaN(zoom) {
+				oldView.Zoom = zoom
+			}
+		}
+	} else if view.Width > 0 && view.Height > 0 {
+		// Non-GUI callers may not have a parent viewport snapshot.
+		oldUnitsPerPixel := math.Max(oldSpanX/view.Width, oldSpanY/view.Height)
+		newUnitsPerPixel := math.Max(newSpanX/view.Width, newSpanY/view.Height)
+		if oldUnitsPerPixel > 0 && newUnitsPerPixel > 0 {
+			oldView.Zoom *= newUnitsPerPixel / oldUnitsPerPixel
+		}
+	}
 	return &oldView
+}
+
+func preferredMapFitExtent(dataExtent [4]float64, layerBounds map[string][4]float64, geometryTypes map[string]string) [4]float64 {
+	var fitExtent [4]float64
+	hasFitExtent := false
+	for name, bounds := range layerBounds {
+		if isPointGeometryType(geometryTypes[name]) {
+			continue
+		}
+		fitExtent, hasFitExtent = mergeExtent(fitExtent, hasFitExtent, bounds)
+	}
+	if hasFitExtent && fitExtent[2] > fitExtent[0] && fitExtent[3] > fitExtent[1] {
+		return fitExtent
+	}
+	return dataExtent
+}
+
+func isPointGeometryType(geometryType string) bool {
+	return strings.Contains(strings.ToUpper(geometryType), "POINT")
+}
+
+func mergeExtent(current [4]float64, hasCurrent bool, next [4]float64) ([4]float64, bool) {
+	if !validMapExtent(next) {
+		return current, hasCurrent
+	}
+	if !hasCurrent {
+		return next, true
+	}
+	return [4]float64{
+		math.Min(current[0], next[0]), math.Min(current[1], next[1]),
+		math.Max(current[2], next[2]), math.Max(current[3], next[3]),
+	}, true
+}
+
+func validMapExtent(bounds [4]float64) bool {
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return bounds[0] <= bounds[2] && bounds[1] <= bounds[3]
 }
 
 func loadWorkspaceRuntime(ctx context.Context, path string, readOnly bool, saveDestination string) (*demoRuntime, error) {
@@ -3036,6 +3522,8 @@ func runtimeInitialViewport(runtime *demoRuntime) render.Viewport {
 // The caller must hold r.mu; these maps can retain substantial geometry/hit
 // data for large read-only projects.
 func (r *demoRuntime) adoptLoadedSpatialStateLocked(next *demoRuntime) {
+	r.mapExtent = next.mapExtent
+	r.mapFitExtent = next.mapFitExtent
 	r.sources = next.sources
 	r.sourcesMu = next.sourcesMu
 	r.viewportReadOnly = next.viewportReadOnly
@@ -3069,6 +3557,8 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.scheduler = next.scheduler
 	r.batchStore = next.batchStore
 	r.publishedRevision = 0
+	r.hasCompleteFrame = false
+	r.completeFrameLayers = ""
 	r.planner = next.planner
 	r.visibility = next.visibility
 	r.visibleLayers = next.visibleLayers
@@ -3076,6 +3566,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.baseLayerStyles = next.baseLayerStyles
 	r.layerGeometryTypes = next.layerGeometryTypes
 	r.layerBounds = next.layerBounds
+	r.layerFeatureCounts = next.layerFeatureCounts
 	r.layerStyleMu = next.layerStyleMu
 	r.mapLabels = next.mapLabels
 	r.builder = next.builder
@@ -3087,7 +3578,6 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.dataMode = next.dataMode
 	r.readOnly = next.readOnly
 	r.previewLoading = preview
-	r.mapExtent = next.mapExtent
 	r.mapCRS = next.mapCRS
 	r.workspaceView = next.workspaceView
 	r.saveDestination = next.saveDestination
@@ -3142,6 +3632,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	if names := next.service.LayerNames(); len(names) > 0 {
 		r.publishAttributes(names[0])
 	}
+	r.startQueuedDataLoadPaths()
 }
 
 func alignLayerCRS(ctx context.Context, layers []core.Layer, targetAuthority string) ([]core.Layer, error) {

@@ -26,6 +26,12 @@ import (
 	"gogis/ui/qt/native"
 )
 
+type forceReadOnlyOverviewContextKey struct{}
+
+func shouldRetryViewportWithOverview(viewportReadOnly, alreadyForced bool, err string) bool {
+	return viewportReadOnly && !alreadyForced && strings.Contains(err, "viewport render batch exceeds the")
+}
+
 // Main.qml is embedded so the prototype can be launched from a checkout
 // without relying on a working directory or an installed resource bundle.
 //
@@ -38,6 +44,7 @@ func main() {
 	if err := startDesktopOutputCapture(); err != nil {
 		fmt.Fprintf(os.Stderr, "GoGIS: unable to capture process output: %v\n", err)
 	}
+	configureShapefileIndexPolicy(os.Args)
 	language, qtArgs := desktopLanguageArgs(os.Args)
 	qt.NewQApplication(qtArgs)
 	// Keep the event loop responsive while GDAL opens and snapshots a large
@@ -111,6 +118,14 @@ func desktopLanguageArgs(args []string) (string, []string) {
 		} else if arg == "--lang" && i+1 < len(args) {
 			i++
 			value = strings.TrimSpace(args[i])
+		} else if strings.HasPrefix(arg, "--spatial-index-threshold=") ||
+			strings.HasPrefix(arg, "--spatial-index-location=") {
+			continue
+		} else if arg == "--spatial-index-threshold" || arg == "--spatial-index-location" {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+			}
+			continue
 		} else {
 			qtArgs = append(qtArgs, arg)
 			continue
@@ -129,6 +144,8 @@ type demoRuntime struct {
 	scheduler                   *render.Scheduler
 	batchStore                  *render.BatchStore
 	publishedRevision           uint64
+	hasCompleteFrame            bool
+	completeFrameLayers         string
 	planner                     render.ChunkPlanner
 	visibility                  *render.LayerVisibility
 	visibleLayers               map[string]bool
@@ -136,6 +153,7 @@ type demoRuntime struct {
 	baseLayerStyles             map[string]core.LayerStyle
 	layerGeometryTypes          map[string]string
 	layerBounds                 map[string][4]float64
+	layerFeatureCounts          map[string]int
 	layerStyleMu                *sync.RWMutex
 	mapLabels                   []render.LayerLabel
 	builder                     render.ChunkBuilder
@@ -143,6 +161,8 @@ type demoRuntime struct {
 	cancel                      context.CancelFunc
 	loadCancel                  context.CancelFunc
 	loadGeneration              uint64
+	pendingLoadBatches          [][]string
+	forceOverviewNext           bool
 	features                    []render.HitFeature
 	viewportReadOnly            bool
 	windowHits                  map[render.ChunkKey][]render.HitFeature
@@ -171,6 +191,7 @@ type demoRuntime struct {
 	readOnlyDisplayCRS          string
 	unavailableSources          map[string]unavailableSource
 	mapExtent                   [4]float64
+	mapFitExtent                [4]float64
 	mapCRS                      string
 	workspaceView               *workspace.ViewState
 	persist                     func(context.Context, string) error
@@ -239,6 +260,13 @@ func loadDemoChunk() *demoRuntime {
 }
 
 func loadEmptyProject() *demoRuntime {
+	runtime := newEmptyProjectRuntime()
+	runtime.publishLayerTree()
+	runtime.publishAttributes("")
+	return runtime
+}
+
+func newEmptyProjectRuntime() *demoRuntime {
 	runtime := &demoRuntime{
 		scheduler:          render.NewScheduler(),
 		batchStore:         render.NewBatchStore(),
@@ -248,14 +276,16 @@ func loadEmptyProject() *demoRuntime {
 		layerStyles:        make(map[string]core.LayerStyle),
 		baseLayerStyles:    make(map[string]core.LayerStyle),
 		layerGeometryTypes: make(map[string]string),
+		layerBounds:        make(map[string][4]float64),
+		layerFeatureCounts: make(map[string]int),
 		layerStyleMu:       &sync.RWMutex{},
+		mapExtent:          [4]float64{0, 0, 1, 1},
+		mapFitExtent:       [4]float64{0, 0, 1, 1},
 		service:            commands.NewProjectService("Untitled", core.CRS{}),
 		builder: func(context.Context, render.ChunkKey) (render.Chunk, error) {
 			return render.Chunk{}, nil
 		},
 	}
-	runtime.publishLayerTree()
-	runtime.publishAttributes("")
 	return runtime
 }
 
@@ -784,7 +814,15 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	planner := r.planner
 	visibility := r.visibility
 	viewportReadOnly := r.viewportReadOnly
+	forceOverview := r.forceOverviewNext
+	r.forceOverviewNext = false
 	visibleLayerNames := visibility.VisibleLayers()
+	layerSignature := strings.Join(visibleLayerNames, "\x00")
+	keepCompleteFrame := r.hasCompleteFrame && r.completeFrameLayers == layerSignature && viewportReadOnly
+	maxVisibleLayerFeatureCount := 0
+	for _, layerName := range visibleLayerNames {
+		maxVisibleLayerFeatureCount = max(maxVisibleLayerFeatureCount, r.layerFeatureCounts[layerName])
+	}
 	layerVisibility := make(map[string]bool, len(r.visibleLayers))
 	for layer, visible := range r.visibleLayers {
 		layerVisibility[layer] = visible
@@ -801,7 +839,10 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	if viewportReadOnly {
 		zoomBucket := readOnlyWindowZoomBucket(viewport.Zoom)
 		planner.ChunkSize = readOnlyWindowChunkSize(zoomBucket)
-		overviewStride = readOnlyOverviewStride(zoomBucket)
+		overviewStride = readOnlyOverviewStrideForFeatureCount(zoomBucket, maxVisibleLayerFeatureCount)
+		if forceOverview {
+			overviewStride = max(2, overviewStride) // Show the approximate-overview status during a budget retry.
+		}
 	}
 	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)
 	keys := keyBuffer.Keys
@@ -876,6 +917,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		}
 		batchStore.Clear()
 		native.SetVertices(nil)
+		r.hasCompleteFrame = false
+		r.completeFrameLayers = ""
 		native.RequestCanvasUpdate()
 		r.publishedRevision = batchStore.Revision()
 		native.SetSelection("", "", "", "No feature selected")
@@ -886,6 +929,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	}
 
 	requestContext, cancel := context.WithCancel(ctx)
+	if forceOverview {
+		requestContext = context.WithValue(requestContext, forceReadOnlyOverviewContextKey{}, true)
+	}
 	requestGeneration := generation
 	r.mu.Lock()
 	if r.scheduler != scheduler {
@@ -926,7 +972,13 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		lastProgress = now
 	}
 	setProgress(presentation.RenderProgress{Phase: "Loading", Total: len(keys), Cancellable: true}, true)
-	native.RecordDiagnostic("render", fmt.Sprintf("request generation=%d layers=%d chunks=%d", requestGeneration, len(visibleLayerNames), len(keys)))
+	zoomBucket := readOnlyWindowZoomBucket(viewport.Zoom)
+	r.mu.Lock()
+	mapExtent, fitExtent := r.mapExtent, r.mapFitExtent
+	r.mu.Unlock()
+	lodBucket := readOnlyOverviewZoomBucket(zoomBucket, mapExtent, fitExtent)
+	native.RecordDiagnostic("render", fmt.Sprintf("request generation=%d layers=%d chunks=%d zoom=%g lod=%d forced_overview=%t",
+		requestGeneration, len(visibleLayerNames), len(keys), viewport.Zoom, lodBucket, forceOverview))
 
 	go func(requestKeys []render.ChunkKey, keyBuffer *render.ChunkKeyBuffer, scheduler *render.Scheduler) {
 		defer scheduler.ReleaseChunkKeyBuffer(keyBuffer)
@@ -935,11 +987,14 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		renderedVertices := 0
 		renderErr := ""
 		lastPublish := time.Now()
+		// Publishing flattens and copies the complete visible batch. Limit that
+		// repeated work during bulk loads while keeping partial results responsive.
+		const progressivePublishInterval = 50 * time.Millisecond
 		firstPublish := false
 		var publishScratch []render.Vertex
 		dirty := true // BeginGeneration may have removed now-hidden chunks.
-		publishBatch := func() {
-			if !dirty || requestContext.Err() != nil {
+		publishBatch := func(final bool) {
+			if !dirty || requestContext.Err() != nil || (keepCompleteFrame && !final) {
 				return
 			}
 			r.mu.Lock()
@@ -981,14 +1036,35 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			}
 			renderedVertices += len(result.Chunk.Vertices)
 			dirty = true
-			if time.Since(lastPublish) >= 16*time.Millisecond {
-				publishBatch()
+			if time.Since(lastPublish) >= progressivePublishInterval {
+				publishBatch(false)
 			}
 		}
-		publishBatch()
+		publishBatch(requestContext.Err() == nil && renderErr == "" && completed == len(requestKeys))
 		if requestContext.Err() != nil {
 			setProgress(presentation.RenderProgress{Phase: "Render cancelled"}, true)
 		} else if renderErr != "" {
+			if shouldRetryViewportWithOverview(viewportReadOnly, forceOverview, renderErr) {
+				r.mu.Lock()
+				canRetry := r.scheduler == scheduler && scheduler.Generation() == requestGeneration
+				if canRetry {
+					r.forceOverviewNext = true
+				}
+				r.mu.Unlock()
+				if canRetry {
+					for _, layerName := range visibleLayerNames {
+						scheduler.InvalidateLayer(layerName)
+					}
+					r.mu.Lock()
+					canRetry = r.scheduler == scheduler && scheduler.Generation() == requestGeneration && r.forceOverviewNext
+					r.mu.Unlock()
+					if canRetry {
+						native.RecordDiagnostic("render", fmt.Sprintf("retry generation=%d using generalized polygon boundaries after viewport batch budget", requestGeneration))
+						r.refresh(context.Background(), viewport)
+						return
+					}
+				}
+			}
 			stats := scheduler.Stats()
 			native.RecordDiagnostic("render", fmt.Sprintf(
 				"incomplete generation=%d chunks=%d vertices=%d elapsed_ms=%d cache_hits=%d chunks_built=%d error=%s",
@@ -997,8 +1073,25 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				renderErr,
 			))
 			native.SetRenderStatus("Render incomplete; zoom in and try again: " + renderErr)
+		} else if completed != len(requestKeys) {
+			// A closed result stream is not proof that every requested chunk was
+			// delivered (for example, cancellation or a scheduler regression can
+			// end it early). Never label a partial viewport as ready.
+			missing := len(requestKeys) - completed
+			native.RecordDiagnostic("render", fmt.Sprintf(
+				"incomplete generation=%d chunks=%d/%d vertices=%d elapsed_ms=%d missing_results=%d",
+				requestGeneration, completed, len(requestKeys), renderedVertices,
+				time.Since(renderStartedAt).Milliseconds(), missing,
+			))
+			native.SetRenderStatus(fmt.Sprintf("Render incomplete; zoom in and try again: %d chunks were not returned", missing))
 		} else {
 			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(requestKeys)}, true)
+			r.mu.Lock()
+			if r.scheduler == scheduler && scheduler.Generation() == requestGeneration {
+				r.hasCompleteFrame = true
+				r.completeFrameLayers = layerSignature
+			}
+			r.mu.Unlock()
 			stats := scheduler.Stats()
 			native.RecordDiagnostic("render", fmt.Sprintf(
 				"ready generation=%d chunks=%d vertices=%d elapsed_ms=%d cache_hits=%d chunks_built=%d",
@@ -1443,6 +1536,7 @@ func (r *demoRuntime) cancelCurrentRender() {
 	if loading {
 		r.loadGeneration++
 		r.loadCancel = nil
+		r.pendingLoadBatches = nil
 		r.previewLoading = false
 	}
 	r.mu.Unlock()
@@ -1483,6 +1577,8 @@ func startViewportSync(runtime *demoRuntime) {
 	lastLoadGeneration := native.LoadGeneration()
 	lastSaveGeneration := native.SaveGeneration()
 	go func() {
+		var viewportChangedAt time.Time
+		pendingViewportRefresh := false
 		for range time.NewTicker(16 * time.Millisecond).C {
 			saveGeneration := native.SaveGeneration()
 			if saveGeneration != lastSaveGeneration {
@@ -1491,14 +1587,18 @@ func startViewportSync(runtime *demoRuntime) {
 			}
 			loadGeneration := native.LoadGeneration()
 			if loadGeneration != lastLoadGeneration {
-				lastLoadGeneration = loadGeneration
-				paths, err := native.CurrentLoadPaths()
+				requests, err := native.CurrentLoadRequests()
 				if err != nil {
 					native.SetRenderStatus("Open failed: invalid file selection")
-				} else if len(paths) == 0 {
-					native.SetRenderStatus("Open cancelled")
 				} else {
-					runtime.startDataLoadPaths(paths)
+					lastLoadGeneration = loadGeneration
+					for _, paths := range requests {
+						if len(paths) == 0 {
+							native.SetRenderStatus("Open cancelled")
+						} else {
+							runtime.startDataLoadPaths(paths)
+						}
+					}
 				}
 			}
 			qtGeneration := native.ViewportGeneration()
@@ -1506,20 +1606,41 @@ func startViewportSync(runtime *demoRuntime) {
 			layerSettingsGeneration := native.LayerSettingsGeneration()
 			if layerSettingsGeneration != lastLayerSettingsGeneration {
 				lastLayerSettingsGeneration = layerSettingsGeneration
-				if err := applyLayerSettings(runtime, native.CurrentLayerSettings()); err != nil {
-					native.SetRenderStatus("Layer settings failed: " + err.Error())
+				payload := native.CurrentLayerSettings()
+				var action struct {
+					Operation string `json:"operation"`
+				}
+				_ = json.Unmarshal([]byte(payload), &action)
+				if action.Operation == "remove" {
+					native.SetRenderStatus("Removing layer")
+				}
+				if err := applyLayerSettings(runtime, payload); err != nil {
+					if action.Operation == "remove" {
+						native.SetRenderStatus("Remove layer failed: " + err.Error())
+					} else {
+						native.SetRenderStatus("Layer settings failed: " + err.Error())
+					}
 					runtime.publishLayerTree()
-				} else {
+				} else if action.Operation != "remove" {
 					native.SetRenderStatus("Layer settings applied")
 				}
 			}
 			viewport := native.CurrentViewport()
-			if qtGeneration != lastQtGeneration || layerVisibilityGeneration != lastLayerVisibilityGeneration {
+			if qtGeneration != lastQtGeneration {
 				lastQtGeneration = qtGeneration
-				if layerVisibilityGeneration != lastLayerVisibilityGeneration {
-					lastLayerVisibilityGeneration = layerVisibilityGeneration
-					applyLayerVisibility(runtime, native.CurrentLayerVisibility())
-				}
+				viewportChangedAt = time.Now()
+				pendingViewportRefresh = true
+			}
+			visibilityChanged := layerVisibilityGeneration != lastLayerVisibilityGeneration
+			if visibilityChanged {
+				lastLayerVisibilityGeneration = layerVisibilityGeneration
+				applyLayerVisibility(runtime, native.CurrentLayerVisibility())
+			}
+			// Reuse the already rendered map while a wheel/drag gesture is
+			// active. Rebuilding each 16 ms cancels expensive GDAL windows
+			// before parcel tiles can ever finish.
+			if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
+				pendingViewportRefresh = false
 				runtime.advanceRenderGeneration()
 				width, height := viewport.Width, viewport.Height
 				if width <= 0 {
@@ -1537,7 +1658,9 @@ func startViewportSync(runtime *demoRuntime) {
 						X: 0.5 - viewport.PanX/(width*zoom),
 						Y: 0.5 + viewport.PanY/(height*zoom),
 					},
-					Zoom: zoom,
+					Zoom:        zoom,
+					ScreenWidth: viewport.ViewportWidth, ScreenHeight: viewport.ViewportHeight,
+					CanvasWidth: width, CanvasHeight: height,
 				})
 			}
 			clickGeneration := native.ClickGeneration()
@@ -1553,6 +1676,7 @@ func startViewportSync(runtime *demoRuntime) {
 			cancelGeneration := native.CancelGeneration()
 			if cancelGeneration != lastCancelGeneration {
 				lastCancelGeneration = cancelGeneration
+				pendingViewportRefresh = false
 				runtime.cancelCurrentRender()
 			}
 			activeLayerGeneration := native.ActiveLayerGeneration()
@@ -1574,6 +1698,7 @@ func startViewportSync(runtime *demoRuntime) {
 }
 
 type layerSettingsRequest struct {
+	Operation       string             `json:"operation,omitempty"`
 	Name            string             `json:"name"`
 	DisplayName     string             `json:"displayName"`
 	SourcePath      string             `json:"sourcePath"`
@@ -1591,6 +1716,12 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	}
 	if request.Name == "" {
 		return fmt.Errorf("layer identity is missing")
+	}
+	if request.Operation == "remove" {
+		return runtime.startRemoveLayer(request.Name)
+	}
+	if request.Operation != "" {
+		return fmt.Errorf("unknown layer operation %q", request.Operation)
 	}
 	request.DisplayName = strings.TrimSpace(request.DisplayName)
 	if request.DisplayName == "" {
@@ -1696,8 +1827,10 @@ func (r *demoRuntime) refreshCurrentViewport() {
 	}
 	r.advanceRenderGeneration()
 	r.refresh(context.Background(), render.Viewport{
-		Center: render.Point{X: 0.5 - viewport.PanX/(width*zoom), Y: 0.5 + viewport.PanY/(height*zoom)},
-		Zoom:   zoom,
+		Center:      render.Point{X: 0.5 - viewport.PanX/(width*zoom), Y: 0.5 + viewport.PanY/(height*zoom)},
+		Zoom:        zoom,
+		ScreenWidth: viewport.ViewportWidth, ScreenHeight: viewport.ViewportHeight,
+		CanvasWidth: width, CanvasHeight: height,
 	})
 }
 

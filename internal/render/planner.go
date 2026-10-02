@@ -59,11 +59,17 @@ func (p ChunkPlanner) VisibleKeysIntoLimit(dst []ChunkKey, viewport Viewport, la
 	if zoom < 0.0001 {
 		zoom = 0.0001
 	}
-	span := 1 / zoom
-	minXValue := math.Floor((viewport.Center.X-span/2)/chunkSize) - float64(margin)
-	maxXValue := math.Floor((viewport.Center.X+span/2)/chunkSize) + float64(margin)
-	minYValue := math.Floor((viewport.Center.Y-span/2)/chunkSize) - float64(margin)
-	maxYValue := math.Floor((viewport.Center.Y+span/2)/chunkSize) + float64(margin)
+	spanX, spanY := 1/zoom, 1/zoom
+	if viewport.ScreenWidth > 0 && viewport.CanvasWidth > 0 {
+		spanX *= viewport.ScreenWidth / viewport.CanvasWidth
+	}
+	if viewport.ScreenHeight > 0 && viewport.CanvasHeight > 0 {
+		spanY *= viewport.ScreenHeight / viewport.CanvasHeight
+	}
+	minXValue := math.Floor((viewport.Center.X-spanX/2)/chunkSize) - float64(margin)
+	maxXValue := math.Floor((viewport.Center.X+spanX/2)/chunkSize) + float64(margin)
+	minYValue := math.Floor((viewport.Center.Y-spanY/2)/chunkSize) - float64(margin)
+	maxYValue := math.Floor((viewport.Center.Y+spanY/2)/chunkSize) + float64(margin)
 	// Reject values outside a conservative integer range before converting;
 	// this also keeps subtraction and loop increments overflow-safe.
 	const maxChunkCoordinate = float64(1 << 30)

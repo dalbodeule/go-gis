@@ -33,6 +33,26 @@ func TestChunkPlannerChangesZoomBucketAndExtent(t *testing.T) {
 	}
 }
 
+func TestChunkPlannerCoversWideClippedViewport(t *testing.T) {
+	planner := ChunkPlanner{ChunkSize: 0.1, Margin: 0}
+	viewport := Viewport{
+		Center: Point{X: 0.5, Y: 0.5}, Zoom: 4,
+		ScreenWidth: 1600, ScreenHeight: 800,
+		CanvasWidth: 800, CanvasHeight: 800,
+	}
+	keys := planner.VisibleKeys(viewport, "parcels")
+	minX, maxX := int(^uint(0)>>1), -int(^uint(0)>>1)-1
+	for _, key := range keys {
+		minX = min(minX, key.X)
+		maxX = max(maxX, key.X)
+	}
+	// The actual canvas shows x=[0.25,0.75]. A square plan would stop at
+	// x=[0.375,0.625], leaving both sides visibly empty.
+	if minX > 2 || maxX < 7 {
+		t.Fatalf("wide viewport chunk columns = %d..%d; want coverage through 2..7", minX, maxX)
+	}
+}
+
 func TestChunkPlannerTracksNegativePan(t *testing.T) {
 	planner := ChunkPlanner{ChunkSize: 1, Margin: 0}
 	keys := planner.VisibleKeys(Viewport{Center: Point{X: 2.1, Y: -1.2}, Zoom: 2}, "labels")

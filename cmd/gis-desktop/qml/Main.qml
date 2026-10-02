@@ -38,7 +38,9 @@ ApplicationWindow {
             "Lua field access hint": "feature.FIELD reads an attribute; use feature[\"field name\"] when a field contains spaces. Types: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). Return boolean from rules and string/number/nil from label text.",
             "Insert field into rule…": "Insert field into rule…",
-            "Insert field into label…": "Insert field into label…"
+            "Insert field into label…": "Insert field into label…",
+            "Center": "Center", "Center + rotation": "Center + rotation", "Free angle": "Free angle",
+            "Lua field types": "Lua field types", "Open the attribute table to inspect the layer schema.": "Open the attribute table to inspect the layer schema."
         }),
         ko: ({
             "Lua label editor": "Lua 레이블 편집기",
@@ -46,7 +48,9 @@ ApplicationWindow {
             "Lua field access hint": "feature.FIELD로 속성을 읽습니다. 필드명에 공백이 있으면 feature[\"필드 이름\"]을 사용하세요. 필드 형식: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). 규칙은 boolean, 레이블 식은 string/number/nil을 반환합니다.",
             "Insert field into rule…": "규칙에 필드 삽입…",
-            "Insert field into label…": "레이블에 필드 삽입…"
+            "Insert field into label…": "레이블에 필드 삽입…",
+            "Center": "중앙", "Center + rotation": "중앙 + 회전", "Free angle": "자유 각도",
+            "Lua field types": "Lua 필드 형식", "Open the attribute table to inspect the layer schema.": "레이어 필드를 확인하려면 속성 테이블을 여세요."
         }),
         jp: ({
             "Lua label editor": "Luaラベルエディター",
@@ -54,7 +58,9 @@ ApplicationWindow {
             "Lua field access hint": "feature.FIELDで属性を読み取ります。空白を含むフィールド名にはfeature[\"フィールド名\"]を使用します。型: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style)。ルールはboolean、ラベル式はstring/number/nilを返します。",
             "Insert field into rule…": "ルールにフィールドを挿入…",
-            "Insert field into label…": "ラベルにフィールドを挿入…"
+            "Insert field into label…": "ラベルにフィールドを挿入…",
+            "Center": "中央", "Center + rotation": "中央 + 回転", "Free angle": "自由角度",
+            "Lua field types": "Luaフィールド型", "Open the attribute table to inspect the layer schema.": "レイヤーの項目を確認するには属性テーブルを開いてください。"
         })
     })
 
@@ -62,6 +68,12 @@ ApplicationWindow {
         en: ({"Logs": "Logs", "Application log": "Application log", "Showing the most recent process output and application errors. Older entries are discarded.": "Showing the most recent process output and application errors. Older entries are discarded."}),
         ko: ({"Logs": "로그", "Application log": "애플리케이션 로그", "Showing the most recent process output and application errors. Older entries are discarded.": "최근 프로세스 출력과 애플리케이션 오류를 표시합니다. 오래된 항목은 순차적으로 삭제됩니다."}),
         jp: ({"Logs": "ログ", "Application log": "アプリケーションログ", "Showing the most recent process output and application errors. Older entries are discarded.": "最近のプロセス出力とアプリケーションエラーを表示します。古い項目は順次削除されます。"})
+    })
+
+    property var viewTranslations: ({
+        en: ({"Zoom to full extent": "Zoom to full extent"}),
+        ko: ({"Zoom to full extent": "전체 범위", "Remove layer…": "레이어 제거…", "Remove layer from project": "프로젝트에서 레이어 제거", "Remove '%1' from this project? The source file will not be deleted.": "이 프로젝트에서 '%1' 레이어를 제거할까요? 원본 파일은 삭제되지 않습니다.", "Transparent": "투명", "Opaque": "불투명", "Set point symbols, boundary lines, and polygon fill. Colors use #RRGGBB; sizes are in millimeters on screen.": "점·경계선·폴리곤 채우기를 설정합니다. 색상은 #RRGGBB, 크기는 화면 기준 mm입니다.", "Outline only (no polygon fill)": "윤곽선만 표시 (채우기 없음)", "Fill opacity: 0 = transparent, 1 = opaque. Boundary lines remain visible. This setting affects polygons only.": "채우기 불투명도: 0은 투명, 1은 불투명입니다. 경계선은 계속 보이며 폴리곤에만 적용됩니다.", "Available fields…": "사용 가능한 필드…", "Choose a field or type a template, for example ${NAME} (${CODE}).": "필드를 선택하거나 ${NAME} (${CODE})처럼 템플릿을 입력하세요.", "Fields for this layer": "이 레이어의 필드", "Click a field to insert ${FIELD} at the cursor. A single field name also works.": "필드를 누르면 커서 위치에 ${FIELD}가 삽입됩니다. 필드명만 입력해도 됩니다.", "Field list is loading or unavailable for this layer.": "필드 목록을 불러오는 중이거나 이 레이어에서는 사용할 수 없습니다."}),
+        jp: ({"Zoom to full extent": "全体表示", "Remove layer…": "レイヤーを除去…", "Remove layer from project": "プロジェクトからレイヤーを除去", "Remove '%1' from this project? The source file will not be deleted.": "このプロジェクトから'%1'を除去しますか？元のファイルは削除しません。", "Transparent": "透明", "Opaque": "不透明", "Set point symbols, boundary lines, and polygon fill. Colors use #RRGGBB; sizes are in millimeters on screen.": "点・境界線・ポリゴンの塗りを設定します。色は#RRGGBB、サイズは画面上のmmです。", "Outline only (no polygon fill)": "輪郭線のみ表示（塗りなし）", "Fill opacity: 0 = transparent, 1 = opaque. Boundary lines remain visible. This setting affects polygons only.": "塗りの不透明度: 0は透明、1は不透明です。境界線は表示されたままです。ポリゴンのみに適用されます。", "Available fields…": "使用可能なフィールド…", "Choose a field or type a template, for example ${NAME} (${CODE}).": "フィールドを選ぶか、${NAME} (${CODE})のように入力してください。", "Fields for this layer": "このレイヤーのフィールド", "Click a field to insert ${FIELD} at the cursor. A single field name also works.": "フィールドを選ぶとカーソル位置に${FIELD}を挿入します。フィールド名だけでも使えます。", "Field list is loading or unavailable for this layer.": "フィールド一覧を読み込み中、またはこのレイヤーでは利用できません。"})
     })
 
     function tr(key) {
@@ -74,12 +86,21 @@ ApplicationWindow {
         var diagnosticDictionary = diagnosticTranslations[language] || diagnosticTranslations.en;
         if (diagnosticDictionary[key] !== undefined)
             return diagnosticDictionary[key];
+        var viewDictionary = viewTranslations[language] || viewTranslations.en;
+        if (viewDictionary[key] !== undefined)
+            return viewDictionary[key];
         var dictionary = translations[language] || translations.en;
         return dictionary[key] || translations.en[key] || key;
     }
 
     function localizedStatus(raw) {
         var status = String(raw || "");
+        if (status === "Removing layer")
+            return language === "ko" ? "레이어 제거 중" : language === "jp" ? "レイヤーを除去中" : status;
+        if (status.indexOf("Layer removed: ") === 0)
+            return (language === "ko" ? "레이어 제거 완료: " : language === "jp" ? "レイヤーを除去しました: " : "Layer removed: ") + status.substring("Layer removed: ".length);
+        if (status.indexOf("Remove layer failed: ") === 0)
+            return (language === "ko" ? "레이어 제거 실패: " : language === "jp" ? "レイヤーの除去に失敗しました: " : "Remove layer failed: ") + status.substring("Remove layer failed: ".length);
         var dictionary = {
             en: {"Loading": "Loading", "Loading: checking feature count": "Checking feature count", "Preview displayed; loading full data": "Preview displayed; loading full data", "Layer settings applied": "Layer settings applied", "Loading cancelled": "Loading cancelled", "Render cancelled": "Render cancelled", "Dataset size unavailable; opened read-only to limit memory": "Dataset size unavailable; opened read-only to limit memory", "Render incomplete; zoom in and try again: ": "Render incomplete; zoom in and try again: ", "Open failed: ": "Open failed: ", "Save failed: ": "Save failed: ", "Workspace load failed: ": "Workspace load failed: ", "Layer settings failed: ": "Layer settings failed: ", "Render stopped: ": "Render stopped: ", "Render error: ": "Render error: ", "Render skipped: ": "Render skipped: ", "Loading ": "Loading ", "Saving ": "Saving ", "Saved ": "Saved ", "Dataset has at least ": "Dataset has at least "},
             ko: {"Loading": "불러오는 중", "Loading: checking feature count": "피처 개수 확인 중", "Preview displayed; loading full data": "미리보기 표시됨 · 전체 데이터 불러오는 중", "Layer settings applied": "레이어 설정 적용 완료", "Loading cancelled": "불러오기 취소됨", "Render cancelled": "렌더링 취소됨", "Dataset size unavailable; opened read-only to limit memory": "데이터 크기를 알 수 없어 메모리 보호를 위해 읽기 전용으로 열었습니다", "Render incomplete; zoom in and try again: ": "일부 렌더링을 완료하지 못했습니다. 확대 후 다시 시도하세요: ", "Open failed: ": "열기 실패: ", "Save failed: ": "저장 실패: ", "Workspace load failed: ": "작업공간 열기 실패: ", "Workspace save failed: ": "작업공간 저장 실패: ", "Layer settings failed: ": "레이어 설정 실패: ", "Layer reload failed: ": "레이어 다시 열기 실패: ", "Attribute page failed: ": "속성 페이지 표시 실패: ", "Attribute page exceeds the 16 MiB display payload limit": "속성 페이지가 16 MiB 표시 한도를 초과했습니다", "Render stopped: ": "렌더링 중단: ", "Render error: ": "렌더링 오류: ", "Render skipped: ": "렌더링 생략: ", "Label display skipped: ": "레이블 표시 생략: ", "Loading ": "불러오는 중: ", "Saving ": "저장 중: ", "Saved ": "저장 완료: ", "Workspace saved ": "작업공간 저장 완료: ", "Workspace loaded ": "작업공간 열기 완료: ", "Loading workspace ": "작업공간 불러오는 중: ", "Add files requires the native GDAL build": "파일을 추가하려면 GDAL 지원 데스크톱 빌드가 필요합니다", "Reopening layer source with selected encoding": "선택한 인코딩으로 레이어 원본 다시 여는 중", "Layer source reloaded": "레이어 원본 다시 열기 완료", "Vertex edit failed: ": "정점 편집 실패: ", "Vertex moved": "정점 이동 완료", "No visible layers": "표시 중인 레이어가 없습니다", "No vector files selected": "벡터 파일을 선택하지 않았습니다", "A file load is already in progress": "파일을 불러오는 중입니다", "Selected source is already loaded": "선택한 원본이 이미 열려 있습니다", "Cannot add files until the read-only source is ready": "읽기 전용 원본이 준비될 때까지 파일을 추가할 수 없습니다", "Open cancelled": "열기를 취소했습니다", "Save cancelled": "저장을 취소했습니다", "Dataset has at least ": "피처가 최소 "},
@@ -97,6 +118,12 @@ ApplicationWindow {
             if (language === "jp") return "ベクターファイル " + loadingFiles[1] + " 件を読み込み中";
             return status;
         }
+        var queuedSelections = /^Loading in progress; (\d+) selection\(s\) queued$/.exec(status);
+        if (queuedSelections) {
+            if (language === "ko") return "파일 불러오는 중 · 추가 요청 " + queuedSelections[1] + "건 대기";
+            if (language === "jp") return "ファイル読み込み中 · 追加要求 " + queuedSelections[1] + " 件待機";
+            return status;
+        }
         var exact = dictionary[status];
         if (exact !== undefined) return exact;
         if (status.indexOf("Workspace loaded; relink unavailable layers: ") === 0 && language === "ko") return "작업공간을 열었습니다. 다시 연결할 레이어: " + status.substring("Workspace loaded; relink unavailable layers: ".length);
@@ -111,14 +138,14 @@ ApplicationWindow {
         var status = String(raw || "").toLowerCase();
         if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
         if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
-        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0) return "#175cd3";
-        if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("ready") >= 0) return "#2e7d32";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0) return "#175cd3";
+        if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0) return "#2e7d32";
         return "#65717d";
     }
 
     function statusIsBusy(raw) {
         var status = String(raw || "").toLowerCase();
-        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0;
+        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0;
     }
 
     function memorySummary(processBytes, heapBytes, available, kind) {
@@ -298,7 +325,7 @@ ApplicationWindow {
             bottomPadding: 8
             wrapMode: TextEdit.NoWrap
             selectByMouse: true
-            font.family: "monospace"
+            font.family: Qt.platform.os === "osx" ? "Menlo" : Qt.platform.os === "windows" ? "Consolas" : "DejaVu Sans Mono"
             color: "transparent"
             selectedTextColor: "transparent"
             selectionColor: "#557aa6d6"
@@ -368,7 +395,7 @@ ApplicationWindow {
     Menu {
         id: layerContextMenu
         objectName: "layerContextMenu"
-        closePolicy: Popup.CloseOnEscape
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
         property string targetLayerName: ""
         MenuItem {
             objectName: "layerContextZoomToLayer"
@@ -394,6 +421,33 @@ ApplicationWindow {
             objectName: "layerContextLabels"
             text: rootWindow.tr("Labels and expressions")
             onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "labels")
+        }
+        MenuSeparator {}
+        MenuItem {
+            objectName: "layerContextRemove"
+            text: rootWindow.tr("Remove layer…")
+            onTriggered: {
+                removeLayerDialog.targetLayerName = layerContextMenu.targetLayerName;
+                removeLayerDialog.open();
+            }
+        }
+    }
+
+    Dialog {
+        id: removeLayerDialog
+        objectName: "removeLayerDialog"
+        modal: true
+        title: rootWindow.tr("Remove layer from project")
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        width: Math.min(440, rootWindow.width - 48)
+        property string targetLayerName: ""
+        contentItem: Label {
+            text: rootWindow.tr("Remove '%1' from this project? The source file will not be deleted.").replace("%1", removeLayerDialog.targetLayerName)
+            wrapMode: Text.WordWrap
+        }
+        onAccepted: {
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "remove", name: targetLayerName});
+            mapCanvas.layerSettingsGeneration += 1;
         }
     }
 
@@ -425,10 +479,15 @@ ApplicationWindow {
                         text: (model.sourceError ? "⚠ " : "") + (typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName)
                         checked: layerVisible
                         onToggled: {
+                            if (index < 0 || index >= layerModel.count || layerModel.get(index).name !== name)
+                                return;
                             layerModel.setProperty(index, "layerVisible", checked);
                             mapViewport.syncLayerVisibility();
                         }
-                        onClicked: mapViewport.selectLayer(name)
+                        onClicked: {
+                            if (mapViewport.findLayerIndex(name) >= 0)
+                                mapViewport.selectLayer(name);
+                        }
                     }
                     MouseArea {
                         objectName: "layerContextMouseArea"
@@ -474,6 +533,8 @@ ApplicationWindow {
                 property string activeLayer: ""
                 property string pendingWorkspaceActiveLayer: ""
                 property var dataBounds: [0, 0, 1, 1]
+                property var fitBounds: [0, 0, 1, 1]
+                property bool hasMapMetadata: false
                 property bool pendingInitialLayerFit: false
                 property bool hasSavedWorkspaceView: false
                 property string dataCRS: ""
@@ -488,6 +549,44 @@ ApplicationWindow {
                 property int layerLabelGenerationSeen: -1
                 property int vertexHandleGenerationSeen: -1
                 property string renderStatus: "Ready"
+
+                // mapCanvas covers the data extent while the clipped viewport
+                // may show only part of it. Preserve enough zoom range for a
+                // 25 m-wide view, including the canvas/viewport width ratio.
+                // Projected CRSs currently follow the app's meter-unit scale
+                // convention; EPSG:4326 is converted at the data extent center.
+                function maxMapZoom() {
+                    if (mapCanvas.width <= 0 || width <= 0 || dataBounds.length < 4)
+                        return 8.0;
+                    var spanX = dataBounds[2] - dataBounds[0];
+                    if (!isFinite(spanX) || spanX <= 0)
+                        return 8.0;
+                    var targetUnits = 25.0;
+                    if (dataCRS.toUpperCase() === "EPSG:4326") {
+                        var latitude = (dataBounds[1] + dataBounds[3]) / 2;
+                        var metersPerDegree = 111319.49 * Math.max(0.01, Math.cos(latitude * Math.PI / 180));
+                        targetUnits = 25.0 / metersPerDegree;
+                    }
+                    var required = spanX * width / (mapCanvas.width * targetUnits);
+                    if (!isFinite(required) || required <= 0)
+                        return 8.0;
+                    return Math.max(8.0, Math.min(1000000.0, required));
+                }
+
+                function metersPerMapUnitX(bounds, crs) {
+                    if (String(crs).toUpperCase() !== "EPSG:4326")
+                        return 1;
+                    var latitude = (bounds[1] + bounds[3]) / 2;
+                    return 111319.49 * Math.max(0.01, Math.cos(latitude * Math.PI / 180));
+                }
+
+                function mapMeterAspectRatio(bounds, crs) {
+                    var spanX = bounds[2] - bounds[0];
+                    var spanY = bounds[3] - bounds[1];
+                    if (!isFinite(spanX) || !isFinite(spanY) || spanX <= 0 || spanY <= 0)
+                        return 1;
+                    return spanX * metersPerMapUnitX(bounds, crs) / (spanY * (String(crs).toUpperCase() === "EPSG:4326" ? 111319.49 : 1));
+                }
 
                 ListModel {
                     id: attributeModel
@@ -510,6 +609,8 @@ ApplicationWindow {
                 }
 
                 function selectLayer(name) {
+                    if (activeLayer !== name)
+                        attributeFieldHints = [];
                     activeLayer = name;
                     mapCanvas.activeLayer = name;
                     mapCanvas.activeLayerGeneration += 1;
@@ -585,20 +686,50 @@ ApplicationWindow {
                     return true;
                 }
 
-                function fitPreferredInitialLayer() {
+                function zoomToFullExtent() {
+                    if (mapCanvas.width <= 0 || mapCanvas.height <= 0 || width <= 0 || height <= 0)
+                        return false;
+                    var bounds = fitBounds.length === 4 ? fitBounds : dataBounds;
+                    var spanX = dataBounds[2] - dataBounds[0];
+                    var spanY = dataBounds[3] - dataBounds[1];
+                    var fractionX = (bounds[2] - bounds[0]) / spanX;
+                    var fractionY = (bounds[3] - bounds[1]) / spanY;
+                    if (spanX <= 0 || spanY <= 0 || fractionX <= 0 || fractionY <= 0)
+                        return false;
+                    var fitZoom = Math.min(width / (mapCanvas.width * fractionX),
+                                           height / (mapCanvas.height * fractionY)) * 0.9;
+                    if (!isFinite(fitZoom) || fitZoom <= 0)
+                        return false;
+                    mapZoom = fitZoom;
+                    var centerX = (bounds[0] + bounds[2]) / 2;
+                    var centerY = (bounds[1] + bounds[3]) / 2;
+                    var nx = (centerX - dataBounds[0]) / spanX;
+                    var ny = (centerY - dataBounds[1]) / spanY;
+                    panX = (0.5 - nx) * mapCanvas.width * mapZoom;
+                    panY = (ny - 0.5) * mapCanvas.height * mapZoom;
+                    pendingInitialLayerFit = false;
+                    viewportGeneration += 1;
+                    return true;
+                }
+
+                function fitInitialMapExtent() {
                     if (!pendingInitialLayerFit || hasSavedWorkspaceView)
                         return false;
-                    var fallback = "";
-                    for (var i = 0; i < layerModel.count; ++i) {
-                        var row = layerModel.get(i);
-                        if (!row.boundsJson || row.boundsJson === "[]")
-                            continue;
-                        if (fallback === "")
-                            fallback = row.name;
-                        if ((row.geometryType || "").toUpperCase().indexOf("POLYGON") >= 0)
-                            return zoomToLayerExtent(row.name);
-                    }
-                    return fallback !== "" && zoomToLayerExtent(fallback);
+                    if (layerModel.count === 0)
+                        return false;
+                    // Use the same aggregate dataBounds that defines the render
+                    // canvas. Layer-specific bounds may omit a distant feature
+                    // or differ from a read-only viewport's transformed extent.
+                    return zoomToFullExtent();
+                }
+
+                onWidthChanged: {
+                    if (pendingInitialLayerFit)
+                        Qt.callLater(function() { mapViewport.fitInitialMapExtent(); });
+                }
+                onHeightChanged: {
+                    if (pendingInitialLayerFit)
+                        Qt.callLater(function() { mapViewport.fitInitialMapExtent(); });
                 }
 
                 function currentMapCoordinate() {
@@ -620,7 +751,7 @@ ApplicationWindow {
 
                 function luaFieldHintText() {
                     if (!attributeFieldHints.length)
-                        return "Open the attribute table to inspect the layer schema.";
+                        return rootWindow.tr("Open the attribute table to inspect the layer schema.");
                     var hints = [];
                     for (var i = 0; i < attributeFieldHints.length; ++i) {
                         var field = attributeFieldHints[i];
@@ -716,10 +847,7 @@ ApplicationWindow {
                     id: mapCanvas
                     objectName: "goGisMapCanvas"
                     property real mapAspectRatio: {
-                        var bounds = mapViewport.dataBounds;
-                        var spanX = bounds[2] - bounds[0];
-                        var spanY = bounds[3] - bounds[1];
-                        return spanX > 0 && spanY > 0 ? spanX / spanY : 1;
+                        return mapViewport.mapMeterAspectRatio(mapViewport.dataBounds, mapViewport.dataCRS);
                     }
                     property real viewportPanX: mapViewport.panX
                     property real viewportPanY: mapViewport.panY
@@ -763,9 +891,18 @@ ApplicationWindow {
                     property bool memoryStatusAvailable: false
                     property string mapMetadataPayload: ""
                     property int mapMetadataGeneration: 0
+                    property int mapMetadataAppliedGeneration: 0
                     property int cancelGeneration: 0
                     property string loadPath: ""
+                    property string loadRequestJournal: "[]"
                     property int loadGeneration: 0
+                    property int loadCapturedGeneration: 0
+                    onLoadCapturedGenerationChanged: {
+                        var requests = JSON.parse(loadRequestJournal);
+                        loadRequestJournal = JSON.stringify(requests.filter(function(request) {
+                            return request.generation > loadCapturedGeneration;
+                        }));
+                    }
                     property string savePath: ""
                     property int saveGeneration: 0
                     scale: mapViewport.mapZoom
@@ -900,8 +1037,12 @@ ApplicationWindow {
                         if (path.length > 0)
                             paths.push(path);
                     }
+                    var generation = mapCanvas.loadGeneration + 1;
+                    var pending = JSON.parse(mapCanvas.loadRequestJournal);
+                    pending.push({generation: generation, paths: paths});
+                    mapCanvas.loadRequestJournal = JSON.stringify(pending);
                     mapCanvas.loadPath = JSON.stringify(paths);
-                    mapCanvas.loadGeneration += 1;
+                    mapCanvas.loadGeneration = generation;
                 }
 
                 function localPathFromUrl(url) {
@@ -944,9 +1085,11 @@ ApplicationWindow {
                     }
                     onExited: mapViewport.cursorValid = false
                     onWheel: function (wheel) {
-                        var factor = wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15;
+                        // A notch advances far enough to reach parcel-level
+                        // detail without dozens of wheel events and renders.
+                        var factor = Math.pow(1.3, wheel.angleDelta.y / 120.0);
                         var oldZoom = mapViewport.mapZoom;
-                        var newZoom = Math.max(0.25, Math.min(8.0, oldZoom * factor));
+                        var newZoom = Math.max(0.25, Math.min(mapViewport.maxMapZoom(), oldZoom * factor));
                         var normalizedX = 0.5 + (wheel.x - mapCanvas.x - mapCanvas.width / 2) / (mapCanvas.width * oldZoom);
                         var normalizedY = 0.5 - (wheel.y - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * oldZoom);
                         var baseX = (mapViewport.width - mapCanvas.width) / 2;
@@ -990,6 +1133,7 @@ ApplicationWindow {
                         if (mapCanvas.layerTreePayload !== mapViewport.layerTreePayloadSeen) {
                             mapViewport.layerTreePayloadSeen = mapCanvas.layerTreePayload;
                             var layers = JSON.parse(mapCanvas.layerTreePayload);
+                            var previousActiveLayer = mapViewport.activeLayer;
                             layerModel.clear();
                             for (var layerIndex = 0; layerIndex < layers.length; ++layerIndex) {
                                 layerModel.append({
@@ -1012,8 +1156,25 @@ ApplicationWindow {
                                         })
                                 });
                             }
-                            if (layers.length > 0)
-                                mapViewport.selectLayer(layers[0].name);
+                            if (layers.length > 0) {
+                                var selectedName = layers[0].name;
+                                for (var selectedIndex = 0; selectedIndex < layers.length; ++selectedIndex) {
+                                    if (layers[selectedIndex].name === previousActiveLayer) {
+                                        selectedName = previousActiveLayer;
+                                        break;
+                                    }
+                                }
+                                mapViewport.selectLayer(selectedName);
+                            } else {
+                                mapViewport.activeLayer = "";
+                                mapViewport.attributeFieldHints = [];
+                                mapViewport.hasMapMetadata = false;
+                                layerContextMenu.close();
+                            }
+                            if (mapViewport.findLayerIndex(layerSettingsDialog.targetLayerName) < 0)
+                                layerSettingsDialog.close();
+                            if (mapViewport.findLayerIndex(layerContextMenu.targetLayerName) < 0)
+                                layerContextMenu.close();
                             if (mapViewport.pendingWorkspaceActiveLayer !== "") {
                                 for (var activeIndex = 0; activeIndex < layerModel.count; ++activeIndex) {
                                     if (layerModel.get(activeIndex).name === mapViewport.pendingWorkspaceActiveLayer) {
@@ -1023,9 +1184,8 @@ ApplicationWindow {
                                 }
                                 mapViewport.pendingWorkspaceActiveLayer = "";
                             }
-                            attributeLayerTabs.currentIndex = 0;
                             mapViewport.syncLayerVisibility();
-                            mapViewport.fitPreferredInitialLayer();
+                            mapViewport.fitInitialMapExtent();
                         }
                         if (mapCanvas.layerLabelGeneration !== mapViewport.layerLabelGenerationSeen) {
                             mapViewport.layerLabelGenerationSeen = mapCanvas.layerLabelGeneration;
@@ -1045,22 +1205,31 @@ ApplicationWindow {
                             for (var handleIndex = 0; handleIndex < handles.length; ++handleIndex)
                                 vertexHandleModel.append(handles[handleIndex]);
                         }
-                        if (mapCanvas.mapMetadataGeneration !== mapViewport.mapMetadataGenerationSeen) {
+                        if (mapCanvas.mapMetadataPayload !== "" && mapCanvas.mapMetadataGeneration !== mapViewport.mapMetadataGenerationSeen) {
                             mapViewport.mapMetadataGenerationSeen = mapCanvas.mapMetadataGeneration;
+                            var oldBounds = mapViewport.dataBounds;
+                            var oldCRS = mapViewport.dataCRS;
+                            var oldZoom = mapViewport.mapZoom;
+                            var oldCanvasWidth = mapCanvas.width;
+                            var oldCanvasHeight = mapCanvas.height;
+                            var oldCenterX = oldBounds[0] + (0.5 - mapViewport.panX / (oldCanvasWidth * oldZoom)) * (oldBounds[2] - oldBounds[0]);
+                            var oldCenterY = oldBounds[1] + (0.5 + mapViewport.panY / (oldCanvasHeight * oldZoom)) * (oldBounds[3] - oldBounds[1]);
+                            var oldMetersPerPixel = (oldBounds[2] - oldBounds[0]) * mapViewport.metersPerMapUnitX(oldBounds, oldCRS) / (oldCanvasWidth * oldZoom);
+                            var preserveExistingView = mapViewport.hasMapMetadata;
                             var metadata = ({});
                             try {
                                 metadata = JSON.parse(mapCanvas.mapMetadataPayload);
                                 if (metadata.bounds && metadata.bounds.length === 4) {
                                     mapViewport.dataBounds = metadata.bounds;
+                                    mapViewport.fitBounds = metadata.fitBounds && metadata.fitBounds.length === 4 ? metadata.fitBounds : metadata.bounds;
                                     mapViewport.dataCRS = metadata.crs || "";
                                 }
                             } catch (error) {
                                 mapViewport.dataBounds = [0, 0, 1, 1];
+                                mapViewport.fitBounds = [0, 0, 1, 1];
                                 mapViewport.dataCRS = "";
                             }
-                            mapViewport.panX = 0;
-                            mapViewport.panY = 0;
-                            mapViewport.mapZoom = 1;
+                            mapViewport.hasMapMetadata = metadata.hasLayers !== false;
                             if (metadata.view) {
                                 mapViewport.hasSavedWorkspaceView = true;
                                 mapViewport.pendingInitialLayerFit = false;
@@ -1079,11 +1248,31 @@ ApplicationWindow {
                                 }
                             } else {
                                 mapViewport.hasSavedWorkspaceView = false;
-                                mapViewport.pendingInitialLayerFit = true;
                                 mapViewport.pendingWorkspaceActiveLayer = "";
-                                mapViewport.fitPreferredInitialLayer();
+                                var newBounds = mapViewport.dataBounds;
+                                var newSpanX = newBounds[2] - newBounds[0];
+                                var newSpanY = newBounds[3] - newBounds[1];
+                                var newAspect = mapViewport.mapMeterAspectRatio(newBounds, mapViewport.dataCRS);
+                                var newCanvasWidth = Math.min(mapViewport.width, mapViewport.height * newAspect);
+                                var newCanvasHeight = Math.min(mapViewport.height, mapViewport.width / newAspect);
+                                var newUnitsPerPixel = oldMetersPerPixel / mapViewport.metersPerMapUnitX(newBounds, mapViewport.dataCRS);
+                                if (preserveExistingView && oldCRS === mapViewport.dataCRS && isFinite(oldCenterX) && isFinite(oldCenterY) &&
+                                        isFinite(newUnitsPerPixel) && newUnitsPerPixel > 0 && newCanvasWidth > 0 && newCanvasHeight > 0 &&
+                                        newSpanX > 0 && newSpanY > 0) {
+                                    mapViewport.mapZoom = newSpanX / (newCanvasWidth * newUnitsPerPixel);
+                                    mapViewport.panX = (0.5 - (oldCenterX - newBounds[0]) / newSpanX) * newCanvasWidth * mapViewport.mapZoom;
+                                    mapViewport.panY = ((oldCenterY - newBounds[1]) / newSpanY - 0.5) * newCanvasHeight * mapViewport.mapZoom;
+                                    mapViewport.pendingInitialLayerFit = false;
+                                } else {
+                                    mapViewport.panX = 0;
+                                    mapViewport.panY = 0;
+                                    mapViewport.mapZoom = 1;
+                                    mapViewport.pendingInitialLayerFit = true;
+                                    mapViewport.fitInitialMapExtent();
+                                }
                             }
                             mapViewport.viewportGeneration += 1;
+                            mapCanvas.mapMetadataAppliedGeneration = mapCanvas.mapMetadataGeneration;
                         }
                         mapViewport.renderStatus = mapCanvas.renderStatus;
                         mapViewport.selectedLayer = mapCanvas.selectionLayer;
@@ -1101,6 +1290,8 @@ ApplicationWindow {
                 }
                 ColumnLayout {
                     anchors.centerIn: parent
+                    // Keep the empty-state action above the full-map pan/click area.
+                    z: 6
                     visible: layerModel.count === 0
                     spacing: 8
                     Label {
@@ -1121,6 +1312,17 @@ ApplicationWindow {
                         text: rootWindow.tr("Add vector files")
                         onClicked: fileDialog.open()
                     }
+                }
+
+                Button {
+                    objectName: "zoomToFullExtentButton"
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    anchors.margins: 10
+                    z: 6
+                    visible: layerModel.count > 0
+                    text: rootWindow.tr("Zoom to full extent")
+                    onClicked: mapViewport.zoomToFullExtent()
                 }
             }
         }
@@ -1411,8 +1613,8 @@ ApplicationWindow {
         objectName: "layerSettingsDialog"
         modal: true
         title: rootWindow.tr("Layer properties") + " — " + targetLayerName
-        width: 620
-        height: Math.max(320, Math.min(760, rootWindow.height - 120))
+        width: Math.min(720, rootWindow.width - 48)
+        height: Math.max(320, Math.min(760, rootWindow.height - 80))
         standardButtons: Dialog.Apply | Dialog.Cancel
         property string targetLayerName: ""
         property string originalSourcePath: ""
@@ -1420,6 +1622,32 @@ ApplicationWindow {
         property string originalSourceEncoding: ""
         property string labelLuaSource: ""
         property string activeCategory: "general"
+        property string targetGeometryType: ""
+        property real previousFillOpacity: 0.35
+        property real labelCaptionWidth: Math.min(180, Math.max(120, layerSettingsScroll.availableWidth * 0.25))
+        onActiveCategoryChanged: {
+            if (layerSettingsScroll.contentItem)
+                layerSettingsScroll.contentItem.contentY = 0;
+        }
+
+        function insertLabelField(fieldName) {
+            var reference = "${" + fieldName + "}";
+            var position = labelExpressionField.cursorPosition;
+            labelExpressionField.insert(position, reference);
+            labelExpressionField.cursorPosition = position + reference.length;
+            labelExpressionField.forceActiveFocus();
+        }
+
+        function styleAppliesTo(kind) {
+            var type = targetGeometryType.toUpperCase();
+            if (type === "" || type.indexOf("COLLECTION") >= 0)
+                return true;
+            if (kind === "point")
+                return type.indexOf("POINT") >= 0;
+            if (kind === "line")
+                return type.indexOf("LINE") >= 0 || type.indexOf("POLYGON") >= 0;
+            return type.indexOf("POLYGON") >= 0;
+        }
 
         function loadLayer() {
             if (layerModel.count === 0)
@@ -1427,6 +1655,7 @@ ApplicationWindow {
             var rowIndex = Math.max(0, Math.min(attributeLayerTabs.currentIndex, layerModel.count - 1));
             var layer = layerModel.get(rowIndex);
             targetLayerName = layer.name;
+            targetGeometryType = layer.geometryType || "";
             displayNameField.text = layer.displayName || layer.name;
             sourcePathField.text = layer.sourcePath || "";
             originalSourcePath = sourcePathField.text.trim();
@@ -1440,10 +1669,11 @@ ApplicationWindow {
             var style = layer.style || ({});
             pointColorField.text = style.pointColor || "#d1495b";
             lineColorField.text = style.lineColor || "#2b6cb0";
-            polygonColorField.text = style.polygonColor || "#75b798";
+            polygonColorField.text = style.polygonColor || "#356b53";
             pointSizeField.text = String(style.pointSizeMm || 2.2);
             lineWidthField.text = String(style.lineWidthMm || 0.45);
             fillOpacityField.text = String(style.fillOpacity === undefined ? 0.35 : style.fillOpacity);
+            previousFillOpacity = Number(fillOpacityField.text) > 0 ? Number(fillOpacityField.text) : 0.35;
             var labels = layer.labels || ({});
             labelsEnabledField.checked = labels.enabled === true;
             labelExpressionField.text = labels.expression || "";
@@ -1505,9 +1735,15 @@ ApplicationWindow {
         onAccepted: submitLayer()
 
         contentItem: ScrollView {
+            id: layerSettingsScroll
+            objectName: "layerSettingsScroll"
             clip: true
+            contentWidth: availableWidth
+            contentHeight: layerSettingsColumn.implicitHeight
             ColumnLayout {
-                width: parent.width
+                id: layerSettingsColumn
+                width: layerSettingsScroll.availableWidth
+                height: implicitHeight
                 spacing: 8
                 TabBar {
                     id: layerCategoryTabs
@@ -1518,10 +1754,10 @@ ApplicationWindow {
                         if (currentIndex >= 0)
                             layerSettingsDialog.activeCategory = ["general", "source", "symbology", "labels"][currentIndex];
                     }
-                    TabButton { text: rootWindow.tr("General") }
-                    TabButton { text: rootWindow.tr("Data source") }
-                    TabButton { text: rootWindow.tr("Symbology") }
-                    TabButton { text: rootWindow.tr("Labels and expressions") }
+                    TabButton { width: layerSettingsScroll.availableWidth / 4; text: rootWindow.tr("General") }
+                    TabButton { width: layerSettingsScroll.availableWidth / 4; text: rootWindow.tr("Data source") }
+                    TabButton { width: layerSettingsScroll.availableWidth / 4; text: rootWindow.tr("Symbology") }
+                    TabButton { width: layerSettingsScroll.availableWidth / 4; text: rootWindow.tr("Labels and expressions") }
                 }
                 Label {
                     text: rootWindow.tr("General")
@@ -1615,61 +1851,117 @@ ApplicationWindow {
                     topPadding: 8
                     visible: layerSettingsDialog.activeCategory === "symbology"
                 }
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.tr("Set point symbols, boundary lines, and polygon fill. Colors use #RRGGBB; sizes are in millimeters on screen.")
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "symbology"
+                }
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
                     visible: layerSettingsDialog.activeCategory === "symbology"
                     Label {
                         text: rootWindow.tr("Point color")
+                        visible: layerSettingsDialog.styleAppliesTo("point")
                     }
                     TextField {
                         id: pointColorField
                         objectName: "pointColorField"
                         Layout.fillWidth: true
+                        visible: layerSettingsDialog.styleAppliesTo("point")
                     }
                     Label {
                         text: rootWindow.tr("Point size (mm)")
+                        visible: layerSettingsDialog.styleAppliesTo("point")
                     }
                     TextField {
                         id: pointSizeField
                         objectName: "pointSizeField"
                         Layout.fillWidth: true
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        visible: layerSettingsDialog.styleAppliesTo("point")
                     }
                     Label {
                         text: rootWindow.tr("Line color")
+                        visible: layerSettingsDialog.styleAppliesTo("line")
                     }
                     TextField {
                         id: lineColorField
                         objectName: "lineColorField"
                         Layout.fillWidth: true
+                        visible: layerSettingsDialog.styleAppliesTo("line")
                     }
                     Label {
                         text: rootWindow.tr("Line width (mm)")
+                        visible: layerSettingsDialog.styleAppliesTo("line")
                     }
                     TextField {
                         id: lineWidthField
                         objectName: "lineWidthField"
                         Layout.fillWidth: true
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        visible: layerSettingsDialog.styleAppliesTo("line")
                     }
                     Label {
                         text: rootWindow.tr("Polygon color")
+                        visible: layerSettingsDialog.styleAppliesTo("polygon")
                     }
                     TextField {
                         id: polygonColorField
                         objectName: "polygonColorField"
                         Layout.fillWidth: true
+                        visible: layerSettingsDialog.styleAppliesTo("polygon")
                     }
                     Label {
                         text: rootWindow.tr("Fill opacity (0–1)")
+                        visible: layerSettingsDialog.styleAppliesTo("polygon")
                     }
                     TextField {
                         id: fillOpacityField
                         objectName: "fillOpacityField"
                         Layout.fillWidth: true
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        visible: layerSettingsDialog.styleAppliesTo("polygon")
                     }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: layerSettingsDialog.activeCategory === "symbology" && layerSettingsDialog.styleAppliesTo("polygon")
+                    Label { text: rootWindow.tr("Transparent") }
+                    Slider {
+                        objectName: "fillOpacitySlider"
+                        Layout.fillWidth: true
+                        from: 0
+                        to: 100
+                        value: Math.max(0, Math.min(100, Number(fillOpacityField.text) * 100))
+                        onMoved: fillOpacityField.text = String(Math.round(value) / 100)
+                    }
+                    Label { text: rootWindow.tr("Opaque") }
+                }
+                CheckBox {
+                    id: outlineOnlyField
+                    objectName: "outlineOnlyField"
+                    text: rootWindow.tr("Outline only (no polygon fill)")
+                    checked: Number(fillOpacityField.text) === 0
+                    visible: layerSettingsDialog.activeCategory === "symbology" && layerSettingsDialog.styleAppliesTo("polygon")
+                    onClicked: {
+                        if (checked) {
+                            if (Number(fillOpacityField.text) > 0)
+                                layerSettingsDialog.previousFillOpacity = Number(fillOpacityField.text);
+                            fillOpacityField.text = "0";
+                        } else {
+                            fillOpacityField.text = String(layerSettingsDialog.previousFillOpacity);
+                        }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.tr("Fill opacity: 0 = transparent, 1 = opaque. Boundary lines remain visible. This setting affects polygons only.")
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "symbology" && layerSettingsDialog.styleAppliesTo("polygon")
                 }
                 Label {
                     text: rootWindow.tr("Labels and expressions")
@@ -1683,9 +1975,19 @@ ApplicationWindow {
                     text: rootWindow.tr("Show labels")
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
-                Label {
-                    text: rootWindow.tr("Label field / template")
+                RowLayout {
+                    Layout.fillWidth: true
                     visible: layerSettingsDialog.activeCategory === "labels"
+                    Label {
+                        Layout.fillWidth: true
+                        text: rootWindow.tr("Label field / template")
+                    }
+                    Button {
+                        id: labelFieldHintButton
+                        objectName: "labelFieldHintButton"
+                        text: rootWindow.tr("Available fields…")
+                        onClicked: labelFieldHintPopup.open()
+                    }
                 }
                 TextField {
                     id: labelExpressionField
@@ -1694,32 +1996,51 @@ ApplicationWindow {
                     placeholderText: "e.g. ${name}"
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.tr("Choose a field or type a template, for example ${NAME} (${CODE}).")
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "labels"
+                }
                 RowLayout {
                     Layout.fillWidth: true
+                    spacing: 8
                     visible: layerSettingsDialog.activeCategory === "labels"
                     Label {
                         text: rootWindow.tr("Placement")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
                     }
                     ComboBox {
                         id: labelPlacementField
                         objectName: "labelPlacementField"
                         Layout.fillWidth: true
-                        model: ["Center", "Center + rotation", "Free angle"]
+                        model: [rootWindow.tr("Center"), rootWindow.tr("Center + rotation"), rootWindow.tr("Free angle")]
                     }
                 }
-                TextField {
-                    id: labelRotationField
-                    objectName: "labelRotationField"
+                RowLayout {
                     Layout.fillWidth: true
-                    placeholderText: rootWindow.tr("Rotation field (optional)")
+                    spacing: 8
                     visible: layerSettingsDialog.activeCategory === "labels"
+                    Label {
+                        text: rootWindow.tr("Rotation field (optional)")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
+                    }
+                    TextField {
+                        id: labelRotationField
+                        objectName: "labelRotationField"
+                        Layout.fillWidth: true
+                        placeholderText: rootWindow.tr("Rotation field (optional)")
+                    }
                 }
                 GridLayout {
                     Layout.fillWidth: true
                     columns: 2
+                    columnSpacing: 8
                     visible: layerSettingsDialog.activeCategory === "labels"
                     Label {
                         text: rootWindow.tr("Text height (mm)")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
                     }
                     TextField {
                         id: labelHeightField
@@ -1728,7 +2049,9 @@ ApplicationWindow {
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                     }
                     Label {
+                        id: labelMinScaleCaption
                         text: rootWindow.tr("Minimum scale denominator")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
                     }
                     TextField {
                         id: labelMinScaleField
@@ -1738,6 +2061,7 @@ ApplicationWindow {
                     }
                     Label {
                         text: rootWindow.tr("Maximum scale denominator")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
                     }
                     TextField {
                         id: labelMaxScaleField
@@ -1747,7 +2071,7 @@ ApplicationWindow {
                     }
                 }
                 Label {
-                    text: "Label display rule (Lua; return true/false)"
+                    text: rootWindow.tr("Display rule — return true to show this feature's label") + " (Lua)"
                     wrapMode: Text.WordWrap
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
@@ -1759,13 +2083,13 @@ ApplicationWindow {
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 Label {
-                    text: "Lua label script (return text using feature fields)"
+                    text: rootWindow.tr("Label text — return string, number, or nil") + " (Lua)"
                     wrapMode: Text.WordWrap
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: "Lua field types: " + mapViewport.luaFieldHintText()
+                    text: rootWindow.tr("Lua field types") + ": " + mapViewport.luaFieldHintText()
                     color: "#65717d"
                     wrapMode: Text.WordWrap
                     visible: layerSettingsDialog.activeCategory === "labels"
@@ -1777,6 +2101,60 @@ ApplicationWindow {
                     onClicked: luaEditorDialog.open()
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
+            }
+        }
+    }
+
+    Popup {
+        id: labelFieldHintPopup
+        objectName: "labelFieldHintPopup"
+        parent: Overlay.overlay
+        anchors.centerIn: Overlay.overlay
+        modal: true
+        width: Math.min(460, rootWindow.width - 64)
+        height: Math.min(450, rootWindow.height - 96)
+        padding: 16
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.tr("Fields for this layer")
+                font.bold: true
+            }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.tr("Click a field to insert ${FIELD} at the cursor. A single field name also works.")
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: mapViewport.attributeFieldHints.length === 0
+                text: rootWindow.tr("Field list is loading or unavailable for this layer.")
+                wrapMode: Text.WordWrap
+            }
+            ListView {
+                id: labelFieldList
+                objectName: "labelFieldList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: mapViewport.attributeFieldHints
+                spacing: 4
+                delegate: Button {
+                    objectName: "labelFieldHintRow"
+                    width: labelFieldList.width
+                    text: modelData.name + "  ·  " + (modelData.type || "unknown")
+                    onClicked: {
+                        layerSettingsDialog.insertLabelField(modelData.name);
+                        labelFieldHintPopup.close();
+                    }
+                }
+            }
+            Button {
+                Layout.alignment: Qt.AlignRight
+                text: rootWindow.tr("Close")
+                onClicked: labelFieldHintPopup.close()
             }
         }
     }

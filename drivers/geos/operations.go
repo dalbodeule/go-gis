@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 
 	"gogis/internal/core"
@@ -20,6 +21,10 @@ type Operator struct {
 }
 
 const minDisplaySimplificationPoints = 32
+
+// overviewUnionGrid suppresses sub-decimeter seams between separately digitized
+// projected polygons in an approximate, read-only display overview.
+const overviewUnionGrid = 0.1
 
 // NewOperator creates a GEOS operator with a dedicated context.
 func NewOperator() *Operator {
@@ -104,6 +109,89 @@ func (o *Operator) SimplifyForDisplay(ctx context.Context, layer core.Layer, tol
 		output.Destroy()
 	}
 	return result, nil
+}
+
+// DissolvePolygonBoundariesForDisplay returns the coverage boundary of the
+// polygons in a bounded read-only window. It is intended for coarse overview
+// rendering only: parcel-level borders and feature interaction are omitted,
+// while the source layer remains unchanged for detailed zooms and queries.
+func (o *Operator) DissolvePolygonBoundariesForDisplay(ctx context.Context, layer core.Layer) (output core.Layer, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			output = core.Layer{}
+			err = fmt.Errorf("GEOS failed to dissolve polygon overview: %v", recovered)
+		}
+	}()
+	geometries := make([]*geoslib.Geom, 0, len(layer.Features))
+	for index := range layer.Features {
+		if err := ctx.Err(); err != nil {
+			for _, geometry := range geometries {
+				geometry.Destroy()
+			}
+			return core.Layer{}, err
+		}
+		geometry := layer.Features[index].Geometry
+		if geometry == nil || !strings.Contains(strings.ToUpper(geometry.GeometryType()), "POLYGON") {
+			continue
+		}
+		wkb, ok := geometry.(core.WKBGeometry)
+		if !ok {
+			continue
+		}
+		parsed, err := o.context.NewGeomFromWKB(wkb.WKB)
+		if err != nil {
+			for _, current := range geometries {
+				current.Destroy()
+			}
+			return core.Layer{}, fmt.Errorf("read polygon feature %d for overview dissolve: %w", layer.Features[index].ID, err)
+		}
+		geometries = append(geometries, parsed)
+	}
+	if len(geometries) == 0 {
+		return layer, nil
+	}
+	collection := o.context.NewCollection(geoslib.TypeIDGeometryCollection, geometries)
+	// A fixed precision model prevents tiny coordinate discrepancies from
+	// surviving as sliver gaps and spikes in the coarse coverage outline. Geographic
+	// coordinates need a degree-sized grid; unknown CRS units disable snapping.
+	// The input layer is untouched; exact source geometries are used at detail zooms.
+	gridSize := overviewUnionGridSize(layer.CRS.AuthorityCode)
+	var union *geoslib.Geom
+	if gridSize > 0 {
+		union = collection.UnaryUnionPrec(gridSize)
+	} else {
+		union = collection.UnaryUnion()
+	}
+	collection.Destroy()
+	if union == nil {
+		return core.Layer{}, fmt.Errorf("dissolve polygon coverage for overview")
+	}
+	boundary := union.Boundary()
+	union.Destroy()
+	if boundary == nil {
+		return core.Layer{}, fmt.Errorf("extract dissolved polygon boundary for overview")
+	}
+	result := layer
+	result.Features = []core.Feature{{Geometry: core.WKBGeometry{WKB: boundary.ToWKB()}}}
+	boundary.Destroy()
+	return result, nil
+}
+
+func overviewUnionGridSize(authorityCode string) float64 {
+	parts := strings.Split(strings.ToUpper(strings.TrimSpace(authorityCode)), ":")
+	if len(parts) != 2 || parts[0] != "EPSG" {
+		return 0
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0
+	}
+	// Most EPSG geographic 2D/3D CRSs are in the 4xxx range. Include common
+	// modern geographic codes outside that range; 1e-6 degree is about 0.1 m.
+	if (code >= 4000 && code < 5000) || code == 4326 || code == 4979 || code == 6318 || code == 6668 || code == 7844 {
+		return 1e-6
+	}
+	return overviewUnionGrid
 }
 
 func (o *Operator) binary(ctx context.Context, left, right core.Layer, operation func(*geoslib.Geom, *geoslib.Geom) *geoslib.Geom) (core.Layer, error) {

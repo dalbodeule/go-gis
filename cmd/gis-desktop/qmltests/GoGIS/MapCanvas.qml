@@ -37,7 +37,9 @@ Item {
     property int mapMetadataGeneration: 0
     property int cancelGeneration: 0
     property string loadPath: ""
+    property string loadRequestJournal: "[]"
     property int loadGeneration: 0
+    property int loadCapturedGeneration: 0
     property string savePath: ""
     property int saveGeneration: 0
 }

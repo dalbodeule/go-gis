@@ -98,6 +98,37 @@ func TestPolygonFillColorMultipliesColorAlphaByFillOpacity(t *testing.T) {
 	}
 }
 
+func TestOverviewDeduplicatesSharedPolygonEdgesWithoutDroppingFeatures(t *testing.T) {
+	layer := core.Layer{Name: "parcels", Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((1 0, 2 0, 2 1, 1 1, 1 0))"}},
+	}}
+	bounds := [4]float64{0, 0, 2, 1}
+	key := ChunkKey{Layer: "parcels", X: 0, Y: 0}
+	full, _, err := NewLayerSourcesWithExtentAndChunkSizeForChunk([]core.Layer{layer}, bounds, 1, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deduplicated, hits, err := NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines([]core.Layer{layer}, bounds, 1, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullChunk, err := full[layer.Name].Builder(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deduplicatedChunk, err := deduplicated[layer.Name].Builder(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullChunk.Vertices) != 16 || len(deduplicatedChunk.Vertices) != 14 {
+		t.Fatalf("normal/deduplicated outline vertices = %d/%d; want 16/14", len(fullChunk.Vertices), len(deduplicatedChunk.Vertices))
+	}
+	if len(hits) != 2 {
+		t.Fatalf("deduplicated outline dropped feature hit geometry: got %d hits, want both parcels", len(hits))
+	}
+}
+
 func TestLineLabelUsesHalfLengthAndPolygonLabelUsesExplicitInteriorAnchor(t *testing.T) {
 	settings := core.LabelSettings{Enabled: true, Expression: "name", Placement: "free-angle", HeightMM: 2.5}
 	line, err := NewLayerSource(core.Layer{Name: "routes", Labels: settings, Features: []core.Feature{{

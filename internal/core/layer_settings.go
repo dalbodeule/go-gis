@@ -12,8 +12,11 @@ var ErrInvalidLayerSettings = errors.New("invalid layer settings")
 // DefaultLayerStyle returns a neutral style that is legible on a light map.
 func DefaultLayerStyle() LayerStyle {
 	return LayerStyle{
-		PointColor: "#d1495b", LineColor: "#2b6cb0", PolygonColor: "#75b798",
-		PointSizeMM: 2.2, LineWidthMM: 0.45, FillOpacity: 0.35,
+		PointColor: "#d1495b", LineColor: "#2b6cb0", PolygonColor: "#356b53",
+		// Keep dense cadastral boundaries sub-pixel to avoid turning a
+		// citywide overview into a visually solid polygon mass. The native
+		// renderer converts these physical sizes to screen pixels.
+		PointSizeMM: 1.6, LineWidthMM: 0.18, FillOpacity: 0.12,
 	}
 }
 

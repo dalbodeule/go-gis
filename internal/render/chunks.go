@@ -725,7 +725,10 @@ func (s *Scheduler) splitCachedRequest(keys []ChunkKey) (*cachedChunkSnapshot, [
 			snapshot = s.acquireCachedSnapshot(len(keys))
 			if firstMissing >= 0 {
 				buffers = s.acquireRequestBuffers(len(keys))
-				missing = append(buffers.missing, keys[:firstMissing]...)
+				// Include every key before this first cache hit. Several leading
+				// misses may have been scanned while seenHit was false; using only
+				// firstMissing silently dropped all but the first one.
+				missing = append(buffers.missing, keys[:index]...)
 				cachedKeys = buffers.cachedKeys
 			}
 		}
@@ -742,8 +745,12 @@ func (s *Scheduler) splitCachedRequest(keys []ChunkKey) (*cachedChunkSnapshot, [
 	}
 	if buffers == nil {
 		buffers = s.acquireRequestBuffers(len(keys))
-		cachedKeys = append(buffers.cachedKeys, keys[:len(snapshot.chunks)]...)
-		missing = buffers.missing
+		// Preserve the cached/missing partition accumulated above. Rebuilding
+		// cachedKeys from a prefix is incorrect when hits and misses interleave,
+		// and replacing missing with the empty pooled slice drops every miss
+		// after a leading cache hit (the viewport then appears partially ready).
+		cachedKeys = append(buffers.cachedKeys, cachedKeys...)
+		missing = append(buffers.missing, missing...)
 	}
 	buffers.cachedKeys = cachedKeys
 	buffers.missing = missing

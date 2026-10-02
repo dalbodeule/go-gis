@@ -11,6 +11,11 @@ type Point struct {
 type Viewport struct {
 	Center Point
 	Zoom   float64
+	// ScreenWidth and ScreenHeight are the clipped viewport dimensions in
+	// pixels. CanvasWidth/CanvasHeight are the unscaled map item dimensions.
+	// Zero values keep the square viewport used by headless callers.
+	ScreenWidth, ScreenHeight float64
+	CanvasWidth, CanvasHeight float64
 }
 
 // NewViewport returns a usable default viewport.

@@ -141,6 +141,9 @@ func TestLayerSourceBoundsArePerLayerNotProjectUnion(t *testing.T) {
 	if got, want := runtime.layerBounds["survey-point"], [4]float64{90, 80, 90, 80}; got != want {
 		t.Fatalf("survey point bounds = %v, want %v", got, want)
 	}
+	if got, want := runtime.mapFitExtent, [4]float64{10, 20, 30, 40}; got != want {
+		t.Fatalf("preferred fit extent = %v, want polygon bounds %v", got, want)
+	}
 }
 
 func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
@@ -148,7 +151,8 @@ func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
 		zoom   float64
 		bucket int
 		size   float64
-	}{{0.5, -1, 0.03125}, {1, 0, 0.03125}, {2, 1, 0.015625}, {4, 2, 0.0078125}, {16, 4, 0.0078125}, {math.Inf(1), 0, 0.03125}} {
+	}{{0.5, -1, 0.03125}, {1, 0, 0.03125}, {2, 1, 0.015625}, {4, 2, 0.0078125}, {16, 4, 0.0078125},
+		{64, 6, 0.001953125}, {128, 7, 0.001953125}, {math.Inf(1), 0, 0.03125}} {
 		if bucket := readOnlyWindowZoomBucket(test.zoom); bucket != test.bucket {
 			t.Errorf("zoom bucket for %v = %d, want %d", test.zoom, bucket, test.bucket)
 		}
@@ -156,13 +160,13 @@ func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
 			t.Errorf("chunk size for bucket %d = %v, want %v", test.bucket, size, test.size)
 		}
 	}
-	if size := readOnlyWindowChunkSize(100); size != 0.0078125 {
-		t.Fatalf("extreme zoom chunk size = %v, want minimum size 1/128", size)
+	if size := readOnlyWindowChunkSize(100); size != 0.0000002384185791015625 {
+		t.Fatalf("extreme zoom chunk size = %v, want minimum size 1/4194304", size)
 	}
 }
 
 func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
-	for _, test := range []struct{ bucket, stride int }{{-7, 256}, {-2, 16}, {-1, 8}, {0, 4}, {1, 2}, {2, 1}} {
+	for _, test := range []struct{ bucket, stride int }{{-7, 256}, {-2, 8}, {-1, 1}, {0, 1}, {1, 1}, {2, 1}} {
 		if got := readOnlyOverviewStride(test.bucket); got != test.stride {
 			t.Errorf("overview stride at bucket %d = %d, want %d", test.bucket, got, test.stride)
 		}
@@ -182,6 +186,68 @@ func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
 	}
 	if len(layer.Features) != 16 {
 		t.Fatalf("source layer was mutated to %d features", len(layer.Features))
+	}
+	sparseIDs := core.Layer{Features: make([]core.Feature, 12)}
+	for index := range sparseIDs.Features {
+		sparseIDs.Features[index] = core.Feature{ID: uint64(101 + index*17)}
+	}
+	sampled = sampleReadOnlyOverviewFeatures(sparseIDs, 3)
+	for index, feature := range sampled.Features {
+		if want := uint64(101 + (index*3+2)*17); feature.ID != want {
+			t.Fatalf("sparse-FID sample %d = %d, want ordinally spaced FID %d", index, feature.ID, want)
+		}
+	}
+}
+
+func TestReadOnlyOverviewSimplificationToleranceTracksZoom(t *testing.T) {
+	extent := [4]float64{0, 0, 20_000, 10_000}
+	for _, test := range []struct {
+		bucket int
+		want   float64
+	}{{-1, 6}, {0, 3}, {1, 1.5}, {2, 0.75}} {
+		if got := readOnlyOverviewSimplificationTolerance(extent, test.bucket); math.Abs(got-test.want) > 1e-9 {
+			t.Errorf("simplification tolerance at bucket %d = %g, want %g", test.bucket, got, test.want)
+		}
+	}
+}
+
+func TestReadOnlyOverviewZoomIsRelativeToPreferredExtent(t *testing.T) {
+	data := [4]float64{211_407.24, 43_257.02, 2_287_874.9, 459_484.82}
+	fit := [4]float64{211_407.24, 423_223.66, 236_805.50, 459_484.82}
+	if got := readOnlyOverviewZoomBucket(5, data, fit); got != 1 {
+		t.Fatalf("fit-scale LOD bucket at raw bucket 5 = %d, want overview bucket 1", got)
+	}
+	if got := readOnlyOverviewZoomBucket(6, data, fit); got != 2 {
+		t.Fatalf("fit-scale LOD bucket at raw bucket 6 = %d, want detail bucket 2", got)
+	}
+}
+
+func TestReadOnlyOverviewStrideBoundsDenseLayerAndRestoresDetailOnZoom(t *testing.T) {
+	for _, test := range []struct {
+		bucket, features, stride int
+	}{{-1, 208_015, 1}, {0, 208_015, 1}, {2, 208_015, 1}, {3, 208_015, 1}, {4, 208_015, 1}, {5, 208_015, 1}, {6, 208_015, 1}, {3, 1_000_000, 5}} {
+		if got := readOnlyOverviewStrideForFeatureCount(test.bucket, test.features); got != test.stride {
+			t.Errorf("overview stride for bucket=%d features=%d = %d, want %d",
+				test.bucket, test.features, got, test.stride)
+		}
+	}
+	const sejongFeatures = 208_015
+	stride := readOnlyOverviewStrideForFeatureCount(-1, sejongFeatures)
+	retained := sejongFeatures / stride
+	if retained < maxReadOnlyOverviewFeatures/2 || retained > maxReadOnlyOverviewFeatures {
+		t.Fatalf("full-extent overview sample retains %d features at stride %d; want a dense sample within the %d-feature budget",
+			retained, stride, maxReadOnlyOverviewFeatures)
+	}
+	fit := preferredMapFitExtent(
+		[4]float64{211_407.24, 43_257.02, 2_287_874.9, 459_484.82},
+		map[string][4]float64{
+			"parcels":       [4]float64{211_407.24, 423_223.66, 236_805.50, 459_484.82},
+			"survey-points": [4]float64{212_159.77, 43_257.02, 2_287_874.9, 459_421.8},
+		},
+		map[string]string{"parcels": "Polygon", "survey-points": "Point"},
+	)
+	if want := [4]float64{211_407.24, 423_223.66, 236_805.50, 459_484.82}; fit != want {
+		t.Fatalf("preferred fit extent = %v, want parcel extent %v", fit, want)
 	}
 }
 
@@ -533,6 +599,31 @@ func TestDesktopLoadsOnlySelectedGeoPackageLayer(t *testing.T) {
 	}
 	if allLayers.mapExtent != [4]float64{126.995, 36.995, 127.005, 37.005} {
 		t.Fatalf("common map extent = %v", allLayers.mapExtent)
+	}
+	readOnlyAll, err := loadDataRuntimeModeContext(context.Background(), path, "", "", "", "", true)
+	if err != nil {
+		t.Fatalf("load read-only multi-layer GeoPackage: %v", err)
+	}
+	if err := readOnlyAll.startRemoveLayer("first"); err != nil {
+		t.Fatalf("remove one GeoPackage layer: %v", err)
+	}
+	removedDeadline := time.Now().Add(4 * time.Second)
+	removed := false
+	for time.Now().Before(removedDeadline) {
+		readOnlyAll.mu.Lock()
+		names := readOnlyAll.service.LayerNames()
+		readOnlyAll.mu.Unlock()
+		if len(names) == 1 && names[0] == "selected" {
+			removed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !removed {
+		t.Fatalf("removing one GeoPackage layer left %v", readOnlyAll.service.LayerNames())
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("removing layer deleted GeoPackage: %v", err)
 	}
 	for _, readOnly := range []bool{true, false} {
 		runtime, err := loadDataRuntimeModeContext(context.Background(), path, "selected", "", "", "", readOnly)
@@ -910,15 +1001,255 @@ func TestWorkspaceViewNormalizesPanAndZoom(t *testing.T) {
 	}
 }
 
+func TestRemoveLayerKeepsRemainingProjectAndClearsLastLayer(t *testing.T) {
+	layers := []core.Layer{
+		{Name: "west", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true,
+			Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (100 100)"}, Properties: map[string]any{"name": "west feature"}}}},
+		{Name: "east", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true,
+			Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (1000 1000)"}}}},
+	}
+	runtime, err := buildDataRuntime(context.Background(), layers, "", "", "EPSG:5186", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.startRemoveLayer("missing"); err == nil {
+		t.Fatal("missing layer removal should fail")
+	}
+	if err := applyLayerSettings(runtime, `{"operation":"unknown","name":"east"}`); err == nil {
+		t.Fatal("unknown layer action should be rejected")
+	}
+	runtime.mu.Lock()
+	runtime.loadCancel = func() {}
+	runtime.mu.Unlock()
+	if err := runtime.startRemoveLayer("east"); err == nil {
+		t.Fatal("removing a layer during another load should be rejected")
+	}
+	runtime.mu.Lock()
+	runtime.loadCancel = nil
+	runtime.mu.Unlock()
+	waitForLayers := func(want []string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			runtime.mu.Lock()
+			got := runtime.service.LayerNames()
+			runtime.mu.Unlock()
+			if len(got) == len(want) {
+				matching := true
+				for i := range got {
+					matching = matching && got[i] == want[i]
+				}
+				if matching {
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("layer removal did not produce %v", want)
+	}
+	if err := applyLayerSettings(runtime, `{"operation":"remove","name":"east"}`); err != nil {
+		t.Fatal(err)
+	}
+	waitForLayers([]string{"west"})
+	page, total, err := runtime.attributePageReader(context.Background(), "west", 0, 10)
+	if err != nil || total != 1 || len(page.Features) != 1 || page.Features[0].Properties["name"] != "west feature" {
+		t.Fatalf("remaining layer attribute page = %+v, total %d, err %v", page, total, err)
+	}
+	if runtime.attributeFeatureReader != nil {
+		t.Fatal("editable layer should read current feature properties from the service")
+	}
+	if _, exists := runtime.layerStyles["east"]; exists {
+		t.Fatal("removed layer style is still resident")
+	}
+	if err := runtime.startRemoveLayer("west"); err != nil {
+		t.Fatal(err)
+	}
+	waitForLayers(nil)
+}
+
+func TestRapidVectorSelectionsQueueUntilCurrentLoadPublishes(t *testing.T) {
+	directory := t.TempDir()
+	paths := []string{filepath.Join(directory, "first.geojson"), filepath.Join(directory, "second.geojson")}
+	for index, path := range paths {
+		content := fmt.Sprintf(`{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"feature %d"},"geometry":{"type":"Point","coordinates":[%d,37]}}]}`, index, 126+index)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := loadDataRuntimeFiles(context.Background(), paths[:1], nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := newEmptyProjectRuntime()
+	runtime.loadGeneration = 1
+	runtime.loadCancel = func() {}
+	runtime.startDataLoadPaths([]string{filepath.Join(directory, "missing.geojson")})
+	runtime.startDataLoadPaths(paths[1:])
+	runtime.startDataLoadPaths(paths[1:])
+	if len(runtime.pendingLoadBatches) != 3 || runtime.pendingLoadBatches[1][0] != paths[1] {
+		t.Fatalf("queued selections = %v, want invalid then two second-source selections", runtime.pendingLoadBatches)
+	}
+	runtime.replaceWithLoaded(first, 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.mu.Lock()
+		count := len(runtime.service.LayerNames())
+		loading := runtime.loadCancel != nil
+		queued := len(runtime.pendingLoadBatches)
+		runtime.mu.Unlock()
+		if count == 2 && !loading {
+			if queued != 0 {
+				t.Fatalf("queue not drained: %d pending selections", queued)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	runtime.mu.Lock()
+	names := runtime.service.LayerNames()
+	runtime.mu.Unlock()
+	t.Fatalf("queued second source was not added; layers = %v", names)
+}
+
+func TestCancellingLoadDiscardsQueuedVectorSelections(t *testing.T) {
+	runtime := newEmptyProjectRuntime()
+	cancelled := false
+	runtime.loadCancel = func() { cancelled = true }
+	runtime.startDataLoadPaths([]string{filepath.Join(t.TempDir(), "later.geojson")})
+	if len(runtime.pendingLoadBatches) != 1 {
+		t.Fatalf("queued selections = %v, want one", runtime.pendingLoadBatches)
+	}
+	runtime.cancelCurrentRender()
+	if !cancelled || runtime.loadCancel != nil || len(runtime.pendingLoadBatches) != 0 {
+		t.Fatalf("cancellation left a pending load: cancelled=%v pending=%v", cancelled, runtime.pendingLoadBatches)
+	}
+}
+
+func TestRemoveReadOnlyLayerKeepsOtherSourceFile(t *testing.T) {
+	directory := t.TempDir()
+	paths := []string{filepath.Join(directory, "west.geojson"), filepath.Join(directory, "east.geojson")}
+	for index, path := range paths {
+		content := fmt.Sprintf(`{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"value":%d},"geometry":{"type":"Point","coordinates":[%d,37]}}]}`, index, 126+index)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime, err := loadReadOnlyDataRuntimeWithBaseLayers(context.Background(), []vectorSourceSpec{{Path: paths[0]}, {Path: paths[1]}}, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := runtime.service.LayerNames()
+	if len(names) != 2 {
+		t.Fatalf("loaded layers = %v; want two", names)
+	}
+	if err := runtime.startRemoveLayer(names[0]); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.mu.Lock()
+		remaining := runtime.service.LayerNames()
+		runtime.mu.Unlock()
+		if len(remaining) == 1 && remaining[0] == names[1] {
+			runtime.mu.Lock()
+			visible := runtime.visibleLayers[names[1]]
+			runtime.mu.Unlock()
+			if !visible {
+				t.Fatalf("retained layer %q became hidden", names[1])
+			}
+			if _, err := os.Stat(paths[0]); err != nil {
+				t.Fatalf("removing project layer deleted its source file: %v", err)
+			}
+			if _, err := os.Stat(paths[1]); err != nil {
+				t.Fatalf("remaining source file unavailable: %v", err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("read-only layer removal did not leave %q", names[1])
+}
+
 func TestPreserveMapWorldViewAcrossExpandedLayerExtent(t *testing.T) {
 	view := preserveMapWorldView(
-		native.Viewport{PanX: 50, PanY: 25, Zoom: 2, Width: 200, Height: 100},
+		native.Viewport{PanX: 50, PanY: 25, Zoom: 2, Width: 100, Height: 100,
+			ViewportWidth: 200, ViewportHeight: 100},
 		[4]float64{0, 0, 100, 100},
 		[4]float64{-100, -100, 300, 200},
 		"roads",
 	)
-	if view == nil || math.Abs(view.CenterX-0.34375) > 1e-9 || math.Abs(view.CenterY-0.5416666666666666) > 1e-9 || view.Zoom != 2 || view.ActiveLayer != "roads" {
+	if view == nil || math.Abs(view.CenterX-0.3125) > 1e-9 || math.Abs(view.CenterY-0.5416666666666666) > 1e-9 || math.Abs(view.Zoom-6) > 1e-9 || view.ActiveLayer != "roads" {
 		t.Fatalf("preserved world view = %+v", view)
+	}
+}
+
+func TestRapidLayerAppendUsesPendingViewWhenCanvasSnapshotIsStale(t *testing.T) {
+	oldExtent := [4]float64{0, 0, 400, 100}
+	newExtent := [4]float64{0, 0, 800, 400}
+	staleCanvas := native.Viewport{Width: 100, Height: 100, Zoom: 1, ViewportWidth: 800, ViewportHeight: 400}
+	if !viewportCanvasAspectIsStale(staleCanvas, oldExtent, "EPSG:5186") {
+		t.Fatal("stale canvas aspect was not detected")
+	}
+	pending := workspace.ViewState{CenterX: 0.3, CenterY: 0.4, Zoom: 2}
+	view := preserveSavedMapWorldView(pending, staleCanvas, oldExtent, newExtent, "EPSG:5186", "west")
+	if math.Abs(view.CenterX-0.15) > 1e-9 || math.Abs(view.CenterY-0.1) > 1e-9 ||
+		math.Abs(view.Zoom-4) > 1e-9 || view.ActiveLayer != "west" {
+		t.Fatalf("rapid append changed position or map scale: %+v", view)
+	}
+}
+
+func TestInitialFitViewExistsBeforeFirstLayerMetadataIsApplied(t *testing.T) {
+	layers := []core.Layer{{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true,
+		Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (0 0)"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200 100)"}},
+		}}}
+	runtime, err := buildDataRuntime(context.Background(), layers, "", "", "EPSG:5186", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewport := native.Viewport{ViewportWidth: 800, ViewportHeight: 400}
+	view := initialFitWorkspaceView(runtime, viewport)
+	if view == nil || view.ActiveLayer != "parcels" || math.Abs(view.CenterX-0.5) > 1e-9 ||
+		math.Abs(view.CenterY-0.5) > 1e-9 || math.Abs(view.Zoom-0.9) > 1e-9 {
+		t.Fatalf("initial fit view = %+v", view)
+	}
+	if got := initialFitWorkspaceView(runtime, native.Viewport{}); got != nil {
+		t.Fatalf("headless viewport should defer first fit to QML, got %+v", got)
+	}
+}
+
+func TestGeographicCanvasAspectUsesMetersAtExtentCenter(t *testing.T) {
+	extent := [4]float64{126, 36, 128, 38}
+	want := math.Cos(37 * math.Pi / 180)
+	if got := extentAspectMeters(extent, "EPSG:4326"); math.Abs(got-want) > 1e-9 {
+		t.Fatalf("geographic meter aspect = %g; want %g", got, want)
+	}
+}
+
+func TestPreserveMapWorldViewWithDistantPointOutlier(t *testing.T) {
+	oldExtent := [4]float64{211407.24, 423223.66, 236805.50, 459484.82}
+	newExtent := [4]float64{211407.24, 43257.02, 2287874.90, 459484.82}
+	oldCanvasWidth := 1000 * (oldExtent[2] - oldExtent[0]) / (oldExtent[3] - oldExtent[1])
+	oldView := native.Viewport{
+		PanX: 120, PanY: -80, Zoom: 18,
+		Width: oldCanvasWidth, Height: 1000,
+		ViewportWidth: 1500, ViewportHeight: 1000,
+	}
+	view := preserveMapWorldView(oldView, oldExtent, newExtent, "parcels")
+	oldState := workspaceViewFromViewport(oldView, "parcels")
+	oldWorldX := oldExtent[0] + oldState.CenterX*(oldExtent[2]-oldExtent[0])
+	oldWorldY := oldExtent[1] + oldState.CenterY*(oldExtent[3]-oldExtent[1])
+	newWorldX := newExtent[0] + view.CenterX*(newExtent[2]-newExtent[0])
+	newWorldY := newExtent[1] + view.CenterY*(newExtent[3]-newExtent[1])
+	newCanvasWidth := math.Min(oldView.ViewportWidth,
+		oldView.ViewportHeight*(newExtent[2]-newExtent[0])/(newExtent[3]-newExtent[1]))
+	oldUnitsPerPixel := (oldExtent[2] - oldExtent[0]) / (oldView.Width * oldView.Zoom)
+	newUnitsPerPixel := (newExtent[2] - newExtent[0]) / (newCanvasWidth * view.Zoom)
+	if math.Abs(newWorldX-oldWorldX) > 1e-6 || math.Abs(newWorldY-oldWorldY) > 1e-6 ||
+		math.Abs(newUnitsPerPixel-oldUnitsPerPixel) > 1e-9 || view.ActiveLayer != "parcels" {
+		t.Fatalf("outlier layer changed current position or scale: old=(%g,%g,%g) new=(%g,%g,%g)",
+			oldWorldX, oldWorldY, oldUnitsPerPixel, newWorldX, newWorldY, newUnitsPerPixel)
 	}
 }
 
@@ -1429,6 +1760,8 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 	loaded := &demoRuntime{
 		sources:                   map[string]render.LayerSource{"large": {}},
 		sourcesMu:                 sourceMu,
+		mapExtent:                 [4]float64{0, 0, 100, 100},
+		mapFitExtent:              [4]float64{10, 20, 30, 40},
 		viewportReadOnly:          true,
 		windowHits:                map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 77}}},
 		windowFeatureCounts:       map[render.ChunkKey]int{key: 1},
@@ -1447,6 +1780,8 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 	current := &demoRuntime{
 		sources:              map[string]render.LayerSource{"old": {}},
 		sourcesMu:            &sync.RWMutex{},
+		mapExtent:            [4]float64{-1, -1, 1, 1},
+		mapFitExtent:         [4]float64{-1, -1, 1, 1},
 		viewportReadOnly:     true,
 		windowHits:           map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 1}}},
 		windowFeatureNames:   map[uint64]string{1: "old"},
@@ -1458,6 +1793,10 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 	current.mu.Unlock()
 	if _, ok := current.sources["large"]; !current.viewportReadOnly || current.sourcesMu != sourceMu || !ok {
 		t.Fatal("loaded render sources or viewport mode were not transferred")
+	}
+	if current.mapExtent != loaded.mapExtent || current.mapFitExtent != loaded.mapFitExtent {
+		t.Fatalf("loaded canvas/fit extents were not transferred: canvas=%v fit=%v; want canvas=%v fit=%v",
+			current.mapExtent, current.mapFitExtent, loaded.mapExtent, loaded.mapFitExtent)
 	}
 	if len(current.windowHits[key]) != 1 || current.windowHits[key][0].FeatureID != 77 ||
 		current.windowFeatureCounts[key] != 1 || current.windowFeatureIDs[key][0] != 77 ||
@@ -1890,6 +2229,274 @@ func TestWindowedReadOnlyLargeSourceInitialViewportRefresh(t *testing.T) {
 		memory.HeapAlloc>>20, currentRSS>>20, rssAvailable)
 	if peakRSS, ok := benchmarkProcessMaxRSSBytes(); ok {
 		t.Logf("real-source initial-viewport refresh process peak-RSS-MiB=%d", peakRSS/(1<<20))
+	}
+}
+
+func TestWindowedReadOnlyFullExtentOverviewCompletesRealSource(t *testing.T) {
+	paths := filepath.SplitList(os.Getenv("GOGIS_TEST_LARGE_VECTOR_SOURCES"))
+	if len(paths) == 0 || paths[0] == "" {
+		t.Skip("set GOGIS_TEST_LARGE_VECTOR_SOURCES to a platform path-list of real large vector sources")
+	}
+	previousPolicy := activeShapefileIndexPolicy
+	configureShapefileIndexPolicy([]string{
+		"--spatial-index-threshold=100000",
+		"--spatial-index-location=cache",
+	})
+	defer func() { activeShapefileIndexPolicy = previousPolicy }()
+
+	ctx := context.Background()
+	var runtime *demoRuntime
+	var autoReadOnly bool
+	var featureCount int
+	var viewport render.Viewport
+	var err error
+	if len(paths) > 1 {
+		// Reproduce the user workflow: open the parcel layer, then append the
+		// point layer while preserving the already-fitted parcel view.
+		baseRuntime, large, count, loadErr := loadDataRuntimeFilesWithLargePolicy(
+			ctx, paths[:1], nil, "", false)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		baseHasPolygon := false
+		for _, geometryType := range baseRuntime.layerGeometryTypes {
+			baseHasPolygon = baseHasPolygon || isPolygonOverviewLayer(geometryType)
+		}
+		if !baseHasPolygon {
+			baseRuntime.closeAttributeSource()
+			t.Fatalf("first source %q is not the parcel polygon layer", paths[0])
+		}
+		baseExtent := baseRuntime.mapExtent
+		fitBounds := baseRuntime.mapFitExtent
+		baseSpanX, baseSpanY := baseExtent[2]-baseExtent[0], baseExtent[3]-baseExtent[1]
+		fractionX := (fitBounds[2] - fitBounds[0]) / baseSpanX
+		fractionY := (fitBounds[3] - fitBounds[1]) / baseSpanY
+		const viewportWidth, viewportHeight = 1280.0, 720.0
+		oldCanvasWidth := math.Min(viewportWidth, viewportHeight*baseSpanX/baseSpanY)
+		oldCanvasHeight := math.Min(viewportHeight, viewportWidth*baseSpanY/baseSpanX)
+		baseZoom := 0.9 / math.Max(fractionX, fractionY)
+		centerX := ((fitBounds[0]+fitBounds[2])/2 - baseExtent[0]) / baseSpanX
+		centerY := ((fitBounds[1]+fitBounds[3])/2 - baseExtent[1]) / baseSpanY
+		oldView := native.Viewport{
+			PanX: (0.5 - centerX) * oldCanvasWidth * baseZoom,
+			PanY: (centerY - 0.5) * oldCanvasHeight * baseZoom,
+			Zoom: baseZoom, Width: oldCanvasWidth, Height: oldCanvasHeight,
+			ViewportWidth: viewportWidth, ViewportHeight: viewportHeight,
+		}
+		baseRuntime.closeAttributeSource()
+		sources := make([]vectorSourceSpec, 0, len(paths))
+		for _, path := range paths {
+			sources = append(sources, vectorSourceSpec{Path: path})
+		}
+		runtime, err = loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, "", nil, &baseExtent)
+		if err == nil {
+			runtime.workspaceView = preserveMapWorldView(oldView, baseExtent, runtime.mapExtent, "")
+			preserved := runtime.workspaceView
+			newSpanX := runtime.mapExtent[2] - runtime.mapExtent[0]
+			newSpanY := runtime.mapExtent[3] - runtime.mapExtent[1]
+			newCanvasWidth := math.Min(viewportWidth, viewportHeight*newSpanX/newSpanY)
+			newCanvasHeight := math.Min(viewportHeight, viewportWidth*newSpanY/newSpanX)
+			viewport = render.Viewport{
+				Center:      render.Point{X: preserved.CenterX, Y: preserved.CenterY},
+				Zoom:        preserved.Zoom,
+				ScreenWidth: viewportWidth, ScreenHeight: viewportHeight,
+				CanvasWidth: newCanvasWidth, CanvasHeight: newCanvasHeight,
+			}
+			preservedWorldCenterX := runtime.mapExtent[0] + preserved.CenterX*newSpanX
+			preservedWorldCenterY := runtime.mapExtent[1] + preserved.CenterY*newSpanY
+			if math.Abs(preservedWorldCenterX-(fitBounds[0]+fitBounds[2])/2) > 1e-6 ||
+				math.Abs(preservedWorldCenterY-(fitBounds[1]+fitBounds[3])/2) > 1e-6 {
+				t.Fatalf("adding outlier points shifted the fitted parcel center: got=(%g,%g) parcel-center=(%g,%g)",
+					preservedWorldCenterX, preservedWorldCenterY,
+					(fitBounds[0]+fitBounds[2])/2, (fitBounds[1]+fitBounds[3])/2)
+			}
+			oldUnitsPerPixel := baseSpanX / (oldCanvasWidth * baseZoom)
+			wantZoom := newSpanX / (newCanvasWidth * oldUnitsPerPixel)
+			if math.Abs(preserved.Zoom-wantZoom) > 1e-9 {
+				t.Fatalf("adding outlier points changed the visible parcel scale: zoom=%g, want %g", preserved.Zoom, wantZoom)
+			}
+		}
+		autoReadOnly, featureCount = large, count
+	} else {
+		runtime, autoReadOnly, featureCount, err = loadDataRuntimeFilesWithLargePolicy(
+			ctx, paths, nil, "", false)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if !autoReadOnly || !runtime.viewportReadOnly || featureCount < largeDatasetReadOnlyThreshold {
+		t.Fatalf("large-source policy: automatic-read-only=%t viewport=%t features=%d", autoReadOnly, runtime.viewportReadOnly, featureCount)
+	}
+	if len(paths) > 1 {
+		polygonLayer, pointLayer := "", ""
+		for name, geometryType := range runtime.layerGeometryTypes {
+			if isPointGeometryType(geometryType) {
+				pointLayer = name
+			} else if strings.Contains(strings.ToUpper(geometryType), "POLYGON") {
+				polygonLayer = name
+			}
+		}
+		if polygonLayer == "" || pointLayer == "" {
+			t.Fatalf("combined test did not load both polygon and point layers: %#v", runtime.layerGeometryTypes)
+		}
+		polygonBounds := runtime.layerBounds[polygonLayer]
+		if runtime.mapFitExtent != polygonBounds {
+			t.Fatalf("fit bounds %v include point outliers; want parcel bounds %v", runtime.mapFitExtent, polygonBounds)
+		}
+		if runtime.mapExtent[2] < 1_000_000 || runtime.mapExtent[1] > 100_000 {
+			t.Fatalf("complete data canvas bounds %v dropped the source point outliers", runtime.mapExtent)
+		}
+	}
+	fitBounds := runtime.mapFitExtent
+	if len(paths) == 1 {
+		spanX, spanY := runtime.mapExtent[2]-runtime.mapExtent[0], runtime.mapExtent[3]-runtime.mapExtent[1]
+		fitFractionX := (fitBounds[2] - fitBounds[0]) / spanX
+		fitFractionY := (fitBounds[3] - fitBounds[1]) / spanY
+		viewport = render.Viewport{
+			Center: render.Point{
+				X: ((fitBounds[0]+fitBounds[2])/2 - runtime.mapExtent[0]) / spanX,
+				Y: ((fitBounds[1]+fitBounds[3])/2 - runtime.mapExtent[1]) / spanY,
+			},
+			Zoom: 0.9 / math.Max(fitFractionX, fitFractionY),
+		}
+	}
+	planner := runtime.planner
+	viewportBucket := readOnlyWindowZoomBucket(viewport.Zoom)
+	semanticLOD := readOnlyOverviewZoomBucket(viewportBucket, runtime.mapExtent, runtime.mapFitExtent)
+	planner.ChunkSize = readOnlyWindowChunkSize(viewportBucket)
+	t.Logf("sequential-append viewport: zoom=%g raw_bucket=%d semantic_lod=%d map_extent=%v fit_extent=%v chunk_size=%g",
+		viewport.Zoom, viewportBucket, semanticLOD,
+		runtime.mapExtent, runtime.mapFitExtent, planner.ChunkSize)
+	var keys []render.ChunkKey
+	for _, layerName := range runtime.service.LayerNames() {
+		keys = append(keys, planner.VisibleKeys(viewport, layerName)...)
+	}
+	if len(keys) == 0 || len(keys) >= 1225 {
+		t.Fatalf("parcel-area fit planned %d chunks at zoom %g from total extent %v / fit extent %v; expect non-empty and smaller than the outlier-diluted 1225-chunk full-world view",
+			len(keys), viewport.Zoom, runtime.mapExtent, fitBounds)
+	}
+	started := time.Now()
+	var totalVertices int64
+	polygonMinX, polygonMinY := math.Inf(1), math.Inf(1)
+	polygonMaxX, polygonMaxY := math.Inf(-1), math.Inf(-1)
+	for index, key := range keys {
+		chunk, err := runtime.builder(context.Background(), key)
+		if err != nil {
+			t.Fatalf("real-source overview chunk %d/%d (%v): %v", index+1, len(keys), key, err)
+		}
+		if len(chunk.Vertices) > render.MaxChunkVertices {
+			t.Fatalf("overview chunk %v has %d vertices, limit is %d", key, len(chunk.Vertices), render.MaxChunkVertices)
+		}
+		totalVertices += int64(len(chunk.Vertices))
+		if isPolygonOverviewLayer(runtime.layerGeometryTypes[key.Layer]) {
+			for _, vertex := range chunk.Vertices {
+				polygonMinX = math.Min(polygonMinX, float64(vertex.X))
+				polygonMinY = math.Min(polygonMinY, float64(vertex.Y))
+				polygonMaxX = math.Max(polygonMaxX, float64(vertex.X))
+				polygonMaxY = math.Max(polygonMaxY, float64(vertex.Y))
+			}
+		}
+	}
+	if totalVertices == 0 {
+		t.Fatal("real-source overview produced no perimeter vertices")
+	}
+	if totalVertices > render.MaxBatchVertices {
+		t.Fatalf("real-source complete overview has %d vertices across %d chunks, viewport budget is %d", totalVertices, len(keys), render.MaxBatchVertices)
+	}
+	if !math.IsInf(polygonMinX, 1) {
+		spanX := runtime.mapExtent[2] - runtime.mapExtent[0]
+		spanY := runtime.mapExtent[3] - runtime.mapExtent[1]
+		wantMinX := (runtime.mapFitExtent[0] - runtime.mapExtent[0]) / spanX
+		wantMinY := (runtime.mapFitExtent[1] - runtime.mapExtent[1]) / spanY
+		wantMaxX := (runtime.mapFitExtent[2] - runtime.mapExtent[0]) / spanX
+		wantMaxY := (runtime.mapFitExtent[3] - runtime.mapExtent[1]) / spanY
+		const perimeterExtentTolerance = 0.002 // allow display-only simplification at city scale
+		if polygonMinX > wantMinX+perimeterExtentTolerance || polygonMinY > wantMinY+perimeterExtentTolerance ||
+			polygonMaxX < wantMaxX-perimeterExtentTolerance || polygonMaxY < wantMaxY-perimeterExtentTolerance {
+			t.Fatalf("overview polygon perimeter envelope [%g %g %g %g] does not cover fitted parcel bounds [%g %g %g %g]",
+				polygonMinX, polygonMinY, polygonMaxX, polygonMaxY, wantMinX, wantMinY, wantMaxX, wantMaxY)
+		}
+	}
+	t.Logf("real-source complete overview: chunks=%d vertices=%d elapsed=%s", len(keys), totalVertices, time.Since(started).Round(time.Millisecond))
+	if len(paths) > 1 {
+		t.Logf("real-source geometry types: %#v", runtime.layerGeometryTypes)
+		forcedContext := context.WithValue(ctx, forceReadOnlyOverviewContextKey{}, true)
+		started = time.Now()
+		var forcedVertices int64
+		loggedLayers := make(map[string]bool)
+		for _, key := range keys {
+			chunk, err := runtime.builder(forcedContext, key)
+			if err != nil {
+				t.Fatalf("forced generalized overview chunk %v: %v", key, err)
+			}
+			forcedVertices += int64(len(chunk.Vertices))
+			if len(chunk.Vertices) > 0 && !loggedLayers[key.Layer] {
+				lineVertices, pointVertices, fillVertices := 0, 0, 0
+				for _, vertex := range chunk.Vertices {
+					switch vertex.Kind {
+					case render.VertexLine:
+						lineVertices++
+					case render.VertexPoint:
+						pointVertices++
+					case render.VertexFill:
+						fillVertices++
+					}
+				}
+				t.Logf("forced overview sample chunk %v geometry=%s vertices=%d lines=%d points=%d fills=%d",
+					key, runtime.layerGeometryTypes[key.Layer], len(chunk.Vertices), lineVertices, pointVertices, fillVertices)
+				loggedLayers[key.Layer] = true
+			}
+		}
+		if forcedVertices == 0 || forcedVertices > render.MaxBatchVertices {
+			t.Fatalf("forced generalized overview has %d vertices, want 1..%d", forcedVertices, render.MaxBatchVertices)
+		}
+		t.Logf("real-source generalized safety retry: chunks=%d vertices=%d elapsed=%s", len(keys), forcedVertices, time.Since(started).Round(time.Millisecond))
+	}
+}
+
+func TestWindowedReadOnlyZoomedParcelRemainsVisibleRealSource(t *testing.T) {
+	paths := filepath.SplitList(os.Getenv("GOGIS_TEST_LARGE_VECTOR_SOURCES"))
+	if len(paths) < 2 || paths[0] == "" || paths[1] == "" {
+		t.Skip("set GOGIS_TEST_LARGE_VECTOR_SOURCES to the parcel and survey-point SHPs")
+	}
+	runtime, err := loadReadOnlyDataRuntimeWithBaseLayers(context.Background(),
+		[]vectorSourceSpec{{Path: paths[0]}, {Path: paths[1]}}, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	data, fit := runtime.mapExtent, runtime.mapFitExtent
+	centerX := ((fit[0]+fit[2])/2 - data[0]) / (data[2] - data[0])
+	centerY := ((fit[1]+fit[3])/2 - data[1]) / (data[3] - data[1])
+	for _, zoom := range []float64{194.44, 840} {
+		viewport := render.Viewport{
+			Center: render.Point{X: centerX, Y: centerY}, Zoom: zoom,
+			ScreenWidth: 1600, ScreenHeight: 1000, CanvasWidth: 800, CanvasHeight: 1000,
+		}
+		planner := runtime.planner
+		planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+		var polygonVertices, totalVertices, chunkCount int
+		started := time.Now()
+		for name, geometryType := range runtime.layerGeometryTypes {
+			for _, key := range planner.VisibleKeys(viewport, name) {
+				chunkCount++
+				chunk, err := runtime.builder(context.Background(), key)
+				if err != nil {
+					t.Fatalf("zoomed chunk %v: %v", key, err)
+				}
+				totalVertices += len(chunk.Vertices)
+				if isPolygonOverviewLayer(geometryType) {
+					polygonVertices += len(chunk.Vertices)
+				}
+			}
+		}
+		if polygonVertices == 0 || totalVertices > render.MaxBatchVertices {
+			t.Fatalf("zoom %.2f view vertices: parcel=%d total=%d (limit %d); parcel must remain visible after adding survey points",
+				zoom, polygonVertices, totalVertices, render.MaxBatchVertices)
+		}
+		t.Logf("zoom %.2f Sejong chunks=%d parcel vertices=%d total=%d elapsed=%s",
+			zoom, chunkCount, polygonVertices, totalVertices, time.Since(started).Round(time.Millisecond))
 	}
 }
 

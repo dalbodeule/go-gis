@@ -4,6 +4,10 @@
 취약점 조회를 한곳에 모은다. 자동 검증 결과와 실제 사용자 환경의 결과를
 혼동하지 않도록 각 항목에 환경과 증거를 기록한다.
 
+현재 데스크톱 변경의 범위·검증 결과·사용자 화면 확인 항목은
+[커밋 준비 문서](../commit-prep.md)에 요약했다. 아래는 시점별 상세 기록이며,
+오프스크린 QML/Qt 테스트와 실제 사용자의 화면 확인을 구별해야 한다.
+
 `GO-2026-5970`은 잘못된 UTF-8 입력에서 `golang.org/x/text/unicode/norm.Iter`가 무한 루프에
 빠질 수 있다고 보고하며, 수정 경계는 `golang.org/x/text v0.39.0`이다. 저장소를 `v0.42.0`으로
 올렸다(Go 1.27.1 환경). 해당 모듈이 요구하는 `golang.org/x/sync`도 v0.23.0으로 갱신됐다.
@@ -838,6 +842,63 @@ publish했고, 34,645 hit features / 18 MiB retained payload에서 viewport feat
 hide/show 결과는 Go/GDAL/runtime 통합 확인이며 Qt/GPU 실제 화면표시나 체감 프레임 시간의
 증거로 간주하지 않는다.
 
+2026-10-02 사용자가 제공한 `chunks=7/1225`, `missing_results=1218` 로그를 조사해
+`Scheduler.splitCachedRequest`의 두 cache/miss 분할 오류를 수정했다. 첫 cache hit 전에 여러
+miss가 있으면 첫 miss만 보관하던 문제와, 요청 앞부분이 cache hit인 경우 뒤쪽 miss 목록을
+pool buffer로 옮기며 버리던 문제가 함께 있었다. 두 회귀 테스트는 선행 miss, 선행 cache hit,
+interleaved hit/miss 및 result/chunk key 짝을 검사한다. 사용자 세종 연속지적도 208,015 features를
+전체범위 zoom=1로 여는 opt-in 테스트에서 QIX 캐시를 적용한 뒤 1,225/1,225 chunks,
+308,213 render vertices가 2.153초에 `ready`로 완료됐다. 연속지적도+도근점 결합의 layer-fit
+viewport는 270/270 chunks, 320,557 vertices가 2.888초에 완료됐고, hide/show 재표시는
+270 cache hits / 0 rebuild로 끝났다. 이는 실자료를 쓰는 Go/GDAL/runtime와 스케줄러 완료 확인이며,
+눈에 보이는 Qt 창이나 GPU scenegraph의 픽셀/프레임 확인은 아니다.
+
+같은 날 million-point SHP 비교 benchmark를 다시 1회씩 실행했다. `.qix` 적용 fixture는
+loader+첫 window 7.76 ms, 첫 window 1.75 ms였고, QIX 없는 fixture는 각각 105.4 ms,
+99.24 ms였다. isolated loader child peak RSS는 두 경우 모두 76 MiB였다. 이 결과는 QIX가
+있는 합성 uniform-point SHP의 window query 개선을 보여 주지만, QIX 준비/복사 시간은 fixture
+생성 단계라 측정에서 제외되어 있으며 복잡한 polygon geometry 처리나 실제 Qt 프레임 속도와는
+구분해야 한다.
+
+2026-10-02 후속 visible Qt 앱 확인에서는 테스트용 `.app` bundle로 실제 사용자 세종시 SHP를
+열었다. 로그에 QIX 사용, `request generation=0/1/2`, 이어서 `first-publish generation=2`
+57 ms / 4,102 vertices, `ready generation=2 chunks=1225 vertices=302728 elapsed_ms=3094`
+가 기록됐다. 즉 이전 `7/1225`, `missing_results=1218`은 재현되지 않았고 1,225개 요청 타일의
+결과가 전부 도착했다. 창의 상태는 `Approximate overview ready; zoom in for exact geometry and
+selection`이었고 전체 세종 영역이 지도 뷰포트에 보이는 것을 화면으로 확인했다. 관측된 RSS는
+로드 중 약 523 MiB, 로그 창을 닫은 뒤 441 MiB였으며 Go heap은 약 20 MiB였다. 이는 이 한
+실자료·한 기기에서의 정상 렌더 확인일 뿐 전국 규모의 메모리 상한 보증이나 GPU별 프레임
+성능 검증은 아니다. 데이터의 세로형 extent 때문에 지도 양옆에 여백이 남는 것은 전체 영역을
+맞춰 표시한 결과이며 누락 타일로 보이는 공백과 구별된다.
+
+사용자가 제공한 첫 실행/전체 extent 스크린샷(2026-10-02)을 조사했다. 빈 화면의 가운데
+`Add vector files` 버튼이 전체 map pan/click `MouseArea`보다 낮은 QML stacking order에 있어
+마우스 입력을 가로챌 수 있음을 확인해 empty-state action을 위로 올렸다. 수정된 visible Qt
+빌드에서 해당 버튼을 실제로 눌렀고 macOS OpenFiles 선택기가 열린 것을 확인했다. 전체 extent가
+잘려 보이는 상태에서 복구할 수 있도록 `Zoom to full extent` 버튼도 추가했으며, 이 버튼은
+현재 metadata dataBounds의 폭·높이를 viewport에 90%로 맞추고 pan을 초기화한다. 초기 layer fit이
+개별 우선 polygon bounds와 전체 렌더 범위가 달라져 잘리지 않도록 초기 표시도 aggregate
+metadata dataBounds 기준으로 맞추며, 레이아웃 크기 준비 전 실패하면 viewport 크기 변경 시
+pending fit을 재시도한다.
+2026-10-02 최신 native 빌드로 실제 세종시 SHP를 열었을 때 처음부터 세종시 전체 개요가
+viewport 안에 표시됐고, `Approximate overview ready` 상태였다. 이어 좌표 이동 입력에
+EPSG:5186 dataset extent 밖인 `(0, 0)`을 넣어 지도 형상이 사라지는 상태를 의도적으로 만든
+뒤 `Zoom to full extent`를 눌렀다. overview가 다시 로딩되어 전체 영역이 화면에 표시되고
+`Approximate overview ready`로 돌아오는 것을 visible Qt 화면에서 확인했다. 최초 로드 로그는
+`ready generation=2 chunks=1225 vertices=302728 elapsed_ms=2412`였다. 따라서 최초 버튼 동작,
+초기 fit, 범위 밖 이동 후 전체 범위 복원을 실제 SHP/Qt 화면에서 검증했다. 표시된 것은 넓은
+축척의 근사 overview이며 정밀 경계는 확대 시 확인해야 한다.
+
+같은 세종시 전체범위 개요가 사용자 화면에서 여전히 성기다는 후속 피드백을 반영했다. 이전
+기능수 기반 샘플은 전체 208,015개에서 약 1/32(약 6,500개)만 남길 수 있었다. 전체범위의
+overview budget을 50,000 중 80%(40,000)까지 사용하고, required stride를 다음 2의 거듭제곱으로
+올림하지 않도록 변경했다. SHP feature ID modulo 대신 각 공간 창의 GDAL 결과 순서에서 일정
+간격으로 골라 FID가 불연속인 데이터의 편향을 줄였다. 세종 데이터 계산은 stride 6 / 약 34,669
+features다. 실데이터 전체 1,225 chunk 통합 테스트는 `ready`, 1,703,697 render vertices,
+2.231초로 완료됐다. 이전 기준은 302,728 vertices / 약 2.4초였으며 새 결과도 2.5M-vertex
+안전 한도 이하다. 사용자 눈으로 본 밀도 및 다른 지역에서의 경계 대표성은 다음 visible build
+확인에서 최종 검증해야 한다.
+
 2026-10-02 진단에서 C++ `GOGIS_PERF=1` 타이머 시작 함수가 workspace 경로에서 호출되지 않던
 것을 발견했다. 이제 단일 파일, 파일 추가, workspace 로드 진입점 모두에서
 `native.BeginLoadTrace()`를 호출하며, C++ 측에서 환경변수가 켜졌을 때만 trace를 출력한다. 진단용
@@ -947,3 +1008,93 @@ RSS는 542 MiB. 동일 뷰 hide/show는 2,450 cache hits / 0 chunk rebuild / 4 m
 이는 Qt scenegraph/GPU 프레임 시간이나 사용자 창의 실제 픽셀 표시 검증이 아니며, 전체 완료
 시간은 여전히 약 64초다. visible UI에서 표본 개요가 적절하게 보이는지, 실 GPU에서 첫 표시와
 줌인 전환이 매끄러운지는 사용자 세션에서 확인해야 한다.
+
+2026-10-02 전체범위의 지적 경계가 과도하게 빠지는 문제를 줄이기 위해 fitted extent 대비
+Douglas-Peucker 허용치를 기존 약 1픽셀에서 약 0.45픽셀로 낮췄다. 단순화 허용치는 줌인할수록
+절반씩 줄고, viewport 전체 피처 표본 예산은 유지한다. 세종시 연속지적도 단일 SHP 전체범위
+실데이터 검증은 1,225/1,225 chunk 완료, 1,755,205 expanded vertices, 2.717초였으며
+2,500,000 vertex safety limit 미만이었다. 이는 경계 밀도를 더 보존하면서 안전 한도에
+844,795 vertices 여유를 남긴다. 후속 실제 Qt/macOS 화면 검증에서 전체범위는 `Approximate
+overview ready` 상태로 보였고 화면에서 연속지적 경계의 촘촘한 분포를 확인했다. 전체범위
+렌더는 첫 publication 58 ms / 24,228 vertices, 1,225/1,225 chunk 완료 2.622초 /
+1,703,697 vertices였다. 한 단계 휠 확대(화면 표기 축척 약 1:22,326)는 361/361 chunk,
+1,037,491 vertices, 1.092초에 완료되어 세부 경계가 화면을 채우는 것을 확인했다. 이후
+전체범위 복귀도 1,225/1,225 chunk, 2.622초 내 완료됐다. 다만 UI 계측 RSS는 확대 직후
+약 2.1 GiB, 전체범위 재표시 후 약 1.8 GiB까지 관찰됐다가 로그창을 닫은 뒤 781 MiB로
+내려왔다. 화면 밀도 개선은 확인했으나 장시간 대용량 세션의 메모리 상한/회수는 별도 최적화
+과제로 남긴다. 재현 로그는 해당 앱의 Logs 창에서 확인 가능하다.
+
+2026-10-02 사용자가 전체범위 경계 대비를 더 강화해달라고 요청하여 기본 폴리곤 스타일을
+짙은 녹색(`#356b53`), 0.65 mm 외곽선, 0.12 채움 불투명도로 조정했다. 실제 Qt/macOS 창에서
+동일 세종 SHP 전체범위를 다시 열어 경계선 대비가 눈에 띄게 강해진 것을 확인했다. style 변경
+후 정점 수는 동일하게 1,703,697이며, 첫 publication 50 ms, 1,225/1,225 chunk 완료
+3.068초로 geometry workload는 증가하지 않았다. 테스트 중 UI RSS는 관측 시점에 1.3–1.9 GiB
+범위였으므로, 가시성 개선과 별개로 실제 저메모리 환경/복수 레이어 메모리 검증은 추가로 필요하다.
+
+2026-10-02 지적도근점과 연속지적도를 함께 여는 상황을 재현했다. 도근점은 11,971개이며
+extent는 `212159.77, 43257.02 - 2287874.9, 459421.8`로, 연속지적도 extent
+`211407.24, 423223.66 - 236805.50, 459484.82` 바깥에 크게 떨어진 점 2개가 있었다.
+원본을 수정하거나 제거하지 않고 전체 데이터 bounds와 초기 fit bounds를 분리해, 초기 fit은
+폴리곤 bounds를 우선하고 전체 bounds는 계속 보존한다.
+
+결합 viewport의 폴리곤 외곽선이 2,500,000 vertex 안전 예산을 넘기는 것도 Go/native 경로에서
+직접 확인했다: 135개 청크에서 내부 필지선까지 그리면 3,110,956 vertices였다. 넓은 축척의
+폴리곤 개요는 제한된 GDAL spatial window의 모든 피처를 GEOS로 coverage dissolve한 뒤 외부
+coverage boundary만 그리도록 변경했다. 첫 실파일 통합 테스트에서는 연속지적도를 먼저 열고
+도근점을 추가한 뒤 기존 viewport의 지상 축척과 중심을 보존해 70개 청크를 10.4초에 만들었고
+합계는 280,124 vertices였다. 따라서 2,500,000 vertex 예산을 지켰다.
+인접한 두 사각형의 GEOS 회귀 테스트는 공유 내부 경계가 제거되고 외곽선 길이만 보존되는 것을
+확인한다. 정확한 필지 경계와 선택은 확대 시 원본 geometry로 복귀한다.
+
+이 통합 테스트는 실제 파일을 읽고 전체 viewport 청크의 Go/native render payload를 만들지만,
+Qt scenegraph/GPU 창의 픽셀 출력까지 검증한 것은 아니다. 현재 Codex 실행은 `no screens
+available`로 GUI를 열지 못하므로, 다음 확인은 새 `desktop-native` 빌드를 사용자 macOS 화면에서
+두 SHP 동시 로드하여 전체 세종 외곽선, outlier로 인한 초기 축척 변화 여부, 로그의 `Render
+incomplete` 부재를 확인하는 것이다.
+
+2026-10-02 결합 화면의 `lod=6` 로그를 조사하면서 `replaceWithLoadedMode`의 공간상태 전달에서
+`mapExtent`만 새 runtime으로 교체되고 `mapFitExtent`는 이전 값(초기 로드에서는 0 extent)에
+남을 수 있음을 확인했다. 그 결과 point outlier 추가 뒤에도 LOD가 폴리곤 fit 축척을 반영하지
+못하고, 강제 개요의 단순화 허용치도 유효하지 않을 수 있었다. `adoptLoadedSpatialStateLocked`가
+전체/fit extent를 함께 전달하도록 수정하고 회귀 테스트를 추가했다. 실제 두 SHP 렌더 payload
+테스트는 계속 통과했지만, 수정된 빌드의 로그에서 LOD가 올바르게 바뀌고 실제 화면에서 전체
+외곽선이 정상적으로 보이는지는 아직 사용자 화면 확인이 필요하다.
+
+후속 재현에서 기존 축척 보존 방식이 outlier로 바뀐 전체 bounds의 긴 축을 기준으로 하여,
+세로가 긴 필지 fit bounds 전체를 viewport에 담지 못하는 경우를 확인했다. read-only 레이어 추가
+시에는 전체 bounds를 유지하되 화면은 point 제외 fit bounds에 다시 맞추고, chunk 크기는 raw
+zoom에 따른 안전한 세분도를 유지하도록 수정했다. 실자료 테스트에서 viewport 270개 청크가
+21.2초에 완료됐고 75,146 vertices를 만들었다. 폴리곤 overview 정점 envelope가 실제 fit bounds
+전체를 포함하는지 검사해 통과했다. 추가로 EPSG:5186 개요 dissolve에만 0.1 coordinate-unit
+precision grid를 적용했다. 세종 SHP 전체 overview 정점은 280,124에서 37,792로 줄었고 fit
+envelope 검증도 통과했다. 4cm 인접 경계 틈을 메우는 GEOS 테스트와 geographic CRS의 도 단위
+grid 테스트를 추가했다. precision grid만 적용한 기존 축척 viewport에서는 70개 청크, 37,792
+vertices였다. 필지 fit bounds 전체를 다시 맞춘 viewport에서는 270개 청크, 75,146 vertices로
+완료됐고 외곽 envelope 포함 검사도 통과했다. 두 결과는 다른 viewport 조건의 측정치다. 이는
+실제 Qt 화면 픽셀 모양을 증명하지 않으므로, 새 desktop-native
+빌드에서 두 레이어를 로드해 외곽선과 `ready` 상태를 확인해야 한다.
+
+2026-10-03 레이어 수명주기와 축척 연속성 변경은 네이티브 Go 테스트,
+QML 테스트 27개, `desktop-native` 빌드까지 통과했다. 테스트는 같은 GUI 프레임의
+복수 파일 선택 이벤트, 로드 중 대기열과 실패 후 다음 요청, 취소 시 대기열 삭제,
+기존 세계좌표 중심·미터/픽셀 보존, EPSG:5186의 가로·세로 축척 일치를 포함한다.
+실제 macOS 창은 이 실행 환경의 화면 자동화에서 보이지 않아 아직 육안 검증하지 못했다.
+사용자 화면에서 세종 연속지적도와 도근점을 빠르게 연달아 추가하고, 두 레이어가
+모두 남는지와 화면 중심·축척이 유지되는지 확인해야 한다. 우클릭 메뉴 바깥 클릭
+닫기 및 레이어 제거 후 원본 SHP가 그대로 있는지도 확인한다.
+같은 날 두 실제 SHP를 읽는 확대 렌더 회귀를 다시 실행했다. zoom 194.44에서
+96청크·연속지적도 2,303,588 vertices, zoom 840에서 84청크·294,778 vertices로
+모두 정점 안전 상한 아래에서 연속지적도가 표시 대상에 남았다. 이는 실제 화면의
+축척·픽셀 출력 검증을 대체하지 않는다.
+빠른 파일 선택 대기열, 취소, 미적용 metadata의 화면 중심 보존 및 레이어 제거
+회귀는 `go test -race -tags 'qt native'` 표적 실행도 통과했다.
+후속으로 오프스크린 Qt 창에 실제 `GoGIS.MapCanvas`를 생성하는 브리지 통합
+테스트를 추가했다. 한 GUI 프레임에 QML 요청 두 건을 기록했을 때 C++ 장면 그래프
+동기화가 두 요청을 모두 순서대로 캡처하고 Go가 한 번만 소비하는지 확인한다.
+`go test -tags 'qt native' ./...` 전체와 QML 테스트 27개가 통과했다. 다만 이
+통합 테스트도 사용자의 실제 창에서 렌더링된 지도 픽셀과 메뉴 조작을 확인하지는 않는다.
+속성창은 별도 Qt Quick Test 오프스크린/Basic 스타일로 한국어 레이블·심볼 설정
+페이지를 캡처해 배치를 확인했다. 레이블 배치·회전·숫자 입력의 시작 열을 통일하고
+남아 있던 영어 배치 선택지와 Lua 설명을 번역한 뒤, QML 레이아웃/번역 회귀
+27개와 `desktop-native` 빌드를 다시 통과했다. 이 캡처는 macOS 네이티브
+컨트롤 스타일의 실제 사용자 화면을 대체하지 않는다.

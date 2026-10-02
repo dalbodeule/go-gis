@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+func TestDefaultLayerStylePrioritizesReadablePolygonBoundaries(t *testing.T) {
+	style := DefaultLayerStyle()
+	if style.PolygonColor != "#356b53" || style.LineWidthMM != 0.18 || style.PointSizeMM != 1.6 || style.FillOpacity != 0.12 {
+		t.Fatalf("default polygon presentation = color %s, line width %.2f mm, point size %.2f mm, fill opacity %.2f; want dark, fine boundaries with a light fill",
+			style.PolygonColor, style.LineWidthMM, style.PointSizeMM, style.FillOpacity)
+	}
+}
+
 func TestLayerCloneDetachesLabels(t *testing.T) {
 	layer := Layer{
 		Name: "labels",

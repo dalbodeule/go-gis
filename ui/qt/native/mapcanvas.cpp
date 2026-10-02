@@ -1,6 +1,9 @@
 #include "mapcanvas.h"
 
 #include <QColor>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QQuickItem>
 #include <QSGGeometryNode>
 #include <QSGVertexColorMaterial>
@@ -47,8 +50,8 @@ static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm
                   offsetof(GoGISVertex, kind) == 16,
               "Go render.Vertex field offsets changed");
 std::vector<GoGISVertex> g_vertices;
-constexpr size_t kMaxSourceVertexCount = 4 * 1024 * 1024;
-constexpr size_t kMaxSceneGraphVertices = 8 * 1024 * 1024;
+constexpr size_t kMaxSourceVertexCount = 8 * 1024 * 1024;
+constexpr size_t kMaxSceneGraphVertices = 24 * 1024 * 1024;
 constexpr size_t kRetainedVertexCapacityFloor = 64 * 1024;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
@@ -59,6 +62,8 @@ std::atomic<double> g_pan_y{0};
 std::atomic<double> g_zoom{1};
 std::atomic<double> g_width{1};
 std::atomic<double> g_height{1};
+std::atomic<double> g_viewport_width{1};
+std::atomic<double> g_viewport_height{1};
 std::atomic<double> g_logical_pixels_per_mm{96.0 / 25.4};
 std::atomic<bool> g_visible{true};
 std::atomic<unsigned long long> g_click_generation{0};
@@ -105,9 +110,10 @@ std::atomic<unsigned long long> g_memory_status_generation{0};
 std::mutex g_map_metadata_mutex;
 std::string g_map_metadata_payload;
 std::atomic<unsigned long long> g_map_metadata_generation{0};
+std::atomic<unsigned long long> g_map_metadata_applied_generation{0};
 std::atomic<unsigned long long> g_cancel_generation{0};
 std::mutex g_load_mutex;
-std::string g_load_path;
+QJsonArray g_load_requests;
 std::atomic<unsigned long long> g_load_generation{0};
 std::mutex g_save_mutex;
 std::string g_save_path;
@@ -234,6 +240,9 @@ void update_viewport_snapshot(const QQuickItem* item) {
     g_zoom.store(item->scale(), std::memory_order_relaxed);
     g_width.store(item->width(), std::memory_order_relaxed);
     g_height.store(item->height(), std::memory_order_relaxed);
+    const auto* viewport = item->parentItem();
+    g_viewport_width.store(viewport != nullptr ? viewport->width() : item->width(), std::memory_order_relaxed);
+    g_viewport_height.store(viewport != nullptr ? viewport->height() : item->height(), std::memory_order_relaxed);
     g_visible.store(item->isVisible(), std::memory_order_relaxed);
 }
 
@@ -364,6 +373,11 @@ public:
                 setProperty("mapMetadataGeneration", QVariant::fromValue<qulonglong>(map_metadata_generation));
                 map_metadata_generation_ = map_metadata_generation;
             }
+            const auto applied_metadata_generation = property("mapMetadataAppliedGeneration").toULongLong();
+            if (applied_metadata_generation != g_map_metadata_applied_generation.load(std::memory_order_relaxed)) {
+                update_viewport_snapshot(this);
+                g_map_metadata_applied_generation.store(applied_metadata_generation, std::memory_order_relaxed);
+            }
 
             const auto cancel_generation = property("cancelGeneration").toULongLong();
             if (cancel_generation != g_cancel_generation.load(std::memory_order_relaxed)) {
@@ -372,9 +386,20 @@ public:
 
             const auto load_generation = property("loadGeneration").toULongLong();
             if (load_generation != g_load_generation.load(std::memory_order_relaxed)) {
-                std::lock_guard<std::mutex> lock(g_load_mutex);
-                g_load_path = property("loadPath").toString().toStdString();
-                g_load_generation.store(load_generation, std::memory_order_relaxed);
+                const auto journal = QJsonDocument::fromJson(property("loadRequestJournal").toString().toUtf8()).array();
+                const auto previous = g_load_generation.load(std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lock(g_load_mutex);
+                    for (const auto& entry : journal) {
+                        const auto request = entry.toObject();
+                        const auto generation = request.value("generation").toInteger();
+                        if (generation > static_cast<qint64>(previous) && generation <= static_cast<qint64>(load_generation)) {
+                            g_load_requests.append(request);
+                        }
+                    }
+                    g_load_generation.store(load_generation, std::memory_order_relaxed);
+                }
+                setProperty("loadCapturedGeneration", QVariant::fromValue<qulonglong>(load_generation));
             }
 
             const auto save_generation = property("saveGeneration").toULongLong();
@@ -433,8 +458,12 @@ protected:
             // a full geometry rewrite keeps large static layers cheap.
             std::lock_guard<std::mutex> lock(g_vertices_mutex);
             const auto source_generation = g_vertices_generation.load(std::memory_order_relaxed);
+            const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
+            const float logical_pixels_per_mm = static_cast<float>(
+                g_logical_pixels_per_mm.load(std::memory_order_relaxed));
             if (source_generation != rendered_generation_ || width != rendered_width_ ||
-                height != rendered_height_) {
+                height != rendered_height_ || item_scale != rendered_scale_ ||
+                logical_pixels_per_mm != rendered_pixels_per_mm_) {
                 const size_t source_vertex_count = g_vertices.size();
                 size_t output_vertex_count = 0;
                 bool can_render_geometry = true;
@@ -496,7 +525,6 @@ protected:
                     rendered_vertex_count_ = 0;
                 }
                 if (can_render_geometry) {
-                    const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
                     size_t output = 0;
                     bool vertex_write_out_of_bounds = false;
                     auto set_vertex = [vertices, output_vertex_count, &vertex_write_out_of_bounds](
@@ -533,9 +561,10 @@ protected:
                         const float y1 = (1.0f - first.y) * height;
                         const float x2 = second.x * width;
                         const float y2 = (1.0f - second.y) * height;
-                        const float logical_pixels_per_mm = static_cast<float>(
-                            g_logical_pixels_per_mm.load(std::memory_order_relaxed));
-                        const float size = std::max(0.5f, first.size_mm * logical_pixels_per_mm / item_scale);
+                        // Apply the minimum in screen pixels, then undo the
+                        // item's zoom. A 0.5 local-pixel floor grows to 100
+                        // screen pixels at 200x zoom and obscures the map.
+                        const float size = std::max(0.5f, first.size_mm * logical_pixels_per_mm) / item_scale;
                         if (first.kind == 1) {
                             const float half = size * 0.5f;
                             set_vertex(output++, x1 - half, y1 - half, color);
@@ -582,6 +611,8 @@ protected:
                 rendered_stage_ = g_vertices_stage;
                 rendered_width_ = width;
                 rendered_height_ = height;
+                rendered_scale_ = item_scale;
+                rendered_pixels_per_mm_ = logical_pixels_per_mm;
                 geometry_changed = true;
             }
         }
@@ -601,12 +632,18 @@ protected:
             change == ItemVisibleHasChanged) {
             update_viewport_snapshot(this);
             g_viewport_generation.fetch_add(1, std::memory_order_relaxed);
+            if (change == ItemScaleHasChanged) {
+                update();
+            }
         }
     }
 
     void geometryChange(const QRectF& newGeometry, const QRectF& oldGeometry) override {
         QQuickItem::geometryChange(newGeometry, oldGeometry);
         update_viewport_snapshot(this);
+        if (newGeometry.size() != oldGeometry.size()) {
+            g_viewport_generation.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
 private:
@@ -627,6 +664,8 @@ private:
     int rendered_stage_ = 0;
     float rendered_width_ = -1.0f;
     float rendered_height_ = -1.0f;
+    float rendered_scale_ = -1.0f;
+    float rendered_pixels_per_mm_ = -1.0f;
 };
 
 extern "C" void gogis_register_qml_types(void) {
@@ -709,7 +748,8 @@ extern "C" void gogis_request_canvas_update(void) {
 }
 
 extern "C" void gogis_canvas_viewport(double* pan_x, double* pan_y, double* zoom,
-                                       double* width, double* height) {
+                                       double* width, double* height,
+                                       double* viewport_width, double* viewport_height) {
     if (pan_x != nullptr) {
         *pan_x = g_pan_x.load(std::memory_order_relaxed);
     }
@@ -724,6 +764,12 @@ extern "C" void gogis_canvas_viewport(double* pan_x, double* pan_y, double* zoom
     }
     if (height != nullptr) {
         *height = g_height.load(std::memory_order_relaxed);
+    }
+    if (viewport_width != nullptr) {
+        *viewport_width = g_viewport_width.load(std::memory_order_relaxed);
+    }
+    if (viewport_height != nullptr) {
+        *viewport_height = g_viewport_height.load(std::memory_order_relaxed);
     }
 }
 
@@ -894,6 +940,14 @@ extern "C" void gogis_set_map_metadata(const char* payload) {
     g_map_metadata_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" unsigned long long gogis_map_metadata_generation(void) {
+    return g_map_metadata_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" unsigned long long gogis_map_metadata_applied_generation(void) {
+    return g_map_metadata_applied_generation.load(std::memory_order_relaxed);
+}
+
 extern "C" unsigned long long gogis_cancel_generation(void) {
     return g_cancel_generation.load(std::memory_order_relaxed);
 }
@@ -902,14 +956,16 @@ extern "C" unsigned long long gogis_load_generation(void) {
     return g_load_generation.load(std::memory_order_relaxed);
 }
 
-extern "C" void gogis_load_path(char* buffer, int buffer_length) {
-    if (buffer == nullptr || buffer_length <= 0) {
-        return;
-    }
+extern "C" int gogis_load_requests(char* buffer, int buffer_length) {
     std::lock_guard<std::mutex> lock(g_load_mutex);
-    const auto copy_length = std::min<size_t>(g_load_path.size(), static_cast<size_t>(buffer_length - 1));
-    std::memcpy(buffer, g_load_path.data(), copy_length);
-    buffer[copy_length] = '\0';
+    const auto payload = QJsonDocument(g_load_requests).toJson(QJsonDocument::Compact);
+    if (buffer == nullptr || buffer_length <= payload.size()) {
+        return payload.size();
+    }
+    std::memcpy(buffer, payload.constData(), static_cast<size_t>(payload.size()));
+    buffer[payload.size()] = '\0';
+    g_load_requests = QJsonArray();
+    return payload.size();
 }
 
 extern "C" unsigned long long gogis_save_generation(void) {

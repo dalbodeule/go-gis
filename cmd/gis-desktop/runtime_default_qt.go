@@ -20,6 +20,10 @@ func (r *demoRuntime) startDataLoadPaths(_ []string) {
 	native.SetRenderStatus("Add files requires the native GDAL build")
 }
 
+func (r *demoRuntime) startRemoveLayer(_ string) error {
+	return fmt.Errorf("removing layers requires the native GDAL build")
+}
+
 func (r *demoRuntime) saveDataset(destination string) {
 	native.SetRenderStatus("Save failed: build desktop with native GDAL support")
 }

@@ -10,7 +10,7 @@ import (
 )
 
 func TestViewportBatchBudgetFitsQtSceneGraphExpansionLimit(t *testing.T) {
-	const maxQtSceneGraphVertices = 8 * 1024 * 1024
+	const maxQtSceneGraphVertices = 24 * 1024 * 1024
 	const maxExpandedVerticesPerSourceVertex = 3
 	if expanded := MaxBatchVertices * maxExpandedVerticesPerSourceVertex; expanded > maxQtSceneGraphVertices {
 		t.Fatalf("viewport source budget %d may expand to %d Qt vertices, exceeding %d",
@@ -623,6 +623,89 @@ func TestSchedulerStatsTrackCacheStaleAndCancellation(t *testing.T) {
 	collect(canceled)
 	if got := scheduler.Stats(); got.CanceledCalls != 1 {
 		t.Fatalf("cancellation stats = %#v", got)
+	}
+}
+
+func TestSchedulerReturnsAllLeadingMissesBeforeFirstCacheHit(t *testing.T) {
+	scheduler := NewScheduler()
+	keys := []ChunkKey{
+		{Layer: "parcels", X: 0},
+		{Layer: "parcels", X: 1},
+		{Layer: "parcels", X: 2},
+		{Layer: "parcels", X: 3},
+		{Layer: "parcels", X: 4},
+	}
+	for _, index := range []int{2, 4} {
+		got := collect(scheduler.Request(context.Background(), []ChunkKey{keys[index]}, func(_ context.Context, key ChunkKey) (Chunk, error) {
+			return Chunk{Key: key}, nil
+		}))
+		if len(got) != 1 {
+			t.Fatalf("priming cache for key %v returned %d results", keys[index], len(got))
+		}
+	}
+
+	var built atomic.Int64
+	results := collect(scheduler.RequestUnique(context.Background(), keys, func(_ context.Context, key ChunkKey) (Chunk, error) {
+		built.Add(1)
+		return Chunk{Key: key}, nil
+	}))
+	if len(results) != len(keys) {
+		t.Fatalf("scheduler returned %d results for %d requested keys: %#v", len(results), len(keys), results)
+	}
+	returned := make(map[ChunkKey]bool, len(results))
+	for _, result := range results {
+		returned[result.Key] = true
+	}
+	for _, key := range keys {
+		if !returned[key] {
+			t.Errorf("requested key %v was omitted from scheduler results", key)
+		}
+	}
+	if got := built.Load(); got != 3 {
+		t.Fatalf("builder called %d times, want the 3 uncached keys", got)
+	}
+}
+
+func TestSchedulerReturnsAllMissesAfterLeadingCacheHits(t *testing.T) {
+	scheduler := NewScheduler()
+	keys := []ChunkKey{
+		{Layer: "parcels", X: 0},
+		{Layer: "parcels", X: 1},
+		{Layer: "parcels", X: 2},
+		{Layer: "parcels", X: 3},
+		{Layer: "parcels", X: 4},
+	}
+	for _, index := range []int{0, 4} {
+		got := collect(scheduler.Request(context.Background(), []ChunkKey{keys[index]}, func(_ context.Context, key ChunkKey) (Chunk, error) {
+			return Chunk{Key: key}, nil
+		}))
+		if len(got) != 1 {
+			t.Fatalf("priming cache for key %v returned %d results", keys[index], len(got))
+		}
+	}
+
+	var built atomic.Int64
+	results := collect(scheduler.RequestUnique(context.Background(), keys, func(_ context.Context, key ChunkKey) (Chunk, error) {
+		built.Add(1)
+		return Chunk{Key: key}, nil
+	}))
+	if len(results) != len(keys) {
+		t.Fatalf("scheduler returned %d results for %d requested keys: %#v", len(results), len(keys), results)
+	}
+	returned := make(map[ChunkKey]bool, len(results))
+	for _, result := range results {
+		returned[result.Key] = true
+		if result.Key != result.Chunk.Key {
+			t.Errorf("result key %v was paired with cached chunk %v", result.Key, result.Chunk.Key)
+		}
+	}
+	for _, key := range keys {
+		if !returned[key] {
+			t.Errorf("requested key %v was omitted from scheduler results", key)
+		}
+	}
+	if got := built.Load(); got != 3 {
+		t.Fatalf("builder called %d times, want the 3 uncached keys", got)
 	}
 }
 

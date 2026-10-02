@@ -164,16 +164,44 @@ snapshot을 시도하지만, reader 안전 상한(최대 100,000 feature/128 MiB
 
 대용량 읽기 전용 모드는 GDAL 공간창을 viewport chunk 단위로 조회하며, 화면 밖의
 geometry 전체를 Go 메모리에 적재하지 않는다. 제한된 뷰포트 청크를 요청하며,
-넓은 영역이 화면에 맞는 낮은 줌(zoom bucket -2 이하)에서는 복잡한 선·폴리곤에 GEOS의
+넓은 영역이 화면에 맞는 개요 줌(zoom bucket 1 이하)에서는 복잡한 선·폴리곤에 GEOS의
 topology-preserving display simplification을 적용한다. 이는 첫 화면이나 실사용 GPU 프레임 시간 최적화가
 검증 완료됐다는 뜻은 아니다.
-zoom bucket 1 이하에서는 일정 간격의 feature 표본만 사용하고, 속성·라벨·피처 선택용
-geometry를 보유하지 않는다. 정확한 전체 형상과 선택은 zoom bucket 2 이상으로 확대하면
-다시 활성화되며, 상태 표시줄에 근사 개요 모드임을 알린다.
-단순화는 화면 표시용 chunk에만 적용되며 원본 geometry, 편집 데이터, 내보내기 데이터는 변경하지 않는다. 넓은 축척의 화면 형상과 경계는 근사일
+zoom bucket 1 이하에서는 폴리곤 원본 피처를 제한된 viewport 창에서 모두 읽은 뒤 GEOS로
+coverage boundary를 dissolve한다. 따라서 개요에서도 필지 외곽 전체를 유지하면서 내부 공유
+경계는 생략하고, 피처 선택용 geometry는 보유하지 않는다. 포인트 및 비폴리곤 피처는 확대
+단계에 따라 결정적으로 표본화할 수 있다. 정확한 전체 형상과 선택은 zoom bucket 2 이상으로
+확대하면 다시 활성화되며, 상태 표시줄에 근사 개요 모드임을 알린다. Dissolve는 청크별·읽기
+전용 메모리 한도 안에서 수행되며 원본 geometry, 편집 데이터, 내보내기 데이터는 변경하지 않는다.
+넓은 축척의 화면 형상과 경계는 근사일
 수 있고, viewport의 feature/payload/native vertex 상한에 걸리면 로그에 불완전 렌더를
 표시한다. 이는 전국 단위 전체 피처를 한 번에 메모리에 올리지 않도록 하는 정책이지,
 모든 데이터를 한 화면에 완전히 표시한다는 보장은 아니다.
+
+휠 확대 한도는 현재 데이터 범위와 지도 캔버스/뷰포트 비율에서 계산하며, 최소 25m 폭의
+지도를 볼 수 있도록 한다. EPSG:4326은 데이터 범위 중심 위도에서 경도 폭을 미터로
+근사한다. 그 밖의 투영 좌표계는 미터 단위 좌표를 전제로 하므로 다른 단위의 CRS는
+표시 축척이 정확하지 않을 수 있다. zoom bucket 4보다 더 확대하면 공간 조회창을 단계적으로
+줄여 상세 뷰에서 필요 이상의 주변 geometry를 읽지 않는다.
+
+큰 SHP의 반복 공간 조회에는 QIX 공간 인덱스를 사용할 수 있다. 기본 설정은 피처 수
+100,000개 이상인 viewport 기반 읽기 전용 SHP를 OS 임시 디렉터리에 복사한 뒤 QIX를
+만드는 것이다. 원본 파일은 변경하지 않으며, 복사본은 원본 경로·구성 파일 크기·수정 시각을
+기준으로 재사용한다. SHP와 DBF 등의 복사본만큼 임시 디스크 공간이 더 필요하다. 원본
+폴더에 `.qix`만 생성하려면 `--spatial-index-location=source`를 지정한다. 이 모드는 원본
+폴더 쓰기 권한이 필요하고, 원본 geometry/속성 파일은 수정하지 않는다. 실패하면 인덱스
+없이 원본을 여는 경로로 계속한다.
+
+```sh
+./build/gogis-desktop-native --spatial-index-threshold=100000 --spatial-index-location=cache
+./build/gogis-desktop-native --spatial-index-threshold=250000 --spatial-index-location=source
+```
+
+`--spatial-index-threshold=0` 또는 `--spatial-index-location=off`로 자동 생성을 끌 수 있다.
+동일한 설정은 `GOGIS_SHAPEFILE_INDEX_THRESHOLD`와 `GOGIS_SHAPEFILE_INDEX_LOCATION`
+환경변수로 전달할 수도 있으며, 명령행 값이 환경변수보다 우선한다. 기본값은 `100000`과
+`cache`다. 임시 인덱스를 만들려면 GDAL이 사용하는 `.qix`가 SHP와 같은 폴더에 있어야
+하므로 cache 모드는 sidecar만 따로 두지 않고 관련 SHP 구성 파일을 임시 폴더에 복사한다.
 
 `desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
 실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면

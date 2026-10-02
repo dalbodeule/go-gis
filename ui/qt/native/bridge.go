@@ -77,23 +77,27 @@ func RequestCanvasUpdate() {
 
 // Viewport is the latest GUI-thread snapshot of the map item transform.
 type Viewport struct {
-	PanX   float64
-	PanY   float64
-	Zoom   float64
-	Width  float64
-	Height float64
+	PanX           float64
+	PanY           float64
+	Zoom           float64
+	Width          float64
+	Height         float64
+	ViewportWidth  float64
+	ViewportHeight float64
 }
 
 // CurrentViewport returns a thread-safe snapshot suitable for render planning.
 func CurrentViewport() Viewport {
-	var panX, panY, zoom, width, height C.double
-	C.gogis_canvas_viewport(&panX, &panY, &zoom, &width, &height)
+	var panX, panY, zoom, width, height, viewportWidth, viewportHeight C.double
+	C.gogis_canvas_viewport(&panX, &panY, &zoom, &width, &height, &viewportWidth, &viewportHeight)
 	return Viewport{
-		PanX:   float64(panX),
-		PanY:   float64(panY),
-		Zoom:   float64(zoom),
-		Width:  float64(width),
-		Height: float64(height),
+		PanX:           float64(panX),
+		PanY:           float64(panY),
+		Zoom:           float64(zoom),
+		Width:          float64(width),
+		Height:         float64(height),
+		ViewportWidth:  float64(viewportWidth),
+		ViewportHeight: float64(viewportHeight),
 	}
 }
 
@@ -284,17 +288,43 @@ type MapViewState struct {
 
 // SetMapMetadataWithView publishes the map extent and optional saved workspace view.
 func SetMapMetadataWithView(crs string, extent [4]float64, view *MapViewState) {
+	SetMapMetadataWithFitBounds(crs, extent, extent, view)
+}
+
+// SetMapMetadataWithFitBounds separates the complete data canvas bounds from
+// the preferred extent used by initial/full-extent view fitting.
+func SetMapMetadataWithFitBounds(crs string, extent, fitBounds [4]float64, view *MapViewState) {
+	SetMapMetadataWithLayerPresence(crs, extent, fitBounds, view, true)
+}
+
+// SetMapMetadataWithLayerPresence also distinguishes an empty project from a
+// layer whose CRS is unknown or whose bounds happen to be the unit square.
+func SetMapMetadataWithLayerPresence(crs string, extent, fitBounds [4]float64, view *MapViewState, hasLayers bool) {
 	payload, err := json.Marshal(struct {
-		CRS    string        `json:"crs"`
-		Bounds [4]float64    `json:"bounds"`
-		View   *MapViewState `json:"view,omitempty"`
-	}{CRS: crs, Bounds: extent, View: view})
+		CRS       string        `json:"crs"`
+		Bounds    [4]float64    `json:"bounds"`
+		FitBounds [4]float64    `json:"fitBounds"`
+		View      *MapViewState `json:"view,omitempty"`
+		HasLayers bool          `json:"hasLayers"`
+	}{CRS: crs, Bounds: extent, FitBounds: fitBounds, View: view, HasLayers: hasLayers})
 	if err != nil {
 		return
 	}
 	cPayload := C.CString(string(payload))
 	defer C.free(unsafe.Pointer(cPayload))
 	C.gogis_set_map_metadata(cPayload)
+}
+
+// MapMetadataGeneration is the latest metadata published to the GUI.
+func MapMetadataGeneration() uint64 {
+	return uint64(C.gogis_map_metadata_generation())
+}
+
+// AppliedMapMetadataGeneration is the latest generation QML has processed and
+// the canvas has acknowledged. A lower value means the viewport snapshot may
+// still use an older extent.
+func AppliedMapMetadataGeneration() uint64 {
+	return uint64(C.gogis_map_metadata_applied_generation())
 }
 
 // CancelGeneration returns the latest user cancellation request.
@@ -307,13 +337,30 @@ func LoadGeneration() uint64 {
 	return uint64(C.gogis_load_generation())
 }
 
-// CurrentLoadPaths decodes the local paths selected in QML.
-func CurrentLoadPaths() ([]string, error) {
-	buffer := make([]C.char, 262144)
-	C.gogis_load_path((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
-	var paths []string
-	err := json.Unmarshal([]byte(C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))), &paths)
-	return paths, err
+// CurrentLoadRequests consumes every selection captured since the previous
+// read, including multiple selections made within a single GUI frame.
+func CurrentLoadRequests() ([][]string, error) {
+	for {
+		size := int(C.gogis_load_requests(nil, 0))
+		if size > 16<<20 {
+			return nil, fmt.Errorf("queued file selections exceed the 16 MiB bridge limit")
+		}
+		buffer := make([]C.char, size+1)
+		if needed := int(C.gogis_load_requests((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))); needed >= len(buffer) {
+			continue // Another GUI frame appended a selection between the two calls.
+		}
+		var requests []struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal([]byte(C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))), &requests); err != nil {
+			return nil, err
+		}
+		result := make([][]string, len(requests))
+		for index, request := range requests {
+			result[index] = request.Paths
+		}
+		return result, nil
+	}
 }
 
 // SaveGeneration returns the latest QML GeoPackage save request generation.

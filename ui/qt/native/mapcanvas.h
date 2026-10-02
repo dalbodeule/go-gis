@@ -34,7 +34,8 @@ void gogis_request_canvas_update(void);
 // Reads the latest GUI-thread viewport snapshot without touching Qt objects
 // from the caller's goroutine.
 void gogis_canvas_viewport(double* pan_x, double* pan_y, double* zoom,
-                           double* width, double* height);
+                           double* width, double* height,
+                           double* viewport_width, double* viewport_height);
 
 // Returns whether the registered MapCanvas is currently visible in QML.
 int gogis_canvas_visible(void);
@@ -85,13 +86,15 @@ void gogis_set_memory_status(unsigned long long process_bytes,
 
 // Publishes the current map coordinate bounds and display CRS to QML.
 void gogis_set_map_metadata(const char* payload);
+unsigned long long gogis_map_metadata_generation(void);
+unsigned long long gogis_map_metadata_applied_generation(void);
 
 // Returns the latest user-requested render cancellation generation.
 unsigned long long gogis_cancel_generation(void);
 
 // Reads the JSON array of local file paths emitted by the QML file picker.
 unsigned long long gogis_load_generation(void);
-void gogis_load_path(char* buffer, int buffer_length);
+int gogis_load_requests(char* buffer, int buffer_length);
 
 // Reads a GeoPackage save request emitted by QML.
 unsigned long long gogis_save_generation(void);

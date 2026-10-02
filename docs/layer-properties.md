@@ -13,6 +13,11 @@ Appending another layer keeps the current map center and zoom while expanding
 the combined extent. Start the desktop in Korean or Japanese with
 `./build/gogis-desktop-native --lang=ko` or `--lang=jp`; English is the default.
 The **About GoGIS** window shows version, runtime, build target, and license.
+Right-click a layer and choose **Remove layer…** to remove it from the current
+project after confirmation. Its SHP, GeoPackage, or other source file is not
+deleted. Clicking outside the layer menu closes it. Adding or removing other
+layers preserves the current map center and approximate metric screen scale;
+use **Zoom to full extent** when you want to fit all layers again.
 For an editable layer, select a feature, choose **Edit vertices**,
 and drag a vertex handle. The edit is applied to the layer and saved to its
 configured destination; read-only layers do not expose vertex handles. To limit
@@ -38,10 +43,17 @@ line width, and label height are in millimeters and stay screen-sized while
 zooming. The renderer uses Qt's reported screen pixel density to convert
 millimeters to screen coordinates; reported physical size can vary in accuracy
 by monitor and operating system. Polygon fill opacity is from 0 (transparent)
-to 1 (opaque); polygon holes are preserved.
+to 1 (opaque); polygon holes are preserved. Use **Outline only (no polygon
+fill)** to set opacity to 0 while keeping boundary lines visible. Unchecking
+it restores the previous nonzero opacity. The slider offers a quick visual
+adjustment and the numeric field allows an exact value. The symbology page
+shows controls relevant to the layer's geometry type when it is known.
 
 Labels can use a property template, for example `${name}` or
-`${name} (${class})`. Text height is in millimeters. Minimum and maximum scale
+`${name} (${class})`. Click **Available fields…** next to the label template to see this layer's
+attribute names and types; clicking one inserts `${FIELD}` at the cursor.
+The list may take a moment to appear while the active layer's attributes load.
+Text height is in millimeters. Minimum and maximum scale
 are denominator limits: at `1:25,000`, a minimum of `1,000` and maximum of
 `50,000` includes the label. A zero limit is unbounded. Polygon anchors are
 placed on the polygon interior; line labels use the half-length point.

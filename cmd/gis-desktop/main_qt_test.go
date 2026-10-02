@@ -29,6 +29,26 @@ func TestMarshalLayerLabelsNormalizesNilSlice(t *testing.T) {
 	}
 }
 
+func TestViewportBatchBudgetRetriesOnceWithGeneralizedOverview(t *testing.T) {
+	batchError := "viewport render batch exceeds the 2500000-vertex safety limit"
+	for _, test := range []struct {
+		name, err        string
+		readOnly, forced bool
+		want             bool
+	}{
+		{name: "large read-only viewport", err: batchError, readOnly: true, want: true},
+		{name: "already retried", err: batchError, readOnly: true, forced: true},
+		{name: "editable project", err: batchError},
+		{name: "different render failure", err: "GEOS simplify failed", readOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldRetryViewportWithOverview(test.readOnly, test.forced, test.err); got != test.want {
+				t.Fatalf("shouldRetryViewportWithOverview() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPrioritizeViewportChunksStartsAtCenterAndPreservesLayerOrder(t *testing.T) {
 	keys := []render.ChunkKey{
 		{Layer: "parcels", X: 0, Y: 0},

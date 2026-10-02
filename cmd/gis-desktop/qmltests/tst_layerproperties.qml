@@ -51,10 +51,32 @@ TestCase {
         compare(JSON.parse(canvas.loadPath), ["/tmp/roads.shp"]);
     }
 
+    function test_rapidFileSelectionsSurviveOneGuiFrame() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var generation = canvas.loadGeneration;
+        canvas.loadCapturedGeneration = generation;
+        viewport.requestLoadFiles(["file:///tmp/first.shp"]);
+        viewport.requestLoadFiles(["file:///tmp/second.shp"]);
+        var pending = JSON.parse(canvas.loadRequestJournal);
+        compare(pending.length, 2);
+        compare(pending[0].generation, generation + 1);
+        compare(pending[0].paths, ["/tmp/first.shp"]);
+        compare(pending[1].generation, generation + 2);
+        compare(pending[1].paths, ["/tmp/second.shp"]);
+        canvas.loadCapturedGeneration = generation + 1;
+        compare(JSON.parse(canvas.loadRequestJournal).length, 1);
+        canvas.loadCapturedGeneration = generation + 2;
+        compare(JSON.parse(canvas.loadRequestJournal).length, 0);
+    }
+
     function test_translationsCoverSelectedLanguages() {
         appWindow.language = "ko";
         compare(appWindow.tr("Layers"), "레이어");
         compare(appWindow.tr("Add vector files"), "벡터 파일 추가");
+        compare(appWindow.tr("Center + rotation"), "중앙 + 회전");
+        compare(appWindow.tr("Lua field types"), "Lua 필드 형식");
+        compare(appWindow.tr("Display rule — return true to show this feature's label"), "표시 규칙 — 레이블 표시 시 true 반환");
         compare(appWindow.tr("Lua label editor"), "Lua 레이블 편집기");
         verify(appWindow.tr("Lua field access hint").indexOf("필드 형식: %1") >= 0);
         appWindow.language = "jp";
@@ -120,8 +142,13 @@ TestCase {
         var layerList = findChild(appWindow, "layerList");
         canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
         tryCompare(layerModel, "count", 1);
+        tryVerify(function() { return layerModel.get(0).name === "roads"; });
+        tryVerify(function() {
+            var current = layerList.itemAtIndex(0);
+            return current !== null && current.objectName === "layerDelegate_roads";
+        });
         var delegate = layerList.itemAtIndex(0);
-        verify(delegate !== null);
+        wait(50);
 
         var generation = canvas.layerVisibilityGeneration;
         mouseClick(delegate, delegate.width / 2, delegate.height / 2);
@@ -150,13 +177,41 @@ TestCase {
         viewport.panY = 0;
         viewport.pendingInitialLayerFit = true;
         var generation = viewport.viewportGeneration;
-        verify(viewport.fitPreferredInitialLayer(), "initial fit should prefer a polygon layer over outlier points");
+        verify(viewport.zoomToLayerExtent("parcels"), "layer fit should use the polygon bounds rather than outlier point bounds");
         verify(!viewport.pendingInitialLayerFit);
         verify(viewport.mapZoom > 1, "the polygon layer extent should be enlarged to fit the canvas");
         verify(Math.abs(viewport.panX) > 0 && Math.abs(viewport.panY) > 0,
                "the viewport should center on the selected layer extent");
         compare(viewport.dataBounds, [0, 0, 1000, 1000], "zooming must not discard outlier data bounds");
         compare(viewport.viewportGeneration, generation + 1);
+    }
+
+    function test_zoomToFullExtentUsesPreferredPolygonFitBounds() {
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(viewport !== null);
+        viewport.dataBounds = [211407.24, 43257.02, 2287874.9, 459484.82];
+        viewport.fitBounds = [211407.24, 423223.66, 236805.50, 459484.82];
+        viewport.mapZoom = 1;
+        viewport.panX = 0;
+        viewport.panY = 0;
+        verify(viewport.zoomToFullExtent(), "full-extent should fit the parcel area without discarding outlier data bounds");
+        verify(viewport.mapZoom > 1, "parcel extent should be enlarged inside the complete data canvas");
+        verify(Math.abs(viewport.panX) > 0 && Math.abs(viewport.panY) > 0,
+               "the fitted parcel extent should be centered within the complete data canvas");
+        compare(viewport.dataBounds, [211407.24, 43257.02, 2287874.9, 459484.82]);
+    }
+
+    function test_outlierBoundsStillAllowTwentyTimesMoreZoomFromParcelView() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        viewport.dataBounds = [211407.24, 43257.02, 2287874.9, 459484.82];
+        viewport.dataCRS = "EPSG:5186";
+        verify(canvas.width > 0 && viewport.width > 0);
+        var spanX = viewport.dataBounds[2] - viewport.dataBounds[0];
+        // Approx. 1:6,437 is the scale shown in the reported screen.
+        var zoomAtReportedScale = spanX * 96 / (canvas.width * 0.0254 * 6437);
+        verify(viewport.maxMapZoom() >= 20 * zoomAtReportedScale,
+               "the cadastral view must allow at least twenty times more zoom");
     }
 
     function test_memorySummaryDistinguishesPeakAndGoHeap() {
@@ -172,6 +227,16 @@ TestCase {
         canvas.processMemoryKind = 1;
         canvas.memoryStatusAvailable = true;
         tryCompare(label, "text", "프로세스 작업 집합 100 MiB · Go 힙 20 MiB");
+        appWindow.language = "en";
+    }
+
+    function test_queuedFileSelectionStatusIsLocalized() {
+        appWindow.language = "ko";
+        compare(appWindow.localizedStatus("Loading in progress; 2 selection(s) queued"),
+                "파일 불러오는 중 · 추가 요청 2건 대기");
+        appWindow.language = "jp";
+        compare(appWindow.localizedStatus("Loading in progress; 2 selection(s) queued"),
+                "ファイル読み込み中 · 追加要求 2 件待機");
         appWindow.language = "en";
     }
 
@@ -196,11 +261,39 @@ TestCase {
         menu.popup();
         tryCompare(menu, "visible", true);
         compare(menu.targetLayerName, "roads");
+        mouseClick(viewport, viewport.width / 2, viewport.height / 2);
+        tryCompare(menu, "visible", false);
+        menu.popup();
+        tryCompare(menu, "visible", true);
         mouseClick(findChild(appWindow, "layerContextSymbology"));
         tryCompare(dialog, "visible", true);
         compare(dialog.targetLayerName, "roads");
         compare(dialog.activeCategory, "symbology");
         dialog.close();
+
+        var removeDialog = findChild(appWindow, "removeLayerDialog");
+        var removeItem = findChild(appWindow, "layerContextRemove");
+        var beforeRemoveGeneration = canvas.layerSettingsGeneration;
+        menu.popup();
+        tryCompare(menu, "visible", true);
+        mouseClick(removeItem);
+        tryCompare(removeDialog, "visible", true);
+        compare(removeDialog.targetLayerName, "roads");
+        mouseClick(removeDialog.standardButton(Dialog.Cancel));
+        tryCompare(removeDialog, "visible", false);
+        compare(canvas.layerSettingsGeneration, beforeRemoveGeneration);
+        menu.popup();
+        tryCompare(menu, "visible", true);
+        mouseClick(removeItem);
+        tryCompare(removeDialog, "visible", true);
+        mouseClick(removeDialog.standardButton(Dialog.Ok));
+        tryCompare(canvas, "layerSettingsGeneration", beforeRemoveGeneration + 1);
+        compare(JSON.parse(canvas.layerSettingsPayload).operation, "remove");
+        compare(JSON.parse(canvas.layerSettingsPayload).name, "roads");
+        canvas.layerTreePayload = "[]";
+        tryCompare(layerModel, "count", 0);
+        compare(viewport.activeLayer, "");
+        compare(menu.visible, false);
     }
 
     function test_aboutDialogShowsBuildInformation() {
@@ -274,6 +367,52 @@ TestCase {
         canvas.mapMetadataGeneration += 1;
         tryCompare(viewport, "dataCRS", "EPSG:3857");
         compare(Math.round(canvas.width / canvas.height * 1000) / 1000, 2);
+    }
+
+    function test_rapidLayerMetadataKeepsWorldCenterAndMeterScale() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var layerModel = findChild(appWindow, "layerModel");
+        canvas.layerTreePayload = JSON.stringify([{name: "first", visible: true}]);
+        canvas.mapMetadataPayload = JSON.stringify({bounds: [0, 0, 200, 100], crs: "EPSG:5186"});
+        canvas.mapMetadataGeneration += 1;
+        tryVerify(function() { return layerModel.count === 1 && layerModel.get(0).name === "first"; });
+        tryVerify(function() { return viewport.dataBounds[2] === 200 && viewport.dataCRS === "EPSG:5186"; });
+        viewport.mapZoom = 2.3;
+        viewport.panX = 70;
+        viewport.panY = -30;
+        function center() {
+            var bounds = viewport.dataBounds;
+            return [bounds[0] + (0.5 - viewport.panX / (canvas.width * viewport.mapZoom)) * (bounds[2] - bounds[0]),
+                    bounds[1] + (0.5 + viewport.panY / (canvas.height * viewport.mapZoom)) * (bounds[3] - bounds[1])];
+        }
+        function unitsPerPixel() {
+            return (viewport.dataBounds[2] - viewport.dataBounds[0]) / (canvas.width * viewport.mapZoom);
+        }
+        var beforeCenter = center();
+        var beforeScale = unitsPerPixel();
+        canvas.layerTreePayload = JSON.stringify([{name: "first", visible: true}, {name: "second", visible: true}]);
+        canvas.mapMetadataPayload = JSON.stringify({bounds: [-100, -500, 1100, 300], crs: "EPSG:5186"});
+        canvas.mapMetadataGeneration += 1;
+        tryVerify(function() { return viewport.dataBounds[2] === 1100 && layerModel.count === 2; });
+        canvas.layerTreePayload = JSON.stringify([{name: "first", visible: true}, {name: "second", visible: true}, {name: "third", visible: true}]);
+        canvas.mapMetadataPayload = JSON.stringify({bounds: [-1000, -600, 1200, 400], crs: "EPSG:5186"});
+        canvas.mapMetadataGeneration += 1;
+        tryVerify(function() { return viewport.dataBounds[2] === 1200 && layerModel.count === 3; });
+        compare(canvas.mapMetadataAppliedGeneration, canvas.mapMetadataGeneration);
+        var afterCenter = center();
+        verify(Math.abs(afterCenter[0] - beforeCenter[0]) < 1e-6);
+        verify(Math.abs(afterCenter[1] - beforeCenter[1]) < 1e-6);
+        verify(Math.abs(unitsPerPixel() - beforeScale) < 1e-9);
+        var spanX = viewport.dataBounds[2] - viewport.dataBounds[0];
+        var spanY = viewport.dataBounds[3] - viewport.dataBounds[1];
+        verify(Math.abs(canvas.width / spanX - canvas.height / spanY) < 1e-9);
+
+        canvas.mapMetadataPayload = JSON.stringify({bounds: [126, 36, 128, 38], crs: "EPSG:4326"});
+        canvas.mapMetadataGeneration += 1;
+        tryCompare(viewport, "dataCRS", "EPSG:4326");
+        var expectedAspect = Math.cos(37 * Math.PI / 180);
+        verify(Math.abs(canvas.width / canvas.height - expectedAspect) < 1e-6);
     }
 
     function test_nullLabelAndHandlePayloadsBecomeEmptyLists() {
@@ -528,5 +667,77 @@ TestCase {
         canvas.renderStatus = "Layer settings applied";
         tryCompare(renderStatus, "text", "Layer settings applied");
         compare(renderStatus.color.toString(), "#2e7d32");
+    }
+
+    function test_layerPropertyLayoutFieldHintsAndOutlineOnly() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "layerSettingsDialog");
+        var viewport = findChild(appWindow, "mapViewport");
+        var scroll = findChild(appWindow, "layerSettingsScroll");
+        var expression = findChild(appWindow, "labelExpressionField");
+        var hintButton = findChild(appWindow, "labelFieldHintButton");
+        var hintPopup = findChild(appWindow, "labelFieldHintPopup");
+        var outlineOnly = findChild(appWindow, "outlineOnlyField");
+        var fillOpacity = findChild(appWindow, "fillOpacityField");
+        verify(dialog !== null && scroll !== null && hintPopup !== null);
+        canvas.layerTreePayload = JSON.stringify([{name: "parcels", visible: true, geometryType: "POLYGON",
+            style: {fillOpacity: 0.45}, labels: {expression: ""}}]);
+        var layerModel = findChild(appWindow, "layerModel");
+        tryCompare(layerModel, "count", 1);
+        tryVerify(function() { return layerModel.get(0).name === "parcels"; });
+        viewport.openLayerPropertiesForCategory("parcels", "labels");
+        tryCompare(dialog, "visible", true);
+        wait(100);
+        verify(scroll.contentWidth <= scroll.availableWidth + 1, "property pages must not scroll horizontally");
+        var placement = findChild(appWindow, "labelPlacementField");
+        var rotation = findChild(appWindow, "labelRotationField");
+        var heightField = findChild(appWindow, "labelHeightField");
+        var placementX = placement.mapToItem(scroll, 0, 0).x;
+        verify(Math.abs(rotation.mapToItem(scroll, 0, 0).x - placementX) < 1,
+               "rotation and placement inputs should share a label column");
+        verify(Math.abs(heightField.mapToItem(scroll, 0, 0).x - placementX) < 1,
+               "numeric label inputs should align with placement");
+        var originalWidth = appWindow.width;
+        try {
+            appWindow.width = 500;
+            wait(50);
+            verify(scroll.contentWidth <= scroll.availableWidth + 1,
+                   "narrow property pages must not require horizontal scrolling");
+            verify(expression.width > 100, "label template remains editable in a narrow window");
+        } finally {
+            appWindow.width = originalWidth;
+            wait(50);
+        }
+        viewport.attributeFieldHints = [{name: "LOT_NO", type: "text"}, {name: "CODE", type: "integer"}];
+        expression.text = "Parcel: ";
+        expression.cursorPosition = expression.text.length;
+        compare(dialog.activeCategory, "labels");
+        compare(hintButton.visible, true);
+        mouseClick(hintButton);
+        tryCompare(hintPopup, "visible", true);
+        var fieldList = findChild(hintPopup, "labelFieldList");
+        verify(fieldList !== null);
+        compare(viewport.attributeFieldHints.length, 2);
+        compare(fieldList.count, 2);
+        verify(fieldList.height > 0, "field list needs available height");
+        tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
+        var fieldRow = fieldList.itemAtIndex(0);
+        verify(fieldRow !== null);
+        verify(fieldRow.text.indexOf("LOT_NO") >= 0);
+        mouseClick(fieldRow);
+        tryCompare(hintPopup, "visible", false);
+        compare(expression.text, "Parcel: ${LOT_NO}");
+        dialog.activeCategory = "symbology";
+        wait(50);
+        compare(findChild(appWindow, "pointColorField").visible, false);
+        compare(findChild(appWindow, "lineColorField").visible, true);
+        compare(fillOpacity.text, "0.45");
+        compare(outlineOnly.checked, false);
+        mouseClick(outlineOnly);
+        compare(fillOpacity.text, "0");
+        compare(outlineOnly.checked, true);
+        mouseClick(outlineOnly);
+        compare(fillOpacity.text, "0.45");
+        dialog.close();
     }
 }
