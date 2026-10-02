@@ -79,7 +79,10 @@ func (s *Store) begin(ctx context.Context) (*Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Transaction{tx: tx, table: quoteIdentifier(s.Table)}, nil
+	// Keep the validated identifier unquoted inside the transaction. Query
+	// builders quote it at the SQL boundary; storing an already-quoted name
+	// would make schema/delete builders quote it a second time.
+	return &Transaction{tx: tx, table: s.Table}, nil
 }
 
 // ReadLayer reads the configured table into a detached core layer snapshot.
@@ -216,7 +219,7 @@ func (t *Transaction) WriteLayer(ctx context.Context, layer core.Layer) error {
 	if err != nil {
 		return err
 	}
-	query := fmt.Sprintf("INSERT INTO %s (id, geom, properties) VALUES ($1, ST_GeomFromText($2, $3), $4::jsonb)", t.table)
+	query := insertLayerQuery(t.table)
 	for _, feature := range layer.Features {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -268,6 +271,10 @@ func schemaQuery(table string) string {
     geom geometry NOT NULL,
     properties JSONB NOT NULL DEFAULT '{}'::jsonb
 )`, quoteIdentifier(table))
+}
+
+func insertLayerQuery(table string) string {
+	return fmt.Sprintf("INSERT INTO %s (id, geom, properties) VALUES ($1, ST_GeomFromText($2, $3), $4::jsonb)", quoteIdentifier(table))
 }
 
 func readLayerQuery(table string) string {

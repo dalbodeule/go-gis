@@ -85,6 +85,7 @@ type Layer struct {
 	Visible         bool
 	Style           LayerStyle
 	Labels          LabelSettings
+	DisplayRule     string `json:"displayRule,omitempty"`
 }
 
 // LayerStyle stores renderer-independent display options for a vector layer.

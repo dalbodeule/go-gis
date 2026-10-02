@@ -30,6 +30,14 @@ maps are retained per editor, and the HTML escape callback is reused during each
 debounced full-source pass. QML tests cover escaping, multi-line numbering,
 long-bracket syntax, and a 60 KB script near the runtime source limit.
 
+The layer properties Lua editor also stores a separate feature display rule.
+It runs against each feature in the render snapshot and must return a boolean.
+Returning `false` hides that feature from rendering and map hit testing without
+changing the source layer or saved project features. Label visibility rules
+remain independent and only suppress labels. In materialized layers, label and
+display-rule changes rebuild the render source; in viewport-backed layers, the
+affected cached windows are discarded and rebuilt with the new settings.
+
 ## Measurements
 
 Apple M3 rerun on 2026-10-01, 10K synthetic features, three runs with

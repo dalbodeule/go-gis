@@ -21,8 +21,9 @@ func TestWorkspaceRoundTripPreservesLayerSettingsWithoutFeatures(t *testing.T) {
 	project := core.Project{Name: "field work", CRS: core.CRS{AuthorityCode: "EPSG:5179"}, Layers: []core.Layer{{
 		Name: "roads", DisplayName: "Road centerlines", SourcePath: "../data/roads.shp", SourceLayerName: "roads", SourceEncoding: "CP949",
 		CRS: core.CRS{AuthorityCode: "EPSG:5179"}, Visible: false, Style: core.DefaultLayerStyle(),
-		Labels:   core.LabelSettings{Enabled: true, Expression: "${name}", Rule: `return feature.active == true`, LuaScript: `return feature.name .. " #" .. feature.id`, Placement: "center-rotated", RotationField: "angle", HeightMM: 2.5, MinScale: 1000, MaxScale: 50000},
-		Features: []core.Feature{{ID: 1}},
+		Labels:      core.LabelSettings{Enabled: true, Expression: "${name}", Rule: `return feature.active == true`, LuaScript: `return feature.name .. " #" .. feature.id`, Placement: "center-rotated", RotationField: "angle", HeightMM: 2.5, MinScale: 1000, MaxScale: 50000},
+		DisplayRule: `return feature.active == true`,
+		Features:    []core.Feature{{ID: 1}},
 	}}}
 	project.Layers[0].Style = style
 	if err := Save(path, FromProject(project)); err != nil {
@@ -44,8 +45,9 @@ func TestWorkspaceRoundTripPreservesLayerSettingsWithoutFeatures(t *testing.T) {
 		got.Layers[0].SourceLayerName != "roads" || got.Layers[0].SourceEncoding != "CP949" || got.Layers[0].Visible {
 		t.Fatalf("workspace did not preserve source and visibility: %+v", got.Layers)
 	}
-	if got.Layers[0].Labels != project.Layers[0].Labels || got.Layers[0].Style != project.Layers[0].Style {
-		t.Fatalf("workspace did not preserve style/labels: %+v", got.Layers[0])
+	if got.Layers[0].Labels != project.Layers[0].Labels || got.Layers[0].Style != project.Layers[0].Style ||
+		got.Layers[0].DisplayRule != project.Layers[0].DisplayRule {
+		t.Fatalf("workspace did not preserve style, labels, or display rule: %+v", got.Layers[0])
 	}
 	if len(got.Layers[0].Features) != 0 {
 		t.Fatal("workspace unexpectedly embedded feature data")

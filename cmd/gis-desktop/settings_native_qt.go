@@ -37,9 +37,7 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 	for index, layer := range layers {
 		targetLayer := layer.Name == request.Name
 		if targetLayer {
-			if request.SourcePath != layer.SourcePath {
-				layer.SourceCRS = ""
-			}
+			layer.SourceCRS = request.SourceCRS
 			layer.SourcePath = request.SourcePath
 			layer.SourceLayerName = request.SourceLayerName
 			layer.SourceEncoding = request.SourceEncoding
@@ -47,6 +45,7 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 			layer.Visible = request.Visible
 			layer.Style = request.Style
 			layer.Labels = request.Labels
+			layer.DisplayRule = request.DisplayRule
 			found = true
 		} else {
 			otherName := layer.DisplayName
@@ -66,7 +65,7 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 			Path: layer.SourcePath, LayerName: layer.SourceLayerName, SourceCRS: layer.SourceCRS,
 			FallbackCRS: layer.CRS.AuthorityCode, AllowUnavailable: allowUnavailable,
 			Encoding: layer.SourceEncoding, Name: layer.Name, DisplayName: layer.DisplayName,
-			Visible: &visible, Style: layer.Style, Labels: layer.Labels,
+			Visible: &visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 		if !readOnly {
 			source.InsertAt = index

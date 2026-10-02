@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1001,6 +1002,57 @@ func TestWorkspaceViewNormalizesPanAndZoom(t *testing.T) {
 	}
 }
 
+func TestProjectCRSChangeReprojectsLayersAndUpdatesWorkspaceCRS(t *testing.T) {
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
+		Name: "points", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}}},
+	}}, "", "", "EPSG:4326", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.service.SetProjectInfo("Survey", core.CRS{AuthorityCode: "EPSG:4326"})
+	if err := runtime.startProjectCRSChange("invalid-crs"); err == nil {
+		t.Fatal("invalid project CRS was accepted")
+	}
+	if err := runtime.startProjectCRSChange("EPSG:3857"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.mu.Lock()
+		service := runtime.service
+		finished := runtime.loadCancel == nil
+		var name string
+		var crs core.CRS
+		if service != nil {
+			name, crs = service.ProjectInfo()
+		}
+		runtime.mu.Unlock()
+		if finished && crs.AuthorityCode == "EPSG:3857" {
+			if name != "Survey" || runtime.mapCRS != "EPSG:3857" {
+				t.Fatalf("project identity/CRS after reproject = (%q, %q, %q)", name, crs.AuthorityCode, runtime.mapCRS)
+			}
+			project := service.Project()
+			wkt, ok := project.Layers[0].Features[0].Geometry.(core.WKTGeometry)
+			if !ok {
+				t.Fatalf("reprojected geometry type = %T", project.Layers[0].Features[0].Geometry)
+			}
+			coordinates := strings.Fields(strings.Trim(strings.TrimSuffix(strings.TrimPrefix(wkt.WKT, "POINT ("), ")"), " "))
+			if len(coordinates) != 2 {
+				t.Fatalf("reprojected point WKT = %q", wkt.WKT)
+			}
+			x, xErr := strconv.ParseFloat(coordinates[0], 64)
+			y, yErr := strconv.ParseFloat(coordinates[1], 64)
+			if xErr != nil || yErr != nil || math.Abs(x-14_150_000) > 100_000 || math.Abs(y-4_440_000) > 100_000 {
+				t.Fatalf("reprojected coordinates = (%v,%v), errors=(%v,%v)", x, y, xErr, yErr)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("project CRS reproject did not complete within 10 seconds")
+}
+
 func TestRemoveLayerKeepsRemainingProjectAndClearsLastLayer(t *testing.T) {
 	layers := []core.Layer{
 		{Name: "west", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true,
@@ -1287,8 +1339,107 @@ func TestApplyLayerSettingsRejectsInvalidLuaBeforeProjectMutation(t *testing.T) 
 	}
 }
 
+func TestApplyLayerSettingsRejectsInvalidFeatureDisplayRule(t *testing.T) {
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: "roads", DisplayName: "roads", SourcePath: "roads.shp", SourceLayerName: "roads",
+		Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(), DisplayRule: `return feature.kind ==`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(&demoRuntime{}, string(payload)); err == nil || !strings.Contains(err.Error(), "invalid Lua feature display rule") {
+		t.Fatalf("invalid feature display rule error = %v", err)
+	}
+}
+
+func TestFeatureDisplayRuleFiltersRenderSnapshotAndKeepsProjectData(t *testing.T) {
+	layer := core.Layer{
+		Name: "roads", Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(),
+		DisplayRule: `return feature.visible == true`,
+		Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (0 0)"}, Properties: map[string]any{"visible": true}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (1 1)"}, Properties: map[string]any{"visible": false}},
+		},
+	}
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{layer}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(runtime.sources["roads"].Features); got != 1 || runtime.sources["roads"].Features[0].FeatureID != 1 {
+		t.Fatalf("render source features = %+v, want only feature 1", runtime.sources["roads"].Features)
+	}
+	if got := runtime.sources["roads"].Extent; got != [4]float64{0, 0, 1, 1} {
+		t.Fatalf("feature filter changed the source extent: %v", got)
+	}
+	projectLayer, ok := runtime.service.ProjectLayerRenderSnapshot("roads")
+	if !ok || len(projectLayer.Features) != 2 {
+		t.Fatalf("project source data was filtered: found=%t features=%d", ok, len(projectLayer.Features))
+	}
+}
+
+func TestReadOnlyMaterializedLayerRebuildsLabelsAfterSettingsChange(t *testing.T) {
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
+		Name: "parcels", DisplayName: "Parcels", SourcePath: "parcels.gpkg", SourceLayerName: "parcels",
+		Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings(),
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"}, Properties: map[string]any{"name": "Parcel A", "show": true}}},
+	}}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.readOnly = true
+	labels := core.LabelSettings{
+		Enabled: true, Expression: "${name}", LuaScript: "return feature.name",
+		Placement: "center", HeightMM: 2.5,
+	}
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: "parcels", DisplayName: "Parcels", SourcePath: "parcels.gpkg", SourceLayerName: "parcels",
+		Visible: true, Style: core.DefaultLayerStyle(), Labels: labels,
+		DisplayRule: "return feature.show == true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.sources["parcels"].Labels; len(got) != 1 || got[0].Text != "Parcel A" {
+		t.Fatalf("read-only materialized labels were not rebuilt: %+v", got)
+	}
+	if got := len(runtime.sources["parcels"].Features); got != 1 {
+		t.Fatalf("display filter produced %d rendered features, want 1", got)
+	}
+}
+
+func TestDesktopDXFExportConnectsActiveLayerToExporter(t *testing.T) {
+	layer := core.Layer{
+		Name: "roads", DisplayName: "Roads", Visible: true, Style: core.DefaultLayerStyle(),
+		Labels:   core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center", HeightMM: 2.5},
+		Features: []core.Feature{{ID: 3, Geometry: core.WKTGeometry{WKT: "LINESTRING (127 37, 127.1 37.1)"}, Properties: map[string]any{"name": "세종로"}}},
+	}
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{layer}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "roads.dxf")
+	if err := runtime.exportActiveLayerDXF(path, "ares-utf8"); err != nil {
+		t.Fatalf("export active layer: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, expected := range []string{"LWPOLYLINE", "TEXT", "세종로"} {
+		if !strings.Contains(text, expected) {
+			t.Errorf("desktop DXF output missing %q", expected)
+		}
+	}
+}
+
 func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	style := core.DefaultLayerStyle()
+	updatedStyle := style
+	updatedStyle.LineColor = "#123456"
 	labels := core.DefaultLabelSettings()
 	labels.Enabled = true
 	labels.Expression = "${street} ${number}"
@@ -1299,21 +1450,19 @@ func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	labels.HeightMM = 2.5
 	labels.MinScale = 1000
 	labels.MaxScale = 50000
-	service, err := newLoadedProjectService([]core.Layer{{
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
 		Name: "roads", DisplayName: "roads", SourcePath: "roads.shp", SourceLayerName: "roads",
 		Visible: true, Style: style, Labels: core.DefaultLabelSettings(),
-	}})
+		Fields:   []core.Field{{Name: "street", Type: core.FieldTypeText}, {Name: "number", Type: core.FieldTypeNumber}, {Name: "active", Type: core.FieldTypeBool}, {Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 2 0)"}, Properties: map[string]any{"street": "Main", "number": 4, "active": true, "name": "Main", "angle": 0}}},
+	}}, "", "", "", "", "", false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &demoRuntime{
-		service: service, visibleLayers: map[string]bool{"roads": true},
-		visibility:  render.NewLayerVisibility("roads"),
-		layerStyles: map[string]core.LayerStyle{}, layerStyleMu: &sync.RWMutex{},
-	}
+	service := runtime.service
 	payload, err := json.Marshal(layerSettingsRequest{
 		Name: "roads", DisplayName: "Cadastral Roads", SourcePath: "roads.shp",
-		SourceLayerName: "roads", Visible: false, Style: style, Labels: labels,
+		SourceLayerName: "roads", Visible: false, Style: updatedStyle, Labels: labels,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1322,8 +1471,32 @@ func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	layer, ok := service.LayerProperties("roads")
-	if !ok || layer.DisplayName != "Cadastral Roads" || layer.Visible || layer.Labels != labels {
+	if !ok || layer.DisplayName != "Cadastral Roads" || layer.Visible || layer.Labels != labels || layer.Style != updatedStyle {
 		t.Fatalf("updated layer properties = %+v, found=%t", layer, ok)
+	}
+	if got := runtime.sources["roads"].Labels; len(got) != 1 || got[0].Text != "Main" || got[0].HeightMM != 2.5 {
+		t.Fatalf("updated label settings were not rebuilt into render source: %+v", got)
+	}
+	wantLineColor := render.ColorForGeometry(updatedStyle, "LINESTRING")
+	foundLine := false
+	for x := 0; x < 4 && !foundLine; x++ {
+		for y := 0; y < 4 && !foundLine; y++ {
+			chunk, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "roads", X: x, Y: y})
+			if err != nil {
+				t.Fatalf("build updated style chunk: %v", err)
+			}
+			for _, vertex := range chunk.Vertices {
+				if vertex.Kind == render.VertexLine {
+					foundLine = true
+					if vertex.Color != wantLineColor {
+						t.Fatalf("line color = %#08x, want %#08x", vertex.Color, wantLineColor)
+					}
+				}
+			}
+		}
+	}
+	if !foundLine {
+		t.Fatal("style test chunk did not contain line vertices")
 	}
 	if runtime.loadGeneration != 0 {
 		t.Fatalf("non-source layer settings triggered a source reload (generation %d)", runtime.loadGeneration)
@@ -1538,7 +1711,7 @@ func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	style := core.DefaultLayerStyle()
 	style.FillOpacity = 0
 	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
-		Name: "areas", Style: style,
+		Name: "areas", DisplayName: "areas", SourcePath: "areas.gpkg", SourceLayerName: "areas", Visible: true, Style: style,
 		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))"}}},
 	}}, "", "", "", "", "", false, nil, nil)
 	if err != nil {
@@ -1546,9 +1719,16 @@ func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	}
 	updated := style
 	updated.FillOpacity = 0.6
-	runtime.layerStyleMu.Lock()
-	runtime.layerStyles["areas"] = updated
-	runtime.layerStyleMu.Unlock()
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: "areas", DisplayName: "areas", SourcePath: "areas.gpkg", SourceLayerName: "areas", Visible: true, Style: updated,
+		Labels: core.DefaultLabelSettings(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(payload)); err != nil {
+		t.Fatalf("apply opacity setting: %v", err)
+	}
 	chunk, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "areas", X: 0, Y: 0})
 	if err != nil {
 		t.Fatal(err)

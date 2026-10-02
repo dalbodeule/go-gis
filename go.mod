@@ -9,6 +9,7 @@ require (
 	github.com/twpayne/go-geos v0.23.0
 	github.com/twpayne/go-proj/v11 v11.1.0
 	github.com/yuin/gopher-lua v1.1.2
+	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.42.0
 )
 

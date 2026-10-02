@@ -17,6 +17,18 @@ import (
 	"gogis/internal/core"
 )
 
+func TestValidateCRS(t *testing.T) {
+	for _, test := range []struct {
+		code  string
+		valid bool
+	}{{"EPSG:5186", true}, {"EPSG:4326", true}, {"not-a-crs", false}, {"", false}} {
+		err := ValidateCRS(test.code)
+		if (err == nil) != test.valid {
+			t.Errorf("ValidateCRS(%q) error = %v; valid=%t", test.code, err, test.valid)
+		}
+	}
+}
+
 func TestTransformerTransformsBoundsWithVisualizationAxisOrder(t *testing.T) {
 	transformer := Transformer{}
 	got, err := transformer.TransformBounds(context.Background(), core.CRS{AuthorityCode: "EPSG:4326"}, core.CRS{AuthorityCode: "EPSG:3857"}, [4]float64{-1, -1, 1, 1})

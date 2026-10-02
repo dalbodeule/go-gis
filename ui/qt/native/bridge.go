@@ -374,3 +374,10 @@ func CurrentSavePath() string {
 	C.gogis_save_path((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }
+
+// CurrentSaveProfile returns the export profile selected by the QML save dialog.
+func CurrentSaveProfile() string {
+	buffer := make([]C.char, 128)
+	C.gogis_save_profile((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}

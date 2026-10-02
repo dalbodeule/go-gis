@@ -137,6 +137,19 @@ func TestQuoteIdentifierQuotesEachPart(t *testing.T) {
 	}
 }
 
+func TestPostGISWriteQueriesQuoteRawIdentifierOnce(t *testing.T) {
+	table := "gis.roads"
+	if got, want := schemaQuery(table), "CREATE TABLE IF NOT EXISTS \"gis\".\"roads\" (\n    id BIGINT PRIMARY KEY,\n    geom geometry NOT NULL,\n    properties JSONB NOT NULL DEFAULT '{}'::jsonb\n)"; got != want {
+		t.Fatalf("schema query = %q, want %q", got, want)
+	}
+	if got, want := clearLayerQuery(table), `DELETE FROM "gis"."roads"`; got != want {
+		t.Fatalf("clear query = %q, want %q", got, want)
+	}
+	if got, want := insertLayerQuery(table), `INSERT INTO "gis"."roads" (id, geom, properties) VALUES ($1, ST_GeomFromText($2, $3), $4::jsonb)`; got != want {
+		t.Fatalf("insert query = %q, want %q", got, want)
+	}
+}
+
 func TestValidTableIdentifierEnforcesPostgreSQLPartLimits(t *testing.T) {
 	for _, table := range []string{"roads", "gis.roads", strings.Repeat("r", maxPostgreSQLIdentifierBytes)} {
 		if !validTableIdentifier(table) {

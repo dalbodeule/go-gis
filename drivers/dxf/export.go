@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"gogis/internal/core"
+	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/encoding/korean"
 	"golang.org/x/text/transform"
 )
@@ -33,6 +34,9 @@ var ARESUTF8 = Profile{ACADVersion: "AC1015", CodePage: "UTF-8", TextHeight: 1}
 // declared DXF header are now deterministic.
 var ARESCP949 = Profile{ACADVersion: "AC1015", CodePage: "ANSI_949", TextHeight: 1}
 
+// ARESSHIFTJIS is the common legacy code page for Japanese CAD deployments.
+var ARESSHIFTJIS = Profile{ACADVersion: "AC1015", CodePage: "ANSI_932", TextHeight: 1}
+
 // Exporter writes a small, inspectable ASCII DXF subset without hiding header
 // or encoding decisions behind a third-party library.
 type Exporter struct {
@@ -52,6 +56,8 @@ func (e Exporter) Export(ctx context.Context, destination string, layer core.Lay
 	case "", "ares-utf8":
 	case "ares-cp949":
 		configuration = ARESCP949
+	case "ares-shift-jis":
+		configuration = ARESSHIFTJIS
 	default:
 		return fmt.Errorf("unsupported DXF profile %q", profile)
 	}
@@ -370,8 +376,13 @@ func newTextEncoder(codePage string) (textEncoder, error) {
 		return func(value string, dst []byte) ([]byte, error) {
 			return append(dst, value...), nil
 		}, nil
-	case "CP949", "ANSI_949", "EUC-KR":
-		encoder := korean.EUCKR.NewEncoder()
+	case "CP949", "ANSI_949", "EUC-KR", "SHIFT-JIS", "SHIFT_JIS", "CP932", "ANSI_932":
+		encoderName := "CP949"
+		var encoder transform.Transformer = korean.EUCKR.NewEncoder()
+		if normalized := strings.ToUpper(strings.TrimSpace(codePage)); normalized == "SHIFT-JIS" || normalized == "SHIFT_JIS" || normalized == "CP932" || normalized == "ANSI_932" {
+			encoderName = "Shift-JIS"
+			encoder = japanese.ShiftJIS.NewEncoder()
+		}
 		var sourceBuffer []byte
 		return func(value string, dst []byte) ([]byte, error) {
 			encoder.Reset()
@@ -399,11 +410,11 @@ func newTextEncoder(codePage string) (textEncoder, error) {
 					continue
 				}
 				if err != nil {
-					return nil, fmt.Errorf("encode DXF text as CP949: %w", err)
+					return nil, fmt.Errorf("encode DXF text as %s: %w", encoderName, err)
 				}
 			}
 			if _, _, err := encoder.Transform(dst[len(dst):cap(dst)], nil, true); err != nil && err != transform.ErrShortDst {
-				return nil, fmt.Errorf("encode DXF text as CP949: %w", err)
+				return nil, fmt.Errorf("encode DXF text as %s: %w", encoderName, err)
 			}
 			return dst, nil
 		}, nil

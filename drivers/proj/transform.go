@@ -78,6 +78,20 @@ func (Transformer) Transform(ctx context.Context, source, target core.CRS, layer
 	return transformLayerWithPJ(ctx, source, target, layer, pj)
 }
 
+// ValidateCRS reports whether PROJ can resolve an authority/code as a CRS.
+func ValidateCRS(authorityCode string) error {
+	code := strings.TrimSpace(authorityCode)
+	if code == "" {
+		return fmt.Errorf("CRS is required")
+	}
+	pj, err := projlib.NewCRSToCRS(code, code, nil)
+	if err != nil {
+		return fmt.Errorf("invalid CRS %q: %w", code, err)
+	}
+	_ = pj
+	return nil
+}
+
 // TransformLayers transforms layers that share one source CRS and target CRS
 // through one retained PROJ pipeline. It avoids repeating pipeline creation
 // when a dataset contains many layers with the same CRS.

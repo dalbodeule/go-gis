@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"gogis/internal/core"
+	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/encoding/korean"
 )
 
@@ -505,6 +506,28 @@ func TestExporterWritesCP949Profile(t *testing.T) {
 	}
 	if strings.Contains(string(contents), "한글 도로") {
 		t.Fatal("CP949 output unexpectedly contains UTF-8 label bytes")
+	}
+}
+
+func TestExporterWritesShiftJISProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sample-shift-jis.dxf")
+	layer := core.Layer{Name: "roads", Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (139.7 35.6)"},
+		Properties: map[string]any{"label": "地図"},
+	}}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-shift-jis"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), "ANSI_932") {
+		t.Fatalf("missing Shift-JIS header: %q", contents)
+	}
+	decoded, err := japanese.ShiftJIS.NewDecoder().Bytes(contents)
+	if err != nil || !strings.Contains(string(decoded), "地図") {
+		t.Fatalf("Shift-JIS label did not round trip: %q, err=%v", decoded, err)
 	}
 }
 

@@ -117,11 +117,36 @@ var _ drivers.GeometryOnlyWindowReader = Reader{}
 // in read order because the current core model intentionally does not expose
 // a GDAL-specific FID type.
 func (reader Reader) Open(ctx context.Context, source, layerName string) (core.Layer, error) {
+	return reader.OpenWithLimits(ctx, source, layerName, maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+}
+
+// OpenWithLimits reads one layer into a detached snapshot within explicit
+// feature and decoded-payload limits. Callers handling deliberate exports can
+// choose a larger bounded budget than the interactive default.
+func (reader Reader) OpenWithLimits(ctx context.Context, source, layerName string, maxFeatures int, maxBytes int64) (core.Layer, error) {
 	if err := ctx.Err(); err != nil {
 		return core.Layer{}, err
 	}
+	if maxFeatures <= 0 || maxBytes <= 0 {
+		return core.Layer{}, fmt.Errorf("materialized read limits must be positive")
+	}
 	if isGeoJSONStreamSource(source) {
-		return readGeoJSONSourceSnapshot(ctx, source, layerName, true)
+		layer, err := readGeoJSONSourceSnapshot(ctx, source, layerName, true)
+		if err != nil {
+			return core.Layer{}, err
+		}
+		payloadBytes := int64(0)
+		for _, feature := range layer.Features {
+			featureBytes := estimateFeaturePayloadBytes(feature)
+			if featureBytes > maxBytes-payloadBytes {
+				return core.Layer{}, fmt.Errorf("layer %q exceeds the configured materialization limit of %d features or %d bytes", layer.Name, maxFeatures, maxBytes)
+			}
+			payloadBytes += featureBytes
+		}
+		if len(layer.Features) > maxFeatures {
+			return core.Layer{}, fmt.Errorf("layer %q exceeds the configured materialization limit of %d features or %d bytes", layer.Name, maxFeatures, maxBytes)
+		}
+		return layer, nil
 	}
 	registerDrivers()
 	dataset, err := openDataset(source, reader.Encoding)
@@ -145,7 +170,7 @@ func (reader Reader) Open(ctx context.Context, source, layerName string) (core.L
 		layer = layers[0]
 	}
 
-	return readMaterializedLayer(ctx, layer, true)
+	return readLayerOptionsLimited(ctx, layer, true, maxFeatures, maxBytes)
 }
 
 // OpenGeometryOnly reads layer identity, CRS, feature IDs, and geometry while

@@ -222,6 +222,12 @@ driver로도 수행할 수 있습니다. 예를 들어 샘플 GeoJSON을 변환�
 다시 읽고 geometry 수와 extent를 인식하는지 확인합니다. 이 검사는 ARES Commander의 실제 화면·한글 글꼴
 호환성을 대체하지 않으며, ARES 검증은 대상 앱에서 별도로 수행해야 합니다.
 
+Native desktop에서는 **Export active layer to DXF**로 활성 레이어를 UTF-8 DXF로
+내보낼 수 있습니다. 내보내기 전에 레이어의 Lua 표시 필터와 레이블을 계산합니다.
+읽기 전용 viewport source는 전체 피처를 다시 읽으며, 최대 1,000,000개 피처와
+768 MiB의 디코딩된 geometry/attribute payload까지만 허용합니다. 한도를 넘으면
+오류를 표시하고 부분 파일은 내보내지 않습니다.
+
 ```sh
 go run -tags native ./cmd/gis-cli convert \
   --input testdata/sample.geojson \

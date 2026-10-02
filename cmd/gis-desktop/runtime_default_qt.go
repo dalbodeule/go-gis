@@ -5,8 +5,13 @@ package main
 import (
 	"fmt"
 
+	"gogis/internal/core"
 	"gogis/ui/qt/native"
 )
+
+type readOnlyLayerBinding struct {
+	layer core.Layer
+}
 
 func loadRuntime(_ []string) *demoRuntime {
 	return loadEmptyProject()
@@ -24,7 +29,11 @@ func (r *demoRuntime) startRemoveLayer(_ string) error {
 	return fmt.Errorf("removing layers requires the native GDAL build")
 }
 
-func (r *demoRuntime) saveDataset(destination string) {
+func (r *demoRuntime) startProjectCRSChange(_ string) error {
+	return fmt.Errorf("changing the project CRS requires the native GDAL build")
+}
+
+func (r *demoRuntime) saveDataset(destination, _ string) {
 	native.SetRenderStatus("Save failed: build desktop with native GDAL support")
 }
 

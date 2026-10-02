@@ -99,6 +99,7 @@ int gogis_load_requests(char* buffer, int buffer_length);
 // Reads a GeoPackage save request emitted by QML.
 unsigned long long gogis_save_generation(void);
 void gogis_save_path(char* buffer, int buffer_length);
+void gogis_save_profile(char* buffer, int buffer_length);
 
 #ifdef __cplusplus
 }

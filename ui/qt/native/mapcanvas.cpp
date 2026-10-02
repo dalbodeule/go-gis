@@ -117,6 +117,7 @@ QJsonArray g_load_requests;
 std::atomic<unsigned long long> g_load_generation{0};
 std::mutex g_save_mutex;
 std::string g_save_path;
+std::string g_save_profile;
 std::atomic<unsigned long long> g_save_generation{0};
 std::mutex g_selection_mutex;
 std::string g_selection_layer;
@@ -406,6 +407,7 @@ public:
             if (save_generation != g_save_generation.load(std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(g_save_mutex);
                 g_save_path = property("savePath").toString().toStdString();
+                g_save_profile = property("saveProfile").toString().toStdString();
                 g_save_generation.store(save_generation, std::memory_order_relaxed);
             }
 
@@ -979,5 +981,15 @@ extern "C" void gogis_save_path(char* buffer, int buffer_length) {
     std::lock_guard<std::mutex> lock(g_save_mutex);
     const auto copy_length = std::min<size_t>(g_save_path.size(), static_cast<size_t>(buffer_length - 1));
     std::memcpy(buffer, g_save_path.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
+extern "C" void gogis_save_profile(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_save_mutex);
+    const auto copy_length = std::min<size_t>(g_save_profile.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_save_profile.data(), copy_length);
     buffer[copy_length] = '\0';
 }

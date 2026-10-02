@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"gogis/drivers/dxf"
 	"gogis/drivers/gdal"
 	geosdriver "gogis/drivers/geos"
 	"gogis/drivers/proj"
@@ -689,6 +690,7 @@ func loadReadOnlyDataRuntimeWithBaseLayers(ctx context.Context, sources []vector
 			if source.Labels != (core.LabelSettings{}) {
 				layer.Labels = source.Labels
 			}
+			layer.DisplayRule = source.DisplayRule
 			layer = layer.WithDefaultPresentation()
 			bindings[layer.Name] = readOnlyLayerBinding{
 				session: session, sourceName: sourceLayerName, layer: layer,
@@ -982,7 +984,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				SourceLayerName: overview.Name, SourceEncoding: source.Encoding,
 				SourceCRS: sourceCRS, CRS: core.CRS{AuthorityCode: targetCRS},
 				Visible:     source.Visible == nil || *source.Visible,
-				DisplayName: source.DisplayName, Style: source.Style, Labels: source.Labels,
+				DisplayName: source.DisplayName, Style: source.Style, Labels: source.Labels, DisplayRule: source.DisplayRule,
 			}
 			if source.Name != "" {
 				layer.Name = source.Name
@@ -1047,6 +1049,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{})
 	runtime.windowFeatureNames = make(map[uint64]string)
 	runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
+	runtime.readOnlyBindings = bindings
 	runtime.unavailableSources = unavailable
 	runtime.readOnlyBaseLayers = append([]core.Layer(nil), baseLayers...)
 	runtime.readOnlyBaseFeatures = append([]render.HitFeature(nil), runtime.features...)
@@ -1096,13 +1099,15 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	}
 	baseBuilder := runtime.builder
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
-		if _, isWindowLayer := bindings[key.Layer]; !isWindowLayer {
+		runtime.mu.Lock()
+		binding, isWindowLayer := runtime.readOnlyBindings[key.Layer]
+		runtime.mu.Unlock()
+		if !isWindowLayer {
 			if _, missing := unavailable[key.Layer]; !missing && baseBuilder != nil {
 				return baseBuilder(ctx, key)
 			}
 		}
-		binding, ok := bindings[key.Layer]
-		if !ok {
+		if !isWindowLayer {
 			if _, missing := unavailable[key.Layer]; missing {
 				return render.Chunk{Key: key}, nil
 			}
@@ -1158,6 +1163,10 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		})
 		if err != nil {
 			return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
+		}
+		window.DisplayRule = binding.layer.DisplayRule
+		if err := applyFeatureDisplayRule(ctx, &window); err != nil {
+			return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
 		}
 		if overview {
 			window = sampleReadOnlyOverviewFeatures(window, overviewStride)
@@ -1337,6 +1346,8 @@ const (
 	maxDesktopGeoJSONIndexFeatures = 2_000_000
 	maxDesktopMaterializedFeatures = 1_000_000
 	maxDesktopMaterializedBytes    = 256 << 20
+	maxDesktopDXFExportFeatures    = 1_000_000
+	maxDesktopDXFExportBytes       = 768 << 20
 )
 
 func isPolygonOverviewLayer(geometryType string) bool {
@@ -1696,7 +1707,7 @@ func unavailableWorkspaceLayer(source vectorSourceSpec) core.Layer {
 	return core.Layer{
 		Name: name, DisplayName: source.DisplayName, SourcePath: source.Path,
 		SourceLayerName: source.LayerName, SourceEncoding: source.Encoding, SourceCRS: source.SourceCRS,
-		CRS: core.CRS{AuthorityCode: crs}, Visible: visible, Style: source.Style, Labels: source.Labels,
+		CRS: core.CRS{AuthorityCode: crs}, Visible: visible, Style: source.Style, Labels: source.Labels, DisplayRule: source.DisplayRule,
 	}.WithDefaultPresentation()
 }
 
@@ -1725,23 +1736,47 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 	if err != nil {
 		return nil, fmt.Errorf("align CRS: %w", err)
 	}
-	if err := prepareLayerLabels(ctx, layers); err != nil {
+	projectLayers := layers
+	filteredExtent := bounds
+	hasDisplayRule := false
+	for _, layer := range layers {
+		if strings.TrimSpace(layer.DisplayRule) != "" {
+			hasDisplayRule = true
+			break
+		}
+	}
+	if filteredExtent == nil && hasDisplayRule {
+		extent, extentErr := render.LayerExtent(projectLayers)
+		if extentErr != nil {
+			return nil, fmt.Errorf("calculate unfiltered layer extent: %w", extentErr)
+		}
+		filteredExtent = &extent
+	}
+	renderLayers := make([]core.Layer, len(layers))
+	for index, layer := range layers {
+		renderLayers[index] = layer
+		renderLayers[index].Features = append([]core.Feature(nil), layer.Features...)
+		if err := applyFeatureDisplayRule(ctx, &renderLayers[index]); err != nil {
+			return nil, fmt.Errorf("layer %q display rule: %w", layer.Name, err)
+		}
+	}
+	if err := prepareLayerLabels(ctx, renderLayers); err != nil {
 		return nil, err
 	}
 	var sources map[string]render.LayerSource
 	var features []render.HitFeature
 	var sourceErr error
-	if bounds != nil && readOnly {
-		sources, features, sourceErr = render.NewLayerSourcesWithExtentAndChunkSize(layers, *bounds, readOnlyWindowChunkSize(0))
-	} else if bounds != nil {
-		sources, features, sourceErr = render.NewLayerSourcesWithExtent(layers, *bounds)
+	if filteredExtent != nil && readOnly {
+		sources, features, sourceErr = render.NewLayerSourcesWithExtentAndChunkSize(renderLayers, *filteredExtent, readOnlyWindowChunkSize(0))
+	} else if filteredExtent != nil {
+		sources, features, sourceErr = render.NewLayerSourcesWithExtent(renderLayers, *filteredExtent)
 	} else {
-		sources, features, sourceErr = render.NewLayerSourcesWithFeatures(layers)
+		sources, features, sourceErr = render.NewLayerSourcesWithFeatures(renderLayers)
 	}
 	if sourceErr != nil {
 		return nil, fmt.Errorf("prepare layers: %w", sourceErr)
 	}
-	if err := attachPolygonFillGeometry(ctx, layers, sources); err != nil {
+	if err := attachPolygonFillGeometry(ctx, renderLayers, sources); err != nil {
 		return nil, fmt.Errorf("prepare polygon fills: %w", err)
 	}
 	layerNames := make([]string, 0, len(layers))
@@ -1780,7 +1815,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 		mapExtent = sources[layers[0].Name].Extent
 		mapCRS = layers[0].CRS.AuthorityCode
 	}
-	serviceLayers := layers
+	serviceLayers := projectLayers
 	if readOnly {
 		// Geometry and WKB are already owned by render sources. Keeping a second
 		// full layer snapshot in ProjectService would double the large-import
@@ -1843,7 +1878,7 @@ func buildDataRuntime(ctx context.Context, layers []core.Layer, input, sourceCRS
 	runtime.mapFitExtent = preferredMapFitExtent(runtime.mapExtent, runtime.layerBounds, runtime.layerGeometryTypes)
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
 		runtime.sourcesMu.RLock()
-		source, ok := sources[key.Layer]
+		source, ok := runtime.sources[key.Layer]
 		runtime.sourcesMu.RUnlock()
 		if !ok {
 			return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
@@ -1944,6 +1979,9 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 	layer, ok := service.ProjectLayerRenderSnapshot(layerName)
 	if !ok {
 		return fmt.Errorf("layer %q was not found", layerName)
+	}
+	if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
+		return fmt.Errorf("layer %q display rule: %w", layerName, err)
 	}
 	if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
 		return err
@@ -2417,6 +2455,34 @@ func prepareLayerLabels(ctx context.Context, layers []core.Layer) error {
 	return prepareLayerLabelsWithMaximumDuration(ctx, layers, maxLabelScriptExecutionDuration)
 }
 
+// applyFeatureDisplayRule filters only the render snapshot. Source and project
+// features remain untouched, including on editable layers.
+func applyFeatureDisplayRule(ctx context.Context, layer *core.Layer) error {
+	if layer == nil || strings.TrimSpace(layer.DisplayRule) == "" || len(layer.Features) == 0 {
+		return nil
+	}
+	program, err := scripting.CompileLabelProgram(layer.DisplayRule)
+	if err != nil {
+		return err
+	}
+	defer program.Close()
+	visible := layer.Features[:0]
+	for _, feature := range layer.Features {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		show, err := program.EvaluateRule(ctx, feature.Properties)
+		if err != nil {
+			return fmt.Errorf("feature %d: %w", feature.ID, err)
+		}
+		if show {
+			visible = append(visible, feature)
+		}
+	}
+	layer.Features = visible
+	return nil
+}
+
 func prepareLayerLabelsWithMaximumDuration(ctx context.Context, layers []core.Layer, maximum time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2575,6 +2641,10 @@ func (r *demoRuntime) publishMapMetadata() {
 	r.mu.Lock()
 	crs, extent, fitExtent, savedView := r.mapCRS, r.mapExtent, r.mapFitExtent, r.workspaceView
 	hasLayers := r.service != nil && len(r.service.LayerNames()) > 0
+	if crs == "" && r.service != nil {
+		_, projectCRS := r.service.ProjectInfo()
+		crs = projectCRS.AuthorityCode
+	}
 	r.mu.Unlock()
 	var view *native.MapViewState
 	if savedView != nil {
@@ -2740,6 +2810,7 @@ func loadDataRuntimeSourcesWithCRS(ctx context.Context, sources []vectorSourceSp
 			if source.Labels != (core.LabelSettings{}) {
 				layer.Labels = source.Labels
 			}
+			layer.DisplayRule = source.DisplayRule
 			layer = layer.WithDefaultPresentation()
 			appendLayer(layer, source, layerIndex)
 		}
@@ -2768,19 +2839,27 @@ func layerMetadataOnly(layers []core.Layer) []core.Layer {
 		metadata[index] = core.Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath, SourceLayerName: layer.SourceLayerName,
 			SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS, CRS: layer.CRS,
-			Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels,
+			Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return metadata
 }
 
-func (r *demoRuntime) saveDataset(destination string) {
+func (r *demoRuntime) saveDataset(destination, profile string) {
 	if destination == "" {
 		native.SetRenderStatus("Save cancelled")
 		return
 	}
 	if strings.EqualFold(filepath.Ext(destination), ".gogis") {
 		r.saveWorkspace(destination)
+		return
+	}
+	if strings.EqualFold(filepath.Ext(destination), ".dxf") {
+		if err := r.exportActiveLayerDXF(destination, profile); err != nil {
+			native.SetRenderStatus("DXF export failed: " + err.Error())
+			return
+		}
+		native.SetRenderStatus("DXF exported: " + destination)
 		return
 	}
 	if !strings.EqualFold(filepath.Ext(destination), ".gpkg") {
@@ -2814,6 +2893,96 @@ func (r *demoRuntime) saveDataset(destination string) {
 	r.saveDestination = destination
 	r.mu.Unlock()
 	native.SetRenderStatus("Saved " + destination)
+}
+
+func (r *demoRuntime) exportActiveLayerDXF(destination, profile string) error {
+	r.mu.Lock()
+	service := r.service
+	readOnly := r.readOnly
+	displayCRS := r.readOnlyDisplayCRS
+	sources := append([]vectorSourceSpec(nil), r.readOnlySources...)
+	r.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	layerName := native.CurrentActiveLayer()
+	if layerName == "" {
+		names := service.LayerNames()
+		if len(names) == 0 {
+			return fmt.Errorf("no layers are available")
+		}
+		layerName = names[0]
+	}
+	properties, ok := service.LayerProperties(layerName)
+	if !ok {
+		names := service.LayerNames()
+		if len(names) > 0 {
+			layerName = names[0]
+			properties, ok = service.LayerProperties(layerName)
+		}
+	}
+	if !ok {
+		return fmt.Errorf("active layer %q was not found", layerName)
+	}
+	var layer core.Layer
+	if readOnly {
+		var source *vectorSourceSpec
+		for index := range sources {
+			if sources[index].Name == layerName || (sources[index].Path == properties.SourcePath &&
+				(sources[index].LayerName == "" || sources[index].LayerName == properties.SourceLayerName)) {
+				source = &sources[index]
+				break
+			}
+		}
+		if source == nil {
+			return fmt.Errorf("source for layer %q is unavailable", layerName)
+		}
+		sourceLayerName := properties.SourceLayerName
+		if sourceLayerName == "" {
+			sourceLayerName = source.LayerName
+		}
+		loaded, err := (gdal.Reader{Encoding: source.Encoding}).OpenWithLimits(
+			context.Background(), source.Path, sourceLayerName, maxDesktopDXFExportFeatures, maxDesktopDXFExportBytes)
+		if err != nil {
+			return fmt.Errorf("read layer for export: %w", err)
+		}
+		layer = loaded
+		if source.SourceCRS != "" {
+			layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
+		}
+		targetCRS := properties.CRS.AuthorityCode
+		if targetCRS == "" {
+			targetCRS = displayCRS
+		}
+		if targetCRS != "" && layer.CRS.AuthorityCode != "" && !strings.EqualFold(targetCRS, layer.CRS.AuthorityCode) {
+			layer, err = (proj.Transformer{}).Transform(context.Background(), layer.CRS, core.CRS{AuthorityCode: targetCRS}, layer)
+			if err != nil {
+				return fmt.Errorf("transform layer for export: %w", err)
+			}
+		}
+	} else {
+		layer, ok = service.ProjectLayerRenderSnapshot(layerName)
+		if !ok {
+			return fmt.Errorf("layer %q data was not found", layerName)
+		}
+	}
+	layer.Name = properties.Name
+	layer.DisplayName = properties.DisplayName
+	layer.Labels = properties.Labels
+	layer.DisplayRule = properties.DisplayRule
+	if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
+		return fmt.Errorf("apply feature display filter: %w", err)
+	}
+	if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
+		return fmt.Errorf("prepare layer labels: %w", err)
+	}
+	if profile == "" {
+		profile = "ares-utf8"
+	}
+	if err := (dxf.Exporter{}).Export(context.Background(), destination, layer, profile); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *demoRuntime) saveWorkspace(destination string) {
@@ -2880,6 +3049,119 @@ func installInMemoryAttributeReaders(runtime *demoRuntime, layers []core.Layer) 
 // startRemoveLayer changes only the in-memory project. Source datasets are
 // never deleted; rebuilding the remaining sources also recalculates their
 // normalized render extent without retaining the removed layer's geometry.
+func (r *demoRuntime) startProjectCRSChange(authorityCode string) error {
+	if err := proj.ValidateCRS(authorityCode); err != nil {
+		return err
+	}
+	target := core.CRS{AuthorityCode: authorityCode}
+	r.mu.Lock()
+	if r.loadCancel != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("wait for the current layer load to finish")
+	}
+	service := r.service
+	if service == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("no project is loaded")
+	}
+	projectName, oldProjectCRS := service.ProjectInfo()
+	if strings.EqualFold(oldProjectCRS.AuthorityCode, authorityCode) && strings.EqualFold(r.mapCRS, authorityCode) {
+		r.mu.Unlock()
+		return nil
+	}
+	properties := service.ProjectLayerProperties()
+	readOnly := r.readOnly
+	saveDestination := r.saveDestination
+	baseLayers := append([]core.Layer(nil), r.readOnlyBaseLayers...)
+	var editableLayers []core.Layer
+	if !readOnly {
+		editableLayers = service.ProjectRenderSnapshot().Layers
+	}
+	visibility := make(map[string]bool, len(r.visibleLayers))
+	for name, visible := range r.visibleLayers {
+		visibility[name] = visible
+	}
+	sources := make([]vectorSourceSpec, 0, len(properties))
+	if readOnly {
+		for _, layer := range properties {
+			if layer.SourcePath == "" {
+				continue
+			}
+			visible := visibility[layer.Name]
+			sources = append(sources, vectorSourceSpec{
+				Path: layer.SourcePath, LayerName: layer.SourceLayerName,
+				Encoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
+				Name: layer.Name, DisplayName: layer.DisplayName, Visible: &visible,
+				Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
+				AllowUnavailable: true,
+			})
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.loadCancel = cancel
+	r.loadGeneration++
+	generation := r.loadGeneration
+	r.mu.Unlock()
+	native.SetRenderStatus("Reprojecting project to " + authorityCode)
+
+	go func() {
+		var next *demoRuntime
+		var err error
+		switch {
+		case readOnly && len(sources) > 0:
+			next, err = loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, authorityCode, baseLayers, nil)
+		case len(editableLayers) > 0:
+			next, err = buildDataRuntime(ctx, editableLayers, "", "", authorityCode, "", "", readOnly, nil, nil)
+			if err == nil {
+				installInMemoryAttributeReaders(next, editableLayers)
+				if !readOnly {
+					next.attributeFeatureReader = nil
+					if saveDestination != "" {
+						configureRuntimePersistence(next, saveDestination)
+					}
+				}
+			}
+		case len(baseLayers) > 0:
+			next, err = buildDataRuntime(ctx, baseLayers, "", "", authorityCode, "", "", true, nil, nil)
+			if err == nil {
+				next.readOnlyBaseLayers = baseLayers
+				installInMemoryAttributeReaders(next, baseLayers)
+			}
+		default:
+			next = newEmptyProjectRuntime()
+			next.mapCRS = authorityCode
+			next.readOnlyDisplayCRS = authorityCode
+		}
+		r.mu.Lock()
+		current := generation == r.loadGeneration
+		if current && err != nil {
+			r.loadCancel = nil
+		}
+		r.mu.Unlock()
+		if !current {
+			if next != nil && next.closeAttributeSource != nil {
+				next.closeAttributeSource()
+			}
+			return
+		}
+		if err != nil {
+			native.SetRenderStatus("Project CRS change failed: " + err.Error())
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			if next.closeAttributeSource != nil {
+				next.closeAttributeSource()
+			}
+			return
+		}
+		next.service.SetProjectInfo(projectName, target)
+		next.workspaceView = nil // Fit the newly projected extent; old normalized coordinates are not a reliable world view.
+		r.replaceWithLoaded(next, generation)
+		native.SetRenderStatus("Project CRS set to " + authorityCode)
+	}()
+	return nil
+}
+
 func (r *demoRuntime) startRemoveLayer(name string) error {
 	r.mu.Lock()
 	if r.loadCancel != nil {
@@ -2957,7 +3239,7 @@ func (r *demoRuntime) startRemoveLayer(name string) error {
 					Path: layer.SourcePath, LayerName: layer.SourceLayerName,
 					Encoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
 					Name: layer.Name, DisplayName: layer.DisplayName, Visible: &visible,
-					Style: layer.Style, Labels: layer.Labels, AllowUnavailable: true,
+					Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule, AllowUnavailable: true,
 				})
 			}
 			if len(sources) == 0 {
@@ -3407,7 +3689,7 @@ func loadWorkspaceRuntimeWithLargePolicy(ctx context.Context, path string, readO
 			Path: layer.SourcePath, LayerName: layer.SourceLayerName, SourceCRS: layer.SourceCRS,
 			FallbackCRS: fallbackCRS, AllowUnavailable: true,
 			Encoding: layer.SourceEncoding, Name: layer.Name, DisplayName: layer.DisplayName,
-			Visible: &visible, Style: layer.Style, Labels: layer.Labels,
+			Visible: &visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	largeReadOnly := false
@@ -3540,6 +3822,7 @@ func (r *demoRuntime) adoptLoadedSpatialStateLocked(next *demoRuntime) {
 	r.readOnlyBaseLayers = next.readOnlyBaseLayers
 	r.readOnlyBaseFeatures = next.readOnlyBaseFeatures
 	r.readOnlyBaseLabels = next.readOnlyBaseLabels
+	r.readOnlyBindings = next.readOnlyBindings
 }
 
 func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGeneration uint64, preview bool) {

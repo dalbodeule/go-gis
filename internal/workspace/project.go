@@ -28,6 +28,7 @@ type Layer struct {
 	Visible         bool               `json:"visible"`
 	Style           core.LayerStyle    `json:"style"`
 	Labels          core.LabelSettings `json:"labels"`
+	DisplayRule     string             `json:"displayRule,omitempty"`
 }
 
 type Document struct {
@@ -52,7 +53,7 @@ func FromProject(project core.Project) Document {
 		doc.Layers[index] = Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath, SourceLayerName: layer.SourceLayerName,
 			SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS, CRS: layer.CRS.AuthorityCode, Visible: layer.Visible,
-			Style: layer.Style, Labels: layer.Labels,
+			Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return doc
@@ -81,7 +82,7 @@ func (d Document) Project() (core.Project, error) {
 		project.Layers[index] = core.Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath, SourceLayerName: layer.SourceLayerName,
 			SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS, CRS: core.CRS{AuthorityCode: layer.CRS},
-			Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels,
+			Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return project, nil

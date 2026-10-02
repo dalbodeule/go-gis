@@ -29,6 +29,27 @@ func TestMarshalLayerLabelsNormalizesNilSlice(t *testing.T) {
 	}
 }
 
+func TestViewportLayerLabelsCullOffscreenAndSampleDenseViews(t *testing.T) {
+	labels := []render.LayerLabel{
+		{Layer: "parcels", X: 0.5, Y: 0.5},
+		{Layer: "parcels", X: 0.54, Y: 0.53},
+		{Layer: "parcels", X: 0.8, Y: 0.5},
+	}
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 100, ViewportHeight: 100, Zoom: 1}
+	visible, omitted := viewportLayerLabels(labels, view, 10)
+	if len(visible) != 2 || omitted != 0 {
+		t.Fatalf("visible labels=%d omitted=%d; want 2 and 0", len(visible), omitted)
+	}
+	labels = make([]render.LayerLabel, 100)
+	for index := range labels {
+		labels[index] = render.LayerLabel{FeatureID: uint64(index), X: .5, Y: .5}
+	}
+	sampled, omitted := viewportLayerLabels(labels, native.Viewport{}, 10)
+	if len(sampled) != 10 || omitted != 90 || sampled[0].FeatureID != 0 || sampled[9].FeatureID != 90 {
+		t.Fatalf("sampled labels=%d omitted=%d first/last=%d/%d", len(sampled), omitted, sampled[0].FeatureID, sampled[len(sampled)-1].FeatureID)
+	}
+}
+
 func TestViewportBatchBudgetRetriesOnceWithGeneralizedOverview(t *testing.T) {
 	batchError := "viewport render batch exceeds the 2500000-vertex safety limit"
 	for _, test := range []struct {

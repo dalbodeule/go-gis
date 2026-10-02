@@ -297,6 +297,27 @@ func TestReaderEncodingOverridesShapefileCPGPerOpen(t *testing.T) {
 	}
 }
 
+func TestReaderOpenWithLimitsUsesCallerBoundedSnapshotBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.gpkg")
+	layer := core.Layer{Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (127 37)"}, Properties: map[string]any{"name": "one"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (128 38)"}, Properties: map[string]any{"name": "two"}},
+	}}
+	if err := (Writer{}).Write(context.Background(), path, layer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Reader{}).OpenWithLimits(context.Background(), path, "roads", 1, 1<<20); err == nil || !strings.Contains(err.Error(), "feature limit") {
+		t.Fatalf("feature cap error = %v, want bounded feature-limit failure", err)
+	}
+	if _, err := (Reader{}).OpenWithLimits(context.Background(), path, "roads", 10, 1); err == nil || !strings.Contains(err.Error(), "payload limit") {
+		t.Fatalf("payload cap error = %v, want bounded payload-limit failure", err)
+	}
+	loaded, err := (Reader{}).OpenWithLimits(context.Background(), path, "roads", 10, 1<<20)
+	if err != nil || len(loaded.Features) != 2 {
+		t.Fatalf("bounded caller snapshot features=%d error=%v", len(loaded.Features), err)
+	}
+}
+
 func TestReaderEncodingIsOnlyAppliedToShapefileDriver(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.gpkg")
 	if err := (Writer{}).Write(context.Background(), path, core.Layer{Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Features: []core.Feature{{

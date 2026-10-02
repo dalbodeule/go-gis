@@ -131,6 +131,41 @@ func NewLayerSourcesWithFeatures(layers []core.Layer) (map[string]LayerSource, [
 	return newLayerSourcesWithFeatures(layers, nil, 0.25, nil)
 }
 
+// LayerExtent calculates the padded source extent without retaining parsed
+// coordinate arrays. It is useful when a render-only filter omits features
+// but the map must keep the original layer framing.
+func LayerExtent(layers []core.Layer) ([4]float64, error) {
+	minX, minY := math.Inf(1), math.Inf(1)
+	maxX, maxY := math.Inf(-1), math.Inf(-1)
+	crsCode := ""
+	for _, layer := range layers {
+		if crsCode == "" {
+			crsCode = layer.CRS.AuthorityCode
+		}
+		for _, feature := range layer.Features {
+			geometry, _, _, _, err := parseFeaturePointsInto(feature.Geometry, nil, nil)
+			if err != nil {
+				return [4]float64{}, fmt.Errorf("layer %q feature %d: %w", layer.Name, feature.ID, err)
+			}
+			if geometry.parts == nil {
+				if err := updateExtent(geometry.points, &minX, &minY, &maxX, &maxY); err != nil {
+					return [4]float64{}, err
+				}
+			} else {
+				for _, part := range geometry.parts {
+					if err := updateExtent(part, &minX, &minY, &maxX, &maxY); err != nil {
+						return [4]float64{}, err
+					}
+				}
+			}
+		}
+	}
+	if math.IsInf(minX, 1) || math.IsInf(minY, 1) || math.IsInf(maxX, -1) || math.IsInf(maxY, -1) {
+		return [4]float64{0, 0, 1, 1}, nil
+	}
+	return paddedDegenerateExtent([4]float64{minX, minY, maxX, maxY}, crsCode), nil
+}
+
 // NewLayerSourcesWithExtent normalizes a partial layer snapshot against the
 // complete dataset extent. Preview and full sources can therefore use the
 // same world coordinates even when the preview contains only a prefix.

@@ -185,6 +185,7 @@ type demoRuntime struct {
 	previewLoading              bool
 	saveDestination             string
 	readOnlySources             []vectorSourceSpec
+	readOnlyBindings            map[string]readOnlyLayerBinding
 	readOnlyBaseLayers          []core.Layer
 	readOnlyBaseFeatures        []render.HitFeature
 	readOnlyBaseLabels          []render.LayerLabel
@@ -229,6 +230,7 @@ type vectorSourceSpec struct {
 	Visible          *bool
 	Style            core.LayerStyle
 	Labels           core.LabelSettings
+	DisplayRule      string
 	AllowUnavailable bool
 	InsertAt         int
 	InsertAtSet      bool
@@ -325,6 +327,7 @@ type layerTreePayloadRow struct {
 	SourceError     string             `json:"sourceError,omitempty"`
 	Style           core.LayerStyle    `json:"style"`
 	Labels          core.LabelSettings `json:"labels"`
+	DisplayRule     string             `json:"displayRule,omitempty"`
 	GeometryType    string             `json:"geometryType,omitempty"`
 	Bounds          *[4]float64        `json:"bounds,omitempty"`
 }
@@ -352,7 +355,7 @@ func (r *demoRuntime) publishLayerTree() {
 		rows[index] = layerTreePayloadRow{
 			Name: name, DisplayName: displayName, SourcePath: layer.SourcePath,
 			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
-			CRS: layer.CRS.AuthorityCode, Visible: visible, SourceError: r.unavailableSources[name].Reason, Style: layer.Style, Labels: layer.Labels,
+			CRS: layer.CRS.AuthorityCode, Visible: visible, SourceError: r.unavailableSources[name].Reason, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 			GeometryType: r.layerGeometryTypes[name],
 		}
 		if bounds, exists := r.layerBounds[name]; exists {
@@ -372,6 +375,7 @@ func (r *demoRuntime) publishLayerLabels() {
 	r.mu.Lock()
 	labels := append([]render.LayerLabel(nil), r.mapLabels...)
 	r.mu.Unlock()
+	labels, omitted := viewportLayerLabels(labels, native.CurrentViewport(), maxLayerLabelCount)
 	payload, err := marshalLayerLabels(labels)
 	if err != nil {
 		native.SetLayerLabelPayload("[]")
@@ -379,6 +383,39 @@ func (r *demoRuntime) publishLayerLabels() {
 		return
 	}
 	native.SetLayerLabelPayload(payload)
+	if omitted > 0 {
+		native.SetRenderStatus(fmt.Sprintf("Showing %d labels in the current view; zoom in for more", len(labels)))
+	}
+}
+
+// viewportLayerLabels bounds QML object creation to labels near the current
+// viewport and samples dense views instead of dropping the entire label layer.
+func viewportLayerLabels(labels []render.LayerLabel, viewport native.Viewport, limit int) ([]render.LayerLabel, int) {
+	if limit <= 0 {
+		return nil, len(labels)
+	}
+	if viewport.Width > 0 && viewport.Height > 0 && viewport.Zoom > 0 && viewport.ViewportWidth > 0 && viewport.ViewportHeight > 0 {
+		centerX := 0.5 - viewport.PanX/(viewport.Width*viewport.Zoom)
+		centerY := 0.5 + viewport.PanY/(viewport.Height*viewport.Zoom)
+		halfWidth := 0.55 * viewport.ViewportWidth / (viewport.Width * viewport.Zoom)
+		halfHeight := 0.55 * viewport.ViewportHeight / (viewport.Height * viewport.Zoom)
+		visible := labels[:0]
+		for _, label := range labels {
+			if label.X >= centerX-halfWidth && label.X <= centerX+halfWidth && label.Y >= centerY-halfHeight && label.Y <= centerY+halfHeight {
+				visible = append(visible, label)
+			}
+		}
+		labels = visible
+	}
+	if len(labels) <= limit {
+		return labels, 0
+	}
+	// Evenly sample in source order so large layers retain spatial coverage.
+	selected := make([]render.LayerLabel, 0, limit)
+	for index := 0; index < limit; index++ {
+		selected = append(selected, labels[index*len(labels)/limit])
+	}
+	return selected, len(labels) - limit
 }
 
 const maxLayerLabelPayloadBytes = 8 << 20
@@ -1583,7 +1620,7 @@ func startViewportSync(runtime *demoRuntime) {
 			saveGeneration := native.SaveGeneration()
 			if saveGeneration != lastSaveGeneration {
 				lastSaveGeneration = saveGeneration
-				runtime.saveDataset(native.CurrentSavePath())
+				runtime.saveDataset(native.CurrentSavePath(), native.CurrentSaveProfile())
 			}
 			loadGeneration := native.LoadGeneration()
 			if loadGeneration != lastLoadGeneration {
@@ -1699,14 +1736,17 @@ func startViewportSync(runtime *demoRuntime) {
 
 type layerSettingsRequest struct {
 	Operation       string             `json:"operation,omitempty"`
+	ProjectCRS      string             `json:"projectCrs,omitempty"`
 	Name            string             `json:"name"`
 	DisplayName     string             `json:"displayName"`
 	SourcePath      string             `json:"sourcePath"`
 	SourceLayerName string             `json:"sourceLayerName"`
 	SourceEncoding  string             `json:"sourceEncoding"`
+	SourceCRS       string             `json:"sourceCrs"`
 	Visible         bool               `json:"visible"`
 	Style           core.LayerStyle    `json:"style"`
 	Labels          core.LabelSettings `json:"labels"`
+	DisplayRule     string             `json:"displayRule,omitempty"`
 }
 
 func applyLayerSettings(runtime *demoRuntime, payload string) error {
@@ -1714,11 +1754,17 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	if err := json.Unmarshal([]byte(payload), &request); err != nil {
 		return fmt.Errorf("invalid settings payload: %w", err)
 	}
+	if request.Operation == "remove" {
+		if request.Name == "" {
+			return fmt.Errorf("layer identity is missing")
+		}
+		return runtime.startRemoveLayer(request.Name)
+	}
+	if request.Operation == "project-crs" {
+		return runtime.startProjectCRSChange(strings.TrimSpace(request.ProjectCRS))
+	}
 	if request.Name == "" {
 		return fmt.Errorf("layer identity is missing")
-	}
-	if request.Operation == "remove" {
-		return runtime.startRemoveLayer(request.Name)
 	}
 	if request.Operation != "" {
 		return fmt.Errorf("unknown layer operation %q", request.Operation)
@@ -1739,6 +1785,13 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	if err := scripting.ValidateLabelComposerScripts(request.Labels.LuaScript, request.Labels.Rule); err != nil {
 		return fmt.Errorf("invalid Lua label settings: %w", err)
 	}
+	if strings.TrimSpace(request.DisplayRule) != "" {
+		program, err := scripting.CompileLabelProgram(request.DisplayRule)
+		if err != nil {
+			return fmt.Errorf("invalid Lua feature display rule: %w", err)
+		}
+		program.Close()
+	}
 	runtime.mu.Lock()
 	service := runtime.service
 	readOnly := runtime.readOnly
@@ -1757,7 +1810,7 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 		return fmt.Errorf("layer %q not found", request.Name)
 	}
 	if request.SourcePath != current.SourcePath || request.SourceLayerName != current.SourceLayerName ||
-		request.SourceEncoding != current.SourceEncoding {
+		request.SourceEncoding != current.SourceEncoding || request.SourceCRS != current.SourceCRS {
 		return runtime.reloadLayerWithSettings(request, readOnly, displayCRS, saveDestination)
 	}
 	if request.DisplayName != "" && request.DisplayName != current.DisplayName {
@@ -1771,6 +1824,7 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	updated.Visible = request.Visible
 	updated.Style = request.Style
 	updated.Labels = request.Labels
+	updated.DisplayRule = request.DisplayRule
 	if err := service.UpdateLayerSettings(request.Name, updated); err != nil {
 		return err
 	}
@@ -1783,8 +1837,11 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 		runtime.visibility.Set(request.Name, request.Visible)
 	}
 	styleChanged := current.Style != updated.Style
+	labelsChanged := current.Labels != updated.Labels
+	displayRuleChanged := current.DisplayRule != updated.DisplayRule
 	scheduler := runtime.scheduler
 	styleMu := runtime.layerStyleMu
+	_, hasReadOnlyWindow := runtime.readOnlyBindings[request.Name]
 	runtime.mu.Unlock()
 	if styleMu == nil {
 		styleMu = &sync.RWMutex{}
@@ -1798,8 +1855,35 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	}
 	runtime.layerStyles[request.Name] = updated.Style
 	styleMu.Unlock()
-	if styleChanged && scheduler != nil {
+	presentationChanged := labelsChanged || displayRuleChanged
+	if presentationChanged && hasReadOnlyWindow {
+		runtime.mu.Lock()
+		binding, exists := runtime.readOnlyBindings[request.Name]
+		if exists {
+			binding.layer.Labels = updated.Labels
+			binding.layer.DisplayRule = updated.DisplayRule
+			runtime.readOnlyBindings[request.Name] = binding
+			for key := range runtime.windowVisibleKeys {
+				if key.Layer == request.Name {
+					runtime.removeWindowChunkLocked(key)
+				}
+			}
+			runtime.rebuildWindowFeaturesLocked()
+		}
+		runtime.mu.Unlock()
+	}
+	if (styleChanged || presentationChanged) && scheduler != nil {
 		scheduler.InvalidateLayer(request.Name)
+	}
+	if presentationChanged && !hasReadOnlyWindow {
+		if err := runtime.rebuildEditedLayer(request.Name); err != nil {
+			_ = service.UpdateLayerSettings(request.Name, current)
+			styleMu.Lock()
+			runtime.layerStyles[request.Name] = current.Style
+			styleMu.Unlock()
+			return fmt.Errorf("rebuild layer presentation: %w", err)
+		}
+	} else if styleChanged || presentationChanged {
 		runtime.refreshCurrentViewport()
 	}
 	runtime.publishLayerTree()

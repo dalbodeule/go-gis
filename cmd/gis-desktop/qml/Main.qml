@@ -34,6 +34,11 @@ ApplicationWindow {
     property var luaTranslations: ({
         en: ({
             "Lua label editor": "Lua label editor",
+            "Export active layer to DXF": "Export active layer to DXF",
+            "Export active layer as DXF (UTF-8)": "Export active layer as DXF (UTF-8)",
+            "Feature display filter — return true to draw this feature": "Feature display filter — return true to draw this feature",
+            "Insert field into display filter…": "Insert field into display filter…",
+            "Feature display filter hides features from the map only; source data stays unchanged.": "Feature display filter hides features from the map only; source data stays unchanged.",
             "Open Lua editor and examples…": "Open Lua editor and examples…",
             "Lua field access hint": "feature.FIELD reads an attribute; use feature[\"field name\"] when a field contains spaces. Types: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). Return boolean from rules and string/number/nil from label text.",
@@ -44,6 +49,11 @@ ApplicationWindow {
         }),
         ko: ({
             "Lua label editor": "Lua 레이블 편집기",
+            "Export active layer to DXF": "활성 레이어를 DXF로 내보내기",
+            "Export active layer as DXF (UTF-8)": "활성 레이어 DXF 내보내기 (UTF-8)",
+            "Feature display filter — return true to draw this feature": "피처 표시 필터 — 그릴 피처는 true 반환",
+            "Insert field into display filter…": "표시 필터에 필드 삽입…",
+            "Feature display filter hides features from the map only; source data stays unchanged.": "피처 표시 필터는 지도에서만 숨기며 원본 데이터는 바뀌지 않습니다.",
             "Open Lua editor and examples…": "Lua 편집기 및 예제 열기…",
             "Lua field access hint": "feature.FIELD로 속성을 읽습니다. 필드명에 공백이 있으면 feature[\"필드 이름\"]을 사용하세요. 필드 형식: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). 규칙은 boolean, 레이블 식은 string/number/nil을 반환합니다.",
@@ -54,6 +64,11 @@ ApplicationWindow {
         }),
         jp: ({
             "Lua label editor": "Luaラベルエディター",
+            "Export active layer to DXF": "アクティブレイヤーをDXFにエクスポート",
+            "Export active layer as DXF (UTF-8)": "アクティブレイヤーをDXFにエクスポート (UTF-8)",
+            "Feature display filter — return true to draw this feature": "地物表示フィルター — 描画する地物はtrueを返す",
+            "Insert field into display filter…": "表示フィルターにフィールドを挿入…",
+            "Feature display filter hides features from the map only; source data stays unchanged.": "地物表示フィルターは地図上で非表示にするだけで、元データは変更しません。",
             "Open Lua editor and examples…": "Luaエディターと例を開く…",
             "Lua field access hint": "feature.FIELDで属性を読み取ります。空白を含むフィールド名にはfeature[\"フィールド名\"]を使用します。型: %1",
             "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style)。ルールはboolean、ラベル式はstring/number/nilを返します。",
@@ -95,6 +110,22 @@ ApplicationWindow {
 
     function localizedStatus(raw) {
         var status = String(raw || "");
+        if (status.indexOf("Reprojecting project to ") === 0) {
+            var targetCRS = status.substring("Reprojecting project to ".length);
+            return language === "ko" ? "프로젝트 좌표계로 변환 중: " + targetCRS : language === "jp" ? "プロジェクト座標系に変換中: " + targetCRS : status;
+        }
+        if (status.indexOf("Project CRS set to ") === 0) {
+            var appliedCRS = status.substring("Project CRS set to ".length);
+            return language === "ko" ? "프로젝트 좌표계 적용 완료: " + appliedCRS : language === "jp" ? "プロジェクト座標系を適用しました: " + appliedCRS : status;
+        }
+        if (status.indexOf("Project CRS change failed: ") === 0) {
+            var crsError = status.substring("Project CRS change failed: ".length);
+            return language === "ko" ? "프로젝트 좌표계 변경 실패: " + crsError : language === "jp" ? "プロジェクト座標系の変更に失敗しました: " + crsError : status;
+        }
+        if (status.indexOf("Showing ") === 0 && status.indexOf(" labels in the current view; zoom in for more") > 0) {
+            var visibleLabelCount = status.substring("Showing ".length).split(" labels")[0];
+            return language === "ko" ? "현재 화면 레이블 " + visibleLabelCount + "개 표시 중 · 더 보려면 확대하세요" : language === "jp" ? "現在の画面にラベル " + visibleLabelCount + " 件を表示中 · 拡大すると増えます" : status;
+        }
         if (status === "Removing layer")
             return language === "ko" ? "레이어 제거 중" : language === "jp" ? "レイヤーを除去中" : status;
         if (status.indexOf("Layer removed: ") === 0)
@@ -138,14 +169,14 @@ ApplicationWindow {
         var status = String(raw || "").toLowerCase();
         if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
         if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
-        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0) return "#175cd3";
-        if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0) return "#2e7d32";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
+        if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0 || status.indexOf("project crs set") >= 0) return "#2e7d32";
         return "#65717d";
     }
 
     function statusIsBusy(raw) {
         var status = String(raw || "").toLowerCase();
-        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0;
+        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
     }
 
     function memorySummary(processBytes, heapBytes, available, kind) {
@@ -371,6 +402,14 @@ ApplicationWindow {
                 onClicked: attributeDialog.open()
             }
             Button {
+                objectName: "projectCRSButton"
+                text: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project CRS"
+                onClicked: {
+                    projectCRSField.text = mapViewport.dataCRS || "";
+                    projectCRSDialog.open();
+                }
+            }
+            Button {
                 objectName: "toggleVertexEditButton"
                 text: rootWindow.vertexEditMode ? "Finish vertex edit" : "Edit vertices"
                 enabled: layerModel.count > 0 && vertexHandleModel.count > 0
@@ -379,6 +418,12 @@ ApplicationWindow {
             Button {
                 text: rootWindow.tr("Save GeoPackage")
                 onClicked: saveDialog.open()
+            }
+            Button {
+                objectName: "exportDxfButton"
+                text: rootWindow.tr("Export active layer to DXF")
+                enabled: layerModel.count > 0
+                onClicked: dxfEncodingDialog.open()
             }
             Button {
                 text: rootWindow.tr("Save workspace")
@@ -447,6 +492,34 @@ ApplicationWindow {
         }
         onAccepted: {
             mapCanvas.layerSettingsPayload = JSON.stringify({operation: "remove", name: targetLayerName});
+            mapCanvas.layerSettingsGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: projectCRSDialog
+        objectName: "projectCRSDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project coordinate reference system"
+        standardButtons: Dialog.Apply | Dialog.Cancel
+        width: Math.min(480, rootWindow.width - 48)
+        anchors.centerIn: Overlay.overlay
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "EPSG 코드 등을 입력하세요. 적용하면 프로젝트의 모든 레이어를 이 좌표계로 변환합니다. 원본 파일은 변경하지 않습니다." : rootWindow.language === "jp" ? "EPSGコードなどを入力してください。適用すると、元ファイルを変更せず全レイヤーをこの座標系に変換します。" : "Enter an authority code such as EPSG:5186. Applying reprojects all project layers; source files are not modified."
+                wrapMode: Text.WordWrap
+            }
+            TextField {
+                id: projectCRSField
+                objectName: "projectCRSField"
+                Layout.fillWidth: true
+                placeholderText: "EPSG:5186 (example)"
+            }
+        }
+        onAccepted: {
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "project-crs", projectCrs: projectCRSField.text});
             mapCanvas.layerSettingsGeneration += 1;
         }
     }
@@ -741,8 +814,19 @@ ApplicationWindow {
                     var ny = 0.5 - (cursorY - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * zoom);
                     var x = bounds[0] + nx * (bounds[2] - bounds[0]);
                     var y = bounds[1] + ny * (bounds[3] - bounds[1]);
-                    var digits = dataCRS.toUpperCase() === "EPSG:4326" ? 6 : 2;
-                    return "X " + Number(x).toFixed(digits) + "  Y " + Number(y).toFixed(digits);
+                    function formatCoordinate(value) {
+                        var fixed = Number(value).toFixed(4);
+                        var parts = fixed.split(".");
+                        var integer = parts[0];
+                        var sign = "";
+                        if (integer.charAt(0) === "-" || integer.charAt(0) === "+") {
+                            sign = integer.charAt(0);
+                            integer = integer.slice(1);
+                        }
+                        integer = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+                        return sign + integer + "." + parts[1];
+                    }
+                    return "X " + formatCoordinate(x) + "  Y " + formatCoordinate(y);
                 }
 
                 function luaFieldAccess(name) {
@@ -904,6 +988,7 @@ ApplicationWindow {
                         }));
                     }
                     property string savePath: ""
+                    property string saveProfile: ""
                     property int saveGeneration: 0
                     scale: mapViewport.mapZoom
                     transformOrigin: Item.Center
@@ -919,7 +1004,7 @@ ApplicationWindow {
                         rotation: mapViewport.screenRotation(model.rotation)
                         text: model.text
                         textFormat: Text.PlainText
-                        font.pixelSize: Math.max(1, model.heightMm * mapCanvas.logicalPixelsPerMm)
+                        font.pixelSize: Math.max(1, Math.round(model.heightMm * mapCanvas.logicalPixelsPerMm))
                         color: "#17212b"
                         style: Text.Outline
                         styleColor: "#ffffff"
@@ -1142,6 +1227,7 @@ ApplicationWindow {
                                     sourcePath: layers[layerIndex].sourcePath || "",
                                     sourceLayerName: layers[layerIndex].sourceLayerName || "",
                                     sourceEncoding: layers[layerIndex].sourceEncoding || "",
+                                    sourceCrs: layers[layerIndex].sourceCrs || "",
                                     sourceError: layers[layerIndex].sourceError || "",
                                     crs: layers[layerIndex].crs || "",
                                     geometryType: layers[layerIndex].geometryType || "",
@@ -1620,7 +1706,9 @@ ApplicationWindow {
         property string originalSourcePath: ""
         property string originalSourceLayerName: ""
         property string originalSourceEncoding: ""
+        property string originalSourceCRS: ""
         property string labelLuaSource: ""
+        property string displayRuleSource: ""
         property string activeCategory: "general"
         property string targetGeometryType: ""
         property real previousFillOpacity: 0.35
@@ -1665,6 +1753,8 @@ ApplicationWindow {
             sourceEncodingField.currentIndex = -1;
             sourceEncodingField.editText = layer.sourceEncoding || "";
             originalSourceEncoding = sourceEncodingField.editText.trim();
+            sourceCRSField.text = layer.sourceCrs || "";
+            originalSourceCRS = sourceCRSField.text.trim();
             visibleField.checked = layer.layerVisible;
             var style = layer.style || ({});
             pointColorField.text = style.pointColor || "#d1495b";
@@ -1684,6 +1774,7 @@ ApplicationWindow {
             labelMaxScaleField.text = String(labels.maxScale || "");
             labelRuleField.text = labels.rule || "";
             labelLuaSource = labels.luaScript || "";
+            displayRuleSource = layer.displayRule || "";
         }
 
         function submitLayer() {
@@ -1702,7 +1793,9 @@ ApplicationWindow {
                 sourcePath: sourcePathField.text,
                 sourceLayerName: sourceLayerField.text,
                 sourceEncoding: sourceEncodingField.editText.trim(),
+                sourceCrs: sourceCRSField.text.trim(),
                 visible: visibleField.checked,
+                displayRule: displayRuleSource,
                 style: {
                     pointColor: pointColorField.text,
                     lineColor: lineColorField.text,
@@ -1796,6 +1889,26 @@ ApplicationWindow {
                         onClicked: relinkFileDialog.open()
                     }
                 }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: layerSettingsDialog.activeCategory === "source"
+                    Label {
+                        text: rootWindow.language === "ko" ? "원본 좌표계 (선택적 재정의)" : rootWindow.language === "jp" ? "ソース座標系 (任意の上書き)" : "Source CRS (optional override)"
+                        color: "#65717d"
+                    }
+                    TextField {
+                        id: sourceCRSField
+                        objectName: "sourceCRSField"
+                        Layout.fillWidth: true
+                        placeholderText: "Auto-detect, or EPSG:5186"
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        text: rootWindow.language === "ko" ? "좌표계가 없거나 잘못 감지된 경우에만 지정하세요. 잘못된 좌표계를 지정하면 위치가 크게 어긋날 수 있습니다." : rootWindow.language === "jp" ? "検出されない、または誤検出された場合のみ指定してください。誤った座標系は位置ずれの原因になります。" : "Set this only when detection is missing or incorrect. A wrong CRS can place the layer far from its true location."
+                        wrapMode: Text.WordWrap
+                        color: "#65717d"
+                    }
+                }
                 Label {
                     id: sourceStatusLabel
                     Layout.fillWidth: true
@@ -1839,8 +1952,8 @@ ApplicationWindow {
                 Label {
                     objectName: "sourceChangeWarning"
                     Layout.fillWidth: true
-                    visible: layerSettingsDialog.activeCategory === "source" && (sourcePathField.text.trim() !== layerSettingsDialog.originalSourcePath || sourceLayerField.text.trim() !== layerSettingsDialog.originalSourceLayerName || sourceEncodingField.editText.trim() !== layerSettingsDialog.originalSourceEncoding)
-                    text: "Changing the source path, internal layer, or encoding reloads this layer. Save unsaved feature edits in it first."
+                    visible: layerSettingsDialog.activeCategory === "source" && (sourcePathField.text.trim() !== layerSettingsDialog.originalSourcePath || sourceLayerField.text.trim() !== layerSettingsDialog.originalSourceLayerName || sourceEncodingField.editText.trim() !== layerSettingsDialog.originalSourceEncoding || sourceCRSField.text.trim() !== layerSettingsDialog.originalSourceCRS)
+                    text: rootWindow.language === "ko" ? "원본 경로, 레이어, 좌표계 또는 인코딩을 바꾸면 레이어를 다시 불러옵니다. 먼저 저장하지 않은 피처 편집 내용을 저장하세요." : rootWindow.language === "jp" ? "ソース、レイヤー、座標系、文字コードを変更すると再読み込みします。未保存の編集を先に保存してください。" : "Changing the source path, layer, CRS, or encoding reloads this layer. Save unsaved feature edits in it first."
                     color: "#9a6700"
                     wrapMode: Text.Wrap
                     textFormat: Text.PlainText
@@ -1975,6 +2088,36 @@ ApplicationWindow {
                     text: rootWindow.tr("Show labels")
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
+                Label {
+                    objectName: "labelVisibilityHint"
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "labels" && labelsEnabledField.checked
+                    text: {
+                        var count = 0;
+                        var availableCount = 0;
+                        var denominator = mapViewport.currentScaleDenominator();
+                        for (var i = 0; i < mapLabelModel.count; ++i) {
+                            var label = mapLabelModel.get(i);
+                            if (label.layer === layerSettingsDialog.targetLayerName) {
+                                ++count;
+                                if ((label.minScale <= 0 || denominator >= label.minScale) && (label.maxScale <= 0 || denominator <= label.maxScale))
+                                    ++availableCount;
+                            }
+                        }
+                        for (var layerIndex = 0; layerIndex < layerModel.count; ++layerIndex) {
+                            var layerRow = layerModel.get(layerIndex);
+                            if (layerRow.name === layerSettingsDialog.targetLayerName && !layerRow.layerVisible)
+                                return rootWindow.language === "ko" ? "레이어가 숨겨져 있어 레이블도 표시되지 않습니다. 레이어 표시를 켜세요." : rootWindow.language === "jp" ? "レイヤーが非表示のためラベルも表示されません。レイヤーを表示してください。" : "The layer is hidden, so its labels are hidden too. Turn on layer visibility.";
+                        }
+                        if (availableCount > 0)
+                            return rootWindow.language === "ko" ? "현재 화면과 축척에서 표시 가능한 레이블 " + availableCount + "개입니다." : rootWindow.language === "jp" ? "現在の表示範囲と縮尺で表示可能なラベルは " + availableCount + " 件です。" : availableCount + " labels are available at the current view and scale.";
+                        if (count > 0)
+                            return rootWindow.language === "ko" ? "현재 축척이 레이블의 최소/최대 축척 범위 밖입니다. 축척 값을 확인하세요." : rootWindow.language === "jp" ? "現在の縮尺はラベルの最小/最大範囲外です。縮尺設定を確認してください。" : "The current scale is outside the labels' minimum/maximum scale range. Check those limits.";
+                        return rootWindow.language === "ko" ? "현재 화면에 표시할 레이블이 없습니다. 레이블 필드/템플릿과 축척 범위를 확인하거나 피처가 있는 곳으로 확대하세요." : rootWindow.language === "jp" ? "現在表示できるラベルがありません。フィールド、縮尺範囲、表示位置を確認してください。" : "No labels are available in this view. Check the label field/template and scale range, or zoom to the features.";
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     visible: layerSettingsDialog.activeCategory === "labels"
@@ -2101,6 +2244,13 @@ ApplicationWindow {
                     onClicked: luaEditorDialog.open()
                     visible: layerSettingsDialog.activeCategory === "labels"
                 }
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.tr("Feature display filter hides features from the map only; source data stays unchanged.")
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "labels"
+                }
             }
         }
     }
@@ -2170,13 +2320,19 @@ ApplicationWindow {
         onOpened: {
             labelRuleEditor.text = labelRuleField.text;
             labelLuaField.text = layerSettingsDialog.labelLuaSource;
+            featureDisplayRuleEditor.text = layerSettingsDialog.displayRuleSource;
         }
         onAccepted: {
             labelRuleField.text = labelRuleEditor.text;
             layerSettingsDialog.labelLuaSource = labelLuaField.text;
+            layerSettingsDialog.displayRuleSource = featureDisplayRuleEditor.text;
         }
-        contentItem: ColumnLayout {
-            spacing: 8
+        contentItem: ScrollView {
+            clip: true
+            contentWidth: availableWidth
+            ColumnLayout {
+                width: parent.width
+                spacing: 8
             Label {
                 Layout.fillWidth: true
                 text: rootWindow.tr("Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.")
@@ -2194,6 +2350,30 @@ ApplicationWindow {
                 text: rootWindow.tr("Lua API help")
                 wrapMode: Text.WordWrap
                 color: "#45515c"
+            }
+            Label {
+                text: rootWindow.tr("Feature display filter — return true to draw this feature")
+                font.bold: true
+            }
+            LuaCodeEditor {
+                id: featureDisplayRuleEditor
+                objectName: "featureDisplayRuleEditor"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 105
+                placeholderText: "return feature.STATUS ~= \"retired\""
+            }
+            ComboBox {
+                objectName: "insertLuaDisplayFilterFieldCombo"
+                Layout.fillWidth: true
+                model: mapViewport.attributeFieldHints
+                textRole: "name"
+                enabled: mapViewport.attributeFieldHints.length > 0
+                displayText: rootWindow.tr("Insert field into display filter…")
+                onActivated: function(index) {
+                    var fieldName = mapViewport.attributeFieldHints[index].name;
+                    featureDisplayRuleEditor.insert(featureDisplayRuleEditor.cursorPosition, mapViewport.luaFieldAccess(fieldName));
+                    currentIndex = -1;
+                }
             }
             Label {
                 text: rootWindow.tr("Display rule — return true to show this feature's label")
@@ -2254,6 +2434,11 @@ ApplicationWindow {
                     text: rootWindow.tr("Insert rule example")
                     onClicked: labelRuleEditor.text = "return feature.CLASS == \"primary\""
                 }
+                Button {
+                    text: rootWindow.tr("Insert filter example")
+                    onClicked: featureDisplayRuleEditor.text = "return feature.STATUS ~= \"retired\""
+                }
+            }
             }
         }
     }
@@ -2325,6 +2510,68 @@ ApplicationWindow {
     }
 
     Platform.FileDialog {
+        id: dxfExportDialog
+        objectName: "dxfExportDialog"
+        title: rootWindow.language === "ko" ? "DXF 인코딩 선택" : rootWindow.language === "jp" ? "DXFの文字コード" : "DXF text encoding"
+        fileMode: Platform.FileDialog.SaveFile
+        nameFilters: ["DXF (*.dxf)"]
+        property string selectedProfile: "ares-utf8"
+        onAccepted: {
+            var path = mapViewport.localPathFromUrl(file);
+            if (!path.toLowerCase().endsWith(".dxf"))
+                path += ".dxf";
+            mapCanvas.savePath = path;
+            mapCanvas.saveProfile = selectedProfile;
+            mapCanvas.saveGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: dxfEncodingDialog
+        objectName: "dxfEncodingDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "DXF 인코딩 선택" : rootWindow.language === "jp" ? "DXFの文字コード" : "DXF text encoding"
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        width: Math.min(420, rootWindow.width - 48)
+        anchors.centerIn: Overlay.overlay
+        onOpened: {
+            dxfEncodingChoice.currentIndex = 0;
+        }
+        onAccepted: {
+            dxfExportDialog.selectedProfile = dxfEncodingChoice.currentValue;
+            dxfExportDialog.open();
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "문자 손실 없이 열 수 있도록 대상 CAD에 맞는 인코딩을 선택하세요." : rootWindow.language === "jp" ? "文字化けを避けるため、対象CADに合った文字コードを選択してください。" : "Choose the encoding supported by the target CAD application to avoid text corruption."
+                wrapMode: Text.WordWrap
+            }
+            ComboBox {
+                id: dxfEncodingChoice
+                objectName: "dxfEncodingChoice"
+                Layout.fillWidth: true
+                textRole: "label"
+                valueRole: "profile"
+                model: rootWindow.language === "ko" ? [
+                    {label: "CP949 (한국어 CAD)", profile: "ares-cp949"},
+                    {label: "UTF-8", profile: "ares-utf8"},
+                    {label: "Shift-JIS (일본어 CAD)", profile: "ares-shift-jis"}
+                ] : rootWindow.language === "jp" ? [
+                    {label: "Shift-JIS (日本語CAD)", profile: "ares-shift-jis"},
+                    {label: "UTF-8", profile: "ares-utf8"},
+                    {label: "CP949 (韓国語CAD)", profile: "ares-cp949"}
+                ] : [
+                    {label: "UTF-8", profile: "ares-utf8"},
+                    {label: "CP949 (Korean CAD)", profile: "ares-cp949"},
+                    {label: "Shift-JIS (Japanese CAD)", profile: "ares-shift-jis"}
+                ]
+            }
+        }
+    }
+
+    Platform.FileDialog {
         id: workspaceDialog
         title: rootWindow.tr("Save GoGIS workspace")
         fileMode: Platform.FileDialog.SaveFile
@@ -2351,6 +2598,9 @@ ApplicationWindow {
         title: rootWindow.tr("Select original layer source")
         fileMode: Platform.FileDialog.OpenFile
         nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json *.dxf)", "All files (*)"]
-        onAccepted: sourcePathField.text = mapViewport.localPathFromUrl(file)
+        onAccepted: {
+            sourcePathField.text = mapViewport.localPathFromUrl(file);
+            sourceCRSField.text = "";
+        }
     }
 }

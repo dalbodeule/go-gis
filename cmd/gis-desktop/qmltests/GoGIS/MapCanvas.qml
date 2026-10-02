@@ -41,5 +41,6 @@ Item {
     property int loadGeneration: 0
     property int loadCapturedGeneration: 0
     property string savePath: ""
+    property string saveProfile: ""
     property int saveGeneration: 0
 }

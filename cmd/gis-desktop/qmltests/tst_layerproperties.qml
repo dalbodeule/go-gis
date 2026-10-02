@@ -105,6 +105,13 @@ TestCase {
         compare(status.color.toString(), "#175cd3");
         canvas.renderStatus = "Save failed: read-only dataset is not editable";
         tryVerify(function() { return status.color.toString() === "#b42318"; });
+        canvas.renderStatus = "Reprojecting project to EPSG:3857";
+        tryCompare(status, "text", "프로젝트 좌표계로 변환 중: EPSG:3857");
+        compare(status.color.toString(), "#175cd3");
+        verify(appWindow.statusIsBusy(canvas.renderStatus));
+        canvas.renderStatus = "Project CRS set to EPSG:3857";
+        tryCompare(status, "text", "프로젝트 좌표계 적용 완료: EPSG:3857");
+        compare(status.color.toString(), "#2e7d32");
         verify(appWindow.statusIsBusy("Saving output.gpkg"));
         verify(appWindow.statusIsBusy("Loading 12/25"));
         verify(!appWindow.statusIsBusy("Saved output.gpkg"));
@@ -311,8 +318,10 @@ TestCase {
     function test_luaEditorHighlightsSyntaxAndSuggestsTypedFields() {
         var dialog = findChild(appWindow, "luaEditorDialog");
         var editor = findChild(dialog, "labelLuaField");
+        var displayEditor = findChild(dialog, "featureDisplayRuleEditor");
         var viewport = findChild(appWindow, "mapViewport");
         verify(editor !== null);
+        verify(displayEditor !== null);
         dialog.open();
         tryCompare(dialog, "visible", true);
         var keywordScript = 'if feature.NAME then return "road" end';
@@ -320,6 +329,8 @@ TestCase {
         tryVerify(function() { return editor.highlightedHTML.indexOf("road") >= 0 && editor.highlightedHTML.indexOf("#7b2cbf") >= 0 && editor.highlightedHTML.indexOf("#16803c") >= 0; });
         verify(editor.highlightedHTML.indexOf("#7b2cbf") >= 0, "Lua keywords should be highlighted");
         verify(editor.highlightedHTML.indexOf("#16803c") >= 0, "Lua strings should be highlighted");
+        displayEditor.text = 'return feature.ACTIVE == true';
+        tryVerify(function() { return displayEditor.highlightedHTML.indexOf("#7b2cbf") >= 0; });
         var escapedScript = 'return feature["road<&\"name"] -- <safe>';
         editor.text = escapedScript;
         tryVerify(function() { return editor.highlightedHTML.indexOf("road&lt;&amp;") >= 0 && editor.highlightedHTML.indexOf("<safe>") < 0; });
@@ -430,6 +441,58 @@ TestCase {
         tryCompare(handles, "count", 0);
     }
 
+    function test_projectCRSChangeAndDXFEncodingDialogs() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var projectDialog = findChild(appWindow, "projectCRSDialog");
+        var projectCRS = findChild(appWindow, "projectCRSField");
+        var encodingDialog = findChild(appWindow, "dxfEncodingDialog");
+        var choice = findChild(appWindow, "dxfEncodingChoice");
+        verify(canvas && projectDialog && projectCRS && encodingDialog && choice);
+
+        projectCRS.text = "EPSG:5179";
+        projectDialog.open();
+        projectDialog.accept();
+        compare(JSON.parse(canvas.layerSettingsPayload).operation, "project-crs");
+        compare(JSON.parse(canvas.layerSettingsPayload).projectCrs, "EPSG:5179");
+
+        appWindow.language = "ko";
+        encodingDialog.open();
+        tryCompare(choice, "currentIndex", 0);
+        compare(choice.currentValue, "ares-cp949");
+        encodingDialog.close();
+        appWindow.language = "jp";
+        encodingDialog.open();
+        tryCompare(choice, "currentIndex", 0);
+        compare(choice.currentValue, "ares-shift-jis");
+        encodingDialog.close();
+        appWindow.language = "en";
+    }
+
+    function test_statusCoordinatesUseFourDecimalsAndDigitGrouping() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        verify(viewport && canvas);
+        var oldBounds = viewport.dataBounds;
+        var oldCRS = viewport.dataCRS;
+        var oldZoom = viewport.mapZoom;
+        var oldCursorX = viewport.cursorX;
+        var oldCursorY = viewport.cursorY;
+        var oldCursorValid = viewport.cursorValid;
+        viewport.dataBounds = [0, 0, 1000000, 100000];
+        viewport.dataCRS = "EPSG:5186";
+        viewport.mapZoom = 1;
+        viewport.cursorX = canvas.x + canvas.width / 2;
+        viewport.cursorY = canvas.y + canvas.height / 2;
+        viewport.cursorValid = true;
+        compare(viewport.currentMapCoordinate(), "X 500,000.0000  Y 50,000.0000");
+        viewport.dataBounds = oldBounds;
+        viewport.dataCRS = oldCRS;
+        viewport.mapZoom = oldZoom;
+        viewport.cursorX = oldCursorX;
+        viewport.cursorY = oldCursorY;
+        viewport.cursorValid = oldCursorValid;
+    }
+
     function test_vertexHandleDragEmitsFeatureVertexEdit() {
         findChild(appWindow, "layerSettingsDialog").close();
         findChild(appWindow, "attributeDialog").close();
@@ -478,6 +541,7 @@ TestCase {
         var sourcePath = findChild(appWindow, "sourcePathField");
         var sourceLayer = findChild(appWindow, "sourceLayerField");
         var sourceEncoding = findChild(appWindow, "sourceEncodingField");
+        var sourceCRS = findChild(appWindow, "sourceCRSField");
         var sourceChangeWarning = findChild(appWindow, "sourceChangeWarning");
         var visible = findChild(appWindow, "visibleField");
         var pointColor = findChild(appWindow, "pointColorField");
@@ -493,6 +557,7 @@ TestCase {
         var luaDialog = findChild(appWindow, "luaEditorDialog");
         var luaOpenButton = findChild(appWindow, "openLuaEditorButton");
         var labelRuleEditor = findChild(appWindow, "labelRuleEditor");
+        var displayRuleEditor = findChild(appWindow, "featureDisplayRuleEditor");
         var labelPlacement = findChild(appWindow, "labelPlacementField");
         var labelRotation = findChild(appWindow, "labelRotationField");
         var labelHeight = findChild(appWindow, "labelHeightField");
@@ -513,6 +578,7 @@ TestCase {
         verify(sourcePath !== null);
         verify(sourceLayer !== null);
         verify(sourceEncoding !== null);
+        verify(sourceCRS !== null);
         verify(sourceChangeWarning !== null);
         verify(visible !== null);
         verify(pointColor !== null);
@@ -528,6 +594,7 @@ TestCase {
         verify(luaDialog !== null);
         verify(luaOpenButton !== null);
         verify(labelRuleEditor !== null);
+        verify(displayRuleEditor !== null);
         verify(labelPlacement !== null);
         verify(labelRotation !== null);
         verify(labelHeight !== null);
@@ -541,6 +608,7 @@ TestCase {
                 sourcePath: "/data/roads.shp",
                 sourceLayerName: "roads",
                 sourceEncoding: "EUC-KR",
+                sourceCrs: "EPSG:5186",
                 visible: true,
                 style: {
                     pointColor: "#112233",
@@ -560,7 +628,8 @@ TestCase {
                     heightMm: 2,
                     minScale: 500,
                     maxScale: 25000
-                }
+                },
+                displayRule: "return feature.visible == true"
             }
         ]);
         tryCompare(layerModel, "count", 1);
@@ -580,6 +649,7 @@ TestCase {
         compare(sourcePath.text, "/data/roads.shp");
         compare(sourceLayer.text, "roads");
         compare(sourceEncoding.editText, "EUC-KR");
+        compare(sourceCRS.text, "EPSG:5186");
         compare(visible.checked, true);
         compare(sourceChangeWarning.visible, false);
         dialog.activeCategory = "symbology";
@@ -592,6 +662,11 @@ TestCase {
         dialog.activeCategory = "labels";
         compare(labelsEnabled.checked, true);
         compare(labelExpression.text, "${label}");
+        canvas.layerLabelPayload = JSON.stringify([{layer: "roads", text: "Sample", x: 0.5, y: 0.5, heightMm: 2.5, minScale: 0, maxScale: 0}]);
+        canvas.layerLabelGeneration += 1;
+        var labelHint = findChild(appWindow, "labelVisibilityHint");
+        verify(labelHint !== null);
+        tryVerify(function() { return labelHint.text.indexOf("1 labels are available") >= 0; });
         compare(labelRule.text, "return feature.visible == true");
         luaDialog.open();
         tryCompare(luaDialog, "visible", true);
@@ -608,6 +683,7 @@ TestCase {
         sourcePath.text = "/tmp/roads.shp";
         sourceLayer.text = "roads_internal";
         sourceEncoding.editText = "CP949";
+        sourceCRS.text = "EPSG:5179";
         compare(sourceChangeWarning.visible, true);
         verify(sourceChangeWarning.text.indexOf("Save unsaved feature edits") >= 0);
         visible.checked = false;
@@ -623,6 +699,7 @@ TestCase {
         labelExpression.text = "${name}";
         labelRuleEditor.text = "return feature.active == true";
         labelLua.text = "return feature.name";
+        displayRuleEditor.text = "return feature.visible == true";
         var luaOkButton = luaDialog.standardButton(Dialog.Ok);
         verify(luaOkButton !== null);
         mouseClick(luaOkButton);
@@ -645,6 +722,7 @@ TestCase {
         compare(request.sourcePath, "/tmp/roads.shp");
         compare(request.sourceLayerName, "roads_internal");
         compare(request.sourceEncoding, "CP949");
+        compare(request.sourceCrs, "EPSG:5179");
         compare(request.visible, false);
         compare(request.style.pointColor, "#aabbcc");
         compare(request.style.pointSizeMm, 3.2);
@@ -656,6 +734,7 @@ TestCase {
         compare(request.labels.expression, "${name}");
         compare(request.labels.rule, "return feature.active == true");
         compare(request.labels.luaScript, "return feature.name");
+        compare(request.displayRule, "return feature.visible == true");
         compare(request.labels.placement, "free-angle");
         compare(request.labels.rotationField, "angle");
         compare(request.labels.heightMm, 3);
