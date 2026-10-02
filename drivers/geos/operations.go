@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 
 	"gogis/internal/core"
 
@@ -17,6 +18,8 @@ import (
 type Operator struct {
 	context *geoslib.Context
 }
+
+const minDisplaySimplificationPoints = 32
 
 // NewOperator creates a GEOS operator with a dedicated context.
 func NewOperator() *Operator {
@@ -48,6 +51,56 @@ func (o *Operator) Buffer(ctx context.Context, layer core.Layer, distance float6
 		output := input.Buffer(distance, 8)
 		input.Destroy()
 		result.Features[i].Geometry = core.WKBGeometry{WKB: output.ToWKB()}
+		output.Destroy()
+	}
+	return result, nil
+}
+
+// SimplifyForDisplay returns a detached layer with topology-preserving
+// simplification applied to line and polygon geometries. It is intended only
+// for coarse-scale, read-only rendering; callers must retain the source layer
+// for editing and export.
+func (o *Operator) SimplifyForDisplay(ctx context.Context, layer core.Layer, tolerance float64) (core.Layer, error) {
+	if tolerance <= 0 {
+		return layer, nil
+	}
+	// This is an ephemeral read-only display copy. Shallow-copy feature headers
+	// and replace only the geometries that benefit from simplification; cloning
+	// every properties map here dominates the cost for cadastral windows.
+	result := layer
+	result.Features = append([]core.Feature(nil), layer.Features...)
+	for index := range result.Features {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		geometry := result.Features[index].Geometry
+		if geometry == nil {
+			continue
+		}
+		geometryType := strings.ToUpper(geometry.GeometryType())
+		if !strings.Contains(geometryType, "LINE") && !strings.Contains(geometryType, "POLYGON") {
+			continue
+		}
+		wkb, ok := geometry.(core.WKBGeometry)
+		if !ok {
+			continue
+		}
+		pointCount, err := wkb.PointCount()
+		if err != nil || pointCount < minDisplaySimplificationPoints {
+			continue
+		}
+		input, err := o.read(geometry)
+		if err != nil {
+			return core.Layer{}, fmt.Errorf("read feature %d for display simplification: %w", result.Features[index].ID, err)
+		}
+		output := input.TopologyPreserveSimplify(tolerance)
+		input.Destroy()
+		if output == nil {
+			continue
+		}
+		if !output.IsEmpty() {
+			result.Features[index].Geometry = core.WKBGeometry{WKB: output.ToWKB()}
+		}
 		output.Destroy()
 	}
 	return result, nil

@@ -18,10 +18,19 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -40,6 +49,7 @@ static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm
 std::vector<GoGISVertex> g_vertices;
 constexpr size_t kMaxSourceVertexCount = 4 * 1024 * 1024;
 constexpr size_t kMaxSceneGraphVertices = 8 * 1024 * 1024;
+constexpr size_t kRetainedVertexCapacityFloor = 64 * 1024;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
 std::atomic<long long> g_perf_load_started_ns{0};
@@ -84,6 +94,14 @@ std::atomic<unsigned long long> g_active_layer_generation{0};
 std::mutex g_render_status_mutex;
 std::string g_render_status;
 std::atomic<unsigned long long> g_render_status_generation{0};
+std::mutex g_diagnostic_log_mutex;
+std::string g_diagnostic_log_payload = "[]";
+std::atomic<unsigned long long> g_diagnostic_log_generation{0};
+std::atomic<unsigned long long> g_process_memory_bytes{0};
+std::atomic<unsigned long long> g_go_heap_bytes{0};
+std::atomic<int> g_process_memory_kind{0};
+std::atomic<int> g_memory_status_available{0};
+std::atomic<unsigned long long> g_memory_status_generation{0};
 std::mutex g_map_metadata_mutex;
 std::string g_map_metadata_payload;
 std::atomic<unsigned long long> g_map_metadata_generation{0};
@@ -113,6 +131,61 @@ void set_render_status_safely(const char* status) noexcept {
     } catch (...) {
         // Reporting a rendering allocation failure must not terminate the UI.
     }
+    if (status != nullptr) {
+#ifdef _WIN32
+        const HANDLE output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (output_handle != nullptr && output_handle != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(output_handle, status, static_cast<DWORD>(std::strlen(status)), &written, nullptr);
+            static constexpr char newline = '\n';
+            WriteFile(output_handle, &newline, 1, &written, nullptr);
+        }
+        const HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
+        if (error_handle != nullptr && error_handle != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(error_handle, status, static_cast<DWORD>(std::strlen(status)), &written, nullptr);
+            static constexpr char newline = '\n';
+            WriteFile(error_handle, &newline, 1, &written, nullptr);
+        }
+#else
+        (void)::write(STDOUT_FILENO, status, std::strlen(status));
+        static constexpr char newline = '\n';
+        (void)::write(STDOUT_FILENO, &newline, 1);
+        (void)::write(STDERR_FILENO, status, std::strlen(status));
+        (void)::write(STDERR_FILENO, &newline, 1);
+#endif
+    }
+}
+
+bool resize_vertex_buffer(size_t count) noexcept {
+    if (count == 0) {
+        std::vector<GoGISVertex>().swap(g_vertices);
+        return true;
+    }
+
+    // Keep small fluctuations cheap, but do not retain a previous viewport's
+    // peak-sized native allocation after the new batch is at least 4x smaller.
+    if (g_vertices.capacity() > kRetainedVertexCapacityFloor &&
+        count <= g_vertices.capacity() / 4) {
+        try {
+            std::vector<GoGISVertex> reduced;
+            reduced.resize(count);
+            g_vertices.swap(reduced);
+            return true;
+        } catch (...) {
+            // Retain the old allocation and fall back to resize; the payload
+            // remains bounded by kMaxSourceVertexCount either way.
+        }
+    }
+    try {
+        g_vertices.resize(count);
+        return true;
+    } catch (const std::bad_alloc&) {
+        set_render_status_safely("Render error: insufficient memory for vertex batch");
+    } catch (...) {
+        set_render_status_safely("Render error: native vertex allocation failed");
+    }
+    return false;
 }
 
 long long steady_nanoseconds() {
@@ -268,6 +341,22 @@ public:
                 render_status_generation_ = render_status_generation;
             }
 
+            const auto diagnostic_log_generation = g_diagnostic_log_generation.load(std::memory_order_relaxed);
+            if (diagnostic_log_generation != diagnostic_log_generation_) {
+                std::lock_guard<std::mutex> lock(g_diagnostic_log_mutex);
+                setProperty("diagnosticLogPayload", QString::fromStdString(g_diagnostic_log_payload));
+                diagnostic_log_generation_ = diagnostic_log_generation;
+            }
+
+            const auto memory_status_generation = g_memory_status_generation.load(std::memory_order_acquire);
+            if (memory_status_generation != memory_status_generation_) {
+                setProperty("processMemoryBytes", QVariant::fromValue<qulonglong>(g_process_memory_bytes.load(std::memory_order_relaxed)));
+                setProperty("goHeapBytes", QVariant::fromValue<qulonglong>(g_go_heap_bytes.load(std::memory_order_relaxed)));
+                setProperty("processMemoryKind", g_process_memory_kind.load(std::memory_order_relaxed));
+                setProperty("memoryStatusAvailable", g_memory_status_available.load(std::memory_order_relaxed) != 0);
+                memory_status_generation_ = memory_status_generation;
+            }
+
             const auto map_metadata_generation = g_map_metadata_generation.load(std::memory_order_relaxed);
             if (map_metadata_generation != map_metadata_generation_) {
                 std::lock_guard<std::mutex> lock(g_map_metadata_mutex);
@@ -319,11 +408,20 @@ protected:
     QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) override {
         auto* node = static_cast<QSGGeometryNode*>(oldNode);
         if (node == nullptr) {
-            node = new QSGGeometryNode();
-            node->setGeometry(&geometry_);
-            node->setMaterial(&material_);
-            node->setFlag(QSGNode::OwnsMaterial, false);
-            node->setFlag(QSGNode::OwnsGeometry, false);
+            try {
+                auto created_node = std::make_unique<QSGGeometryNode>();
+                created_node->setGeometry(&geometry_);
+                created_node->setMaterial(&material_);
+                created_node->setFlag(QSGNode::OwnsMaterial, false);
+                created_node->setFlag(QSGNode::OwnsGeometry, false);
+                node = created_node.release();
+            } catch (const std::bad_alloc&) {
+                set_render_status_safely("Render error: insufficient memory for scene-graph node");
+                return nullptr;
+            } catch (...) {
+                set_render_status_safely("Render error: scene-graph node creation failed");
+                return nullptr;
+            }
         }
 
         const float width = static_cast<float>(this->width());
@@ -521,6 +619,8 @@ private:
     unsigned long long layer_label_generation_ = 0;
     unsigned long long vertex_handle_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
+    unsigned long long diagnostic_log_generation_ = 0;
+    unsigned long long memory_status_generation_ = 0;
     unsigned long long map_metadata_generation_ = 0;
     unsigned long long rendered_generation_ = 0;
     size_t rendered_vertex_count_ = 0;
@@ -545,16 +645,9 @@ extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {
         g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // Keep the vector capacity across frame publishes. The Go bridge already
-    // holds a reusable scratch buffer, so recreating this C++ vector here
-    // would add a second heap allocation to every batch update.
-    try {
-        g_vertices.resize(count);
-    } catch (const std::bad_alloc&) {
-        set_render_status_safely("Render error: insufficient memory for vertex batch");
-        return;
-    } catch (...) {
-        set_render_status_safely("Render error: native vertex allocation failed");
+    // Keep capacity for ordinary frame-size fluctuations; resize_vertex_buffer
+    // releases it on empty views and shrinks it after a substantial reduction.
+    if (!resize_vertex_buffer(count)) {
         return;
     }
     g_vertices_stage = 0;
@@ -583,13 +676,7 @@ extern "C" void gogis_set_vertices_vertex_layout_stage(const void* raw_vertices,
         g_vertices_generation.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    try {
-        g_vertices.resize(count);
-    } catch (const std::bad_alloc&) {
-        set_render_status_safely("Render error: insufficient memory for vertex batch");
-        return;
-    } catch (...) {
-        set_render_status_safely("Render error: native vertex allocation failed");
+    if (!resize_vertex_buffer(count)) {
         return;
     }
     g_vertices_stage = stage;
@@ -775,6 +862,30 @@ extern "C" void gogis_set_render_status(const char* status) {
         g_render_status = status != nullptr ? status : "";
     }
     g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_diagnostic_log_payload(const char* payload) {
+    {
+        std::lock_guard<std::mutex> lock(g_diagnostic_log_mutex);
+        g_diagnostic_log_payload = payload != nullptr ? payload : "[]";
+    }
+    g_diagnostic_log_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_memory_status(unsigned long long process_bytes,
+                                           unsigned long long go_heap_bytes,
+                                           int process_memory_kind,
+                                           int available) {
+    g_process_memory_bytes.store(process_bytes, std::memory_order_relaxed);
+    g_go_heap_bytes.store(go_heap_bytes, std::memory_order_relaxed);
+    g_process_memory_kind.store(process_memory_kind, std::memory_order_relaxed);
+    g_memory_status_available.store(available != 0 ? 1 : 0, std::memory_order_relaxed);
+    g_memory_status_generation.fetch_add(1, std::memory_order_release);
+}
+
+extern "C" unsigned long long gogis_retained_vertex_bytes(void) {
+    std::lock_guard<std::mutex> lock(g_vertices_mutex);
+    return static_cast<unsigned long long>(g_vertices.capacity() * sizeof(GoGISVertex));
 }
 
 extern "C" void gogis_set_map_metadata(const char* payload) {

@@ -31,8 +31,10 @@ type LayerSource struct {
 const MaxChunkVertices = 2 * 1024 * 1024
 
 // MaxBatchVertices bounds the flattened viewport payload before adapters copy
-// it into native memory. Keep this aligned with native renderer input limits.
-const MaxBatchVertices = 4 * 1024 * 1024
+// it into native memory. Qt can expand each source vertex into as many as three
+// scene-graph vertices; the native scene-graph limit is 8 Mi vertices, so this
+// budget leaves headroom and prevents Qt from dropping the entire geometry batch.
+const MaxBatchVertices = 2_500_000
 
 // maxFullLayerChunkGridAxis bounds work when a builder prepares every
 // normalized cell. Single-target viewport builders do not use this full-grid

@@ -122,10 +122,33 @@ geometry snapshot을 보유하지 않았다. 연속지적도는 거친 viewport 
 `QQmlApplicationEngine.LoadData` 중 `Cannot create window: no screens available`로 abort했고,
 이 시점은 initial data loading 호출 전이라 SHP 처리 실패가 아니다. 같은 연속지적도 SHP를
 `QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software`로 실행하자 QML 앱은 12초 동안 abort나
-load-error 로그 없이 유지되어 timeout exit 124로 종료됐다. 이는 software/offscreen 시작 경로만
-확인하며 실제 window, GPU/scene graph, display-link crash 원인이나 RSS를 검증한 결과가 아니다.
-후속 화면 검증 시도에서는 macOS 세션이 잠겨 native app 제어가 불가능했다. 실제 GUI 창 및
-GPU 검증은 사용자가 Mac을 잠금 해제한 세션에서 다시 해야 한다.
+load-error 로그 없이 유지되어 timeout exit 124로 종료됐다. 2026-10-02 재실행은
+`GOGIS_PERF=1 QSG_RENDER_LOOP=basic`을 추가해 약 21초 관찰했다. `load-start`는 기록됐으나
+`vertices-published` 이벤트가 없었고, 터미널에서 수동 종료(exit 130)했다. 따라서 이 실행도
+실제 window·완료된 SHP 렌더·GPU/scene graph·RSS를 검증하지 않는다.
+2026-10-02 후속 화면 검증에서 CUA는 앱 목록을 읽었지만 화면 surface를 제공하지 않았다.
+현재 빌드(`/tmp/gogis-desktop-ui-check`)를 세종 연속지적도 SHP와 함께 실행하자 Qt가
+`Cannot create window: no screens available`를 출력하고 `QQmlApplicationEngine.LoadData` 호출 중
+SIGABRT(exit 2)로 종료됐다. 세종 파일 로딩 전의 플랫폼 창 생성 실패이므로 SHP 처리 경로의
+실패 증거는 아니다. 이 실행에서 실제 UI·RSS 표시·pan/zoom·GPU 검증은 여전히 미완료다.
+첨부 crash report(2026-09-30)는 `EXC_CRASH/SIGABRT`이며 triggered thread가 `CVDisplayLink`다.
+그 스레드의 보이는 stack은 `pthread_kill → raise → Go runtime.raise_trampoline`이다. 로컬
+Go 1.27.1 런타임 소스에서 `raise_trampoline`은 foreign thread가 처리하지 않은 신호를 기본
+동작으로 다시 전달하는 경로로 확인했다. 따라서 이 frame은 SIGABRT를 발생시킨 원래 함수나
+Go 런타임 결함을 특정하지 않는다. 별도 Qt `QSGRenderThread`가 당시
+`GoGISMapCanvas::updatePaintNode` 실행 중이었던 것은 동시 실행 정황일 뿐 인과 증거가 아니다.
+report에는 `EXC_RESOURCE`, allocator 실패, 또는 명시적 OOM 진단이 없어 OOM이라고 확정할 수 없다.
+이는 실제 앱 실행 crash지만 현재 소스에서 원래 SIGABRT 발생 지점을 재현하지 못했다.
+화면이 있는 macOS 로그인 세션이나 Windows
+사용자 환경에서 실제 UI·RSS·pan/zoom 및 threaded/basic render-loop 비교 검증이 필요하다.
+
+2026-10-02 후속 headless 검증에서 `QT_QPA_PLATFORM=minimal QT_QUICK_BACKEND=software
+QSG_RENDER_LOOP=basic` 조합은 첫 실행에 화면 없이 Qt Quick software scene graph를 생성했고,
+preview 147,045 vertices publish 후 `updatePaintNode` 계측이 273,585 vertices로 128–134 ms에
+기록됐다. 하지만 같은 SHP를 연 두 번째 실행은 120초 timeout까지 `load-start`만 기록했고,
+preview/full publish가 없었다. 앞선 45초 실행은 preview scene graph까지 갔지만 full render 전
+timeout이었다. 따라서 headless backend가 일부 장면을 그릴 수 있다는 증거이지, 초기 SHP 로드의
+재현 가능한 완료·실제 화면 표시·crash 부재 보증은 아니다.
 
 재현 시 `GOGIS_TEST_LARGE_VECTOR_SOURCES`에 SHP 경로 두 개 이상을 OS path-list 구분자로
 지정한다. 아래 예시는 macOS/Linux 기준이며 race flag를 빼면 일반 실행이다.
@@ -171,11 +194,13 @@ window snapshot에서 가져오므로 OGR SQL 결과의 query-local ID를 전체
 합친다. GeoPackage 창별 로드 및 속성명 연결 테스트가 통과했다.
 
 GDAL→Go window 읽기는 WKB/property payload 예산을 feature 단위로 누적 검사해 상한을 넘는
-feature를 result slice에 보관하지 않고 요청 전체를 오류 처리한다. 다만 WKB serialization 전
-OGR feature 및 단일 WKB 크기를 알 수 있는 GDAL Go 바인딩이 없어, 단일 거대 피처 순간 할당은
-사전 제한하지 못한다. WKB 출력 버퍼의 C `malloc` 실패는 exporter에 null 포인터를 넘기지
-않고 GDAL 오류로 반환하지만, 이는 OGR geometry 자체의 입력 시 native 메모리 사용량을
-제한하지 않는다. 저메모리 상태에서 GDAL 오류 문자열의 `malloc`/`realloc` 실패도 null write로
+feature를 result slice에 보관하지 않고 요청 전체를 오류 처리한다. GODAL의 `Geometry.WKBSize()`로
+OGR geometry의 WKB 출력 크기를 버퍼 할당 전에 조회하고, 8 MiB를 넘으면 WKB exporter가 출력
+버퍼를 만들기 전에 거부한다. 회귀 테스트는 초과 geometry의 크기 조회 및 사전 거부를 확인한다.
+다만 OGR geometry 자체는 `NextFeature()`가 반환되기 전에 GDAL 드라이버가 이미 읽어 native
+메모리에 구성할 수 있으므로 이 WKB 상한은 입력 geometry의 native 메모리 상한이 아니다.
+WKB 출력 버퍼의 C `malloc` 실패는 exporter에 null 포인터를 넘기지 않고 GDAL 오류로 반환한다.
+저메모리 상태에서 GDAL 오류 문자열의 `malloc`/`realloc` 실패도 null write로
 이어지지 않도록 처리했고, raster band/layer 목록 및 color table 복사 버퍼의 C 할당 실패와
 크기 산술 오버플로 검사도 추가했다. 이들 실패 경로를 실제 시스템 OOM으로 강제 주입한 것은
 아니며, 성공 경로 빌드와 native 테스트 통과만 확인했다.
@@ -719,3 +744,206 @@ synthetic point GeoJSON이므로, 실데이터/다각형 복잡도/OS 자원 차
 stream reader를 사용해야 한다. 공개 `GeometrySession` API가 같은 파일을 raw GDAL으로
 열던 우회도 발견해 `AttributeSession` 기반 bounded path로 바꾸고, `.geojson` 및
 `.geojsonl` 라우팅 회귀 테스트를 추가했다.
+
+### 데스크톱 메모리 표시와 상태 UX
+
+Qt 데스크톱 하단 상태바에 프로세스 메모리와 Go heap을 별도 sampler goroutine에서
+1초 간격으로 표시한다. 동기 저장 같은 UI 요청 폴링을 막는 작업 중에도 표본 갱신은
+계속된다.
+Linux는 `/proc/self/statm`의 현재 resident set, Windows는 process working set,
+macOS CGO 빌드는 Mach `task_info`의 현재 resident set을 사용한다. CGO가 비활성화된
+macOS fallback만 `getrusage` peak RSS를 사용하며 UI에서 측정 종류를 구분한다.
+샘플링할 수 없는 플랫폼에서는 Go heap만 표시하고 측정 불가를 명시한다. 프로세스 값은
+Go/GDAL/Qt의 resident footprint를 포함하지만 GPU 메모리를 포함하지 않으며, Windows
+working set은 RSS와 정의가 달라 다른 플랫폼 수치와 직접 비교할 수 없다.
+표시값은 진단 정보이지 동적 메모리 제한이나 OOM 방지 quota가 아니다.
+
+동적 렌더/로드 상태는 영어 원문을 오류 상세로 보존하면서 영어·한국어·일본어 안내로
+표시하고, 오류(빨강)·취소/경고(황색)·진행 및 읽기 전용(파랑)·성공(초록)·중립(회색)을
+구분한다. 확대 후 재시도 안내를 오류 상태로 표시한다. 로컬 Qt offscreen QML 테스트는
+언어별 상태, 취소/오류/읽기 전용 색상, 메모리 표현을 검증한다. OS 별 프로세스 메모리
+수집은 Linux/Windows 실행 환경에서 별도 확인해야 한다.
+2026-10-02에는 status bar의 마지막 상태만으로는 이전 오류와 native stdout/stderr를 놓칠 수
+있어, footer의 Logs 창과 bounded session collector를 추가했다. Go 애플리케이션의 오류 status와
+프로세스 stdout/stderr를 최근 500건/512 KiB 범위로 보관하고, 한 줄은 16 KiB에서 잘라낸다.
+macOS/Linux는 fd 1/2를 pipe로 tee해 실행 터미널 출력을 유지하고, Windows는 Go 표준 stream과
+Win32 standard handle을 로그 pipe로 바꾼다. 파일에는 자동 저장하지 않는다. pipe 단위 capture/
+mirror, ring cap/UTF-8 truncation, QML 표시 테스트가 통과했다. 실행 파일 초기화 시 stdout/stderr
+pipe 설정 실패는 원래 stderr에 진단하고 앱 시작은 계속한다. OS별 native library 출력이 모든
+플랫폼에서 잡히는지는 실제 Windows 앱에서 별도 확인해야 한다.
+Qt C++ staging vertex vector는 빈 뷰포트에서 capacity를 해제하고 새 payload가 기존
+capacity의 1/4 이하가 되면 축소한다. native bridge regression은 데이터 복사 소유권,
+빈 payload 해제, 큰-후-작은 viewport 버퍼 감소를 직접 검사한다. 이는 Qt GPU/scene graph
+allocator가 OS에 메모리를 반환하는 시점까지 보증하지 않는다. `updatePaintNode`의 최초
+`QSGGeometryNode` 할당도 예외를 잡아 렌더 오류 상태를 내고 null node를 반환하도록 방어했다.
+실제 allocator 실패 주입은 하지 못했으며, `scripts/verify.sh`의 Qt native 빌드/테스트는 통과했다.
+
+저배율에서 세종 연속지적도 query가 20,000-feature window cap을 넘어 첫 타일이 표시되지
+않는 문제를 줄이기 위해 read-only query cell을 최소 1/64 extent로 세분화했다. 현재 Downloads
+실자료 integration은 초기 zoom bucket 0에서 첫 성공 셀(8,962 feature, 735,647 vertex)을
+확인했고, 도근점 셀도 성공했다. 두 소스의 128회 viewport 이동 테스트는 process peak RSS
+181 MiB에서 통과했다. 이것은 Go/GDAL builder 경로의 실자료 검증이며 visible Qt/GPU 앱 동작,
+전국 데이터의 첫 프레임 시간, 100,000-feature/128 MiB viewport-wide cap 해소를 보장하지
+않는다. 초과 셀은 계속 오류로 보고될 수 있다.
+
+실제 `Main.qml`의 MapCanvas에 `diagnosticLogPayload` QML property 선언이 누락돼 native
+bridge에서 갱신한 값이 Logs dialog binding에 전달되지 않던 것을 추가했다. QML regression은
+dialog를 연 뒤 payload가 바뀌어도 stdout/stderr/application 오류가 나타나는지 확인한다.
+Go 상태 오류와 native renderer 오류를 stdout에도 출력하고 native 오류의 stderr 출력은
+유지한다. stdout/stderr 캡처와 offscreen QML 테스트는 통과했으나, 사용자의 실제 창에서
+로그 확인 및 렌더/숨김 전환은 재검증이 필요하다. Logs 버튼은 좁은 창에서도 쉽게 찾도록
+footer 도구줄 맨 왼쪽에 배치했고, QML test는 버튼 signal로 dialog를 열고 로그 payload를
+표시하는 것과 레이어 체크박스 hide/show가 visibility generation/payload를 갱신하는 것을 확인한다.
+
+2026-10-02 현재 변경을 포함한 코드에서 Downloads의 세종 연속지적도 SHP 208,015개와
+지적도근점 SHP 11,971개를 함께 여는 `TestWindowedReadOnlyLargeSourceIntegration`을
+재실행했다. 각 레이어 128회 viewport 이동을 통과했고 test process peak RSS는 166 MiB였다.
+이는 실제 원본을 쓰는 Go/GDAL read-only window/runtime 통합 테스트이지, visible Qt 창,
+GPU 메모리 또는 현재 RSS sampler의 화면 표시 검증은 아니다.
+
+실제 초기 화면과 같은 `zoom=1`, `center=(0.5,0.5)`의 combined-source `refresh` 경로도
+추가 검증했다. 최초에는 연속지적도 타일 하나가 GDAL window의 20,000-feature 제한을 넘어
+나머지 geometry만 publish했다. 이 경우를 위해 과밀 타일만 bounded subdivision으로 재조회하고,
+subcell 경계 중복은 WKB+속성 fingerprint로 제거한다. 깊이 8, 최대 256회 query, aggregate
+32 MiB/window, 100,000 features/viewport 상한을 유지한다. polygon 입력이 triangulation의
+250,000 vertex cap을 넘으면 최대 1,000,000 vertex까지 outline-only로 그리며 GEOS fill을
+건너뛴다. Downloads 실자료 최신 실행은 8,978 chunks를 30.6초에 처리해 3,372,623 vertices를
+publish했지만, 후속 타일의 32 MiB/window 및 4,194,304-vertex viewport batch 상한으로 여전히
+`incomplete`였다. 상한을 제거하지 않고 과밀 타일의 화면상 외곽선을 더 많이 보이게 한 결과다.
+따라서 “No visible layers”가 발생하지 않는 것과 전체 피처가 성공적으로 그려지는 것은 별개이며,
+전역 대용량 데이터의 완전 렌더 보장이 아니다. 동일 뷰에서 도근점을 숨겼다 다시 켠 후에는
+8,969 cache hits, 0 chunks built, 11ms에 Go 렌더 요청이 끝났다. 이는 Qt scene graph가 실제
+프레임을 표시한 시간은 아니므로 화면에서의 최초 표시/레이어 토글 체감 및 실제 GUI는 별도다.
+실패 로그는 과밀 source chunk key도 포함한다. 40,000 feature 한도를 실험했을 때도 같은
+원래 타일은 초과했으므로 단순 상향 대신 bounded subdivision을 적용했다.
+
+2026-10-02 실제 입력 재점검에서 도근점 SHP의 두 좌표 이상치가 전체 결합 extent를 크게
+늘리는 것을 확인했다. 11,971개 중 2개가 나머지 점의 좌표군과 현저히 다른 위치에 있어도
+원본 피처는 보존한다. GDAL overview에서 레이어별 CRS 변환 bounds와 geometry family를
+전달하고, 첫 실행은 bounds가 있는 폴리곤 레이어를 우선 화면에 맞춘다. 레이어 우클릭의
+“Zoom to layer”도 같은 bounds를 사용하며 프로젝트/원본 extent 자체는 바꾸지 않는다.
+read-only 렌더 grid를 1/128 정규화 셀로 세분하고 viewport feature cap은 50,000, payload cap은
+32 MiB로 유지했다. 실제 세종 자료의 폴리곤 맞춤 첫 화면은 5.2초에 1,934,704 vertices를
+publish했고, 34,645 hit features / 18 MiB retained payload에서 viewport feature 상한에 걸려
+`incomplete`를 기록했다. 최신 재실행은 숨김 후 재표시에서 258/258 cache hit, 0 chunk 재빌드,
+약 3ms였다. 테스트 프로세스 peak RSS는 502 MiB(Go heap 약 159 MiB)였다. 따라서 최초 화면에 유효 geometry가 나타나고 앱의
+안전 상한이 작동하는 것은 실자료에서 확인했지만, 해당 지방 전체 피처 완전 렌더는 아직
+보장되지 않으며 실제 사용자 GUI/Qt GPU 프레임 확인도 남아 있다. 이 로그는 벡터 원본을
+수정하거나 이상치를 제거하지 않는다.
+
+같은 진단 바이너리의 visible macOS 창 실행은 pasteboard/Launch Services 연결 오류와 종료
+코드 2로 실패해 실제 사용자 세션 화면 검증으로 사용할 수 없었다. `QT_QPA_PLATFORM=offscreen`
+및 software scene graph에서는 Qt software backend/font 초기화까지만 로그로 확인했고, 25초
+동안 `updatePaintNode`/프레임 진단은 나오지 않아 중단했다. 따라서 위의 실자료 geometry 및
+hide/show 결과는 Go/GDAL/runtime 통합 확인이며 Qt/GPU 실제 화면표시나 체감 프레임 시간의
+증거로 간주하지 않는다.
+
+2026-10-02 진단에서 C++ `GOGIS_PERF=1` 타이머 시작 함수가 workspace 경로에서 호출되지 않던
+것을 발견했다. 이제 단일 파일, 파일 추가, workspace 로드 진입점 모두에서
+`native.BeginLoadTrace()`를 호출하며, C++ 측에서 환경변수가 켜졌을 때만 trace를 출력한다. 진단용
+workspace를 Qt offscreen/software + threaded render loop로 실행했을 때 첫 batch publication은
+143.7 ms, 첫 scenegraph update는 178.3 ms / 14,148 expanded vertices로 기록됐고 60초간 이후
+vertex/frame 로그 및 Go traceback은 없었다. 이 실행은 화면 캡처가 불가능했고 전체 load/ready
+status도 관찰할 수 없어 완전 렌더나 문제 재현/비재현의 증거가 아니다. Visible 사용자 세션
+재현 시 `GOGIS_PERF=1 GOTRACEBACK=all`로 터미널 출력을 함께 보존할 수 있다.
+
+사용자가 제공한 2026-09-30 macOS 27.2 / Go 1.27.1 / Qt 6.11.2 crash report를 직접 확인했다.
+보고서의 확정 정보는 `EXC_CRASH (SIGABRT)`, 종료 코드 6이며, faulting thread 이름은
+`CVDisplayLink`이고 해당 stack에 `runtime.raise_trampoline`이 있다. 별도 QSGRenderThread는
+Qt `QSGThreadedRenderLoop` 아래 `GoGISMapCanvas::updatePaintNode`의 vertex-conversion lambda에서
+실행 중이었다. 보고서에는 `EXC_BAD_ACCESS`, `EXC_RESOURCE`, memory footprint 요약이나 OOM
+원인이 없다. Go 공식 문서상 `GOTRACEBACK=crash`는 unrecovered panic/runtime condition 후
+Unix에서 SIGABRT를 발생시킬 수도 있지만, 이 report의 `runtime.raise_trampoline`/`sigtrampgo`는
+Go signal handler가 전달받은 미처리 신호를 OS 기본 동작으로 다시 보내는 경로다. 이것만으로
+Go가 원래 abort를 발생시켰다고 할 수 없다. 당시 GOTRACEBACK 값 및 abort 직전 stderr/Go
+traceback이 첨부되지 않아 Go runtime panic인지 C/C++ abort인지도 아직 확정하지 못했다. 다음 재현은 앱을 터미널에서 실행하고 두
+파일을 추가해, SIGABRT 직전 terminal stderr와 앱 Logs 화면을 crash report와 함께 보존해야 한다.
+
+2026-10-02 후속 재검증에서 위 실제 세종 SHP 통합 테스트를 `-race`로 재실행해 두 source의
+128회 viewport 이동과 cache 기반 hide/show를 통과했다. race-instrumented test process peak RSS는
+312 MiB였다. 별도 1,000,000-feature synthetic point viewport stress도 `-race`로 128회 이동을
+통과했고 총 window hit/label은 각각 1,952개, peak RSS는 534 MiB였다. 두 RSS 값은 race
+instrumentation을 포함한 테스트 프로세스의 peak 값이며, GUI/GPU 메모리 또는 전국 SHP의
+완전 렌더 보장을 뜻하지 않는다. 실제 창에서의 최초 파일 추가, 화면 표시, layer toggle 체감과
+SIGABRT 재현 여부는 계속 사용자 세션 검증이 필요하다.
+
+2026-10-02 후속 race 검증에서 이전 숨김 캐시가 “모든 레이어를 숨길 때”만 보존되고 단일
+레이어 숨김에서는 버려지는 누락을 발견했다. 이제 현재 뷰의 visible cache는 유지하고 hidden
+layer cache는 최대 1,048,576 vertices까지 유지하며, 다시 표시된 layer는 같은 chunk key cache를
+재사용한다. visible+hidden retention 한도, 전체 숨김 후 복원, 단일 layer 숨김/복원 회귀를
+Qt/native/render `-race`에서 통과했다. 이는 scheduler cache 및 Go 상태 회귀 검증이며 실제
+scene-graph의 프레임 표시 시각은 GUI에서 별도로 확인해야 한다.
+
+같은 시점의 focused race 회귀 테스트 `TestRefreshVisibleLayerPublishesVerticesAndReusesCacheAfterToggle`와
+`TestEmptyProjectRefreshDoesNotReportNoVisibleLayers`도 재실행해 통과했다. 첫 테스트 로그의 단일
+`GoGIS: No visible layers`는 fixture의 유일한 레이어를 의도적으로 숨긴 순간 발생한 것이며,
+초기 가시 레이어 렌더에서는 geometry publish와 재표시 cache hit를 확인했다. 그러므로 이 문구
+하나만으로 SHP 로드 실패를 판정할 수는 없고, 사용자 재현 시 같은 시각의 render generation,
+visible-layer/chunk 수와 로그를 함께 봐야 한다.
+
+2026-10-02 native desktop 실측에서 이와 별도로 Qt scene-graph 전체 geometry batch rejection을
+재현했다. 세종 workspace의 Go viewport batch가 4,109,955 source vertices까지 커진 뒤 Qt의
+triangulated output vertex limit(8 Mi)을 넘었고, `updatePaintNode`가 geometry를 0개로 비우며
+반복 `scene-graph vertex safety limit exceeded`와 `Render incomplete`를 남겼다. Qt는 한 source
+vertex당 최대 3 output vertices를 만들 수 있는데, Go의 4 Mi batch limit은 이 확장 상한과
+정렬되지 않았다. 이에 `render.MaxBatchVertices`를 2,500,000으로 낮춰 최악의 3배 확장도 Qt의
+8 Mi 한도 아래(7.5 Mi)에 두고, 이를 확인하는 limit regression test를 추가했다. cmd/gis-desktop,
+ui/qt/native, internal/render race tests, 실제 두 SHP의 128회 이동 통합 테스트 및 1M-feature
+synthetic viewport race stress(128회 이동, 545 MiB peak RSS)는 수정 후 통과했다.
+
+수정 후 native executable 빌드도 성공했다. 기본 macOS GUI 실행은 현재 Codex 실행 환경에서
+pasteboard/Launch Services 연결 오류와 `Cannot create window: no screens available`로 시작하지
+못했다. offscreen/software 실행도 초기 demo scenegraph 프레임 이후 workspace source 렌더 단계로
+진행하지 않아, 수정 후 Qt scenegraph 상한 오류의 실제 소멸을 확인하지 못했다. 따라서 batch
+상한의 Go-side safety 및 실데이터 runtime 동작은 검증됐지만, Qt 창에서 전체 batch publication과
+실제 화면표시는 사용자 세션에서 재확인해야 한다.
+
+후속 단일 SHP 직접 열기에서는 workspace loader와 달리 offscreen/software scene graph가 실제
+연속지적도 source chunk를 처리했다. `QSG_RENDER_LOOP=basic`으로 약 115초 실행하는 동안
+1,197,047 source vertices가 최대 2,118,627 scene-graph vertices로 변환되어 프레임 업데이트에
+반영됐고, 이 관찰 구간에는 `No visible layers`, scene-graph safety 오류, panic이 없었다. 전체
+viewport 로드가 끝나기 전 진단 목적으로 프로세스를 중단했으므로 완료 시간/최종 viewport
+상태는 미검증이다. 로그는 `/private/tmp/gogis-cadastre-offscreen.log`에 보존했다. 이 결과는
+Qt software renderer의 실제 geometry 변환 경로를 확인하지만, 화면이 없는 offscreen 검증이라
+사용자 GUI/GPU 가시 표시를 대체하지 않는다.
+
+같은 단일 SHP startup의 별도 반복에서는 첫 geometry publication 전 `GoGIS: No visible layers`가
+한 번 출력됐지만, 227 ms부터 source vertices가 publish되고 Qt scene graph로 변환되기 시작했다.
+로그는 9.55초 시점의 478,614 source / 844,962 expanded vertices에서 끝나며, 해당 파일에는
+scene-graph safety error, `Render incomplete`, panic은 없었다. 이 실행은 새 2.5M source cap에
+도달하지 못했고 종료 원인도 로그에 남지 않아 cap 경계 검증으로 보지 않는다. 초기의 단일
+`No visible layers`가 왜 발생했는지는 아직 특정되지 않았으며, 실제 사용자 화면에서 반복되는
+메시지와 동일 원인이라고 단정하지 않는다. 로그는 `/private/tmp/gogis-cadastre-cap-boundary.log`다.
+
+후속 조사에서 대용량 SHP preview 경로의 visibility 불일치를 찾았다. GDAL geometry-prefix
+reader는 `core.Layer.Visible`을 기본값 false로 반환하는데, `buildDataRuntime`의 render-side
+`LayerVisibility`는 모든 layer를 무조건 visible로 만들고 layer-tree snapshot만 false로 만들었다.
+QML이 preview layer tree를 동기화하면 preview의 유일한 layer가 숨겨져 `No visible layers`를
+낼 수 있었다. Preview layer는 임시 첫 화면이므로 명시적으로 visible로 만들고, 일반 runtime
+생성에서도 render visibility와 layer-tree visibility를 `Layer.Visible`에 맞춰 초기화하도록
+수정했다. 회귀 테스트는 preview의 두 visibility 상태 일치와 일반 hidden-layer 상태를 각각
+확인한다.
+
+수정 후 race Go/Qt/native/render 테스트, QML 21/21 및 Qt native 빌드가 통과했다. 최신
+실행파일로 세종 연속지적도 SHP를 offscreen/basic renderer에서 20초 실행해 226,689 expanded
+vertices까지 publish/scenegraph 변환을 관찰했다. 이 구간에는 `No visible layers`, scene-graph
+safety error 또는 panic이 없었고, 진단 구간 후 프로세스를 중단했다. 로그는
+`/private/tmp/gogis-cadastre-visibility-fix.log`에 있다. 두 SHP workspace의 별도 offscreen 실행은
+20초 동안 initial demo geometry 이후 데이터 publication이 없어 종료했으므로, workspace loader
+전체 동작은 이 실행만으로 판정하지 않는다. 사용자 화면과 GPU 검증은 계속 필요하다.
+
+2026-10-02 넓은 축척의 부분 표시를 위해 viewport chunk 요청을 중심 거리 순으로 우선하고,
+줌 bucket에 따라 read-only cell을 1/32 → 1/64 → 1/128로 세분했다. zoom bucket 1 이하에서는
+GDAL geometry-only window에서 결정적 feature 표본만 렌더하고 hit-test/속성/라벨 geometry를
+보유하지 않으며, zoom bucket 2 이상에서 전체 피처와 선택을 복구한다. bucket -2 이하에서는
+복잡한 선·폴리곤을 GEOS topology-preserving 방식으로 단순화하고 fill mesh도 단순화 geometry로
+생성한다. 상태 표시줄은 근사 개요 모드와 확대 후 정밀 선택 가능성을 알린다.
+
+세종 연속지적도 208,015피처와 도근점 77,352피처의 결합 초기 viewport 통합은 ready로 끝났다:
+2,450 chunks, 2,084,067 source vertices, 64.4 s, 오류/안전 상한 초과 없음. 첫 non-empty
+publication은 100 ms / 597 vertices였다. 개요 모드 retained hit features/payload는 0이며 peak
+RSS는 542 MiB. 동일 뷰 hide/show는 2,450 cache hits / 0 chunk rebuild / 4 ms였다. 확대 정밀도
+통합은 두 실 SHP에서 zoom bucket 2를 포함해 레이어당 128회 이동, peak RSS 80 MiB로 통과했다.
+이는 Qt scenegraph/GPU 프레임 시간이나 사용자 창의 실제 픽셀 표시 검증이 아니며, 전체 완료
+시간은 여전히 약 64초다. visible UI에서 표본 개요가 적절하게 보이는지, 실 GPU에서 첫 표시와
+줌인 전환이 매끄러운지는 사용자 세션에서 확인해야 한다.

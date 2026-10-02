@@ -28,6 +28,11 @@ Item {
     property string activeLayer: ""
     property int activeLayerGeneration: 0
     property string renderStatus: "Ready"
+    property string diagnosticLogPayload: "[]"
+    property double processMemoryBytes: 0
+    property double goHeapBytes: 0
+    property int processMemoryKind: 0
+    property bool memoryStatusAvailable: false
     property string mapMetadataPayload: "{}"
     property int mapMetadataGeneration: 0
     property int cancelGeneration: 0

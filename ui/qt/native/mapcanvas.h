@@ -19,6 +19,7 @@ void gogis_set_vertices_vertex_layout(const void* vertices, int vertex_count);
 // in optional performance diagnostics.
 void gogis_set_vertices_vertex_layout_stage(const void* vertices, int vertex_count,
                                             int stage);
+unsigned long long gogis_retained_vertex_bytes(void);
 
 // Starts optional GOGIS_PERF=1 load-to-scene-graph timing.
 void gogis_trace_load_start(void);
@@ -76,6 +77,11 @@ void gogis_active_layer(char* buffer, int buffer_length);
 
 // Publishes the current Go-side render request status to QML.
 void gogis_set_render_status(const char* status);
+void gogis_set_diagnostic_log_payload(const char* payload);
+void gogis_set_memory_status(unsigned long long process_bytes,
+                             unsigned long long go_heap_bytes,
+                             int process_memory_kind,
+                             int available);
 
 // Publishes the current map coordinate bounds and display CRS to QML.
 void gogis_set_map_metadata(const char* payload);

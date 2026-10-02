@@ -41,6 +41,16 @@ TestCase {
         compare(viewport.localPathFromUrl("/data/My Roads.shp"), "/data/My Roads.shp");
     }
 
+    function test_addVectorDialogSelectionRequestsLoad() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var layerModel = findChild(appWindow, "layerModel");
+        var generation = canvas.loadGeneration;
+        viewport.requestLoadFiles(["file:///tmp/roads.shp"]);
+        tryCompare(canvas, "loadGeneration", generation + 1);
+        compare(JSON.parse(canvas.loadPath), ["/tmp/roads.shp"]);
+    }
+
     function test_translationsCoverSelectedLanguages() {
         appWindow.language = "ko";
         compare(appWindow.tr("Layers"), "레이어");
@@ -55,6 +65,114 @@ TestCase {
         appWindow.language = "en";
         compare(appWindow.tr("Layers"), "Layers");
         compare(appWindow.tr("Lua label editor"), "Lua label editor");
+    }
+
+    function test_dynamicStatusIsLocalizedAndSemanticallyColored() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var status = findChild(appWindow, "renderStatusLabel");
+        verify(canvas !== null && status !== null);
+        canvas.renderStatus = "Loading cancelled";
+        appWindow.language = "ko";
+        tryCompare(status, "text", "불러오기 취소됨");
+        compare(status.color.toString(), "#9a6700");
+        canvas.renderStatus = "Render incomplete; zoom in and try again: viewport budget exceeded";
+        tryCompare(status, "text", "일부 렌더링을 완료하지 못했습니다. 확대 후 다시 시도하세요: viewport budget exceeded");
+        compare(status.color.toString(), "#b42318");
+        canvas.renderStatus = "Dataset has at least 250000 features; opened read-only to limit memory";
+        tryCompare(status, "text", "피처 250000개 이상 · 메모리 보호를 위해 읽기 전용으로 열었습니다");
+        compare(status.color.toString(), "#175cd3");
+        canvas.renderStatus = "Save failed: read-only dataset is not editable";
+        tryVerify(function() { return status.color.toString() === "#b42318"; });
+        verify(appWindow.statusIsBusy("Saving output.gpkg"));
+        verify(appWindow.statusIsBusy("Loading 12/25"));
+        verify(!appWindow.statusIsBusy("Saved output.gpkg"));
+        appWindow.language = "jp";
+        compare(appWindow.localizedStatus("Loading: checking feature count"), "地物数を確認中");
+        appWindow.language = "en";
+    }
+
+    function test_diagnosticLogDialogShowsCapturedProcessAndApplicationMessages() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var button = findChild(appWindow, "openDiagnosticLogsButton");
+        var dialog = findChild(appWindow, "diagnosticLogDialog");
+        var logText = findChild(appWindow, "diagnosticLogTextArea");
+        verify(canvas !== null && button !== null && dialog !== null && logText !== null);
+        verify(button.visible, "Logs button should remain available in the footer toolbar");
+        button.clicked();
+        tryCompare(dialog, "visible", true);
+        canvas.diagnosticLogPayload = JSON.stringify([
+            {time: "12:34:56.789", stream: "stderr", message: "GDAL driver warning: test detail"},
+            {time: "12:34:57.000", stream: "application", message: "Render incomplete; zoom in and try again: query budget exceeded"}
+        ]);
+        tryVerify(function() {
+            return logText.text.indexOf("GDAL driver warning: test detail") >= 0 &&
+                   logText.text.indexOf("query budget exceeded") >= 0;
+        });
+        appWindow.language = "ko";
+        compare(dialog.title, "애플리케이션 로그");
+        dialog.close();
+        appWindow.language = "en";
+    }
+
+    function test_layerVisibilityToggleRequestsViewportRefresh() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var layerList = findChild(appWindow, "layerList");
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        tryCompare(layerModel, "count", 1);
+        var delegate = layerList.itemAtIndex(0);
+        verify(delegate !== null);
+
+        var generation = canvas.layerVisibilityGeneration;
+        mouseClick(delegate, delegate.width / 2, delegate.height / 2);
+        tryCompare(canvas, "layerVisibilityGeneration", generation + 1);
+        compare(JSON.parse(canvas.layerVisibilityPayload).roads, false);
+
+        generation = canvas.layerVisibilityGeneration;
+        mouseClick(delegate, delegate.width / 2, delegate.height / 2);
+        tryCompare(canvas, "layerVisibilityGeneration", generation + 1);
+        compare(JSON.parse(canvas.layerVisibilityPayload).roads, true);
+    }
+
+    function test_zoomToLayerExtentFitsPolygonWithoutChangingProjectBounds() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var layerModel = findChild(appWindow, "layerModel");
+        verify(canvas !== null && viewport !== null);
+        viewport.dataBounds = [0, 0, 1000, 1000];
+        canvas.layerTreePayload = JSON.stringify([
+            {name: "survey-points", geometryType: "POINT", bounds: [50, 40, 960, 980], visible: true},
+            {name: "parcels", geometryType: "POLYGON", bounds: [200, 300, 400, 500], visible: true}
+        ]);
+        tryCompare(findChild(appWindow, "layerModel"), "count", 2);
+        viewport.mapZoom = 1;
+        viewport.panX = 0;
+        viewport.panY = 0;
+        viewport.pendingInitialLayerFit = true;
+        var generation = viewport.viewportGeneration;
+        verify(viewport.fitPreferredInitialLayer(), "initial fit should prefer a polygon layer over outlier points");
+        verify(!viewport.pendingInitialLayerFit);
+        verify(viewport.mapZoom > 1, "the polygon layer extent should be enlarged to fit the canvas");
+        verify(Math.abs(viewport.panX) > 0 && Math.abs(viewport.panY) > 0,
+               "the viewport should center on the selected layer extent");
+        compare(viewport.dataBounds, [0, 0, 1000, 1000], "zooming must not discard outlier data bounds");
+        compare(viewport.viewportGeneration, generation + 1);
+    }
+
+    function test_memorySummaryDistinguishesPeakAndGoHeap() {
+        appWindow.language = "ko";
+        compare(appWindow.memorySummary(100 * 1024 * 1024, 20 * 1024 * 1024, true, 2), "프로세스 최고 RSS 100 MiB · Go 힙 20 MiB");
+        compare(appWindow.memorySummary(100 * 1024 * 1024, 20 * 1024 * 1024, true, 1), "프로세스 작업 집합 100 MiB · Go 힙 20 MiB");
+        verify(appWindow.memorySummary(0, 20 * 1024 * 1024, false, 0).indexOf("프로세스 메모리 측정 불가") >= 0);
+
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var label = findChild(appWindow, "memoryStatusLabel");
+        canvas.processMemoryBytes = 100 * 1024 * 1024;
+        canvas.goHeapBytes = 20 * 1024 * 1024;
+        canvas.processMemoryKind = 1;
+        canvas.memoryStatusAvailable = true;
+        tryCompare(label, "text", "프로세스 작업 집합 100 MiB · Go 힙 20 MiB");
+        appWindow.language = "en";
     }
 
     function test_layerContextMenuOpensRequestedCategory() {

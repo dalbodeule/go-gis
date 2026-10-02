@@ -12,6 +12,8 @@ import "C"
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"unsafe"
 
 	"gogis/internal/render"
@@ -57,6 +59,10 @@ func SetVerticesStage(vertices []render.Vertex, stage int) {
 		return
 	}
 	C.gogis_set_vertices_vertex_layout_stage(unsafe.Pointer(&vertices[0]), C.int(len(vertices)), C.int(stage))
+}
+
+func retainedNativeVertexBytes() uint64 {
+	return uint64(C.gogis_retained_vertex_bytes())
 }
 
 // ViewportGeneration returns the generation raised by QML pan/zoom changes.
@@ -230,9 +236,37 @@ func CurrentActiveLayer() string {
 
 // SetRenderStatus publishes a short render progress message to QML.
 func SetRenderStatus(status string) {
+	if isDiagnosticStatus(status) {
+		RecordDiagnostic("application", status)
+		// Keep errors visible when the desktop app is launched from a terminal.
+		// stdout is captured by the same bounded in-memory diagnostics pipeline.
+		_, _ = fmt.Fprintln(os.Stdout, "GoGIS:", status)
+	}
 	cStatus := C.CString(status)
 	defer C.free(unsafe.Pointer(cStatus))
 	C.gogis_set_render_status(cStatus)
+}
+
+// SetDiagnosticLogPayload publishes the current bounded process log to QML.
+func SetDiagnosticLogPayload(payload string) {
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_diagnostic_log_payload(cPayload)
+}
+
+// SetMemoryStatus publishes process memory and Go heap diagnostics separately.
+func SetMemoryStatus(processBytes, goHeapBytes uint64, processMemoryKind string, available bool) {
+	kind, valid := C.int(0), C.int(0)
+	switch processMemoryKind {
+	case "Working set":
+		kind = 1
+	case "Peak RSS":
+		kind = 2
+	}
+	if available {
+		valid = 1
+	}
+	C.gogis_set_memory_status(C.ulonglong(processBytes), C.ulonglong(goHeapBytes), kind, valid)
 }
 
 // SetMapMetadata publishes the current full data extent in display CRS order.

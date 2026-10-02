@@ -16,6 +16,7 @@ import (
 // geometry. Bounds are in the layer's source CRS and use minX,minY,maxX,maxY.
 type LayerOverview struct {
 	Name         string
+	GeometryType string
 	CRS          core.CRS
 	Bounds       [4]float64
 	HasBounds    bool
@@ -64,7 +65,7 @@ func (s *AttributeSession) Inspect(ctx context.Context) ([]LayerOverview, error)
 			return nil, err
 		}
 		header := readLayerHeader(layer)
-		overview := LayerOverview{Name: header.Name, CRS: header.CRS, FeatureCount: -1}
+		overview := LayerOverview{Name: header.Name, GeometryType: geometryTypeFamily(layer.Type()), CRS: header.CRS, FeatureCount: -1}
 		if count, err := layer.FeatureCount(); err == nil {
 			overview.FeatureCount = count
 		}
@@ -75,6 +76,21 @@ func (s *AttributeSession) Inspect(ctx context.Context) ([]LayerOverview, error)
 		result = append(result, overview)
 	}
 	return result, nil
+}
+
+func geometryTypeFamily(geometryType godal.GeometryType) string {
+	switch geometryType {
+	case godal.GTPolygon, godal.GTPolygon25D, godal.GTMultiPolygon, godal.GTMultiPolygon25D:
+		return "POLYGON"
+	case godal.GTLineString, godal.GTLineString25D, godal.GTMultiLineString, godal.GTMultiLineString25D, godal.GTLinearRing:
+		return "LINE"
+	case godal.GTPoint, godal.GTPoint25D, godal.GTMultiPoint, godal.GTMultiPoint25D:
+		return "POINT"
+	case godal.GTGeometryCollection, godal.GTGeometryCollection25D:
+		return "GEOMETRYCOLLECTION"
+	default:
+		return ""
+	}
 }
 
 func validLayerBounds(bounds [4]float64) bool {

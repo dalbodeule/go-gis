@@ -15,8 +15,34 @@ The current prototype has two deliberate boundaries:
   wheel changes zoom while incrementing the QML viewport generation. The Qt
   bridge now exposes that generation to Go, which advances the scheduler and
   batch store before requesting the next canvas update. Older requests are
-  cancelled when a new viewport arrives, and `ChunkPlanner` limits each request
-  to the visible chunks plus look-ahead margin.
+cancelled when a new viewport arrives, and `ChunkPlanner` limits each request
+to the visible chunks plus look-ahead margin.
+Read-only layers keep low-zoom query cells at no more than 1/64 of the combined
+extent. This bounds dense cadastral queries per cell and lets the renderer
+publish early successful cells while later cells continue loading; per-window
+and total visible-data safety limits still apply.
+Visibility toggles also retain cached current-view chunks for hidden layers up
+to a 1M-vertex aggregate budget, so a quick hide/show can reuse completed work
+without pinning the full hidden viewport in memory.
+
+The status bar translates load/render outcomes and visually separates errors,
+cancellations, warnings, progress, and success; its busy indicator also covers
+long saves. A separate sampler updates process memory once per second, including
+during synchronous save work, and shows Go heap separately. The Logs button at the
+far left of the footer opens a session-only, bounded viewer for captured stdout/stderr
+and application errors.
+On macOS/Linux, output is mirrored to the launching terminal while being captured;
+Windows redirects Go and Win32 standard output handles to the viewer. The latest
+500 messages and at most 512 KiB are retained in memory; individual lines are
+limited to 16 KiB. Application and native renderer errors are also echoed to
+stdout (native renderer errors remain on stderr as well). No log file is written
+automatically. The process metric is
+platform-specific (Linux current RSS, Windows working set, macOS CGO current RSS;
+macOS without CGO uses peak RSS) and excludes GPU memory; it is diagnostic, not a
+memory quota.
+The native staging buffer releases storage for an empty viewport and shrinks after
+a 4x-or-greater viewport payload reduction, while retaining capacity for ordinary
+small frame fluctuations.
 
 ## Local build
 

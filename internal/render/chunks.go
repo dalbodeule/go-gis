@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -481,6 +482,62 @@ func (s *Scheduler) RetainOnly(keys []ChunkKey) {
 	s.mu.Unlock()
 }
 
+// RetainViewportChunks keeps every cached visible chunk and a larger-first,
+// vertex-bounded subset of cached hidden chunks from the same viewport.
+func (s *Scheduler) RetainViewportChunks(visibleKeys, hiddenKeys []ChunkKey, hiddenVertexLimit int) {
+	if hiddenVertexLimit < 0 {
+		hiddenVertexLimit = 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	retained := make(map[ChunkKey]Chunk, min(len(visibleKeys)+len(hiddenKeys), len(s.cache)))
+	visibleSet := make(map[ChunkKey]struct{}, len(visibleKeys))
+	retainedVertices := 0
+	for _, key := range visibleKeys {
+		if _, exists := visibleSet[key]; exists {
+			continue
+		}
+		visibleSet[key] = struct{}{}
+		if chunk, exists := s.cache[key]; exists {
+			retained[key] = chunk
+			retainedVertices += len(chunk.Vertices)
+		}
+	}
+	hiddenLimit := min(hiddenVertexLimit, max(0, MaxBatchVertices-retainedVertices))
+	type entry struct {
+		key   ChunkKey
+		chunk Chunk
+	}
+	candidates := make([]entry, 0, min(len(hiddenKeys), len(s.cache)))
+	seenHidden := make(map[ChunkKey]struct{}, len(hiddenKeys))
+	for _, key := range hiddenKeys {
+		if _, visible := visibleSet[key]; visible {
+			continue
+		}
+		if _, duplicate := seenHidden[key]; duplicate {
+			continue
+		}
+		seenHidden[key] = struct{}{}
+		if chunk, exists := s.cache[key]; exists {
+			candidates = append(candidates, entry{key: key, chunk: chunk})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return len(candidates[i].chunk.Vertices) > len(candidates[j].chunk.Vertices)
+	})
+	hiddenVertices := 0
+	for _, item := range candidates {
+		count := len(item.chunk.Vertices)
+		if count > hiddenLimit-hiddenVertices {
+			continue
+		}
+		retained[item.key] = item.chunk
+		hiddenVertices += count
+	}
+	s.cache = retained
+	s.cacheVertices = retainedVertices + hiddenVertices
+}
+
 // cacheChunkLocked accounts immutable geometry payload by vertex count;
 // callers hold s.mu. A rejected replacement removes the old same-key value.
 func (s *Scheduler) cacheChunkLocked(key ChunkKey, chunk Chunk, limit int) bool {
@@ -533,7 +590,7 @@ func (s *Scheduler) Request(ctx context.Context, keys []ChunkKey, builder ChunkB
 
 // RequestUnique is the allocation-friendly form of Request for callers that
 // already guarantee each key appears once. The planner/visibility pipeline
-// uses this path because it creates disjoint row-major keys per layer.
+// uses this path because it creates disjoint ordered keys per layer.
 func (s *Scheduler) RequestUnique(ctx context.Context, keys []ChunkKey, builder ChunkBuilder) <-chan ChunkResult {
 	if len(keys) > MaxViewportChunkKeys {
 		return s.rejectOversizedRequest(len(keys))

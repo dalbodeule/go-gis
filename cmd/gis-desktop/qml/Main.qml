@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs as QuickDialogs
 import Qt.labs.platform as Platform
 import GoGIS 1.0
 
@@ -57,6 +58,12 @@ ApplicationWindow {
         })
     })
 
+    property var diagnosticTranslations: ({
+        en: ({"Logs": "Logs", "Application log": "Application log", "Showing the most recent process output and application errors. Older entries are discarded.": "Showing the most recent process output and application errors. Older entries are discarded."}),
+        ko: ({"Logs": "로그", "Application log": "애플리케이션 로그", "Showing the most recent process output and application errors. Older entries are discarded.": "최근 프로세스 출력과 애플리케이션 오류를 표시합니다. 오래된 항목은 순차적으로 삭제됩니다."}),
+        jp: ({"Logs": "ログ", "Application log": "アプリケーションログ", "Showing the most recent process output and application errors. Older entries are discarded.": "最近のプロセス出力とアプリケーションエラーを表示します。古い項目は順次削除されます。"})
+    })
+
     function tr(key) {
         var override = translationOverrides[language] || translationOverrides.en;
         if (override[key] !== undefined)
@@ -64,8 +71,63 @@ ApplicationWindow {
         var luaDictionary = luaTranslations[language] || luaTranslations.en;
         if (luaDictionary[key] !== undefined)
             return luaDictionary[key];
+        var diagnosticDictionary = diagnosticTranslations[language] || diagnosticTranslations.en;
+        if (diagnosticDictionary[key] !== undefined)
+            return diagnosticDictionary[key];
         var dictionary = translations[language] || translations.en;
         return dictionary[key] || translations.en[key] || key;
+    }
+
+    function localizedStatus(raw) {
+        var status = String(raw || "");
+        var dictionary = {
+            en: {"Loading": "Loading", "Loading: checking feature count": "Checking feature count", "Preview displayed; loading full data": "Preview displayed; loading full data", "Layer settings applied": "Layer settings applied", "Loading cancelled": "Loading cancelled", "Render cancelled": "Render cancelled", "Dataset size unavailable; opened read-only to limit memory": "Dataset size unavailable; opened read-only to limit memory", "Render incomplete; zoom in and try again: ": "Render incomplete; zoom in and try again: ", "Open failed: ": "Open failed: ", "Save failed: ": "Save failed: ", "Workspace load failed: ": "Workspace load failed: ", "Layer settings failed: ": "Layer settings failed: ", "Render stopped: ": "Render stopped: ", "Render error: ": "Render error: ", "Render skipped: ": "Render skipped: ", "Loading ": "Loading ", "Saving ": "Saving ", "Saved ": "Saved ", "Dataset has at least ": "Dataset has at least "},
+            ko: {"Loading": "불러오는 중", "Loading: checking feature count": "피처 개수 확인 중", "Preview displayed; loading full data": "미리보기 표시됨 · 전체 데이터 불러오는 중", "Layer settings applied": "레이어 설정 적용 완료", "Loading cancelled": "불러오기 취소됨", "Render cancelled": "렌더링 취소됨", "Dataset size unavailable; opened read-only to limit memory": "데이터 크기를 알 수 없어 메모리 보호를 위해 읽기 전용으로 열었습니다", "Render incomplete; zoom in and try again: ": "일부 렌더링을 완료하지 못했습니다. 확대 후 다시 시도하세요: ", "Open failed: ": "열기 실패: ", "Save failed: ": "저장 실패: ", "Workspace load failed: ": "작업공간 열기 실패: ", "Workspace save failed: ": "작업공간 저장 실패: ", "Layer settings failed: ": "레이어 설정 실패: ", "Layer reload failed: ": "레이어 다시 열기 실패: ", "Attribute page failed: ": "속성 페이지 표시 실패: ", "Attribute page exceeds the 16 MiB display payload limit": "속성 페이지가 16 MiB 표시 한도를 초과했습니다", "Render stopped: ": "렌더링 중단: ", "Render error: ": "렌더링 오류: ", "Render skipped: ": "렌더링 생략: ", "Label display skipped: ": "레이블 표시 생략: ", "Loading ": "불러오는 중: ", "Saving ": "저장 중: ", "Saved ": "저장 완료: ", "Workspace saved ": "작업공간 저장 완료: ", "Workspace loaded ": "작업공간 열기 완료: ", "Loading workspace ": "작업공간 불러오는 중: ", "Add files requires the native GDAL build": "파일을 추가하려면 GDAL 지원 데스크톱 빌드가 필요합니다", "Reopening layer source with selected encoding": "선택한 인코딩으로 레이어 원본 다시 여는 중", "Layer source reloaded": "레이어 원본 다시 열기 완료", "Vertex edit failed: ": "정점 편집 실패: ", "Vertex moved": "정점 이동 완료", "No visible layers": "표시 중인 레이어가 없습니다", "No vector files selected": "벡터 파일을 선택하지 않았습니다", "A file load is already in progress": "파일을 불러오는 중입니다", "Selected source is already loaded": "선택한 원본이 이미 열려 있습니다", "Cannot add files until the read-only source is ready": "읽기 전용 원본이 준비될 때까지 파일을 추가할 수 없습니다", "Open cancelled": "열기를 취소했습니다", "Save cancelled": "저장을 취소했습니다", "Dataset has at least ": "피처가 최소 "},
+            jp: {"Loading": "読み込み中", "Loading: checking feature count": "地物数を確認中", "Preview displayed; loading full data": "プレビューを表示 · 全データを読み込み中", "Layer settings applied": "レイヤー設定を適用しました", "Loading cancelled": "読み込みをキャンセルしました", "Render cancelled": "描画をキャンセルしました", "Dataset size unavailable; opened read-only to limit memory": "メモリ保護のため読み取り専用で開きました（データ件数不明）", "Render incomplete; zoom in and try again: ": "一部を描画できません。拡大して再試行してください: ", "Open failed: ": "開けませんでした: ", "Save failed: ": "保存できませんでした: ", "Workspace load failed: ": "ワークスペースを開けませんでした: ", "Workspace save failed: ": "ワークスペースを保存できませんでした: ", "Layer settings failed: ": "レイヤー設定に失敗しました: ", "Layer reload failed: ": "レイヤーを再読み込みできませんでした: ", "Attribute page failed: ": "属性ページを表示できませんでした: ", "Attribute page exceeds the 16 MiB display payload limit": "属性ページが16 MiBの表示上限を超えました", "Render stopped: ": "描画を停止しました: ", "Render error: ": "描画エラー: ", "Render skipped: ": "描画を省略しました: ", "Label display skipped: ": "ラベル表示を省略しました: ", "Loading ": "読み込み中: ", "Saving ": "保存中: ", "Saved ": "保存しました: ", "Workspace saved ": "ワークスペースを保存しました: ", "Workspace loaded ": "ワークスペースを開きました: ", "Workspace loaded; relink unavailable layers: ": "ワークスペースを開きました。再リンクが必要なレイヤー: ", "Loading workspace ": "ワークスペースを読み込み中: ", "Add files requires the native GDAL build": "ファイル追加にはGDAL対応デスクトップビルドが必要です", "Reopening layer source with selected encoding": "選択した文字コードでレイヤーソースを再読み込み中", "Layer source reloaded": "レイヤーソースを再読み込みしました", "Vertex edit failed: ": "頂点編集に失敗しました: ", "Vertex moved": "頂点を移動しました", "No visible layers": "表示中のレイヤーがありません", "No vector files selected": "ベクターファイルが選択されていません", "A file load is already in progress": "ファイルを読み込み中です", "Selected source is already loaded": "選択したソースは既に開いています", "Cannot add files until the read-only source is ready": "読み取り専用ソースの準備完了後に追加できます", "Open cancelled": "開く操作をキャンセルしました", "Save cancelled": "保存をキャンセルしました", "Dataset has at least ": "地物数が少なくとも "}
+        }[language] || {};
+        if (status.indexOf("Dataset has at least ") === 0) {
+            var count = status.substring("Dataset has at least ".length).split(" features;")[0];
+            if (language === "ko") return "피처 " + count + "개 이상 · 메모리 보호를 위해 읽기 전용으로 열었습니다";
+            if (language === "jp") return "地物 " + count + " 件以上 · メモリ保護のため読み取り専用で開きました";
+            return status;
+        }
+        var loadingFiles = /^Loading (\d+) vector file\(s\)$/.exec(status);
+        if (loadingFiles) {
+            if (language === "ko") return "벡터 파일 " + loadingFiles[1] + "개 불러오는 중";
+            if (language === "jp") return "ベクターファイル " + loadingFiles[1] + " 件を読み込み中";
+            return status;
+        }
+        var exact = dictionary[status];
+        if (exact !== undefined) return exact;
+        if (status.indexOf("Workspace loaded; relink unavailable layers: ") === 0 && language === "ko") return "작업공간을 열었습니다. 다시 연결할 레이어: " + status.substring("Workspace loaded; relink unavailable layers: ".length);
+        var prefixes = Object.keys(dictionary).sort(function(a, b) { return b.length - a.length; });
+        for (var i = 0; i < prefixes.length; ++i) {
+            if (status.indexOf(prefixes[i]) === 0) return dictionary[prefixes[i]] + status.substring(prefixes[i].length);
+        }
+        return status;
+    }
+
+    function statusColor(raw) {
+        var status = String(raw || "").toLowerCase();
+        if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
+        if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0) return "#175cd3";
+        if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("ready") >= 0) return "#2e7d32";
+        return "#65717d";
+    }
+
+    function statusIsBusy(raw) {
+        var status = String(raw || "").toLowerCase();
+        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0;
+    }
+
+    function memorySummary(processBytes, heapBytes, available, kind) {
+        function mib(bytes) { return (Number(bytes) / (1024 * 1024)).toFixed(0); }
+        var metric = kind === 2 ? (language === "ko" ? "최고 RSS" : language === "jp" ? "最大RSS" : "peak RSS") : kind === 1 ? (language === "ko" ? "작업 집합" : language === "jp" ? "ワーキングセット" : "working set") : "RSS";
+        var processLabel = language === "ko" ? "프로세스 " + metric : language === "jp" ? "プロセス" + metric : "Process " + metric;
+        var heapLabel = language === "ko" ? "Go 힙" : language === "jp" ? "Goヒープ" : "Go heap";
+        if (!available) return heapLabel + " " + mib(heapBytes) + " MiB · " + (language === "ko" ? "프로세스 메모리 측정 불가" : language === "jp" ? "プロセスメモリ測定不可" : "process memory unavailable");
+        return processLabel + " " + mib(processBytes) + " MiB · " + heapLabel + " " + mib(heapBytes) + " MiB";
     }
 
     component LuaCodeEditor: Item {
@@ -267,6 +329,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
             Button {
+                objectName: "addVectorFilesButton"
                 text: rootWindow.tr("Add vector files")
                 onClicked: fileDialog.open()
             }
@@ -307,6 +370,11 @@ ApplicationWindow {
         objectName: "layerContextMenu"
         closePolicy: Popup.CloseOnEscape
         property string targetLayerName: ""
+        MenuItem {
+            objectName: "layerContextZoomToLayer"
+            text: rootWindow.tr("Zoom to layer")
+            onTriggered: mapViewport.zoomToLayerExtent(layerContextMenu.targetLayerName)
+        }
         MenuItem {
             objectName: "layerContextGeneral"
             text: rootWindow.tr("General")
@@ -406,6 +474,8 @@ ApplicationWindow {
                 property string activeLayer: ""
                 property string pendingWorkspaceActiveLayer: ""
                 property var dataBounds: [0, 0, 1, 1]
+                property bool pendingInitialLayerFit: false
+                property bool hasSavedWorkspaceView: false
                 property string dataCRS: ""
                 property real cursorX: 0
                 property real cursorY: 0
@@ -477,6 +547,58 @@ ApplicationWindow {
                             return i;
                     }
                     return -1;
+                }
+
+                function zoomToLayerExtent(name) {
+                    var index = findLayerIndex(name);
+                    if (index < 0 || mapCanvas.width <= 0 || mapCanvas.height <= 0)
+                        return false;
+                    var layerBounds = [];
+                    try {
+                        layerBounds = JSON.parse(layerModel.get(index).boundsJson || "[]");
+                    } catch (error) {
+                        return false;
+                    }
+                    if (layerBounds.length !== 4 || dataBounds.length !== 4)
+                        return false;
+                    var spanX = dataBounds[2] - dataBounds[0];
+                    var spanY = dataBounds[3] - dataBounds[1];
+                    var layerWidth = layerBounds[2] - layerBounds[0];
+                    var layerHeight = layerBounds[3] - layerBounds[1];
+                    if (spanX <= 0 || spanY <= 0 || layerWidth < 0 || layerHeight < 0)
+                        return false;
+                    var fractionX = Math.max(layerWidth / spanX, 0.000001);
+                    var fractionY = Math.max(layerHeight / spanY, 0.000001);
+                    var fitZoom = Math.min(mapViewport.width / (mapCanvas.width * fractionX),
+                                           mapViewport.height / (mapCanvas.height * fractionY)) * 0.9;
+                    if (!isFinite(fitZoom) || fitZoom <= 0)
+                        return false;
+                    var centerX = (layerBounds[0] + layerBounds[2]) / 2;
+                    var centerY = (layerBounds[1] + layerBounds[3]) / 2;
+                    var nx = (centerX - dataBounds[0]) / spanX;
+                    var ny = (centerY - dataBounds[1]) / spanY;
+                    mapZoom = Math.max(0.0001, fitZoom);
+                    panX = (0.5 - nx) * mapCanvas.width * mapZoom;
+                    panY = (ny - 0.5) * mapCanvas.height * mapZoom;
+                    pendingInitialLayerFit = false;
+                    viewportGeneration += 1;
+                    return true;
+                }
+
+                function fitPreferredInitialLayer() {
+                    if (!pendingInitialLayerFit || hasSavedWorkspaceView)
+                        return false;
+                    var fallback = "";
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        var row = layerModel.get(i);
+                        if (!row.boundsJson || row.boundsJson === "[]")
+                            continue;
+                        if (fallback === "")
+                            fallback = row.name;
+                        if ((row.geometryType || "").toUpperCase().indexOf("POLYGON") >= 0)
+                            return zoomToLayerExtent(row.name);
+                    }
+                    return fallback !== "" && zoomToLayerExtent(fallback);
                 }
 
                 function currentMapCoordinate() {
@@ -632,6 +754,13 @@ ApplicationWindow {
                     property string activeLayer: ""
                     property int activeLayerGeneration: 0
                     property string renderStatus: "Ready"
+                    // Must be a declared QML property so updates from the
+                    // native bridge notify bindings such as the Logs dialog.
+                    property string diagnosticLogPayload: "[]"
+                    property double processMemoryBytes: 0
+                    property double goHeapBytes: 0
+                    property int processMemoryKind: 0
+                    property bool memoryStatusAvailable: false
                     property string mapMetadataPayload: ""
                     property int mapMetadataGeneration: 0
                     property int cancelGeneration: 0
@@ -871,6 +1000,8 @@ ApplicationWindow {
                                     sourceEncoding: layers[layerIndex].sourceEncoding || "",
                                     sourceError: layers[layerIndex].sourceError || "",
                                     crs: layers[layerIndex].crs || "",
+                                    geometryType: layers[layerIndex].geometryType || "",
+                                    boundsJson: JSON.stringify(layers[layerIndex].bounds || []),
                                     layerVisible: layers[layerIndex].visible !== false,
                                     style: layers[layerIndex].style || ({}),
                                     labels: layers[layerIndex].labels || ({
@@ -894,6 +1025,7 @@ ApplicationWindow {
                             }
                             attributeLayerTabs.currentIndex = 0;
                             mapViewport.syncLayerVisibility();
+                            mapViewport.fitPreferredInitialLayer();
                         }
                         if (mapCanvas.layerLabelGeneration !== mapViewport.layerLabelGenerationSeen) {
                             mapViewport.layerLabelGenerationSeen = mapCanvas.layerLabelGeneration;
@@ -930,6 +1062,8 @@ ApplicationWindow {
                             mapViewport.panY = 0;
                             mapViewport.mapZoom = 1;
                             if (metadata.view) {
+                                mapViewport.hasSavedWorkspaceView = true;
+                                mapViewport.pendingInitialLayerFit = false;
                                 var view = metadata.view;
                                 var zoom = Math.max(0.0001, Number(view.zoom) || 1);
                                 mapViewport.mapZoom = zoom;
@@ -944,7 +1078,10 @@ ApplicationWindow {
                                     }
                                 }
                             } else {
+                                mapViewport.hasSavedWorkspaceView = false;
+                                mapViewport.pendingInitialLayerFit = true;
                                 mapViewport.pendingWorkspaceActiveLayer = "";
+                                mapViewport.fitPreferredInitialLayer();
                             }
                             mapViewport.viewportGeneration += 1;
                         }
@@ -979,6 +1116,7 @@ ApplicationWindow {
                         color: "#65717d"
                     }
                     Button {
+                        objectName: "emptyStateAddVectorFilesButton"
                         Layout.alignment: Qt.AlignHCenter
                         text: rootWindow.tr("Add vector files")
                         onClicked: fileDialog.open()
@@ -1199,20 +1337,24 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.leftMargin: 12
             anchors.rightMargin: 12
+            Button {
+                objectName: "openDiagnosticLogsButton"
+                text: rootWindow.tr("Logs")
+                onClicked: diagnosticLogDialog.open()
+            }
             BusyIndicator {
                 objectName: "loadBusyIndicator"
-                running: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
+                running: rootWindow.statusIsBusy(mapViewport.renderStatus)
                 visible: running
                 implicitWidth: 22
                 implicitHeight: 22
             }
             Label {
                 objectName: "renderStatusLabel"
-                text: mapViewport.renderStatus
-                color: {
-                    var status = mapViewport.renderStatus.toLowerCase();
-                    return status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 ? "#b42318" : "#2e7d32";
-                }
+                text: rootWindow.localizedStatus(mapViewport.renderStatus)
+                color: rootWindow.statusColor(mapViewport.renderStatus)
+                Layout.maximumWidth: 390
+                elide: Text.ElideRight
             }
             TextField {
                 id: coordinateXInput
@@ -1240,6 +1382,18 @@ ApplicationWindow {
             }
             Item {
                 Layout.fillWidth: true
+            }
+            Label {
+                objectName: "memoryStatusLabel"
+                visible: rootWindow.width >= 1200
+                text: rootWindow.memorySummary(mapCanvas.processMemoryBytes, mapCanvas.goHeapBytes, mapCanvas.memoryStatusAvailable, mapCanvas.processMemoryKind)
+                color: "#65717d"
+                font.pixelSize: 11
+                Layout.maximumWidth: 240
+                elide: Text.ElideRight
+                ToolTip.visible: memoryMouse.containsMouse
+                ToolTip.text: language === "ko" ? "프로세스 메모리에는 Go/GDAL/Qt가 포함됩니다. GPU 메모리는 포함되지 않습니다. macOS CGO 데스크톱은 현재 RSS를 표시합니다." : language === "jp" ? "プロセスメモリにはGo/GDAL/Qtを含みます。GPUメモリは含みません。macOSのCGOデスクトップは現在のRSSを表示します。" : "Process memory includes Go/GDAL/Qt, but excludes GPU memory. The macOS CGO desktop shows current RSS."
+                MouseArea { id: memoryMouse; anchors.fill: parent; hoverEnabled: true }
             }
             Label {
                 text: "Layers: " + layerModel.count + "  ·  " + (mapViewport.dataCRS || "CRS unknown") + "  ·  " + mapViewport.currentMapCoordinate()
@@ -1726,12 +1880,56 @@ ApplicationWindow {
         }
     }
 
-    Platform.FileDialog {
+    Dialog {
+        id: diagnosticLogDialog
+        objectName: "diagnosticLogDialog"
+        title: rootWindow.tr("Application log")
+        modal: true
+        width: Math.min(980, rootWindow.width - 48)
+        height: Math.min(680, rootWindow.height - 48)
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Close
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.tr("Showing the most recent process output and application errors. Older entries are discarded.")
+                color: "#65717d"
+                wrapMode: Text.Wrap
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                TextArea {
+                    objectName: "diagnosticLogTextArea"
+                    readOnly: true
+                    selectByMouse: true
+                    wrapMode: TextEdit.NoWrap
+                    textFormat: TextEdit.PlainText
+                    text: {
+                        try {
+                            var entries = JSON.parse(mapCanvas.diagnosticLogPayload || "[]");
+                            return entries.map(function(entry) {
+                                return "[" + entry.time + "] " + entry.stream + ": " + entry.message;
+                            }).join("\n");
+                        } catch (error) {
+                            return String(mapCanvas.diagnosticLogPayload || "");
+                        }
+                    }
+                    onTextChanged: cursorPosition = length
+                }
+            }
+        }
+    }
+
+    QuickDialogs.FileDialog {
         id: fileDialog
+        objectName: "addVectorFilesDialog"
         title: rootWindow.tr("Add vector files as layers")
-        fileMode: Platform.FileDialog.OpenFiles
-        nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json)", "All files (*)"]
-        onAccepted: mapViewport.requestLoadFiles(files)
+        fileMode: QuickDialogs.FileDialog.OpenFiles
+        nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json *.dxf)", "All files (*)"]
+        onAccepted: mapViewport.requestLoadFiles(selectedFiles)
     }
 
     Platform.FileDialog {
@@ -1774,7 +1972,7 @@ ApplicationWindow {
         id: relinkFileDialog
         title: rootWindow.tr("Select original layer source")
         fileMode: Platform.FileDialog.OpenFile
-        nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json)", "All files (*)"]
+        nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json *.dxf)", "All files (*)"]
         onAccepted: sourcePathField.text = mapViewport.localPathFromUrl(file)
     }
 }

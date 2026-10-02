@@ -162,10 +162,18 @@ snapshot을 시도하지만, reader 안전 상한(최대 100,000 feature/128 MiB
 미리 표시한 뒤 전체 geometry로 교체합니다. 혼합 CRS 또는 재투영이 필요한
 입력은 정확한 전체 범위를 유지하기 위해 미리보기를 생략합니다.
 
-현재 읽기 전용은 속성 맵과 중복 프로젝트 스냅샷을 피하지만 전체 geometry를
-메모리에 적재한다. GDAL `OpenWindowGeometryOnly`는 드라이버 API로 구현되어
-있으나 desktop viewport/chunk 렌더러에는 아직 연결하지 않았다. 그러므로 이 모드는
-전국 단위 데이터의 OOM 방지나 화면 영역만 로드하는 기능을 의미하지 않는다.
+대용량 읽기 전용 모드는 GDAL 공간창을 viewport chunk 단위로 조회하며, 화면 밖의
+geometry 전체를 Go 메모리에 적재하지 않는다. 제한된 뷰포트 청크를 요청하며,
+넓은 영역이 화면에 맞는 낮은 줌(zoom bucket -2 이하)에서는 복잡한 선·폴리곤에 GEOS의
+topology-preserving display simplification을 적용한다. 이는 첫 화면이나 실사용 GPU 프레임 시간 최적화가
+검증 완료됐다는 뜻은 아니다.
+zoom bucket 1 이하에서는 일정 간격의 feature 표본만 사용하고, 속성·라벨·피처 선택용
+geometry를 보유하지 않는다. 정확한 전체 형상과 선택은 zoom bucket 2 이상으로 확대하면
+다시 활성화되며, 상태 표시줄에 근사 개요 모드임을 알린다.
+단순화는 화면 표시용 chunk에만 적용되며 원본 geometry, 편집 데이터, 내보내기 데이터는 변경하지 않는다. 넓은 축척의 화면 형상과 경계는 근사일
+수 있고, viewport의 feature/payload/native vertex 상한에 걸리면 로그에 불완전 렌더를
+표시한다. 이는 전국 단위 전체 피처를 한 번에 메모리에 올리지 않도록 하는 정책이지,
+모든 데이터를 한 화면에 완전히 표시한다는 보장은 아니다.
 
 `desktop-native`는 `qt native` 태그로 GDAL 입력을 활성화하며, 입력 layer의
 실제 이름을 QML 레이어 트리와 속성 테이블에 반영하며, layer 이름을 생략하면
@@ -178,9 +186,12 @@ dataset의 모든 layer를 로드합니다. `--save`를 지정하면 편집 Comm
 공통 CRS이며, 각 layer의 CRS가 다르면 PROJ로 변환합니다. CRS를 알 수 없는
 layer를 변환 대상에 포함할 때는 `--source-crs`를 지정해야 합니다.
 
-DXF exporter의 구조 검증은 GDAL DXF driver로도 수행할 수 있습니다. 예를
-들어 샘플 GeoJSON을 변환한 뒤 GDAL이 DXF를 다시 읽고 geometry 수와 extent를
-인식하는지 확인합니다. 이 검사는 ARES Commander의 실제 화면·한글 글꼴
+Desktop의 파일 열기/추가 대화상자에서 `.dxf`를 벡터 입력으로 선택할 수 있으며,
+GDAL/OGR DXF driver의 읽기 지원 범위 안에서 entity를 가져온다. DXF는 좌표계 정보가
+없는 경우가 많으므로 입력 좌표의 단위와 CRS를 확인해야 한다. 테스트용 UTF-8 도면은
+GDAL을 통해 4개 entity로 읽히는 것을 검사한다. DXF exporter의 구조 검증은 GDAL DXF
+driver로도 수행할 수 있습니다. 예를 들어 샘플 GeoJSON을 변환한 뒤 GDAL이 DXF를
+다시 읽고 geometry 수와 extent를 인식하는지 확인합니다. 이 검사는 ARES Commander의 실제 화면·한글 글꼴
 호환성을 대체하지 않으며, ARES 검증은 대상 앱에서 별도로 수행해야 합니다.
 
 ```sh

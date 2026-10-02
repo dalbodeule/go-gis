@@ -5,7 +5,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +26,34 @@ func TestMarshalLayerLabelsNormalizesNilSlice(t *testing.T) {
 	}
 	if payload != "[]" {
 		t.Fatalf("nil label payload = %q, want []", payload)
+	}
+}
+
+func TestPrioritizeViewportChunksStartsAtCenterAndPreservesLayerOrder(t *testing.T) {
+	keys := []render.ChunkKey{
+		{Layer: "parcels", X: 0, Y: 0},
+		{Layer: "parcels", X: 5, Y: 5},
+		{Layer: "parcels", X: 9, Y: 9},
+		{Layer: "points", X: 0, Y: 0},
+		{Layer: "points", X: 5, Y: 5},
+	}
+	prioritizeViewportChunks(keys, render.Viewport{Center: render.Point{X: 5.5, Y: 5.5}}, 1)
+	if keys[0].Layer != "parcels" || keys[0].X != 5 || keys[0].Y != 5 {
+		t.Fatalf("first layer did not start at viewport center: %+v", keys)
+	}
+	if keys[3].Layer != "points" || keys[3].X != 5 || keys[3].Y != 5 {
+		t.Fatalf("second layer did not preserve group order/start at center: %+v", keys)
+	}
+}
+
+func TestProcessMemoryStatusIsAvailableAndNonzero(t *testing.T) {
+	bytes, kind, ok := processMemoryBytes()
+	if !ok || bytes == 0 || kind == "" {
+		t.Fatalf("process memory sample = (%d, %q, %t), want nonzero supported measurement", bytes, kind, ok)
+	}
+	wantKind := map[string]string{"darwin": "RSS", "linux": "RSS", "windows": "Working set"}[runtime.GOOS]
+	if wantKind != "" && kind != wantKind {
+		t.Fatalf("process memory metric kind = %q, want %q on %s", kind, wantKind, runtime.GOOS)
 	}
 }
 
@@ -386,6 +416,173 @@ func TestRefreshCancelsBuilderWhenAllLayersHidden(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("render builder was not canceled after hiding all layers")
 	}
+}
+
+func TestRefreshPreservesChunkCacheWhileAllLayersAreHidden(t *testing.T) {
+	viewport := render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	planner := render.NewChunkPlanner()
+	planner.ChunkSize = 0.25
+	planner.Margin = 0
+	planner.Domain = [4]float64{0, 0, 0, 0}
+	planner.HasDomain = true
+	keys := planner.VisibleKeys(viewport, "roads")
+	if len(keys) == 0 {
+		t.Fatal("test viewport produced no chunk keys")
+	}
+	scheduler := render.NewScheduler()
+	results := scheduler.RequestUnique(context.Background(), keys[:1], func(_ context.Context, key render.ChunkKey) (render.Chunk, error) {
+		return render.Chunk{Key: key, Vertices: []render.Vertex{{X: 0.25, Y: 0.25}, {X: 0.75, Y: 0.75}}}, nil
+	})
+	for range results {
+	}
+	if _, cached := scheduler.Cached(keys[0]); !cached {
+		t.Fatal("setup failed to cache visible chunk")
+	}
+
+	visibility := render.NewLayerVisibility("roads")
+	visibility.Set("roads", false)
+	runtime := &demoRuntime{
+		scheduler: scheduler, batchStore: render.NewBatchStore(), planner: planner,
+		visibility: visibility, visibleLayers: map[string]bool{"roads": false},
+	}
+	runtime.refresh(context.Background(), viewport)
+	if _, cached := scheduler.Cached(keys[0]); !cached {
+		t.Fatal("hiding every layer discarded the last bounded viewport cache")
+	}
+
+	visibility.Set("roads", true)
+	runtime.visibleLayers["roads"] = true
+	runtime.refresh(context.Background(), viewport)
+	if _, cached := scheduler.Cached(keys[0]); !cached {
+		t.Fatal("restoring a layer discarded its reusable chunk")
+	}
+}
+
+func TestRefreshPreservesHiddenLayerChunksWithinBudget(t *testing.T) {
+	viewport := render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	planner := render.NewChunkPlanner()
+	planner.ChunkSize = 0.25
+	planner.Margin = 0
+	planner.Domain = [4]float64{0, 0, 0, 0}
+	planner.HasDomain = true
+	roads := render.ChunkKey{Layer: "roads", X: 0, Y: 0}
+	buildings := render.ChunkKey{Layer: "buildings", X: 0, Y: 0}
+	scheduler := render.NewScheduler()
+	results := scheduler.RequestUnique(context.Background(), []render.ChunkKey{roads, buildings}, func(_ context.Context, key render.ChunkKey) (render.Chunk, error) {
+		return render.Chunk{Key: key, Vertices: []render.Vertex{{X: 0.1, Y: 0.1}, {X: 0.2, Y: 0.2}}}, nil
+	})
+	for range results {
+	}
+
+	visibility := render.NewLayerVisibility("roads", "buildings")
+	visibility.Set("roads", false)
+	runtime := &demoRuntime{
+		scheduler: scheduler, batchStore: render.NewBatchStore(), planner: planner,
+		visibility: visibility, visibleLayers: map[string]bool{"roads": false, "buildings": true},
+		builder: func(_ context.Context, key render.ChunkKey) (render.Chunk, error) {
+			return render.Chunk{Key: key}, nil
+		},
+	}
+	runtime.refresh(context.Background(), viewport)
+	if _, cached := scheduler.Cached(buildings); !cached {
+		t.Fatal("currently visible layer chunk was not retained")
+	}
+	if _, cached := scheduler.Cached(roads); !cached {
+		t.Fatal("hidden layer chunk was not retained for a visibility toggle")
+	}
+
+	visibility.Set("roads", true)
+	runtime.visibleLayers["roads"] = true
+	runtime.refresh(context.Background(), viewport)
+	if _, cached := scheduler.Cached(roads); !cached {
+		t.Fatal("re-shown layer chunk was not reused")
+	}
+}
+
+func TestEmptyProjectRefreshDoesNotReportNoVisibleLayers(t *testing.T) {
+	before := strings.Count(native.DiagnosticLogJSON(), "No visible layers")
+	runtime := loadEmptyProject()
+	runtime.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1})
+	after := strings.Count(native.DiagnosticLogJSON(), "No visible layers")
+	if after != before {
+		t.Fatalf("empty project refresh added a misleading no-visible-layers diagnostic: before=%d after=%d", before, after)
+	}
+}
+
+func TestRefreshVisibleLayerPublishesVerticesAndReusesCacheAfterToggle(t *testing.T) {
+	runtime := &demoRuntime{
+		scheduler:     render.NewScheduler(),
+		batchStore:    render.NewBatchStore(),
+		planner:       render.NewChunkPlanner(),
+		visibility:    render.NewLayerVisibility("roads"),
+		visibleLayers: map[string]bool{"roads": true},
+		dataMode:      true,
+		builder: func(_ context.Context, key render.ChunkKey) (render.Chunk, error) {
+			return render.Chunk{Key: key, Vertices: []render.Vertex{{X: 0.25, Y: 0.75, Kind: render.VertexLine}}}, nil
+		},
+	}
+	viewport := render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	runtime.advanceRenderGeneration()
+	firstDiagnosticCount := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(context.Background(), viewport)
+	firstReady := waitForRenderDiagnostic(t, firstDiagnosticCount, "ready generation=1")
+	if strings.Contains(firstReady, "vertices=0") {
+		t.Fatalf("initial visible-layer render produced no vertices: %s", firstReady)
+	}
+
+	applyLayerVisibility(runtime, `{"roads":false}`)
+	runtime.advanceRenderGeneration()
+	runtime.refresh(context.Background(), viewport)
+
+	applyLayerVisibility(runtime, `{"roads":true}`)
+	runtime.advanceRenderGeneration()
+	secondDiagnosticCount := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(context.Background(), viewport)
+	secondReady := waitForRenderDiagnostic(t, secondDiagnosticCount, "ready generation=3")
+	if strings.Contains(secondReady, "vertices=0") {
+		t.Fatalf("visible-layer restoration did not publish cached geometry: %s", secondReady)
+	}
+	var cacheHits int
+	if _, err := fmt.Sscanf(strings.SplitN(secondReady, "cache_hits=", 2)[1], "%d", &cacheHits); err != nil {
+		t.Fatalf("parse cache hit count from %q: %v", secondReady, err)
+	}
+	if cacheHits == 0 {
+		t.Fatalf("restored layer rebuilt its chunks instead of using the retained cache: %s", secondReady)
+	}
+}
+
+type renderDiagnostic struct {
+	Stream  string `json:"stream"`
+	Message string `json:"message"`
+}
+
+func diagnosticEntryCount(t *testing.T, payload string) int {
+	t.Helper()
+	var entries []renderDiagnostic
+	if err := json.Unmarshal([]byte(payload), &entries); err != nil {
+		t.Fatalf("decode diagnostic log: %v", err)
+	}
+	return len(entries)
+}
+
+func waitForRenderDiagnostic(t *testing.T, start int, generation string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var entries []renderDiagnostic
+		if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &entries); err != nil {
+			t.Fatalf("decode diagnostic log while waiting: %v", err)
+		}
+		for _, entry := range entries[min(start, len(entries)):] {
+			if entry.Stream == "render" && strings.Contains(entry.Message, generation) &&
+				strings.Contains(entry.Message, "vertices=") && strings.Contains(entry.Message, "cache_hits=") {
+				return entry.Message
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for render diagnostic for %s", generation)
+	return ""
 }
 
 func TestRefreshReadsViewportModeUnderRuntimeLock(t *testing.T) {

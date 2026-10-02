@@ -34,6 +34,22 @@ func TestInitialFeatureCapacityIsBounded(t *testing.T) {
 	}
 }
 
+func TestReaderImportsDXFThroughOGR(t *testing.T) {
+	path := filepath.Join("..", "..", "testdata", "ares", "sample-utf8.dxf")
+	layer, err := (Reader{}).Open(context.Background(), path, "entities")
+	if err != nil {
+		t.Fatalf("open DXF entities: %v", err)
+	}
+	if len(layer.Features) != 4 {
+		t.Fatalf("DXF feature count = %d, want 4", len(layer.Features))
+	}
+	for index, feature := range layer.Features {
+		if feature.Geometry == nil {
+			t.Errorf("DXF feature %d has no geometry", index)
+		}
+	}
+}
+
 func TestValidateSpatialWindowRejectsNonFiniteAndReversedBounds(t *testing.T) {
 	for _, bounds := range [][4]float64{
 		{math.NaN(), 0, 1, 1},

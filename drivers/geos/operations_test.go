@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	geoslib "github.com/twpayne/go-geos"
 	"gogis/internal/core"
 )
 
@@ -28,6 +29,42 @@ func TestConstrainedTrianglesRespectPolygonHole(t *testing.T) {
 	}
 	if len(triangles) == 0 || math.Abs(area-84) > 1e-8 {
 		t.Fatalf("triangles=%d, covered area=%v; want 84 (including a 4x4 hole excluded)", len(triangles), area)
+	}
+}
+
+func TestSimplifyForDisplayReducesGeometryWithoutMutatingSource(t *testing.T) {
+	coordinates := make([]string, 0, 44)
+	for index := 0; index <= 40; index++ {
+		y := 0.0
+		if index%2 == 1 {
+			y = 0.02
+		}
+		coordinates = append(coordinates, fmt.Sprintf("%.1f %.2f", float64(index)/10, y))
+	}
+	coordinates = append(coordinates, "4 4", "0 4", "0 0")
+	polygonText := "POLYGON ((" + strings.Join(coordinates, ", ") + "))"
+	geosContext := geoslib.NewContext()
+	input, err := geosContext.NewGeomFromWKT(polygonText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	polygon := core.WKBGeometry{WKB: input.ToWKB()}
+	input.Destroy()
+	layer := core.Layer{Name: "parcels", Features: []core.Feature{{ID: 7, Geometry: polygon}}}
+	result, err := NewOperator().SimplifyForDisplay(context.Background(), layer, 0.1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := layer.Features[0].Geometry.(core.WKBGeometry).WKB; string(got) != string(polygon.WKB) {
+		t.Fatalf("source geometry mutated: %q", got)
+	}
+	simplified, ok := result.Features[0].Geometry.(core.WKBGeometry)
+	if !ok {
+		t.Fatalf("simplified geometry type = %T, want WKBGeometry", result.Features[0].Geometry)
+	}
+	count, err := simplified.PointCount()
+	if err != nil || count >= len(coordinates) || count < 4 {
+		t.Fatalf("simplified polygon point count = %d, err=%v; want fewer than %d", count, err, len(coordinates))
 	}
 }
 

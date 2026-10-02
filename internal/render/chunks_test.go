@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+func TestViewportBatchBudgetFitsQtSceneGraphExpansionLimit(t *testing.T) {
+	const maxQtSceneGraphVertices = 8 * 1024 * 1024
+	const maxExpandedVerticesPerSourceVertex = 3
+	if expanded := MaxBatchVertices * maxExpandedVerticesPerSourceVertex; expanded > maxQtSceneGraphVertices {
+		t.Fatalf("viewport source budget %d may expand to %d Qt vertices, exceeding %d",
+			MaxBatchVertices, expanded, maxQtSceneGraphVertices)
+	}
+}
+
 func TestSchedulerConfiguresBoundedWorkerCount(t *testing.T) {
 	for _, test := range []struct{ configured, want int }{{-1, 1}, {0, 1}, {1, 1}, {3, 3}, {100, 64}} {
 		scheduler := NewSchedulerWithMaxWorkers(test.configured)
@@ -129,6 +138,33 @@ func TestSchedulerRetainOnlyRebuildsCacheAcrossVisitedViewports(t *testing.T) {
 	scheduler.RetainOnly(nil)
 	if len(scheduler.cache) != 0 {
 		t.Fatalf("empty viewport retained %d cache entries", len(scheduler.cache))
+	}
+}
+
+func TestSchedulerRetainViewportChunksReservesVisibleAndBoundsHiddenCache(t *testing.T) {
+	scheduler := NewScheduler()
+	visible := ChunkKey{Layer: "buildings", X: 1}
+	hiddenLarge := ChunkKey{Layer: "parcels", X: 1}
+	hiddenMedium := ChunkKey{Layer: "parcels", X: 2}
+	hiddenSmall := ChunkKey{Layer: "points", X: 1}
+	scheduler.mu.Lock()
+	scheduler.cacheChunkLocked(visible, Chunk{Vertices: make([]Vertex, 4)}, MaxBatchVertices)
+	scheduler.cacheChunkLocked(hiddenLarge, Chunk{Vertices: make([]Vertex, 8)}, MaxBatchVertices)
+	scheduler.cacheChunkLocked(hiddenMedium, Chunk{Vertices: make([]Vertex, 4)}, MaxBatchVertices)
+	scheduler.cacheChunkLocked(hiddenSmall, Chunk{Vertices: make([]Vertex, 1)}, MaxBatchVertices)
+	scheduler.mu.Unlock()
+
+	scheduler.RetainViewportChunks([]ChunkKey{visible}, []ChunkKey{hiddenLarge, hiddenMedium, hiddenSmall}, 9)
+	for _, key := range []ChunkKey{visible, hiddenLarge, hiddenSmall} {
+		if _, ok := scheduler.Cached(key); !ok {
+			t.Fatalf("visible/largest-within-budget chunk %v was evicted", key)
+		}
+	}
+	if _, ok := scheduler.Cached(hiddenMedium); ok {
+		t.Fatal("hidden chunk beyond the visibility cache budget was retained")
+	}
+	if scheduler.cacheVertices != 13 {
+		t.Fatalf("retained vertex count = %d, want visible 4 + hidden 9", scheduler.cacheVertices)
 	}
 }
 

@@ -3078,6 +3078,9 @@ func (ds *Dataset) Layers() []Layer {
 // SpatialRef returns dataset projection.
 func (layer Layer) SpatialRef() *SpatialRef {
 	hndl := C.OGR_L_GetSpatialRef(layer.handle())
+	if hndl == nil {
+		return nil
+	}
 	return &SpatialRef{handle: hndl, isOwned: false}
 }
 
