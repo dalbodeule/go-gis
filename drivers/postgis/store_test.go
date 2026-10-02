@@ -4,12 +4,50 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"gogis/internal/core"
+
+	"golang.org/x/text/unicode/norm"
 )
+
+func TestNormIterMakesProgressOnMalformedUTF8(t *testing.T) {
+	inputs := [][]byte{
+		{0xff},
+		{0xe2, 0x82},
+		{0xe2, 0x28, 0xa1},
+		{0xc0, 0xaf},
+	}
+	done := make(chan error, 1)
+	go func() {
+		for _, input := range inputs {
+			var iterator norm.Iter
+			iterator.Init(norm.NFC, input)
+			for !iterator.Done() {
+				previous := iterator.Pos()
+				iterator.Next()
+				if iterator.Pos() <= previous {
+					done <- fmt.Errorf("normalizer did not advance on % x", input)
+					return
+				}
+			}
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("normalizer did not finish malformed UTF-8 input within 2 seconds")
+	}
+}
 
 func TestSRIDRequiresPositiveEPSGAuthority(t *testing.T) {
 	for _, test := range []struct {
@@ -99,16 +137,81 @@ func TestQuoteIdentifierQuotesEachPart(t *testing.T) {
 	}
 }
 
+func TestValidTableIdentifierEnforcesPostgreSQLPartLimits(t *testing.T) {
+	for _, table := range []string{"roads", "gis.roads", strings.Repeat("r", maxPostgreSQLIdentifierBytes)} {
+		if !validTableIdentifier(table) {
+			t.Errorf("valid identifier %q was rejected", table)
+		}
+	}
+	for _, table := range []string{"", ".roads", "gis.", "gis..roads", "db.gis.roads", strings.Repeat("r", maxPostgreSQLIdentifierBytes+1), `roads; DROP TABLE users`} {
+		if validTableIdentifier(table) {
+			t.Errorf("invalid identifier %q was accepted", table)
+		}
+	}
+}
+
+func TestPostGISFeatureIDRejectsNegativeBigint(t *testing.T) {
+	if got, err := postGISFeatureID(0); err != nil || got != 0 {
+		t.Fatalf("zero feature ID = %d, %v", got, err)
+	}
+	if got, err := postGISFeatureID(1<<63 - 1); err != nil || got != uint64(1<<63-1) {
+		t.Fatalf("maximum feature ID = %d, %v", got, err)
+	}
+	if got, err := postGISFeatureID(-1); err == nil || got != 0 {
+		t.Fatalf("negative feature ID = %d, %v; want error", got, err)
+	}
+}
+
 func TestPostGISQueriesUseQuotedTableAndStableOrdering(t *testing.T) {
 	if got := schemaQuery(`gis.roads`); !strings.Contains(got, `"gis"."roads"`) || !strings.Contains(got, "JSONB") {
 		t.Fatalf("schema query = %s", got)
 	}
-	if got := readLayerQuery(`gis.roads`); got != `SELECT id, ST_AsText(geom), ST_SRID(geom), properties FROM "gis"."roads" ORDER BY id` {
+	got := readLayerQuery(`gis.roads`)
+	for _, expected := range []string{
+		`"gis"."roads"`, `ST_NPoints(geom) <= 50000`, `pg_column_size(geom) <= 2097152`,
+		`octet_length(properties::text) <= 8388608`, `ORDER BY id LIMIT 100001`,
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("read query %q does not contain %q", got, expected)
+		}
+	}
+	if !strings.HasPrefix(got, "SELECT id,") {
 		t.Fatalf("read query = %s", got)
 	}
 	if got := clearLayerQuery(`gis.roads`); got != `DELETE FROM "gis"."roads"` {
 		t.Fatalf("clear query = %s", got)
 	}
+}
+
+func TestEstimatePostGISPropertyBytesBoundsComplexJSON(t *testing.T) {
+	estimate, err := estimatePostGISPropertyBytes([]byte(`{"name":"road","nested":[1,true,null]}`))
+	if err != nil || estimate <= 0 || estimate > maxPostGISFeatureBytes {
+		t.Fatalf("bounded JSON estimate = %d, %v", estimate, err)
+	}
+	deep := strings.Repeat("[", maxPostGISPropertyDepth+1) + "null" + strings.Repeat("]", maxPostGISPropertyDepth+1)
+	if _, err := estimatePostGISPropertyBytes([]byte(deep)); err == nil || !strings.Contains(err.Error(), "nesting") {
+		t.Fatalf("over-deep JSON error = %v, want nesting limit", err)
+	}
+	wide := `{"values":[` + strings.TrimSuffix(strings.Repeat("0,", maxPostGISPropertyNodes), ",") + "]}"
+	if _, err := estimatePostGISPropertyBytes([]byte(wide)); err == nil || !strings.Contains(err.Error(), "node limit") {
+		t.Fatalf("over-complex JSON error = %v, want node limit", err)
+	}
+	if _, err := estimatePostGISPropertyBytes([]byte(`{"value":`)); err == nil {
+		t.Fatal("malformed JSON was accepted")
+	}
+}
+
+func FuzzEstimatePostGISPropertyBytesNoPanic(f *testing.F) {
+	f.Add([]byte(`{"name":"road","nested":[1,true,null]}`))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`{"deep":{"items":[{"value":"text"}]}}`))
+	f.Add([]byte(`{"broken":`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			t.Skip()
+		}
+		_, _ = estimatePostGISPropertyBytes(data)
+	})
 }
 
 func TestInferFieldsSortsNamesAndMapsJSONTypes(t *testing.T) {

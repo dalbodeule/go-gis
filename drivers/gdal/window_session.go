@@ -17,20 +17,30 @@ import (
 // like AttributeSession; callers can still issue requests from UI callbacks
 // without racing the native dataset.
 type GeometrySession struct {
-	mu         sync.Mutex
-	source     string
-	dataset    *godal.Dataset
-	layer      godal.Layer
-	layerName  string
-	layerReady bool
+	mu            sync.Mutex
+	source        string
+	dataset       *godal.Dataset
+	streamSession *AttributeSession
+	layer         godal.Layer
+	layerName     string
+	layerReady    bool
 }
 
-// OpenGeometrySession opens a reusable read-only window session.
+// OpenGeometrySession opens a reusable read-only window session. GeoJSON and
+// GeoJSONSeq sources use the bounded streaming reader rather than GDAL's raw
+// JSON driver to avoid dataset-sized native materialization.
 func OpenGeometrySession(source string, encoding ...string) (*GeometrySession, error) {
 	registerDrivers()
 	selectedEncoding := ""
 	if len(encoding) > 0 {
 		selectedEncoding = encoding[0]
+	}
+	if isGeoJSONStreamSource(source) {
+		streamSession, err := OpenAttributeSession(source, selectedEncoding)
+		if err != nil {
+			return nil, fmt.Errorf("open %q: %w", source, err)
+		}
+		return &GeometrySession{source: source, streamSession: streamSession}, nil
 	}
 	dataset, err := openDataset(source, selectedEncoding)
 	if err != nil {
@@ -58,6 +68,10 @@ func (s *GeometrySession) openWindow(ctx context.Context, layerName string, boun
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.streamSession != nil {
+		return s.streamSession.OpenWindowWithLimits(ctx, layerName, bounds, includeProperties,
+			maxMaterializedSnapshotFeatures, maxMaterializedSnapshotBytes)
+	}
 	if s.dataset == nil {
 		return core.Layer{}, fmt.Errorf("geometry session for %q is closed", s.source)
 	}
@@ -78,6 +92,11 @@ func (s *GeometrySession) openWindow(ctx context.Context, layerName string, boun
 func (s *GeometrySession) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.streamSession != nil {
+		session := s.streamSession
+		s.streamSession = nil
+		return session.Close()
+	}
 	if s.dataset == nil {
 		return nil
 	}

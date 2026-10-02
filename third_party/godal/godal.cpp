@@ -194,8 +194,20 @@ void godalClose(cctx *ctx, GDALDatasetH ds) {
 typedef void (*fn_def)(void);
 
 int _go_registerDriver(const char *driver, const char *prefix) {
-	char *fnname = (char*)calloc(1,strlen(driver)+strlen(prefix)+1);
-	snprintf(fnname, sizeof(fnname), "%s%s", prefix, driver);
+	if (driver == nullptr || prefix == nullptr) {
+		return 1;
+	}
+	const size_t driverLength = strlen(driver);
+	const size_t prefixLength = strlen(prefix);
+	if (prefixLength > std::numeric_limits<size_t>::max() - driverLength - 1) {
+		return 1;
+	}
+	const size_t functionNameSize = prefixLength + driverLength + 1;
+	char *fnname = (char*)calloc(functionNameSize, sizeof(char));
+	if (fnname == nullptr) {
+		return 1;
+	}
+	snprintf(fnname, functionNameSize, "%s%s", prefix, driver);
 	void *fcn = dlsym(RTLD_DEFAULT,fnname);
 	free(fnname);
 	if (fcn != nullptr) {
@@ -1685,7 +1697,7 @@ namespace cpl
             int ret = _gogdalMultiReadCallback(m_filename, nRanges, (void *)ppData, (void *)panOffsets, (void *)panSizes, &err);
             if (err)
             {
-                CPLError(CE_Failure, CPLE_AppDefined, "%s", err);
+                CPLError(CE_Failure, CPLE_AppDefined, "%s", err != nullptr ? err : "Go VSI size callback failed");
                 errno = EIO;
                 free(err);
                 m_bError = true;
@@ -1742,7 +1754,7 @@ namespace cpl
         }
         else
         {
-            CPLError(CE_Failure, CPLE_AppDefined, "%s", err);
+            CPLError(CE_Failure, CPLE_AppDefined, "%s", err != nullptr ? err : "Go VSI multi-read callback failed");
             errno = EIO;
             free(err);
             m_bError = true;
@@ -1831,7 +1843,7 @@ namespace cpl
         {
             if (nFlags & VSI_STAT_SET_ERROR_FLAG)
             {
-                CPLError(CE_Failure, CPLE_AppDefined, "%s", err);
+                CPLError(CE_Failure, CPLE_AppDefined, "%s", err != nullptr ? err : "Go VSI size callback failed");
                 errno = ENOENT;
             }
             return -1;

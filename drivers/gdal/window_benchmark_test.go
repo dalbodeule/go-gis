@@ -47,6 +47,78 @@ func BenchmarkGDALGeoJSONWindowStream1M(b *testing.B) {
 	}
 }
 
+func BenchmarkGDALGeoJSONIndexedWindow1M(b *testing.B) {
+	benchmarkGDALGeoJSONIndexedWindow1M(b, false, [4]float64{0, 0, 0.0625, 0.0625}, 3_969)
+}
+
+func BenchmarkGDALGeoJSONSpatialGridWindow1M(b *testing.B) {
+	benchmarkGDALGeoJSONIndexedWindow1M(b, true, [4]float64{0, 0, 0.0625, 0.0625}, 3_969)
+}
+
+func BenchmarkGDALGeoJSONIndexedWindow1MZoomed(b *testing.B) {
+	benchmarkGDALGeoJSONIndexedWindow1M(b, false, [4]float64{0.123, 0.456, 0.12301, 0.45601}, 1)
+}
+
+func BenchmarkGDALGeoJSONSpatialGridWindow1MZoomed(b *testing.B) {
+	benchmarkGDALGeoJSONIndexedWindow1M(b, true, [4]float64{0.123, 0.456, 0.12301, 0.45601}, 1)
+}
+
+func BenchmarkGeoJSONSpatialCandidateIndexBuild1M(b *testing.B) {
+	path := benchmarkGeoJSONMillionPoints(b)
+	overviews, index, _, _, err := inspectGeoJSONCollectionWithIndexLimitAndTailBlocks(
+		context.Background(), path, maxGeoJSONInMemoryIndexFeatures)
+	if err != nil || len(index) != 1_000_000 || len(overviews) != 1 {
+		b.Fatalf("index GeoJSON fixture: overview=%#v index=%d err=%v", overviews, len(index), err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if spatial := newGeoJSONSpatialCandidateIndex(index, overviews[0].Bounds, overviews[0].HasBounds); spatial == nil {
+			b.Fatal("spatial candidate index was not built")
+		}
+	}
+	b.ReportMetric(1_000_000, "features/source")
+}
+
+func benchmarkGDALGeoJSONIndexedWindow1M(b *testing.B, useSpatialGrid bool, bounds [4]float64, expectedCount int) {
+	path := benchmarkGeoJSONMillionPoints(b)
+	ctx := context.Background()
+	overviews, index, tailBlocks, _, err := inspectGeoJSONCollectionWithIndexLimitAndTailBlocks(
+		ctx, path, maxGeoJSONInMemoryIndexFeatures)
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != 1_000_000 || len(index) != 1_000_000 {
+		b.Fatalf("index GeoJSON fixture: overview=%#v index=%d err=%v", overviews, len(index), err)
+	}
+	var spatial *geoJSONSpatialCandidateIndex
+	if useSpatialGrid {
+		spatial = newGeoJSONSpatialCandidateIndex(index, overviews[0].Bounds, overviews[0].HasBounds)
+		if spatial == nil {
+			b.Fatal("spatial candidate index was not built")
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var resultCount int
+	for iteration := 0; iteration < b.N; iteration++ {
+		var result core.Layer
+		if useSpatialGrid {
+			result, err = readGeoJSONIndexedWindowWithSpatialIndex(ctx, path, overviews[0], index,
+				tailBlocks, spatial, bounds, true, 20_000, 32<<20)
+		} else {
+			result, err = readGeoJSONIndexedWindowWithTailBlocks(ctx, path, overviews[0], index,
+				tailBlocks, bounds, true, 20_000, 32<<20)
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+		resultCount = len(result.Features)
+		if resultCount != expectedCount {
+			b.Fatalf("window feature count = %d, want %d", resultCount, expectedCount)
+		}
+	}
+	b.ReportMetric(1_000_000, "features/source")
+	b.ReportMetric(float64(resultCount), "window-features/op")
+}
+
 func BenchmarkGeoJSONTailFeatureLookup1MPlus100K(b *testing.B) {
 	const featureCount = 1_100_000
 	path := benchmarkGeoJSONPoints(b, featureCount)

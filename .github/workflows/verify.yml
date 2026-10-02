@@ -77,6 +77,18 @@ jobs:
       - name: Build native CLI
         run: go build -tags native -o build/gis-cli-native ./cmd/gis-cli
 
+      - name: Vet nested GODAL module
+        working-directory: third_party/godal
+        run: go vet ./...
+
+      - name: Test nested GODAL module
+        working-directory: third_party/godal
+        run: go test ./... -skip '^TestVSIGCSNoAuth$'
+
+      - name: Race test nested GODAL module
+        working-directory: third_party/godal
+        run: go test -race ./... -skip '^TestVSIGCSNoAuth$'
+
   postgis-integration:
     name: PostGIS transaction integration
     runs-on: ubuntu-latest
@@ -133,3 +145,7 @@ jobs:
 
       - name: Scan native GIS build configuration
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -tags native ./...
+
+      - name: Scan nested GODAL module
+        working-directory: third_party/godal
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

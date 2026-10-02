@@ -35,6 +35,8 @@ type AttributeSession struct {
 	streamOverviewReady  bool
 	streamIndex          []geoJSONFeatureIndex
 	streamTailBlocks     []geoJSONTailBlock
+	streamSpatialIndex   *geoJSONSpatialCandidateIndex
+	streamSpatialReady   bool
 	streamIndexReady     bool
 	streamIndexStamp     geoJSONFileStamp
 	layer                godal.Layer
@@ -122,6 +124,8 @@ func (s *AttributeSession) SetGeoJSONStreamIndexFeatureLimit(limit int) (applied
 		return true, fmt.Errorf("GeoJSON stream index is already initialized")
 	}
 	s.streamIndexLimit = limit
+	s.streamSpatialIndex = nil
+	s.streamSpatialReady = false
 	return true, nil
 }
 
@@ -254,8 +258,13 @@ func (s *AttributeSession) OpenWindowWithLimits(ctx context.Context, layerName s
 			}
 			return layer, nil
 		}
-		layer, err := readGeoJSONIndexedWindowWithTailBlocks(ctx, s.source, s.streamOverview[0], s.streamIndex,
-			s.streamTailBlocks, bounds, includeProperties, maxFeatures, maxBytes)
+		if !s.streamSpatialReady {
+			s.streamSpatialIndex = newGeoJSONSpatialCandidateIndex(s.streamIndex,
+				s.streamOverview[0].Bounds, s.streamOverview[0].HasBounds)
+			s.streamSpatialReady = true
+		}
+		layer, err := readGeoJSONIndexedWindowWithSpatialIndex(ctx, s.source, s.streamOverview[0], s.streamIndex,
+			s.streamTailBlocks, s.streamSpatialIndex, bounds, includeProperties, maxFeatures, maxBytes)
 		if err != nil {
 			return core.Layer{}, err
 		}
@@ -498,6 +507,9 @@ func (s *AttributeSession) Close() error {
 		s.streamOverview = nil
 		s.streamIndex = nil
 		s.streamTailBlocks = nil
+		s.streamSpatialIndex = nil
+		s.streamSpatialReady = false
+		s.streamIndexStamp = geoJSONFileStamp{}
 		s.streamOverviewReady = false
 		s.streamIndexReady = false
 		return nil

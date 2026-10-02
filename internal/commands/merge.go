@@ -16,6 +16,16 @@ var (
 	ErrDuplicateID      = errors.New("duplicate feature ID during merge")
 )
 
+const mergeCancellationCheckInterval = 256
+
+func addMergeFeatureCount(total, next int) (int, bool) {
+	maxInt := int(^uint(0) >> 1)
+	if total < 0 || next < 0 || next > maxInt-total {
+		return 0, false
+	}
+	return total + next, true
+}
+
 // MergeLayers combines layers with an identical field schema and CRS. Every
 // feature is cloned, so callers can safely use the result as an edit snapshot.
 func MergeLayers(ctx context.Context, layers ...core.Layer) (core.Layer, error) {
@@ -38,14 +48,11 @@ func mergeLayers(ctx context.Context, cloneFeatures bool, layers ...core.Layer) 
 		Editable: true,
 	}
 	totalFeatures := 0
-	for _, layer := range layers {
-		totalFeatures += len(layer.Features)
-	}
-	result.Features = make([]core.Feature, 0, totalFeatures)
-	seenIDs := make(map[uint64]struct{}, totalFeatures)
 	for layerIndex, layer := range layers {
-		if err := ctx.Err(); err != nil {
-			return core.Layer{}, err
+		if layerIndex%mergeCancellationCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return core.Layer{}, err
+			}
 		}
 		if layerIndex > 0 {
 			if !sameCRS(base.CRS, layer.CRS) {
@@ -55,11 +62,46 @@ func mergeLayers(ctx context.Context, cloneFeatures bool, layers ...core.Layer) 
 				return core.Layer{}, fmt.Errorf("%w between %q and %q", ErrSchemaMismatch, base.Name, layer.Name)
 			}
 		}
-		for _, feature := range layer.Features {
+		var ok bool
+		totalFeatures, ok = addMergeFeatureCount(totalFeatures, len(layer.Features))
+		if !ok {
+			return core.Layer{}, fmt.Errorf("merge feature count exceeds the platform limit")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return core.Layer{}, err
+	}
+	seenIDs := make(map[uint64]struct{}, totalFeatures)
+	for _, layer := range layers {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		for featureIndex, feature := range layer.Features {
+			if featureIndex > 0 && featureIndex%mergeCancellationCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return core.Layer{}, err
+				}
+			}
 			if _, exists := seenIDs[feature.ID]; exists {
 				return core.Layer{}, fmt.Errorf("%w: %d", ErrDuplicateID, feature.ID)
 			}
 			seenIDs[feature.ID] = struct{}{}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return core.Layer{}, err
+	}
+	result.Features = make([]core.Feature, 0, totalFeatures)
+	for _, layer := range layers {
+		if err := ctx.Err(); err != nil {
+			return core.Layer{}, err
+		}
+		for featureIndex, feature := range layer.Features {
+			if featureIndex > 0 && featureIndex%mergeCancellationCheckInterval == 0 {
+				if err := ctx.Err(); err != nil {
+					return core.Layer{}, err
+				}
+			}
 			if cloneFeatures {
 				result.Features = append(result.Features, feature.Clone())
 			} else {

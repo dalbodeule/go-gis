@@ -71,6 +71,15 @@ func BenchmarkProjectSnapshot10KFeatures(b *testing.B) {
 	}
 }
 
+func BenchmarkProjectRenderSnapshot10KFeatures(b *testing.B) {
+	service := benchmarkProjectService10K(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		benchmarkProjectSink = service.ProjectRenderSnapshot()
+	}
+}
+
 func BenchmarkBeginEdit10KFeatures(b *testing.B) {
 	service := benchmarkProjectService10K(b)
 	b.ReportAllocs()

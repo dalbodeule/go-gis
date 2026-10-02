@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -367,6 +368,9 @@ func TestGeoJSONStreamingAttributeSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !session.streamGeoJSON || session.dataset != nil {
+		t.Fatal("GeoJSON FeatureCollection session must use bounded streaming rather than opening the raw GDAL dataset")
+	}
 	overviews, err := session.Inspect(context.Background())
 	if err != nil || len(overviews) != 1 || overviews[0].Name != "session-layer" || overviews[0].CRS.AuthorityCode != "EPSG:5179" || overviews[0].FeatureCount != 3 || !overviews[0].HasBounds || overviews[0].Bounds != [4]float64{0, 0, 127.2, 37.5} {
 		t.Fatalf("stream inspect = %#v, err=%v", overviews, err)
@@ -396,8 +400,48 @@ func TestGeoJSONStreamingAttributeSession(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if session.streamOverview != nil || session.streamIndex != nil || session.streamTailBlocks != nil ||
+		session.streamSpatialIndex != nil || session.streamSpatialReady || session.streamIndexStamp != (geoJSONFileStamp{}) {
+		t.Fatal("closed GeoJSON session retained indexed source state")
+	}
 	if _, err := session.Inspect(context.Background()); err == nil {
 		t.Fatal("inspect succeeded after stream session close")
+	}
+}
+
+func TestGeoJSONSessionCloseReleasesSpatialIndex(t *testing.T) {
+	const featureCount = 50_000
+	path := filepath.Join(t.TempDir(), "large-session.geojson")
+	var content strings.Builder
+	content.Grow(featureCount * 90)
+	content.WriteString(`{"type":"FeatureCollection","features":[`)
+	for ordinal := 0; ordinal < featureCount; ordinal++ {
+		if ordinal != 0 {
+			content.WriteByte(',')
+		}
+		fmt.Fprintf(&content, `{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[%d,%d]}}`, ordinal%250, ordinal/250)
+	}
+	content.WriteString(`]}`)
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, err := session.OpenWindowWithLimits(context.Background(), "", [4]float64{0, 100, 0, 100}, false, 2, 1<<20)
+	if err != nil || len(window.Features) != 1 {
+		t.Fatalf("large-session window features=%d err=%v", len(window.Features), err)
+	}
+	if session.streamSpatialIndex == nil || len(session.streamSpatialIndex.ordinals) == 0 {
+		t.Fatal("large GeoJSON query did not build the spatial candidate index")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if session.streamIndex != nil || session.streamTailBlocks != nil || session.streamSpatialIndex != nil ||
+		session.streamSpatialReady || session.streamIndexStamp != (geoJSONFileStamp{}) {
+		t.Fatal("closed large GeoJSON session retained feature or spatial index memory")
 	}
 }
 
@@ -635,6 +679,107 @@ func TestGeoJSONFeatureIndexEntryStaysCompact(t *testing.T) {
 	}
 }
 
+func TestGeoJSONSpatialCandidateIndexMatchesLinearScan(t *testing.T) {
+	index := make([]geoJSONFeatureIndex, 50_002)
+	for ordinal := 0; ordinal < 50_000; ordinal++ {
+		x := float64(ordinal%250) / 2.5
+		y := float64(ordinal/250) / 5
+		xMax, yMax := x, y
+		if ordinal%97 == 0 {
+			xMax, yMax = min(100, x+0.21), min(100, y+0.21)
+		}
+		index[ordinal] = geoJSONFeatureIndex{bounds: [4]float64{x, y, xMax, yMax}, valid: true}
+	}
+	index[50_000] = geoJSONFeatureIndex{bounds: [4]float64{0, 0, 100, 100}, valid: true}
+	index[50_001] = geoJSONFeatureIndex{bounds: [4]float64{10, 10, 20, 20}}
+	spatial := newGeoJSONSpatialCandidateIndex(index, [4]float64{0, 0, 100, 100}, true)
+	if spatial == nil {
+		t.Fatal("spatial candidate index was not built")
+	}
+
+	query := [4]float64{10, 10, 20, 20}
+	candidates, indexed, err := spatial.query(context.Background(), query)
+	if err != nil || !indexed {
+		t.Fatalf("query indexed=%t err=%v", indexed, err)
+	}
+	var got []uint32
+	for _, ordinal := range candidates {
+		if geoJSONBoundsIntersect(index[ordinal].bounds, query) {
+			got = append(got, ordinal)
+		}
+	}
+	var want []uint32
+	for ordinal, entry := range index {
+		if entry.valid && geoJSONBoundsIntersect(entry.bounds, query) {
+			want = append(want, uint32(ordinal))
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidate result count=%d, linear scan count=%d", len(got), len(want))
+	}
+	for ordinal := range want {
+		if got[ordinal] != want[ordinal] {
+			t.Fatalf("candidate[%d]=%d, linear scan=%d", ordinal, got[ordinal], want[ordinal])
+		}
+	}
+	random := rand.New(rand.NewSource(42))
+	for queryNumber := 0; queryNumber < 128; queryNumber++ {
+		x, y := random.Float64()*95, random.Float64()*95
+		query := [4]float64{x, y, x + random.Float64()*5, y + random.Float64()*5}
+		candidates, indexed, err := spatial.query(context.Background(), query)
+		if err != nil || !indexed {
+			t.Fatalf("random query %d indexed=%t err=%v", queryNumber, indexed, err)
+		}
+		got = got[:0]
+		for _, ordinal := range candidates {
+			if index[ordinal].valid && geoJSONBoundsIntersect(index[ordinal].bounds, query) {
+				got = append(got, ordinal)
+			}
+		}
+		want = want[:0]
+		for ordinal, entry := range index {
+			if entry.valid && geoJSONBoundsIntersect(entry.bounds, query) {
+				want = append(want, uint32(ordinal))
+			}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("random query %d candidate count=%d, linear scan count=%d", queryNumber, len(got), len(want))
+		}
+		for ordinal := range want {
+			if got[ordinal] != want[ordinal] {
+				t.Fatalf("random query %d candidate[%d]=%d, linear scan=%d", queryNumber, ordinal, got[ordinal], want[ordinal])
+			}
+		}
+	}
+
+	outside, indexed, err := spatial.query(context.Background(), [4]float64{101, 101, 102, 102})
+	if err != nil || !indexed || len(outside) != 0 {
+		t.Fatalf("outside query candidates=%d indexed=%t err=%v", len(outside), indexed, err)
+	}
+	_, indexed, err = spatial.query(context.Background(), [4]float64{0, 0, 100, 100})
+	if err != nil || indexed {
+		t.Fatalf("wide query should select bounded linear fallback: indexed=%t err=%v", indexed, err)
+	}
+	if _, _, err := spatial.query(context.Background(), [4]float64{math.NaN(), 0, 1, 1}); err == nil {
+		t.Fatal("non-finite query bounds were accepted")
+	}
+	malformed := append([]geoJSONFeatureIndex(nil), index...)
+	malformed[123].bounds = [4]float64{2, 2, 1, 1}
+	if candidateIndex := newGeoJSONSpatialCandidateIndex(malformed, [4]float64{0, 0, 100, 100}, true); candidateIndex != nil {
+		t.Fatal("malformed feature bounds should disable the candidate index")
+	}
+}
+
+func TestGeoJSONSpatialCandidateIndexFallsBackWhenOverflowIsDense(t *testing.T) {
+	index := make([]geoJSONFeatureIndex, 50_000)
+	for ordinal := range index {
+		index[ordinal] = geoJSONFeatureIndex{bounds: [4]float64{0, 0, 100, 100}, valid: true}
+	}
+	if spatial := newGeoJSONSpatialCandidateIndex(index, [4]float64{0, 0, 100, 100}, true); spatial != nil {
+		t.Fatal("dense oversized-feature list should disable the coarse spatial index")
+	}
+}
+
 func TestGeoJSONSeqStreamingUsesBoundedRecordsAndPreservesMissingFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "points.geojsonl")
 	content := "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[1,2]},\"properties\":{\"name\":\"first\"}}\n" +
@@ -650,6 +795,9 @@ func TestGeoJSONSeqStreamingUsesBoundedRecordsAndPreservesMissingFields(t *testi
 		t.Fatal(err)
 	}
 	defer session.Close()
+	if !session.streamGeoJSON || session.dataset != nil {
+		t.Fatal("GeoJSONSeq session must use bounded streaming rather than opening the raw GDAL dataset")
+	}
 	overviews, err := session.Inspect(context.Background())
 	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != 2 {
 		t.Fatalf("GeoJSONSeq overview = %#v, %v; want one layer with two features", overviews, err)
@@ -1013,6 +1161,24 @@ func TestGeometryWKBSizeLimitRejectsBeforeExport(t *testing.T) {
 	}
 }
 
+func TestNewGeometryFromWKBRejectsEmptyInput(t *testing.T) {
+	for name, input := range map[string][]byte{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			geometry, err := godal.NewGeometryFromWKB(input, nil)
+			if err == nil {
+				if geometry != nil {
+					geometry.Close()
+				}
+				t.Fatal("empty WKB input was accepted")
+			}
+			if geometry != nil {
+				geometry.Close()
+				t.Fatal("empty WKB input returned a geometry")
+			}
+		})
+	}
+}
+
 func TestReaderRejectsOversizedGeoJSONMetadataWithoutGDALFallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "metadata.geojson")
 	fixture := `{"type":"FeatureCollection","metadata":"` + strings.Repeat("x", maxGeoJSONMetadataBytes+1) + `","features":[]}`
@@ -1346,7 +1512,7 @@ func TestAttributeSessionSchemaCacheIsDetached(t *testing.T) {
 	}
 }
 
-func TestGeometrySessionReusesDatasetAndCloses(t *testing.T) {
+func TestGeometrySessionUsesBoundedGeoJSONStreamAndCloses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}}]}`
 	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
@@ -1355,6 +1521,9 @@ func TestGeometrySessionReusesDatasetAndCloses(t *testing.T) {
 	session, err := OpenGeometrySession(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if session.streamSession == nil || session.dataset != nil {
+		t.Fatal("GeoJSON geometry session must reuse the bounded stream reader, not raw GDAL")
 	}
 	layer, err := session.OpenWindowGeometryOnly(context.Background(), "", [4]float64{127, 37, 128, 38})
 	if err != nil || len(layer.Features) != 1 || layer.Features[0].Properties != nil {
@@ -1365,6 +1534,26 @@ func TestGeometrySessionReusesDatasetAndCloses(t *testing.T) {
 	}
 	if _, err := session.OpenWindowGeometryOnly(context.Background(), "", [4]float64{127, 37, 128, 38}); err == nil {
 		t.Fatal("closed geometry session accepted a request")
+	}
+}
+
+func TestGeometrySessionRoutesGeoJSONSequenceThroughBoundedStream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roads.geojsonl")
+	fixture := "{\"type\":\"Feature\",\"properties\":{\"name\":\"inside\"},\"geometry\":{\"type\":\"Point\",\"coordinates\":[127.1,37.4]}}\n"
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenGeometrySession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if session.streamSession == nil || session.dataset != nil {
+		t.Fatal("GeoJSONSeq geometry session must reuse the bounded stream reader, not raw GDAL")
+	}
+	layer, err := session.OpenWindowGeometryOnly(context.Background(), "", [4]float64{127, 37, 128, 38})
+	if err != nil || len(layer.Features) != 1 || layer.Features[0].Properties != nil {
+		t.Fatalf("GeoJSONSeq geometry window = layer=%#v err=%v", layer, err)
 	}
 }
 

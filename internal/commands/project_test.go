@@ -36,6 +36,69 @@ func TestProjectServiceAdoptsLoadedLayerSnapshots(t *testing.T) {
 	}
 }
 
+func TestProjectRenderSnapshotSharesPayloadButCopiesMutableHeaders(t *testing.T) {
+	wkb := []byte{1, 2, 3, 4}
+	layer := core.Layer{
+		Name:     "roads",
+		Editable: true,
+		Fields:   []core.Field{{Name: "name", Type: core.FieldTypeText}},
+		Features: []core.Feature{{
+			ID: 1, Geometry: core.WKBGeometry{WKB: wkb},
+			Properties: map[string]any{"name": "main"}, Label: &core.Label{Text: "road"},
+		}},
+	}
+	service, err := NewProjectServiceWithLayers("loaded", core.CRS{AuthorityCode: "EPSG:4326"}, []core.Layer{layer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := service.ProjectRenderSnapshot()
+	if len(snapshot.Layers) != 1 || len(snapshot.Layers[0].Features) != 1 {
+		t.Fatalf("render snapshot shape = %+v", snapshot)
+	}
+	feature := &snapshot.Layers[0].Features[0]
+	stored := &service.project.Layers[0].Features[0]
+	if feature == stored {
+		t.Fatal("render snapshot shares a mutable feature header")
+	}
+	sharedWKB := feature.Geometry.(core.WKBGeometry).WKB
+	if len(sharedWKB) == 0 || &sharedWKB[0] != &wkb[0] {
+		t.Fatal("render snapshot cloned immutable WKB payload")
+	}
+	// Verify the documented payload-sharing contract, then restore the value
+	// before checking copy-on-write edit isolation below.
+	feature.Properties["name"] = "shared payload"
+	if stored.Properties["name"] != "shared payload" {
+		t.Fatal("render snapshot cloned the immutable property payload")
+	}
+	feature.Properties["name"] = "main"
+	if feature.Label == stored.Label {
+		t.Fatal("render snapshot shares a mutable label value")
+	}
+	feature.ID = 99
+	feature.Label.Text = "snapshot label"
+	snapshot.Layers[0].Fields[0].Name = "snapshot field"
+	if stored.ID != 1 || stored.Label.Text != "road" || service.project.Layers[0].Fields[0].Name != "name" {
+		t.Fatal("mutating render snapshot headers changed the committed project")
+	}
+
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetFeatureProperty("roads", 1, "name", "edited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SetFeatureGeometry("roads", 1, core.WKTGeometry{WKT: "POINT (5 6)"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Layers[0].Features[0].Properties["name"] != "main" ||
+		snapshot.Layers[0].Features[0].Geometry.(core.WKBGeometry).WKB[0] != 1 {
+		t.Fatal("copy-on-write edit changed the immutable render snapshot")
+	}
+}
+
 func TestProjectEditCommitAndRollback(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
 	layer := core.Layer{

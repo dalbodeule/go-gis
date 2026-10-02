@@ -72,6 +72,20 @@ func (s *ProjectService) Project() core.Project {
 	return s.project.Clone()
 }
 
+// ProjectRenderSnapshot copies project, layer, field, and feature headers while
+// sharing immutable geometry/property snapshots. Callers may update feature
+// headers and presentation metadata, but must not mutate shared geometry or
+// property values. ProjectService edit transactions use copy-on-write, so edits
+// made after this snapshot remain isolated.
+func (s *ProjectService) ProjectRenderSnapshot() core.Project {
+	result := *s.project
+	result.Layers = make([]core.Layer, len(s.project.Layers))
+	for index, layer := range s.project.Layers {
+		result.Layers[index] = layerRenderSnapshot(layer)
+	}
+	return result
+}
+
 // ProjectInfo returns project identity without cloning its layer data.
 func (s *ProjectService) ProjectInfo() (string, core.CRS) {
 	return s.project.Name, s.project.CRS
@@ -216,12 +230,36 @@ func (s *ProjectService) ProjectLayerRenderSnapshot(name string) (core.Layer, bo
 		if layer.Name != name {
 			continue
 		}
-		result := layer
-		result.Fields = append([]core.Field(nil), layer.Fields...)
-		result.Features = append([]core.Feature(nil), layer.Features...)
-		return result, true
+		return layerRenderSnapshot(layer), true
 	}
 	return core.Layer{}, false
+}
+
+func layerRenderSnapshot(layer core.Layer) core.Layer {
+	result := layer
+	result.Fields = append([]core.Field(nil), layer.Fields...)
+	result.Features = append([]core.Feature(nil), layer.Features...)
+	labelCount := 0
+	for _, feature := range layer.Features {
+		if feature.Label == nil {
+			continue
+		}
+		labelCount++
+	}
+	if labelCount == 0 {
+		return result
+	}
+	labelCopies := make([]core.Label, labelCount)
+	labelIndex := 0
+	for featureIndex, feature := range layer.Features {
+		if feature.Label == nil {
+			continue
+		}
+		labelCopies[labelIndex] = *feature.Label
+		result.Features[featureIndex].Label = &labelCopies[labelIndex]
+		labelIndex++
+	}
+	return result
 }
 
 // LayerEditable reports whether a layer is enabled for geometry edits.

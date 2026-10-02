@@ -732,6 +732,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	builder := r.builder
 	planner := r.planner
 	visibility := r.visibility
+	viewportReadOnly := r.viewportReadOnly
 	renderStage := 0
 	if r.dataMode {
 		renderStage = 2
@@ -740,7 +741,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		}
 	}
 	r.mu.Unlock()
-	if r.viewportReadOnly {
+	if viewportReadOnly {
 		planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
 	}
 	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)

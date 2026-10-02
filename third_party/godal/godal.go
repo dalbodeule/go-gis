@@ -27,6 +27,14 @@ static inline size_t gogis_strnlen(const char* value, size_t limit) {
 	while (length < limit && value[length] != '\0') length++;
 	return length;
 }
+static inline char* gogis_copy_c_string(const char* source, size_t length) {
+	if (length == (size_t)-1) return NULL;
+	char* result = (char*)malloc(length + 1);
+	if (result == NULL) return NULL;
+	if (length != 0) memcpy(result, source, length);
+	result[length] = '\0';
+	return result;
+}
 
 #cgo pkg-config: gdal
 #cgo CXXFLAGS: -std=c++11
@@ -38,12 +46,26 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 )
+
+func checkedCString(value string) (*C.char, error) {
+	var source *C.char
+	if len(value) != 0 {
+		source = (*C.char)(unsafe.Pointer(unsafe.StringData(value)))
+	}
+	result := C.gogis_copy_c_string(source, C.size_t(len(value)))
+	runtime.KeepAlive(value)
+	if result == nil {
+		return nil, fmt.Errorf("cannot allocate native string (%d-byte payload)", len(value))
+	}
+	return result, nil
+}
 
 // DataType is a pixel data types
 type DataType int
@@ -321,7 +343,17 @@ func (band Band) IO(rw IOOperation, srcX, srcY int, buffer interface{}, bufWidth
 	if ro.dsWidth == 0 {
 		ro.dsWidth = bufWidth
 	}
-	dtype := bufferType(buffer)
+	dtype, err := checkedBufferType(buffer)
+	if err != nil {
+		return err
+	}
+	if bufWidth < 0 || bufHeight <= 0 || ro.dsWidth < 0 || ro.dsHeight <= 0 {
+		return fmt.Errorf("raster I/O dimensions are invalid")
+	}
+	if bufWidth > maxRasterCInt || bufHeight > maxRasterCInt || ro.dsWidth > maxRasterCInt || ro.dsHeight > maxRasterCInt ||
+		srcX < -maxRasterCInt || srcX > maxRasterCInt || srcY < -maxRasterCInt || srcY > maxRasterCInt {
+		return fmt.Errorf("raster I/O dimension or offset exceeds the C integer range")
+	}
 	dsize := dtype.Size()
 
 	pixelSpacing := dsize
@@ -329,19 +361,33 @@ func (band Band) IO(rw IOOperation, srcX, srcY int, buffer interface{}, bufWidth
 		pixelSpacing = ro.pixelSpacing
 	}
 	if ro.pixelStride > 0 {
-		pixelSpacing = ro.pixelStride * dsize
+		pixelSpacing, err = checkedRasterMul(ro.pixelStride, dsize)
+		if err != nil {
+			return fmt.Errorf("raster pixel stride: %w", err)
+		}
 	}
-	lineSpacing := bufWidth * pixelSpacing
+	lineSpacing, err := checkedRasterMul(bufWidth, pixelSpacing)
+	if err != nil {
+		return fmt.Errorf("raster line spacing: %w", err)
+	}
 	if ro.lineSpacing > 0 {
 		lineSpacing = ro.lineSpacing
 	}
 	if ro.lineStride > 0 {
-		lineSpacing = ro.lineStride * dsize
+		lineSpacing, err = checkedRasterMul(ro.lineStride, dsize)
+		if err != nil {
+			return fmt.Errorf("raster line stride: %w", err)
+		}
 	}
 
-	minsize := (lineSpacing*(bufHeight-1) + (bufWidth-1)*pixelSpacing + dsize) / dsize
-	cBuf := cBuffer(buffer, minsize)
-	//fmt.Fprintf(os.Stderr, "%v %d %d %d\n", ro.bands, pixelSpacing, lineSpacing, bandSpacing)
+	minsize, err := checkedRasterBufferElements(bufWidth, bufHeight, 1, pixelSpacing, lineSpacing, dsize, dsize)
+	if err != nil {
+		return err
+	}
+	cBuf, err := cBuffer(buffer, minsize)
+	if err != nil {
+		return err
+	}
 	ralg, err := ro.resampling.rioAlg()
 	if err != nil {
 		return err
@@ -366,7 +412,10 @@ func (band Band) Polygonize(dstLayer Layer, opts ...PolygonizeOption) error {
 	for _, opt := range opts {
 		opt.setPolygonizeOpt(&popt)
 	}
-	copts := sliceToCStringArray(popt.options)
+	copts, err := checkedCStringArray(popt.options)
+	if err != nil {
+		return err
+	}
 	defer copts.free()
 	var cMaskBand C.GDALRasterBandH = nil
 	if popt.mask != nil {
@@ -388,7 +437,6 @@ func (band Band) FillNoData(opts ...FillNoDataOption) error {
 	for _, opt := range opts {
 		opt.setFillnodataOpt(&popt)
 	}
-	//copts := sliceToCStringArray(popt.options)
 	//defer copts.free()
 	var cMaskBand C.GDALRasterBandH = nil
 	if popt.mask != nil {
@@ -593,7 +641,7 @@ type cStringArray struct {
 }
 
 func (ca cStringArray) free() {
-	if ca.l > 0 {
+	if ca.arr != nil && ca.l > 0 {
 		garr := (*[1 << 30]*C.char)(unsafe.Pointer(ca.arr))[0:ca.l:ca.l]
 		for i := 0; i < ca.l-1; i++ {
 			C.free(unsafe.Pointer(garr[i]))
@@ -606,18 +654,34 @@ func (ca cStringArray) cPointer() **C.char {
 	return ca.arr
 }
 
-func sliceToCStringArray(in []string) cStringArray {
-	if len(in) > 0 {
-		csa := cStringArray{l: len(in) + 1}
-		csa.arr = (**C.char)(C.malloc(C.size_t(csa.l) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
-		garr := (*[1 << 30]*C.char)(unsafe.Pointer(csa.arr))[0:csa.l:csa.l]
-		for i := range in {
-			garr[i] = C.CString(in[i])
-		}
-		garr[len(in)] = nil
-		return csa
+func checkedCStringArray(in []string) (cStringArray, error) {
+	if len(in) == 0 {
+		return cStringArray{}, nil
 	}
-	return cStringArray{}
+	maxInt := int(^uint(0) >> 1)
+	if len(in) >= maxInt {
+		return cStringArray{}, fmt.Errorf("native string array has too many entries")
+	}
+	l := len(in) + 1
+	ptrSize := unsafe.Sizeof((*C.char)(nil))
+	if uintptr(l) > ^uintptr(0)/ptrSize {
+		return cStringArray{}, fmt.Errorf("native string array size overflows")
+	}
+	array := (**C.char)(C.calloc(C.size_t(l), C.size_t(ptrSize)))
+	if array == nil {
+		return cStringArray{}, fmt.Errorf("cannot allocate native string array with %d entries", len(in))
+	}
+	result := cStringArray{arr: array, l: l}
+	values := (*[1 << 30]*C.char)(unsafe.Pointer(array))[:l:l]
+	for index, value := range in {
+		converted, err := checkedCString(value)
+		if err != nil {
+			result.free()
+			return cStringArray{}, fmt.Errorf("convert native string array entry %d: %w", index, err)
+		}
+		values[index] = converted
+	}
+	return result, nil
 }
 
 func cStringArrayToSlice(in **C.char) []string {
@@ -735,6 +799,9 @@ func (band Band) ColorTable() ColorTable {
 // SetColorTable sets the band's color table. if passing in a 0-length ct.Entries,
 // the band's color table will be cleared
 func (band Band) SetColorTable(ct ColorTable, opts ...SetColorTableOption) error {
+	if err := checkedCIntLength("color table entry count", len(ct.Entries)); err != nil {
+		return err
+	}
 	cto := &setColorTableOpts{}
 	for _, o := range opts {
 		o.setSetColorTableOpt(cto)
@@ -840,7 +907,11 @@ func (ds *Dataset) SetProjection(wkt string, opts ...SetProjectionOption) error 
 	}
 	var cwkt = (*C.char)(nil)
 	if len(wkt) > 0 {
-		cwkt = C.CString(wkt)
+		var err error
+		cwkt, err = checkedCString(wkt)
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(cwkt))
 	}
 	cgc := createCGOContext(nil, po.errorHandler)
@@ -958,10 +1029,16 @@ func (ds *Dataset) Translate(dstDS string, switches []string, opts ...DatasetTra
 		}
 		switches = append(switches, "-of", dname)
 	}
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
-	cname := unsafe.Pointer(C.CString(dstDS))
-	defer C.free(cname)
+	cname, err := checkedCString(dstDS)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
 	hndl := C.godalTranslate(cgc.cPointer(), (*C.char)(cname), ds.handle(), cswitches.cPointer())
@@ -1011,6 +1088,17 @@ func (ds *Dataset) Warp(dstDS string, switches []string, opts ...DatasetWarpOpti
 //
 //	ds.Warp(dst, switches, CreationOption("TILED=YES","BLOCKXSIZE=256"), GTiff)
 func Warp(dstDS string, sourceDS []*Dataset, switches []string, opts ...DatasetWarpOption) (*Dataset, error) {
+	if len(sourceDS) == 0 {
+		return nil, errors.New("warp requires at least one source dataset")
+	}
+	if err := checkedCIntLength("warp source count", len(sourceDS)); err != nil {
+		return nil, err
+	}
+	for i, source := range sourceDS {
+		if source == nil {
+			return nil, fmt.Errorf("warp source dataset %d is nil", i)
+		}
+	}
 	gopts := dsWarpOpts{}
 	for _, opt := range opts {
 		opt.setDatasetWarpOpt(&gopts)
@@ -1033,10 +1121,16 @@ func Warp(dstDS string, sourceDS []*Dataset, switches []string, opts ...DatasetW
 		srcDS[i] = dataset.handle()
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
-	cname := unsafe.Pointer(C.CString(dstDS))
-	defer C.free(cname)
+	cname, err := checkedCString(dstDS)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
 	hndl := C.godalDatasetWarp(cgc.cPointer(), (*C.char)(cname), C.int(len(sourceDS)), (*C.GDALDatasetH)(unsafe.Pointer(&srcDS[0])), cswitches.cPointer())
@@ -1058,12 +1152,26 @@ func Warp(dstDS string, sourceDS []*Dataset, switches []string, opts ...DatasetW
 //		  "-t_srs","epsg:3857",
 //	   "-dstalpha"}
 func (ds *Dataset) WarpInto(sourceDS []*Dataset, switches []string, opts ...DatasetWarpIntoOption) error {
+	if len(sourceDS) == 0 {
+		return errors.New("warp requires at least one source dataset")
+	}
+	if err := checkedCIntLength("warp source count", len(sourceDS)); err != nil {
+		return err
+	}
+	for i, source := range sourceDS {
+		if source == nil {
+			return fmt.Errorf("warp source dataset %d is nil", i)
+		}
+	}
 	gopts := dsWarpIntoOpts{}
 	for _, opt := range opts {
 		opt.setDatasetWarpIntoOpt(&gopts)
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return err
+	}
 	defer cswitches.free()
 
 	dstDS := ds.handle()
@@ -1124,6 +1232,12 @@ func (ds *Dataset) BuildOverviews(opts ...BuildOverviewsOption) error {
 	if len(oopts.levels) == 0 {
 		return nil //nothing to do
 	}
+	if err := checkedCIntLength("overview level count", len(oopts.levels)); err != nil {
+		return err
+	}
+	if err := checkedCIntLength("overview band count", len(oopts.bands)); err != nil {
+		return err
+	}
 	for _, l := range oopts.levels {
 		if l < 2 {
 			return fmt.Errorf("cannot compute overview of level %d", l)
@@ -1136,8 +1250,11 @@ func (ds *Dataset) BuildOverviews(opts ...BuildOverviewsOption) error {
 	if nBands > 0 {
 		cBands = cIntArray(oopts.bands)
 	}
-	cResample := unsafe.Pointer(C.CString(oopts.resampling.String()))
-	defer C.free(cResample)
+	cResample, err := checkedCString(oopts.resampling.String())
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(cResample))
 
 	cgc := createCGOContext(oopts.config, oopts.errorHandler)
 	C.godalBuildOverviews(cgc.cPointer(), ds.handle(), (*C.char)(cResample), nLevels, cLevels,
@@ -1214,6 +1331,13 @@ func (ds *Dataset) IO(rw IOOperation, srcX, srcY int, buffer interface{}, bufWid
 	if ro.dsWidth == 0 {
 		ro.dsWidth = bufWidth
 	}
+	if bufWidth < 0 || bufHeight <= 0 || ro.dsWidth < 0 || ro.dsHeight <= 0 {
+		return fmt.Errorf("raster I/O dimensions are invalid")
+	}
+	if bufWidth > maxRasterCInt || bufHeight > maxRasterCInt || ro.dsWidth > maxRasterCInt || ro.dsHeight > maxRasterCInt ||
+		srcX < -maxRasterCInt || srcX > maxRasterCInt || srcY < -maxRasterCInt || srcY > maxRasterCInt {
+		return fmt.Errorf("raster I/O dimension or offset exceeds the C integer range")
+	}
 	if ro.bands == nil {
 		bands = ds.Bands()
 		if len(bands) == 0 {
@@ -1223,23 +1347,44 @@ func (ds *Dataset) IO(rw IOOperation, srcX, srcY int, buffer interface{}, bufWid
 			ro.bands = append(ro.bands, i+1)
 		}
 	}
-	dtype := bufferType(buffer)
+	dtype, err := checkedBufferType(buffer)
+	if err != nil {
+		return err
+	}
+	if len(ro.bands) == 0 {
+		return fmt.Errorf("raster I/O requires at least one band")
+	}
+	if err := checkedCIntLength("raster I/O band count", len(ro.bands)); err != nil {
+		return err
+	}
 	dsize := dtype.Size()
 
-	pixelSpacing := dsize * len(ro.bands)
+	pixelSpacing, err := checkedRasterMul(dsize, len(ro.bands))
+	if err != nil {
+		return fmt.Errorf("raster pixel spacing: %w", err)
+	}
 	if ro.pixelSpacing > 0 {
 		pixelSpacing = ro.pixelSpacing
 	}
 	if ro.pixelStride > 0 {
-		pixelSpacing = ro.pixelStride * dsize
+		pixelSpacing, err = checkedRasterMul(ro.pixelStride, dsize)
+		if err != nil {
+			return fmt.Errorf("raster pixel stride: %w", err)
+		}
 	}
 
-	lineSpacing := bufWidth * pixelSpacing
+	lineSpacing, err := checkedRasterMul(bufWidth, pixelSpacing)
+	if err != nil {
+		return fmt.Errorf("raster line spacing: %w", err)
+	}
 	if ro.lineSpacing > 0 {
 		lineSpacing = ro.lineSpacing
 	}
 	if ro.lineStride > 0 {
-		lineSpacing = ro.lineStride * dsize
+		lineSpacing, err = checkedRasterMul(ro.lineStride, dsize)
+		if err != nil {
+			return fmt.Errorf("raster line stride: %w", err)
+		}
 	}
 
 	bandSpacing := dsize
@@ -1247,17 +1392,32 @@ func (ds *Dataset) IO(rw IOOperation, srcX, srcY int, buffer interface{}, bufWid
 		bandSpacing = ro.bandSpacing
 	}
 	if ro.bandStride > 0 {
-		bandSpacing = ro.bandStride * dsize
+		bandSpacing, err = checkedRasterMul(ro.bandStride, dsize)
+		if err != nil {
+			return fmt.Errorf("raster band stride: %w", err)
+		}
 	}
 
 	if ro.bandInterleave {
 		pixelSpacing = dsize
-		lineSpacing = bufWidth * dsize
-		bandSpacing = bufHeight * bufWidth * dsize
+		lineSpacing, err = checkedRasterMul(bufWidth, dsize)
+		if err != nil {
+			return fmt.Errorf("raster interleaved line spacing: %w", err)
+		}
+		bandSpacing, err = checkedRasterMul(bufHeight, lineSpacing)
+		if err != nil {
+			return fmt.Errorf("raster interleaved band spacing: %w", err)
+		}
 	}
 
-	minsize := ((len(ro.bands)-1)*bandSpacing + (bufHeight-1)*lineSpacing + (bufWidth-1)*pixelSpacing + dsize) / dsize
-	cBuf := cBuffer(buffer, minsize)
+	minsize, err := checkedRasterBufferElements(bufWidth, bufHeight, len(ro.bands), pixelSpacing, lineSpacing, bandSpacing, dsize)
+	if err != nil {
+		return err
+	}
+	cBuf, err := cBuffer(buffer, minsize)
+	if err != nil {
+		return err
+	}
 
 	ralg, err := ro.resampling.rioAlg()
 	if err != nil {
@@ -1293,9 +1453,12 @@ func RegisterPlugin(name string, opts ...RegisterPluginOption) error {
 	for _, o := range opts {
 		o.setRegisterPluginOpt(&ro)
 	}
-	cgc := createCGOContext(nil, ro.errorHandler)
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cname))
+	cgc := createCGOContext(nil, ro.errorHandler)
 	C.godalRegisterPlugin(cgc.cPointer(), cname)
 	return cgc.close()
 }
@@ -1365,7 +1528,10 @@ func RegisterVector(drivers ...DriverName) error {
 }
 
 func registerDriver(fnname string) error {
-	cfnname := C.CString(fnname)
+	cfnname, err := checkedCString(fnname)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cfnname))
 	ret := C.godalRegisterDriver(cfnname)
 	if ret != 0 {
@@ -1440,7 +1606,10 @@ func RasterDriver(name DriverName) (Driver, bool) {
 }
 
 func getDriver(name string) (Driver, bool) {
-	cname := C.CString(string(name))
+	cname, err := checkedCString(string(name))
+	if err != nil {
+		return Driver{}, false
+	}
 	defer C.free(unsafe.Pointer(cname))
 	hndl := C.GDALGetDriverByName((*C.char)(unsafe.Pointer(cname)))
 	if hndl != nil {
@@ -1466,9 +1635,15 @@ func Create(driver DriverName, name string, nBands int, dtype DataType, width, h
 	for _, opt := range opts {
 		opt.setDatasetCreateOpt(&gopts)
 	}
-	createOpts := sliceToCStringArray(gopts.creation)
-	cname := C.CString(name)
+	createOpts, err := checkedCStringArray(gopts.creation)
+	if err != nil {
+		return nil, err
+	}
 	defer createOpts.free()
+	cname, err := checkedCString(name)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
@@ -1503,9 +1678,15 @@ func CreateVector(driver DriverName, name string, opts ...DatasetCreateOption) (
 	for _, opt := range opts {
 		opt.setDatasetCreateOpt(&gopts)
 	}
-	createOpts := sliceToCStringArray(gopts.creation)
-	cname := C.CString(name)
+	createOpts, err := checkedCStringArray(gopts.creation)
+	if err != nil {
+		return nil, err
+	}
 	defer createOpts.free()
+	cname, err := checkedCString(name)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
@@ -1556,13 +1737,25 @@ func Open(name string, options ...OpenOption) (*Dataset, error) {
 		return nil, fmt.Errorf("error applying options: %w", optErr)
 	}
 
-	csiblings := sliceToCStringArray(oopts.siblingFiles)
-	coopts := sliceToCStringArray(oopts.options)
-	cdrivers := sliceToCStringArray(oopts.drivers)
+	csiblings, err := checkedCStringArray(oopts.siblingFiles)
+	if err != nil {
+		return nil, err
+	}
 	defer csiblings.free()
+	coopts, err := checkedCStringArray(oopts.options)
+	if err != nil {
+		return nil, err
+	}
 	defer coopts.free()
+	cdrivers, err := checkedCStringArray(oopts.drivers)
+	if err != nil {
+		return nil, err
+	}
 	defer cdrivers.free()
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(oopts.config, oopts.errorHandler)
@@ -1667,7 +1860,10 @@ func testErrorAndLogging(opts ...errorAndLoggingOption) error {
 
 // Version returns the runtime version of the gdal library
 func Version() LibVersion {
-	cstr := C.CString("VERSION_NUM")
+	cstr, err := checkedCString("VERSION_NUM")
+	if err != nil {
+		return LibVersion(0)
+	}
 	defer C.free(unsafe.Pointer(cstr))
 	version := C.GoString(C.GDALVersionInfo(cstr))
 	iversion, _ := strconv.Atoi(version)
@@ -1812,75 +2008,189 @@ func gridAlgFromString(str string) (C.GDALGridAlgorithm, error) {
 	}
 }
 
-func bufferType(buffer interface{}) DataType {
+func checkedBufferType(buffer interface{}) (DataType, error) {
 	switch buffer.(type) {
 	case []byte:
-		return Byte
+		return Byte, nil
 	case []int8:
-		return Int8
+		return Int8, nil
 	case []int16:
-		return Int16
+		return Int16, nil
 	case []uint16:
-		return UInt16
+		return UInt16, nil
 	case []int32:
-		return Int32
+		return Int32, nil
 	case []uint32:
-		return UInt32
+		return UInt32, nil
 	case []float32:
-		return Float32
+		return Float32, nil
 	case []float64:
-		return Float64
+		return Float64, nil
 	case []complex64:
-		return CFloat32
+		return CFloat32, nil
 	case []complex128:
-		return CFloat64
+		return CFloat64, nil
 	default:
-		panic("unsupported type")
+		return 0, fmt.Errorf("unsupported raster buffer type %T", buffer)
 	}
+}
+
+func bufferType(buffer interface{}) DataType {
+	dtype, err := checkedBufferType(buffer)
+	if err != nil {
+		panic(err)
+	}
+	return dtype
 }
 
 // cBuffer returns the type of an individual element, and a pointer to the
 // underlying memory array
-func cBuffer(buffer interface{}, minsize int) unsafe.Pointer {
-	sizecheck := func(size int) {
-		if size < minsize {
-			panic(fmt.Sprintf("buffer len=%d less than min=%d", size, minsize))
-		}
+func cBuffer(buffer interface{}, minsize int) (unsafe.Pointer, error) {
+	if minsize < 0 {
+		return nil, fmt.Errorf("required raster buffer size is negative: %d", minsize)
 	}
+	bufferLen := 0
+	var pointer unsafe.Pointer
 	switch buf := buffer.(type) {
 	case []byte:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []int8:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []int16:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []uint16:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []int32:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []uint32:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []float32:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []float64:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []complex64:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	case []complex128:
-		sizecheck(len(buf))
-		return unsafe.Pointer(&buf[0])
+		bufferLen = len(buf)
+		if bufferLen > 0 {
+			pointer = unsafe.Pointer(&buf[0])
+		}
 	default:
-		panic("unsupported type")
+		return nil, fmt.Errorf("unsupported raster buffer type %T", buffer)
 	}
+	if bufferLen < minsize {
+		return nil, fmt.Errorf("raster buffer length %d is smaller than required %d", bufferLen, minsize)
+	}
+	return pointer, nil
+}
+
+const maxRasterCInt = int(1<<31 - 1)
+
+func checkedCIntLength(name string, length int) error {
+	if length < 0 || length > maxRasterCInt {
+		return fmt.Errorf("%s %d exceeds the C integer range", name, length)
+	}
+	return nil
+}
+
+func checkedRasterMul(left, right int) (int, error) {
+	if left < 0 || right < 0 {
+		return 0, fmt.Errorf("negative raster size or stride")
+	}
+	maxInt := int(^uint(0) >> 1)
+	if left != 0 && right > maxInt/left {
+		return 0, fmt.Errorf("raster size or stride overflows int")
+	}
+	return left * right, nil
+}
+
+func checkedRasterBufferElements(width, height, bands, pixelSpacing, lineSpacing, bandSpacing, elementSize int) (int, error) {
+	if width < 0 || height <= 0 || bands <= 0 || elementSize <= 0 {
+		return 0, fmt.Errorf("raster dimensions, band count, or element size are invalid")
+	}
+	limits := [...]struct {
+		name  string
+		value int
+	}{
+		{"buffer width", width}, {"buffer height", height}, {"pixel spacing", pixelSpacing},
+		{"line spacing", lineSpacing}, {"band spacing", bandSpacing}, {"element size", elementSize},
+	}
+	for index, limit := range limits {
+		minimum := 1
+		if index == 0 || (width == 0 && (index == 3 || index == 4)) {
+			minimum = 0
+		}
+		if limit.value < minimum || limit.value > maxRasterCInt {
+			return 0, fmt.Errorf("%s %d is outside the supported C integer range", limit.name, limit.value)
+		}
+	}
+	if bands > maxRasterCInt {
+		return 0, fmt.Errorf("band count %d is outside the supported C integer range", bands)
+	}
+	maxUint := ^uint64(0)
+	span := uint64(elementSize)
+	addProduct := func(count, spacing int) error {
+		if count <= 1 {
+			return nil
+		}
+		left, right := uint64(count-1), uint64(spacing)
+		if right != 0 && left > maxUint/right {
+			return fmt.Errorf("raster buffer span overflows")
+		}
+		product := left * right
+		if span > maxUint-product {
+			return fmt.Errorf("raster buffer span overflows")
+		}
+		span += product
+		return nil
+	}
+	if err := addProduct(width, pixelSpacing); err != nil {
+		return 0, err
+	}
+	if err := addProduct(height, lineSpacing); err != nil {
+		return 0, err
+	}
+	if bands > 1 {
+		if err := addProduct(bands, bandSpacing); err != nil {
+			return 0, err
+		}
+	}
+	need := span / uint64(elementSize)
+	if span%uint64(elementSize) != 0 {
+		need++
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if need > maxInt {
+		return 0, fmt.Errorf("raster buffer requirement exceeds platform int")
+	}
+	return int(need), nil
 }
 
 func (mo majorObject) Metadata(key string, opts ...MetadataOption) string {
@@ -1888,8 +2198,15 @@ func (mo majorObject) Metadata(key string, opts ...MetadataOption) string {
 	for _, opt := range opts {
 		opt.setMetadataOpt(&mopts)
 	}
-	ckey := C.CString(key)
-	cdom := C.CString(mopts.domain)
+	ckey, err := checkedCString(key)
+	if err != nil {
+		return ""
+	}
+	cdom, err := checkedCString(mopts.domain)
+	if err != nil {
+		C.free(unsafe.Pointer(ckey))
+		return ""
+	}
 	defer C.free(unsafe.Pointer(ckey))
 	defer C.free(unsafe.Pointer(cdom))
 	str := C.GDALGetMetadataItem(mo.cHandle, ckey, cdom)
@@ -1901,7 +2218,10 @@ func (mo majorObject) Metadatas(opts ...MetadataOption) map[string]string {
 	for _, opt := range opts {
 		opt.setMetadataOpt(&mopts)
 	}
-	cdom := C.CString(mopts.domain)
+	cdom, err := checkedCString(mopts.domain)
+	if err != nil {
+		return nil
+	}
 	defer C.free(unsafe.Pointer(cdom))
 	strs := C.GDALGetMetadata(mo.cHandle, cdom)
 	strslice := cStringArrayToSlice(strs)
@@ -1925,9 +2245,21 @@ func (mo majorObject) SetMetadata(key, value string, opts ...MetadataOption) err
 	for _, opt := range opts {
 		opt.setMetadataOpt(&mopts)
 	}
-	ckey := C.CString(key)
-	cval := C.CString(value)
-	cdom := C.CString(mopts.domain)
+	ckey, err := checkedCString(key)
+	if err != nil {
+		return err
+	}
+	cval, err := checkedCString(value)
+	if err != nil {
+		C.free(unsafe.Pointer(ckey))
+		return err
+	}
+	cdom, err := checkedCString(mopts.domain)
+	if err != nil {
+		C.free(unsafe.Pointer(ckey))
+		C.free(unsafe.Pointer(cval))
+		return err
+	}
 	defer C.free(unsafe.Pointer(ckey))
 	defer C.free(unsafe.Pointer(cdom))
 	defer C.free(unsafe.Pointer(cval))
@@ -1941,7 +2273,10 @@ func (mo majorObject) ClearMetadata(opts ...MetadataOption) error {
 	for _, opt := range opts {
 		opt.setMetadataOpt(&mopts)
 	}
-	cdom := C.CString(mopts.domain)
+	cdom, err := checkedCString(mopts.domain)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cdom))
 	cgc := createCGOContext(nil, mopts.errorHandler)
 	C.godalClearMetadata(cgc.cPointer(), mo.cHandle, cdom)
@@ -1967,8 +2302,11 @@ func (mo majorObject) SetDescription(description string, opts ...SetDescriptionO
 	}
 
 	cgc := createCGOContext(nil, scio.errorHandler)
-	cname := unsafe.Pointer(C.CString(description))
-	defer C.free(cname)
+	cname, err := checkedCString(description)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(cname))
 	C.godalSetDescription(cgc.cPointer(), mo.cHandle, (*C.char)(cname))
 	return cgc.close()
 }
@@ -2095,7 +2433,10 @@ func NewSpatialRef(userInput string, opts ...CreateSpatialRefOption) (*SpatialRe
 	for _, o := range opts {
 		o.setCreateSpatialRefOpt(cso)
 	}
-	cstr := C.CString(userInput)
+	cstr, err := checkedCString(userInput)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cstr))
 	cgc := createCGOContext(nil, cso.errorHandler)
 	hndl := C.godalCreateUserSpatialRef(cgc.cPointer(), (*C.char)(unsafe.Pointer(cstr)))
@@ -2111,7 +2452,10 @@ func NewSpatialRefFromWKT(wkt string, opts ...CreateSpatialRefOption) (*SpatialR
 	for _, o := range opts {
 		o.setCreateSpatialRefOpt(cso)
 	}
-	cstr := C.CString(wkt)
+	cstr, err := checkedCString(wkt)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cstr))
 	cgc := createCGOContext(nil, cso.errorHandler)
 	hndl := C.godalCreateWKTSpatialRef(cgc.cPointer(), (*C.char)(unsafe.Pointer(cstr)))
@@ -2127,7 +2471,10 @@ func NewSpatialRefFromProj4(proj string, opts ...CreateSpatialRefOption) (*Spati
 	for _, o := range opts {
 		o.setCreateSpatialRefOpt(cso)
 	}
-	cstr := C.CString(proj)
+	cstr, err := checkedCString(proj)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cstr))
 	cgc := createCGOContext(nil, cso.errorHandler)
 	hndl := C.godalCreateProj4SpatialRef(cgc.cPointer(), (*C.char)(unsafe.Pointer(cstr)))
@@ -2199,6 +2546,21 @@ func (trn *Transform) Close() {
 // TODO: create a version of this function that accepts *C.double to avoid allocs?
 // TODO: create a Transform() method that accepts z and successful as options
 func (trn *Transform) TransformEx(x []float64, y []float64, z []float64, successful []bool) error {
+	if len(x) != len(y) {
+		return fmt.Errorf("transform coordinate lengths differ: x=%d y=%d", len(x), len(y))
+	}
+	if len(z) != 0 && len(z) != len(x) {
+		return fmt.Errorf("transform z length %d does not match x/y length %d", len(z), len(x))
+	}
+	if len(successful) != 0 && len(successful) != len(x) {
+		return fmt.Errorf("transform success length %d does not match x/y length %d", len(successful), len(x))
+	}
+	if len(x) == 0 {
+		return nil
+	}
+	if err := checkedCIntLength("coordinate count", len(x)); err != nil {
+		return err
+	}
 	cx := make([]C.double, len(x))
 	cy := make([]C.double, len(x))
 	pcx, pcy := (*C.double)(unsafe.Pointer(&cx[0])), (*C.double)(unsafe.Pointer(&cy[0]))
@@ -2282,7 +2644,10 @@ func (sr *SpatialRef) SemiMinor() (float64, error) {
 
 // AttrValue Fetch indicated attribute of named node from within the WKT tree.
 func (sr *SpatialRef) AttrValue(name string, child int) (string, bool) {
-	cstr := C.CString(name)
+	cstr, err := checkedCString(name)
+	if err != nil {
+		return "", false
+	}
 	defer C.free(unsafe.Pointer(cstr))
 	cret := C.OSRGetAttrValue(sr.handle, cstr, C.int(child))
 	if cret != nil {
@@ -2298,7 +2663,11 @@ func (sr *SpatialRef) AttrValue(name string, child int) (string, bool) {
 func (sr *SpatialRef) AuthorityName(target string) string {
 	cstr := (*C.char)(nil)
 	if len(target) > 0 {
-		cstr = C.CString(target)
+		var err error
+		cstr, err = checkedCString(target)
+		if err != nil {
+			return ""
+		}
 		defer C.free(unsafe.Pointer(cstr))
 	}
 	cret := C.OSRGetAuthorityName(sr.handle, cstr)
@@ -2316,7 +2685,11 @@ func (sr *SpatialRef) AuthorityName(target string) string {
 func (sr *SpatialRef) AuthorityCode(target string) string {
 	cstr := (*C.char)(nil)
 	if len(target) > 0 {
-		cstr = C.CString(target)
+		var err error
+		cstr, err = checkedCString(target)
+		if err != nil {
+			return ""
+		}
 		defer C.free(unsafe.Pointer(cstr))
 	}
 	cret := C.OSRGetAuthorityCode(sr.handle, cstr)
@@ -2362,10 +2735,16 @@ func (ds *Dataset) Rasterize(dstDS string, switches []string, opts ...RasterizeO
 		}
 		switches = append(switches, "-of", dname)
 	}
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
-	cname := unsafe.Pointer(C.CString(dstDS))
-	defer C.free(cname)
+	cname, err := checkedCString(dstDS)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
 	hndl := C.godalRasterize(cgc.cPointer(), (*C.char)(cname), nil, ds.handle(), cswitches.cPointer())
@@ -2384,7 +2763,10 @@ func (ds *Dataset) RasterizeInto(vectorDS *Dataset, switches []string, opts ...R
 	for _, opt := range opts {
 		opt.setRasterizeIntoOpt(&gopts)
 	}
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return err
+	}
 	defer cswitches.free()
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
@@ -2430,6 +2812,9 @@ func (ds *Dataset) RasterizeGeometry(g *Geometry, opts ...RasterizeGeometryOptio
 	}
 	if len(opt.values) != len(opt.bands) {
 		return fmt.Errorf("must pass in same number of values as bands")
+	}
+	if err := checkedCIntLength("rasterize band count", len(opt.bands)); err != nil {
+		return err
 	}
 	cgc := createCGOContext(nil, opt.errorHandler)
 	C.godalRasterizeGeometry(cgc.cPointer(), ds.handle(), g.handle,
@@ -2527,11 +2912,17 @@ func (fd *FieldDefinition) setCreateLayerOpt(o *createLayerOpts) {
 	o.fields = append(o.fields, fd)
 }
 
-func (fd *FieldDefinition) createHandle() C.OGRFieldDefnH {
-	cfname := unsafe.Pointer(C.CString(fd.name))
-	defer C.free(cfname)
-	cfd := C.OGR_Fld_Create((*C.char)(cfname), C.OGRFieldType(fd.ftype))
-	return cfd
+func (fd *FieldDefinition) createHandle() (C.OGRFieldDefnH, error) {
+	cfname, err := checkedCString(fd.name)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cfname))
+	cfd := C.OGR_Fld_Create(cfname, C.OGRFieldType(fd.ftype))
+	if cfd == nil {
+		return nil, fmt.Errorf("cannot create field definition %q", fd.name)
+	}
+	return cfd, nil
 }
 
 // VectorTranslate runs the library version of ogr2ogr
@@ -2566,10 +2957,16 @@ func (ds *Dataset) VectorTranslate(dstDS string, switches []string, opts ...Data
 		}
 		switches = append(switches, "-f", dname)
 	}
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
-	cname := unsafe.Pointer(C.CString(dstDS))
-	defer C.free(cname)
+	cname, err := checkedCString(dstDS)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 
 	cgc := createCGOContext(gopts.config, gopts.errorHandler)
 	hndl := C.godalDatasetVectorTranslate(cgc.cPointer(), (*C.char)(cname), ds.handle(), cswitches.cPointer())
@@ -2962,7 +3359,10 @@ func (f *Feature) SetGeometryColumnName(name string, opts ...SetGeometryColumnNa
 	for _, o := range opts {
 		o.setGeometryColumnNameOpt(so)
 	}
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, so.errorHandler)
 	C.godalFeatureSetGeometryColumnName(cgc.cPointer(), f.handle, (*C.char)(cname))
@@ -3007,7 +3407,11 @@ func (f *Feature) SetFieldValue(field Field, value interface{}, opts ...SetField
 		if !ok {
 			return errors.New("value for this field must be of type 'string'")
 		}
-		cval := C.CString(stringValue)
+		cval, err := checkedCString(stringValue)
+		if err != nil {
+			_ = cgc.close()
+			return err
+		}
 		defer C.free(unsafe.Pointer(cval))
 		C.godalFeatureSetFieldString(cgc.cPointer(), f.handle, C.int(field.index), cval)
 	case FTDate, FTTime, FTDateTime:
@@ -3039,11 +3443,19 @@ func (f *Feature) SetFieldValue(field Field, value interface{}, opts ...SetField
 		if !ok {
 			return errors.New("value for this field must be of type '[]int'")
 		}
+		if err := checkedCIntLength("integer field list length", len(intListValue)); err != nil {
+			_ = cgc.close()
+			return err
+		}
 		C.godalFeatureSetFieldIntegerList(cgc.cPointer(), f.handle, C.int(field.index), C.int(len(intListValue)), cIntArray(intListValue))
 	case FTInt64List:
 		int64ListValue, ok := value.([]int64)
 		if !ok {
 			return errors.New("value for this field must be of type '[]int64'")
+		}
+		if err := checkedCIntLength("integer64 field list length", len(int64ListValue)); err != nil {
+			_ = cgc.close()
+			return err
 		}
 		C.godalFeatureSetFieldInteger64List(cgc.cPointer(), f.handle, C.int(field.index), C.int(len(int64ListValue)), cLongArray(int64ListValue))
 	case FTRealList:
@@ -3051,13 +3463,25 @@ func (f *Feature) SetFieldValue(field Field, value interface{}, opts ...SetField
 		if !ok {
 			return errors.New("value for this field must be of type '[]float64'")
 		}
+		if err := checkedCIntLength("real field list length", len(float64ListValue)); err != nil {
+			_ = cgc.close()
+			return err
+		}
 		C.godalFeatureSetFieldDoubleList(cgc.cPointer(), f.handle, C.int(field.index), C.int(len(float64ListValue)), cDoubleArray(float64ListValue))
 	case FTStringList:
 		stringListValue, ok := value.([]string)
 		if !ok {
 			return errors.New("value for this field must be of type '[]float64'")
 		}
-		cArray := sliceToCStringArray(stringListValue)
+		if err := checkedCIntLength("string field list length", len(stringListValue)); err != nil {
+			_ = cgc.close()
+			return err
+		}
+		cArray, err := checkedCStringArray(stringListValue)
+		if err != nil {
+			_ = cgc.close()
+			return err
+		}
 		C.godalFeatureSetFieldStringList(cgc.cPointer(), f.handle, C.int(field.index), cArray.cPointer())
 		cArray.free()
 	case FTBinary:
@@ -3065,7 +3489,15 @@ func (f *Feature) SetFieldValue(field Field, value interface{}, opts ...SetField
 		if !ok {
 			return errors.New("value for this field must be of type '[]byte'")
 		}
-		C.godalFeatureSetFieldBinary(cgc.cPointer(), f.handle, C.int(field.index), C.int(len(bytesValue)), unsafe.Pointer(&bytesValue[0]))
+		if err := checkedCIntLength("binary field length", len(bytesValue)); err != nil {
+			_ = cgc.close()
+			return err
+		}
+		var data unsafe.Pointer
+		if len(bytesValue) > 0 {
+			data = unsafe.Pointer(&bytesValue[0])
+		}
+		C.godalFeatureSetFieldBinary(cgc.cPointer(), f.handle, C.int(field.index), C.int(len(bytesValue)), data)
 	default:
 		cgc.close() //avoid resource leak
 		return errors.New("setting value is not implemented for this type of field")
@@ -3469,7 +3901,10 @@ func (layer Layer) SetGeometryColumnName(name string, opts ...SetGeometryColumnN
 	for _, o := range opts {
 		o.setGeometryColumnNameOpt(so)
 	}
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return err
+	}
 	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, so.errorHandler)
 	C.godalLayerSetGeometryColumnName(cgc.cPointer(), layer.handle(), (*C.char)(cname))
@@ -3489,7 +3924,10 @@ func (ds *Dataset) CreateLayer(name string, sr *SpatialRef, gtype GeometryType, 
 	if sr != nil {
 		srHandle = sr.handle
 	}
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return Layer{}, err
+	}
 	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, co.errorHandler)
 	hndl := C.godalCreateLayer(cgc.cPointer(), ds.handle(), (*C.char)(unsafe.Pointer(cname)), srHandle, C.OGRwkbGeometryType(gtype))
@@ -3498,8 +3936,10 @@ func (ds *Dataset) CreateLayer(name string, sr *SpatialRef, gtype GeometryType, 
 	}
 	if len(co.fields) > 0 {
 		for _, fld := range co.fields {
-			fhndl := fld.createHandle()
-			//TODO error checking
+			fhndl, err := fld.createHandle()
+			if err != nil {
+				return Layer{}, err
+			}
 			C.OGR_L_CreateField(hndl, fhndl, C.int(0))
 			C.OGR_Fld_Destroy(fhndl)
 		}
@@ -3513,7 +3953,10 @@ func (ds *Dataset) CopyLayer(source Layer, name string, opts ...CopyLayerOption)
 	for _, opt := range opts {
 		opt.setCopyLayerOpt(&co)
 	}
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return Layer{}, err
+	}
 	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, co.errorHandler)
 	hndl := C.godalCopyLayer(cgc.cPointer(), ds.handle(), source.handle(), (*C.char)(unsafe.Pointer(cname)))
@@ -3525,7 +3968,10 @@ func (ds *Dataset) CopyLayer(source Layer, name string, opts ...CopyLayerOption)
 
 // LayerByName fetch a layer by name. Returns nil if not found.
 func (ds *Dataset) LayerByName(name string) *Layer {
-	cname := C.CString(name)
+	cname, err := checkedCString(name)
+	if err != nil {
+		return nil
+	}
 	defer C.free(unsafe.Pointer(cname))
 	hndl := C.GDALDatasetGetLayerByName(ds.handle(), (*C.char)(unsafe.Pointer(cname)))
 	if hndl == nil {
@@ -3551,14 +3997,19 @@ func (ds *Dataset) ExecuteSQL(sql string, opts ...ExecuteSQLOption) (*ResultSet,
 		opt.setExecuteSQLOpt(&eso)
 	}
 
-	csql := C.CString(sql)
+	csql, err := checkedCString(sql)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(csql))
 
-	cDialect := C.CString(string(eso.dialect))
-	defer C.free(unsafe.Pointer(cDialect))
-
-	if eso.dialect == "" {
-		cDialect = nil
+	var cDialect *C.char
+	if eso.dialect != "" {
+		cDialect, err = checkedCString(string(eso.dialect))
+		if err != nil {
+			return nil, err
+		}
+		defer C.free(unsafe.Pointer(cDialect))
 	}
 
 	g := eso.spatialFilter.geom
@@ -3650,7 +4101,10 @@ func NewGeometryFromGeoJSON(geoJSON string, opts ...NewGeometryOption) (*Geometr
 		o.setNewGeometryOpt(no)
 	}
 
-	cgeoJSON := C.CString(geoJSON)
+	cgeoJSON, err := checkedCString(geoJSON)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cgeoJSON))
 	cgc := createCGOContext(nil, no.errorHandler)
 	hndl := C.godalNewGeometryFromGeoJSON(cgc.cPointer(), (*C.char)(unsafe.Pointer(cgeoJSON)))
@@ -3670,7 +4124,10 @@ func NewGeometryFromWKT(wkt string, sr *SpatialRef, opts ...NewGeometryOption) (
 	if sr != nil {
 		srHandle = sr.handle
 	}
-	cwkt := C.CString(wkt)
+	cwkt, err := checkedCString(wkt)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(cwkt))
 	cgc := createCGOContext(nil, no.errorHandler)
 	hndl := C.godalNewGeometryFromWKT(cgc.cPointer(), (*C.char)(unsafe.Pointer(cwkt)), srHandle)
@@ -3682,6 +4139,12 @@ func NewGeometryFromWKT(wkt string, sr *SpatialRef, opts ...NewGeometryOption) (
 
 // NewGeometryFromWKB creates a new Geometry from its WKB representation
 func NewGeometryFromWKB(wkb []byte, sr *SpatialRef, opts ...NewGeometryOption) (*Geometry, error) {
+	if len(wkb) == 0 {
+		return nil, fmt.Errorf("WKB input must not be empty")
+	}
+	if uint64(len(wkb)) > uint64(^uint32(0)>>1) {
+		return nil, fmt.Errorf("WKB input size %d exceeds the C API limit", len(wkb))
+	}
 	no := &newGeometryOpts{}
 	for _, o := range opts {
 		o.setNewGeometryOpt(no)
@@ -3741,6 +4204,9 @@ func (g *Geometry) WKBWithMaxSize(maxBytes int, opts ...GeometryWKBOption) ([]by
 	clen := C.int(0)
 	cgc := createCGOContext(nil, wo.errorHandler)
 	C.godalExportGeometryWKB(cgc.cPointer(), &cwkb, &clen, C.int(maxBytes), g.handle)
+	if cwkb != nil {
+		defer C.free(cwkb)
+	}
 	if err := cgc.close(); err != nil {
 		return nil, err
 	}
@@ -3751,7 +4217,6 @@ func (g *Geometry) WKBWithMaxSize(maxBytes int, opts ...GeometryWKBOption) ([]by
 		return nil, fmt.Errorf("WKB size %d exceeds maximum %d bytes", int(clen), maxBytes)
 	}
 	wkb := C.GoBytes(unsafe.Pointer(cwkb), clen)
-	C.free(unsafe.Pointer(cwkb))
 	return wkb, nil
 }
 
@@ -3826,7 +4291,10 @@ func (g *Geometry) GML(opts ...GMLExportOption) (string, error) {
 	for _, o := range opts {
 		o.setGMLExportOpt(gmlo)
 	}
-	cswitches := sliceToCStringArray(gmlo.creation)
+	cswitches, err := checkedCStringArray(gmlo.creation)
+	if err != nil {
+		return "", err
+	}
 	defer cswitches.free()
 	cgc := createCGOContext(nil, gmlo.errorHandler)
 	cgml := C.godalExportGeometryGML(cgc.cPointer(), g.handle, cswitches.cPointer())
@@ -3849,8 +4317,11 @@ func VSIOpen(path string, opts ...VSIOpenOption) (*VSIFile, error) {
 	for _, o := range opts {
 		o.setVSIOpenOpt(vo)
 	}
-	cname := unsafe.Pointer(C.CString(path))
-	defer C.free(cname)
+	cname, err := checkedCString(path)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, vo.errorHandler)
 	hndl := C.godalVSIOpen(cgc.cPointer(), (*C.char)(cname))
 	if err := cgc.close(); err != nil {
@@ -3879,8 +4350,11 @@ func VSIUnlink(path string, opts ...VSIUnlinkOption) error {
 	for _, o := range opts {
 		o.setVSIUnlinkOpt(vo)
 	}
-	cname := unsafe.Pointer(C.CString(path))
-	defer C.free(cname)
+	cname, err := checkedCString(path)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(cname))
 	cgc := createCGOContext(nil, vo.errorHandler)
 	C.godalVSIUnlink(cgc.cPointer(), (*C.char)(cname))
 	return cgc.close()
@@ -3892,6 +4366,9 @@ var _ io.ReadCloser = &VSIFile{}
 func (vf *VSIFile) Read(buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if err := checkedCIntLength("VSI read buffer length", len(buf)); err != nil {
+		return 0, err
 	}
 	var errmsg *C.char
 	n := C.godalVSIRead(vf.handle, unsafe.Pointer(&buf[0]), C.int(len(buf)), &errmsg)
@@ -3928,31 +4405,80 @@ type KeyMultiReader interface {
 	ReadAtMulti(key string, bufs [][]byte, offs []int64) ([]int, error)
 }
 
+// setCallbackErrorString reports callback errors without allowing C.CString's
+// allocation failure to terminate the Go runtime. The native caller already
+// receives the callback's failure return value when no message can be copied.
+func setCallbackErrorString(target **C.char, err error) {
+	if target == nil || err == nil {
+		return
+	}
+	message, allocErr := checkedCString(callbackErrorText(err))
+	if allocErr == nil {
+		*target = message
+	}
+}
+
+func callbackErrorText(err error) (message string) {
+	defer func() {
+		if recover() != nil {
+			message = "VSI handler returned an error whose Error method panicked"
+		}
+	}()
+	return err.Error()
+}
+
 //export _gogdalSizeCallback
-func _gogdalSizeCallback(ckey *C.char, errorString **C.char) C.longlong {
+func _gogdalSizeCallback(ckey *C.char, errorString **C.char) (result C.longlong) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setCallbackErrorString(errorString, fmt.Errorf("VSI size callback panicked (%T)", recovered))
+			result = -1
+		}
+	}()
 	key := C.GoString(ckey)
 	cbd, err := getGoGDALReader(key)
 	if err != nil {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
 		return -1
 	}
 
 	if cbd.prefix > 0 {
 		key = key[cbd.prefix:]
 	}
-	l, err := cbd.Size(key)
+	l, err := callVSISize(cbd.KeySizerReaderAt, key)
+	if err == nil && l < 0 {
+		err = fmt.Errorf("VSI Size handler returned negative size %d", l)
+	}
 	if err != nil {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
+		return -1
 	}
 	return C.longlong(l)
 }
 
 //export _gogdalMultiReadCallback
-func _gogdalMultiReadCallback(ckey *C.char, nRanges C.int, pocbuffers unsafe.Pointer, coffsets unsafe.Pointer, clengths unsafe.Pointer, errorString **C.char) C.int {
+func _gogdalMultiReadCallback(ckey *C.char, nRanges C.int, pocbuffers unsafe.Pointer, coffsets unsafe.Pointer, clengths unsafe.Pointer, errorString **C.char) (result C.int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setCallbackErrorString(errorString, fmt.Errorf("VSI multi-read callback panicked (%T)", recovered))
+			result = -1
+		}
+	}()
+	if nRanges < 0 || nRanges > 1<<16 {
+		setCallbackErrorString(errorString, fmt.Errorf("invalid VSI multi-read range count %d", int64(nRanges)))
+		return -1
+	}
+	if nRanges == 0 {
+		return 0
+	}
+	if pocbuffers == nil || coffsets == nil || clengths == nil {
+		setCallbackErrorString(errorString, errors.New("VSI multi-read received nil range arrays"))
+		return -1
+	}
 	key := C.GoString(ckey)
 	cbd, err := getGoGDALReader(key)
 	if err != nil {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
 		return -1
 	}
 	/* cbd == nil would be a bug elsewhere */
@@ -3960,44 +4486,122 @@ func _gogdalMultiReadCallback(ckey *C.char, nRanges C.int, pocbuffers unsafe.Poi
 		key = key[cbd.prefix:]
 	}
 	n := int(nRanges)
-	cbuffers := (*[1 << 28]unsafe.Pointer)(unsafe.Pointer(pocbuffers))[:n:n]
-	lengths := (*[1 << 28]C.size_t)(unsafe.Pointer(clengths))[:n:n]
-	offsets := (*[1 << 28]C.ulonglong)(unsafe.Pointer(coffsets))[:n:n]
+	cbuffers := unsafe.Slice((*unsafe.Pointer)(pocbuffers), n)
+	lengths := unsafe.Slice((*C.size_t)(clengths), n)
+	offsets := unsafe.Slice((*C.ulonglong)(coffsets), n)
 
 	buffers := make([][]byte, n)
 	goffsets := make([]int64, n)
 	ret := int64(0)
 	for b := range buffers {
-		l := int(lengths[b])
-		buffers[b] = (*[1 << 28]byte)(unsafe.Pointer(cbuffers[b]))[:l:l]
-		goffsets[b] = int64(offsets[b])
+		l, lengthErr := checkedVSIReadLength(uint64(lengths[b]))
+		if lengthErr != nil {
+			setCallbackErrorString(errorString, lengthErr)
+			return -1
+		}
+		offset, offsetErr := checkedVSIReadOffset(uint64(offsets[b]))
+		if offsetErr != nil {
+			setCallbackErrorString(errorString, offsetErr)
+			return -1
+		}
+		if l != 0 && cbuffers[b] == nil {
+			setCallbackErrorString(errorString, fmt.Errorf("VSI multi-read range %d has a nil buffer", b))
+			return -1
+		}
+		buffers[b] = unsafe.Slice((*byte)(cbuffers[b]), l)
+		goffsets[b] = offset
 	}
 	_, err = cbd.ReadAtMulti(key, buffers, goffsets)
 	if err != nil && err != io.EOF {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
 		ret = -1
 	}
 	return C.int(ret)
 }
 
 //export _gogdalReadCallback
-func _gogdalReadCallback(ckey *C.char, buffer unsafe.Pointer, off C.size_t, clen C.size_t, errorString **C.char) C.size_t {
-	l := int(clen)
+func _gogdalReadCallback(ckey *C.char, buffer unsafe.Pointer, off C.size_t, clen C.size_t, errorString **C.char) (result C.size_t) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setCallbackErrorString(errorString, fmt.Errorf("VSI read callback panicked (%T)", recovered))
+			result = 0
+		}
+	}()
+	l, lengthErr := checkedVSIReadLength(uint64(clen))
+	if lengthErr != nil {
+		setCallbackErrorString(errorString, lengthErr)
+		return 0
+	}
+	offset, offsetErr := checkedVSIReadOffset(uint64(off))
+	if offsetErr != nil {
+		setCallbackErrorString(errorString, offsetErr)
+		return 0
+	}
+	if l != 0 && buffer == nil {
+		setCallbackErrorString(errorString, errors.New("VSI read received a nil buffer"))
+		return 0
+	}
 	key := C.GoString(ckey)
 	cbd, err := getGoGDALReader(key)
 	if err != nil {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
 		return 0
 	}
 	if cbd.prefix > 0 {
 		key = key[cbd.prefix:]
 	}
-	slice := (*[1 << 28]byte)(buffer)[:l:l]
-	rlen, err := cbd.ReadAt(key, slice, int64(off))
+	slice := unsafe.Slice((*byte)(buffer), l)
+	rlen, err := callVSIReadAt(cbd.KeySizerReaderAt, key, slice, offset)
+	if resultErr := checkedVSIReadResult(rlen, l); resultErr != nil {
+		setCallbackErrorString(errorString, resultErr)
+		return 0
+	}
 	if err != nil && err != io.EOF {
-		*errorString = C.CString(err.Error())
+		setCallbackErrorString(errorString, err)
 	}
 	return C.size_t(rlen)
+}
+
+func checkedVSIReadLength(length uint64) (int, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if length > maxInt || length > 1<<28 {
+		return 0, fmt.Errorf("VSI read length %d exceeds the supported limit", length)
+	}
+	return int(length), nil
+}
+
+func checkedVSIReadOffset(offset uint64) (int64, error) {
+	if offset > uint64(^uint64(0)>>1) {
+		return 0, fmt.Errorf("VSI read offset %d exceeds the int64 range", offset)
+	}
+	return int64(offset), nil
+}
+
+func checkedVSIReadResult(read, requested int) error {
+	if read < 0 || read > requested {
+		return fmt.Errorf("VSI reader returned invalid byte count %d for a %d-byte request", read, requested)
+	}
+	return nil
+}
+
+func callVSIReadAt(reader KeySizerReaderAt, key string, buffer []byte, offset int64) (read int, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			read = 0
+			err = fmt.Errorf("VSI ReadAt handler panicked (%T)", recovered)
+		}
+	}()
+	return reader.ReadAt(key, buffer, offset)
+}
+
+func callVSISize(reader KeySizerReaderAt, key string) (size int64, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			size = -1
+			err = fmt.Errorf("VSI Size handler panicked (%T)", recovered)
+		}
+	}()
+	return reader.Size(key)
 }
 
 var handlers map[string]vsiHandler
@@ -4016,40 +4620,74 @@ type vsiHandler struct {
 	prefix int
 }
 
+const maxVSIReadWorkers = 64
+
 func (sp vsiHandler) ReadAtMulti(key string, bufs [][]byte, offs []int64) ([]int, error) {
 	if mcbd, ok := sp.KeySizerReaderAt.(KeyMultiReader); ok {
-		return mcbd.ReadAtMulti(key, bufs, offs)
+		lens, err := mcbd.ReadAtMulti(key, bufs, offs)
+		if len(lens) != len(bufs) {
+			return nil, fmt.Errorf("multi-read returned %d lengths for %d buffers", len(lens), len(bufs))
+		}
+		for i, n := range lens {
+			if resultErr := checkedVSIReadResult(n, len(bufs[i])); resultErr != nil {
+				return nil, fmt.Errorf("multi-read range %d: %w", i, resultErr)
+			}
+		}
+		return lens, err
+	}
+	if len(bufs) != len(offs) {
+		return nil, fmt.Errorf("multi-read has %d buffers and %d offsets", len(bufs), len(offs))
+	}
+	if len(bufs) == 0 {
+		return []int{}, nil
 	}
 	var wg sync.WaitGroup
-	wg.Add(len(bufs))
+	procs := runtime.GOMAXPROCS(0)
+	workers := maxVSIReadWorkers
+	if procs < maxVSIReadWorkers/4 {
+		workers = procs * 4
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(bufs) {
+		workers = len(bufs)
+	}
+	wg.Add(workers)
 	lens := make([]int, len(bufs))
 	var err error
 	var errmu sync.Mutex
-	for b := range bufs {
-		go func(bidx int) {
-			var berr error
+	jobs := make(chan int)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
 			defer wg.Done()
-			lens[bidx], berr = sp.ReadAt(key, bufs[bidx], offs[bidx])
-			if berr != nil && berr != io.EOF {
-				errmu.Lock()
-				if err == nil {
-					err = berr
-				}
-				errmu.Unlock()
-			}
-			if lens[bidx] != int(len(bufs[bidx])) {
-				errmu.Lock()
-				if err == nil {
-					if berr != nil {
-						err = berr
-					} else {
-						err = fmt.Errorf("short read")
+			for bidx := range jobs {
+				read, readErr := callVSIReadAt(sp.KeySizerReaderAt, key, bufs[bidx], offs[bidx])
+				if resultErr := checkedVSIReadResult(read, len(bufs[bidx])); resultErr != nil {
+					read = 0
+					if readErr == nil {
+						readErr = resultErr
 					}
 				}
-				errmu.Unlock()
+				lens[bidx] = read
+				if readErr != nil && readErr != io.EOF || read != len(bufs[bidx]) {
+					errmu.Lock()
+					if err == nil {
+						if readErr != nil {
+							err = readErr
+						} else {
+							err = fmt.Errorf("short read")
+						}
+					}
+					errmu.Unlock()
+				}
 			}
-		}(b)
+		}()
 	}
+	for bidx := range bufs {
+		jobs <- bidx
+	}
+	close(jobs)
 	wg.Wait()
 	return lens, err
 }
@@ -4078,7 +4716,12 @@ func RegisterVSIHandler(prefix string, handler KeySizerReaderAt, opts ...VSIHand
 		return fmt.Errorf("handler already registered on prefix")
 	}
 	cgc := createCGOContext(nil, opt.errorHandler)
-	C.godalVSIInstallGoHandler(cgc.cPointer(), C.CString(prefix), C.size_t(opt.bufferSize), C.size_t(opt.cacheSize))
+	cprefix, err := checkedCString(prefix)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(cprefix))
+	C.godalVSIInstallGoHandler(cgc.cPointer(), cprefix, C.size_t(opt.bufferSize), C.size_t(opt.cacheSize))
 	if err := cgc.close(); err != nil {
 		return err
 	}
@@ -4092,7 +4735,12 @@ func RegisterVSIHandler(prefix string, handler KeySizerReaderAt, opts ...VSIHand
 
 // HasVSIHandler returns true if a VSIHandler is registered for this prefix
 func HasVSIHandler(prefix string) bool {
-	return C.godalVSIHasGoHandler(C.CString(prefix)) != 0
+	cprefix, err := checkedCString(prefix)
+	if err != nil {
+		return false
+	}
+	defer C.free(unsafe.Pointer(cprefix))
+	return C.godalVSIHasGoHandler(cprefix) != 0
 }
 
 // BuildVRT runs the GDALBuildVRT function and creates a VRT dataset from a list of datasets
@@ -4110,13 +4758,22 @@ func BuildVRT(dstVRTName string, sourceDatasets []string, switches []string, opt
 	for _, oo := range bvo.openOptions {
 		switches = append(switches, "-oo", oo)
 	}
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
 
-	cname := unsafe.Pointer(C.CString(dstVRTName))
-	defer C.free(cname)
+	cname, err := checkedCString(dstVRTName)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(cname))
 
-	csources := sliceToCStringArray(sourceDatasets)
+	csources, err := checkedCStringArray(sourceDatasets)
+	if err != nil {
+		return nil, err
+	}
 	defer csources.free()
 
 	cgc := createCGOContext(bvo.config, bvo.errorHandler)
@@ -4163,19 +4820,28 @@ func GridCreate(pszAlgorithm string,
 		return err
 	}
 
-	var (
-		params = unsafe.Pointer(C.CString(pszAlgorithm))
-		cgc    = createCGOContext(nil, gco.errorHandler)
-	)
-	defer C.free(params)
+	params, err := checkedCString(pszAlgorithm)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(params))
 
-	var (
-		dtype        = bufferType(buffer)
-		dsize        = dtype.Size()
-		numGridBytes = C.int(nXSize * nYSize * dsize)
-		cBuf         = cBuffer(buffer, int(numGridBytes)/dsize)
-	)
-	cgc = createCGOContext(nil, gco.errorHandler)
+	if nXSize <= 0 || nYSize <= 0 || nXSize > maxRasterCInt || nYSize > maxRasterCInt || uint64(len(xCoords)) > uint64(^uint32(0)) {
+		return fmt.Errorf("grid dimensions or point count exceed the supported range")
+	}
+	dtype, err := checkedBufferType(buffer)
+	if err != nil {
+		return err
+	}
+	minElements, err := checkedRasterMul(nXSize, nYSize)
+	if err != nil {
+		return fmt.Errorf("grid buffer size: %w", err)
+	}
+	cBuf, err := cBuffer(buffer, minElements)
+	if err != nil {
+		return err
+	}
+	cgc := createCGOContext(nil, gco.errorHandler)
 	C.godalGridCreate(cgc.cPointer(), (*C.char)(params), algCEnum, C.uint(len(xCoords)), cDoubleArray(xCoords), cDoubleArray(yCoords), cDoubleArray(zCoords), C.double(dfXMin), C.double(dfXMax), C.double(dfYMin), C.double(dfYMax), C.uint(nXSize), C.uint(nYSize), C.GDALDataType(dtype), cBuf)
 	if err := cgc.close(); err != nil {
 		return err
@@ -4202,10 +4868,16 @@ func (ds *Dataset) Grid(destPath string, switches []string, opts ...GridOption) 
 		opt.setGridOpt(&gridOpts)
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
 
-	dest := unsafe.Pointer(C.CString(destPath))
+	dest, err := checkedCString(destPath)
+	if err != nil {
+		return nil, err
+	}
 	cgc := createCGOContext(nil, gridOpts.errorHandler)
 	var dsRet C.GDALDatasetH
 	defer C.free(unsafe.Pointer(dest))
@@ -4239,16 +4911,28 @@ func (ds *Dataset) Dem(destPath, processingMode string, colorFilename string, sw
 		opt.setDemOpt(&demOpts)
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
 
-	dest := unsafe.Pointer(C.CString(destPath))
+	dest, err := checkedCString(destPath)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(dest))
-	alg := unsafe.Pointer(C.CString(processingMode))
+	alg, err := checkedCString(processingMode)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(alg))
 	var colorFn *C.char
 	if colorFilename != "" {
-		colorFn = C.CString(colorFilename)
+		colorFn, err = checkedCString(colorFilename)
+		if err != nil {
+			return nil, err
+		}
 		defer C.free(unsafe.Pointer(colorFn))
 	}
 
@@ -4335,11 +5019,20 @@ func (srcBand Band) Viewshed(targetRasterName string, observerX float64, observe
 		opt.setViewshedOpt(&vso)
 	}
 
-	copts := sliceToCStringArray(vso.creation)
+	copts, err := checkedCStringArray(vso.creation)
+	if err != nil {
+		return nil, err
+	}
 	defer copts.free()
-	driver := unsafe.Pointer(C.CString(string(vso.driver)))
+	driver, err := checkedCString(string(vso.driver))
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(driver))
-	targetRaster := unsafe.Pointer(C.CString(targetRasterName))
+	targetRaster, err := checkedCString(targetRasterName)
+	if err != nil {
+		return nil, err
+	}
 	defer C.free(unsafe.Pointer(targetRaster))
 
 	cgc := createCGOContext(nil, vso.errorHandler)
@@ -4375,11 +5068,17 @@ func (ds *Dataset) Nearblack(dstDS string, switches []string, opts ...NearblackO
 		opt.setNearblackOpt(&nearBlackOpts)
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return nil, err
+	}
 	defer cswitches.free()
 
-	dest := unsafe.Pointer(C.CString(dstDS))
-	defer C.free(dest)
+	dest, err := checkedCString(dstDS)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(unsafe.Pointer(dest))
 
 	cgc := createCGOContext(nil, nearBlackOpts.errorHandler)
 	ret := C.godalNearblack(cgc.cPointer(), (*C.char)(dest), nil, ds.handle(), cswitches.cPointer())
@@ -4413,7 +5112,10 @@ func (ds *Dataset) NearblackInto(sourceDs *Dataset, switches []string, opts ...N
 		opt.setNearblackOpt(&nearBlackOpts)
 	}
 
-	cswitches := sliceToCStringArray(switches)
+	cswitches, err := checkedCStringArray(switches)
+	if err != nil {
+		return err
+	}
 	defer cswitches.free()
 
 	cgc := createCGOContext(nil, nearBlackOpts.errorHandler)
@@ -4484,6 +5186,9 @@ func (ds *Dataset) GCPProjection() string {
 
 // SetGCPs runs the GDALSetGCPs function
 func (ds *Dataset) SetGCPs(GCPList []GCP, opts ...SetGCPsOption) error {
+	if err := checkedCIntLength("GCP count", len(GCPList)); err != nil {
+		return err
+	}
 	setGCPsOpts := setGCPsOpts{}
 	for _, opt := range opts {
 		opt.setSetGCPsOpt(&setGCPsOpts)
@@ -4509,9 +5214,15 @@ func (ds *Dataset) SetGCPs(GCPList []GCP, opts ...SetGCPsOption) error {
 		gcpYs[i] = (g.DfGCPY)
 		gcpZs[i] = (g.DfGCPZ)
 	}
-	cIds := sliceToCStringArray(ids)
+	cIds, err := checkedCStringArray(ids)
+	if err != nil {
+		return err
+	}
 	defer cIds.free()
-	cInfos := sliceToCStringArray(infos)
+	cInfos, err := checkedCStringArray(infos)
+	if err != nil {
+		return err
+	}
 	defer cInfos.free()
 
 	gcpList.pszIds = cIds.cPointer()
@@ -4526,7 +5237,10 @@ func (ds *Dataset) SetGCPs(GCPList []GCP, opts ...SetGCPsOption) error {
 	if setGCPsOpts.sr != nil {
 		C.godalSetGCPs2(cgc.cPointer(), ds.handle(), C.int(len(GCPList)), gcpList, setGCPsOpts.sr.handle)
 	} else {
-		GCPProj := C.CString(setGCPsOpts.projString)
+		GCPProj, err := checkedCString(setGCPsOpts.projString)
+		if err != nil {
+			return err
+		}
 		defer C.free(unsafe.Pointer(GCPProj))
 		C.godalSetGCPs(cgc.cPointer(), ds.handle(), C.int(len(GCPList)), gcpList, GCPProj)
 	}
@@ -4539,6 +5253,9 @@ func (ds *Dataset) SetGCPs(GCPList []GCP, opts ...SetGCPsOption) error {
 
 // Convert list of GCPs to a GDAL GeoTransorm array
 func GCPsToGeoTransform(GCPList []GCP, opts ...GCPsToGeoTransformOption) ([6]float64, error) {
+	if err := checkedCIntLength("GCP count", len(GCPList)); err != nil {
+		return [6]float64{}, err
+	}
 	gco := gcpsToGeoTransformOpts{}
 	for _, opt := range opts {
 		opt.setGCPsToGeoTransformOpts(&gco)
@@ -4564,9 +5281,15 @@ func GCPsToGeoTransform(GCPList []GCP, opts ...GCPsToGeoTransformOption) ([6]flo
 		gcpYs[i] = (g.DfGCPY)
 		gcpZs[i] = (g.DfGCPZ)
 	}
-	cIds := sliceToCStringArray(ids)
+	cIds, err := checkedCStringArray(ids)
+	if err != nil {
+		return [6]float64{}, err
+	}
 	defer cIds.free()
-	cInfos := sliceToCStringArray(infos)
+	cInfos, err := checkedCStringArray(infos)
+	if err != nil {
+		return [6]float64{}, err
+	}
 	defer cInfos.free()
 
 	gcpList.pszIds = cIds.cPointer()
@@ -4595,17 +5318,23 @@ func GCPsToGeoTransform(GCPList []GCP, opts ...GCPsToGeoTransformOption) ([6]flo
 }
 
 type cgoContext struct {
-	cctx *C.cctx
-	opts cStringArray
+	cctx    C.cctx
+	opts    cStringArray
+	initErr error
 }
 
 func createCGOContext(configOptions []string, eh ErrorHandler) cgoContext {
-	cgc := cgoContext{
-		opts: sliceToCStringArray(configOptions),
-		cctx: (*C.cctx)(C.malloc(C.size_t(unsafe.Sizeof(C.cctx{})))),
-	}
+	// The context is only retained in GDAL's thread-local error handler for the
+	// duration of a synchronous C call. Keep the small struct in Go memory so
+	// context creation cannot dereference a failed C.malloc under memory pressure.
+	opts, initErr := checkedCStringArray(configOptions)
+	cgc := cgoContext{opts: opts, initErr: initErr}
 	cgc.cctx.configOptions = cgc.opts.cPointer()
-	cgc.cctx.failed = 0
+	if initErr != nil {
+		cgc.cctx.failed = 1
+	} else {
+		cgc.cctx.failed = 0
+	}
 	cgc.cctx.errMessage = nil
 	if eh != nil {
 		cgc.cctx.handlerIdx = C.int(registerErrorHandler(eh))
@@ -4615,14 +5344,23 @@ func createCGOContext(configOptions []string, eh ErrorHandler) cgoContext {
 	return cgc
 }
 
-func (cgc cgoContext) cPointer() *C.cctx {
-	return cgc.cctx
+func (cgc *cgoContext) cPointer() *C.cctx {
+	return &cgc.cctx
 }
 
 // frees the context and returns any error it may contain
-func (cgc cgoContext) close() error {
+func (cgc *cgoContext) close() error {
 	cgc.opts.free()
-	defer C.free(unsafe.Pointer(cgc.cctx))
+	if cgc.initErr != nil {
+		if cgc.cctx.errMessage != nil {
+			C.free(unsafe.Pointer(cgc.cctx.errMessage))
+			cgc.cctx.errMessage = nil
+		}
+		if cgc.cctx.handlerIdx != 0 {
+			defer unregisterErrorHandler(int(cgc.cctx.handlerIdx))
+		}
+		return cgc.initErr
+	}
 	if cgc.cctx.errMessage != nil {
 		/* debug code
 		if cgc.cctx.handlerIdx != 0 {

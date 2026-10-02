@@ -1032,6 +1032,10 @@ predicate는 약 1.25µs였지만 실제 mutex 기반 `IsVisible` predicate는 �
 계약은 유지하면서 detached benchmark가 약 0.69ms/2.80MB/15,064 allocations에서
 약 0.52ms/2.11MB/15,020 allocations로 감소했다. 대부분의 남은 allocations는
 feature별 property/geometry ownership clone 비용이다.
+후속 안전성 점검에서 단일 대형 레이어를 복제하는 동안 context 취소를 관찰하지 않던 점을
+보완했다. `MergeLayers`는 256 feature마다 취소를 확인하고, 여러 레이어의 합계가 platform
+`int` 범위를 넘으면 결과 slice/map 할당 전에 오류를 반환한다. 경계 합계와 레이어 중간 취소
+회귀 테스트가 통과했다.
 
 attribute-table JSON publication 경로는 이미 detached인 page layer의 property
 map을 presentation model에서 다시 복제하고 있었다. read-only 소유권 경계를
@@ -1883,3 +1887,25 @@ process peak RSS 212.3 MiB, retained heap 49.3 MiB였다. 앞의 반복 실행 �
 크기·시각을 보존한 atomic replacement가 기존 byte offset index를 새 파일에 재사용하지 못한다.
 동일한 inode를 직접 수정하면서 크기와 수정시각까지 의도적으로 보존하는 상황은 일반 파일 API
 stamp만으로 탐지할 수 없으므로, 읽기 전후의 stamp 검증을 유지하고 reload 오류를 반환한다.
+
+## 1M GeoJSON viewport bbox 후보 grid
+
+기존 offset/bbox index는 viewport 후보를 고를 때마다 최대 1,000,000개 entry를 선형
+순회했다. 이 작업을 줄이기 위해 per-session 256×256 uniform coarse grid를 추가한다.
+Feature bbox는 교차하는 grid cell에 최대 64회 등록하고, 전체 참조는 2,000,000개로
+제한한다. 이보다 넓은 geometry는 별도 overflow 목록에 두며, overflow 비율·query 영역·후보
+수가 상한을 넘으면 기존 정확한 선형 경로로 fallback한다. 후보 ordinal은 중복 제거하고
+원본 순서로 정렬한 뒤 원래 bbox 검사와 payload/feature cap을 그대로 적용한다. Session
+mutex 아래에서 dedupe bitmap과 candidate slice를 재사용한다.
+
+Apple M3의 synthetic 1M Point 비교에서 좁은 고배율 window(1 feature)는 3.61 ms에서
+1.24 ms로, wide window(3,969 features)는 같은 실행 묶음에서 14.43 ms에서 12.17 ms로
+개선됐다. grid의 일회성 build는 별도 1회 측정에서 18.54 ms와 4.93 MB allocation이었다.
+따라서 첫 viewport에서 소량의 추가 지연/약 5 MiB index를 치르고 반복 pan/zoom query를
+줄이는 선택이다. 측정은 단일 synthetic dataset/호스트이며 complex polygons와 다른 OS에서
+다시 평가해야 한다. Differential bbox test, dense overflow와 broad-query fallback test,
+GDAL native test/race, 1M 및 1,000,001-feature 128-pan stress가 통과했다.
+`AttributeSession.Close()`도 overview/prefix/tail index와 함께 coarse grid, dedupe bitmap,
+candidate buffer 및 source stamp를 비워, 닫힌 상태로 계속 참조되는 session이 spatial index
+메모리를 붙잡지 않게 한다. 50K-entry session test에서 grid 생성 후 close가 이 상태를 모두
+해제하며 통과했다.

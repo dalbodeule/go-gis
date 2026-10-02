@@ -232,9 +232,10 @@ func BenchmarkDesktopReadOnlyLoadGeoJSONSeq1M(b *testing.B) {
 	benchmarkDesktopReadOnlyMillionPath(b, desktopBenchmarkGeoJSONSeqFixture(b, 1_000_000), 1_000_000, true)
 }
 
-// BenchmarkGeoJSONMetadataStages1M isolates the metadata calls that precede
-// read-only rendering so native peak-RSS growth can be attributed to either
-// FeatureCount or Bounds rather than to the later viewport load.
+// BenchmarkGeoJSONMetadataStages1M measures the raw godal/GDAL GeoJSON driver
+// open, FeatureCount, and Bounds costs. It deliberately bypasses the desktop
+// Reader's bounded JSON stream path and is a diagnostic baseline, not the
+// application's large-source loading path.
 func BenchmarkGeoJSONMetadataStages1M(b *testing.B) {
 	path := desktopBenchmarkGeoJSONFixture(b, 1_000_000)
 	godal.RegisterAll()
@@ -277,8 +278,9 @@ func BenchmarkGeoJSONMetadataStages1M(b *testing.B) {
 	b.ReportMetric(float64(boundsRSS)/(1<<20), "rss-after-bounds-MiB")
 }
 
-// BenchmarkGeoJSONSeqMetadataStages1M checks whether the sequence driver keeps
-// its advertised incremental parsing behavior through open and metadata scans.
+// BenchmarkGeoJSONSeqMetadataStages1M measures the raw GDAL GeoJSONSeq driver
+// open and metadata scans. The desktop app routes GeoJSONSeq through its own
+// bounded stream reader instead of this driver path for large vector reads.
 func BenchmarkGeoJSONSeqMetadataStages1M(b *testing.B) {
 	path := desktopBenchmarkGeoJSONSeqFixture(b, 1_000_000)
 	godal.RegisterAll()

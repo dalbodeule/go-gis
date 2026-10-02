@@ -25,7 +25,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -47,6 +49,83 @@ func TestCheckedFeatureCount(t *testing.T) {
 	}
 	if got, err := checkedFeatureCount(-1, 100); err == nil || got != 0 {
 		t.Fatalf("negative feature count = %d, %v; want error", got, err)
+	}
+}
+
+func TestCheckedCIntLength(t *testing.T) {
+	if err := checkedCIntLength("test count", 0); err != nil {
+		t.Fatalf("zero length rejected: %v", err)
+	}
+	if err := checkedCIntLength("test count", maxRasterCInt); err != nil {
+		t.Fatalf("maximum C int length rejected: %v", err)
+	}
+	if err := checkedCIntLength("test count", -1); err == nil {
+		t.Fatal("negative length accepted")
+	}
+	if maxRasterCInt < int(^uint(0)>>1) {
+		if err := checkedCIntLength("test count", maxRasterCInt+1); err == nil {
+			t.Fatal("length above C int range accepted")
+		}
+	}
+}
+
+func TestCheckedVSIReadBounds(t *testing.T) {
+	if got, err := checkedVSIReadLength(4096); err != nil || got != 4096 {
+		t.Fatalf("checkedVSIReadLength(4096) = %d, %v", got, err)
+	}
+	if got, err := checkedVSIReadLength(1 << 28); err != nil || got != 1<<28 {
+		t.Fatalf("checkedVSIReadLength(max) = %d, %v", got, err)
+	}
+	if got, err := checkedVSIReadLength((1 << 28) + 1); err == nil || got != 0 {
+		t.Fatalf("oversized VSI read length = %d, %v; want error", got, err)
+	}
+	if got, err := checkedVSIReadOffset(uint64(^uint64(0) >> 1)); err != nil || got != int64(^uint64(0)>>1) {
+		t.Fatalf("maximum VSI read offset = %d, %v", got, err)
+	}
+	if got, err := checkedVSIReadOffset(^uint64(0)); err == nil || got != 0 {
+		t.Fatalf("overflowing VSI read offset = %d, %v; want error", got, err)
+	}
+	for _, result := range []struct{ read, requested int }{{0, 0}, {4, 4}} {
+		if err := checkedVSIReadResult(result.read, result.requested); err != nil {
+			t.Fatalf("valid VSI read result (%d,%d): %v", result.read, result.requested, err)
+		}
+	}
+	for _, result := range []struct{ read, requested int }{{-1, 4}, {5, 4}} {
+		if err := checkedVSIReadResult(result.read, result.requested); err == nil {
+			t.Fatalf("invalid VSI read result (%d,%d) was accepted", result.read, result.requested)
+		}
+	}
+}
+
+func TestWarpRejectsInvalidSourceLists(t *testing.T) {
+	if ds, err := Warp("out.tif", nil, nil); err == nil || ds != nil {
+		t.Fatalf("Warp with no sources = (%v, %v), want error", ds, err)
+	}
+	if ds, err := Warp("out.tif", []*Dataset{nil}, nil); err == nil || ds != nil {
+		t.Fatalf("Warp with nil source = (%v, %v), want error", ds, err)
+	}
+	var ds *Dataset
+	if err := ds.WarpInto(nil, nil); err == nil {
+		t.Fatal("WarpInto with no sources succeeded, want error")
+	}
+	if err := ds.WarpInto([]*Dataset{nil}, nil); err == nil {
+		t.Fatal("WarpInto with nil source succeeded, want error")
+	}
+}
+
+func TestTransformExRejectsInvalidCoordinateLengths(t *testing.T) {
+	var transform *Transform
+	if err := transform.TransformEx([]float64{1}, nil, nil, nil); err == nil {
+		t.Fatal("TransformEx accepted mismatched x/y lengths")
+	}
+	if err := transform.TransformEx([]float64{1}, []float64{2}, []float64{3, 4}, nil); err == nil {
+		t.Fatal("TransformEx accepted mismatched z length")
+	}
+	if err := transform.TransformEx([]float64{1}, []float64{2}, nil, []bool{true, false}); err == nil {
+		t.Fatal("TransformEx accepted mismatched success length")
+	}
+	if err := transform.TransformEx(nil, nil, nil, nil); err != nil {
+		t.Fatalf("TransformEx on empty input = %v, want nil", err)
 	}
 }
 
@@ -84,69 +163,82 @@ func tempfile() string {
 }
 
 func TestCBuffer(t *testing.T) {
-	var buf interface{}
-	buf = make([]byte, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Byte, bufferType(buf))
-	assert.Equal(t, 1, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]int8, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Int8, bufferType(buf))
-	assert.Equal(t, 1, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]int16, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Int16, bufferType(buf))
-	assert.Equal(t, 2, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]uint16, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, UInt16, bufferType(buf))
-	assert.Equal(t, 2, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]int32, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Int32, bufferType(buf))
-	assert.Equal(t, 4, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]uint32, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, UInt32, bufferType(buf))
-	assert.Equal(t, 4, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]float32, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Float32, bufferType(buf))
-	assert.Equal(t, 4, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]float64, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, Float64, bufferType(buf))
-	assert.Equal(t, 8, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]complex64, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, CFloat32, bufferType(buf))
-	assert.Equal(t, 8, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	buf = make([]complex128, 100)
-	_ = cBuffer(buf, 100)
-	assert.Equal(t, CFloat64, bufferType(buf))
-	assert.Equal(t, 16, bufferType(buf).Size())
-	assert.Panics(t, func() { cBuffer(buf, 101) })
-
-	assert.Panics(t, func() { cBuffer("stringtest", 100) })
+	cases := []struct {
+		buffer interface{}
+		typeID DataType
+		size   int
+	}{
+		{make([]byte, 100), Byte, 1},
+		{make([]int8, 100), Int8, 1},
+		{make([]int16, 100), Int16, 2},
+		{make([]uint16, 100), UInt16, 2},
+		{make([]int32, 100), Int32, 4},
+		{make([]uint32, 100), UInt32, 4},
+		{make([]float32, 100), Float32, 4},
+		{make([]float64, 100), Float64, 8},
+		{make([]complex64, 100), CFloat32, 8},
+		{make([]complex128, 100), CFloat64, 16},
+	}
+	for _, tc := range cases {
+		ptr, err := cBuffer(tc.buffer, 100)
+		assert.NoError(t, err)
+		assert.NotNil(t, ptr)
+		assert.Equal(t, tc.typeID, bufferType(tc.buffer))
+		assert.Equal(t, tc.size, bufferType(tc.buffer).Size())
+		_, err = cBuffer(tc.buffer, 101)
+		assert.Error(t, err)
+	}
+	_, err := cBuffer([]byte{}, 1)
+	assert.Error(t, err)
+	ptr, err := cBuffer([]byte{}, 0)
+	assert.NoError(t, err)
+	assert.Nil(t, ptr)
+	_, err = cBuffer("stringtest", 100)
+	assert.Error(t, err)
 	assert.Panics(t, func() { bufferType("stringtest") })
+}
+
+func TestCheckedRasterBufferElements(t *testing.T) {
+	if got, err := checkedRasterBufferElements(2, 2, 1, 4, 16, 4, 4); err != nil || got != 6 {
+		t.Fatalf("checkedRasterBufferElements = (%d, %v), want (6, nil)", got, err)
+	}
+	if got, err := checkedRasterBufferElements(0, 1, 1, 1, 0, 1, 1); err != nil || got != 1 {
+		t.Fatalf("checkedRasterBufferElements zero-width window = (%d, %v), want (1, nil)", got, err)
+	}
+	if _, err := checkedRasterBufferElements(-1, 1, 1, 1, 1, 1, 1); err == nil {
+		t.Fatal("accepted negative buffer width")
+	}
+	if _, err := checkedRasterBufferElements(maxRasterCInt+1, 2, 1, 1, 1, 1, 1); err == nil {
+		t.Fatal("accepted width outside C int range")
+	}
+	if _, err := checkedRasterBufferElements(maxRasterCInt, maxRasterCInt, maxRasterCInt, maxRasterCInt, maxRasterCInt, maxRasterCInt, 1); err == nil {
+		t.Fatal("accepted overflowing raster buffer span")
+	}
+	if got, err := checkedRasterMul(2, 3); err != nil || got != 6 {
+		t.Fatalf("checkedRasterMul(2,3) = (%d,%v)", got, err)
+	}
+}
+
+func TestRasterIORejectsInvalidBuffersAndDimensions(t *testing.T) {
+	var band Band
+	if err := band.IO(IORead, 0, 0, []byte{1}, -1, 1); err == nil {
+		t.Fatal("Band.IO accepted a negative buffer width")
+	}
+	if err := band.IO(IORead, 0, 0, []byte{1}, 2, 2); err == nil {
+		t.Fatal("Band.IO accepted a buffer smaller than the requested window")
+	}
+	if err := band.IO(IORead, 0, 0, "not a raster buffer", 2, 2); err == nil {
+		t.Fatal("Band.IO accepted an unsupported buffer type")
+	}
+	if err := band.IO(IORead, 0, 0, []byte{}, 1, 1); err == nil {
+		t.Fatal("Band.IO accepted an empty buffer for a non-empty window")
+	}
+	if err := band.IO(IORead, 0, 0, []byte{1}, maxRasterCInt+1, 1); err == nil {
+		t.Fatal("Band.IO accepted dimensions outside the C integer range")
+	}
+	if err := GridCreate("nearest", nil, nil, nil, 0, 1, 0, 1, 1, 1, []byte{}); err == nil {
+		t.Fatal("GridCreate accepted a buffer smaller than the requested grid")
+	}
 }
 
 func TestColorTable(t *testing.T) {
@@ -873,15 +965,9 @@ func TestStridedIO(t *testing.T) {
 	}, padData[0:12])
 	reset()
 
-	assert.Panics(t, func() {
-		_ = ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(1), LineStride(2), BandStride(5))
-	})
-	assert.Panics(t, func() {
-		_ = ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(1), LineStride(3), BandStride(4))
-	})
-	assert.Panics(t, func() {
-		_ = ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(2), LineStride(2), BandStride(4))
-	})
+	assert.Error(t, ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(1), LineStride(2), BandStride(5)))
+	assert.Error(t, ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(1), LineStride(3), BandStride(4)))
+	assert.Error(t, ds.Read(0, 0, padData[0:12], 2, 2, PixelStride(2), LineStride(2), BandStride(4)))
 
 	padData = padData[0:8] //single band tests
 	bnd := ds.Bands()[0]
@@ -900,12 +986,8 @@ func TestStridedIO(t *testing.T) {
 	}, padData)
 	reset()
 
-	assert.Panics(t, func() {
-		_ = bnd.Read(0, 0, padData[0:4], 2, 2, PixelStride(1), LineStride(3))
-	})
-	assert.Panics(t, func() {
-		_ = bnd.Read(0, 0, padData[0:4], 2, 2, PixelStride(2), LineStride(2))
-	})
+	assert.Error(t, bnd.Read(0, 0, padData[0:4], 2, 2, PixelStride(1), LineStride(3)))
+	assert.Error(t, bnd.Read(0, 0, padData[0:4], 2, 2, PixelStride(2), LineStride(2)))
 
 }
 func TestSpacedIO(t *testing.T) {
@@ -3334,6 +3416,7 @@ func TestFeatureAttributes(t *testing.T) {
 	sfield = attrs["binaryCol"]
 	assert.Equal(t, FTBinary, sfield.Type())
 	assert.Equal(t, []byte("foo"), sfield.Bytes())
+	assert.NoError(t, nf.SetFieldValue(attrs["binaryCol"], []byte{}))
 	sfield = attrs["dateCol"]
 	assert.Equal(t, FTDate, sfield.Type())
 	assert.Equal(t, date.Format(dateFormatRFC3339), sfield.DateTime().Format(dateFormatRFC3339))
@@ -3657,6 +3740,105 @@ type multireadErroringHandler struct {
 	bufHandler
 }
 
+type concurrentReadHandler struct {
+	active atomic.Int32
+	peak   atomic.Int32
+}
+
+func (h *concurrentReadHandler) ReadAt(_ string, buf []byte, _ int64) (int, error) {
+	active := h.active.Add(1)
+	for peak := h.peak.Load(); active > peak; peak = h.peak.Load() {
+		if h.peak.CompareAndSwap(peak, active) {
+			break
+		}
+	}
+	defer h.active.Add(-1)
+	time.Sleep(time.Millisecond)
+	return len(buf), nil
+}
+
+func (*concurrentReadHandler) Size(string) (int64, error) { return 0, nil }
+
+func TestVSIReadAtMultiBoundsFallbackConcurrency(t *testing.T) {
+	const count = 4096
+	reader := &concurrentReadHandler{}
+	bufs := make([][]byte, count)
+	offsets := make([]int64, count)
+	for i := range bufs {
+		bufs[i] = make([]byte, 1)
+		offsets[i] = int64(i)
+	}
+	handler := vsiHandler{KeySizerReaderAt: reader}
+	lens, err := handler.ReadAtMulti("", bufs, offsets)
+	require.NoError(t, err)
+	require.Len(t, lens, count)
+	for i, n := range lens {
+		if n != len(bufs[i]) {
+			t.Fatalf("read %d returned %d bytes, want %d", i, n, len(bufs[i]))
+		}
+	}
+	limit := runtime.GOMAXPROCS(0) * 4
+	if limit > maxVSIReadWorkers {
+		limit = maxVSIReadWorkers
+	}
+	if limit > count {
+		limit = count
+	}
+	if peak := int(reader.peak.Load()); peak < 1 || peak > limit {
+		t.Fatalf("peak concurrent reads = %d, want range [1,%d]", peak, limit)
+	}
+}
+
+type invalidReadCountHandler struct{}
+
+func (invalidReadCountHandler) ReadAt(_ string, buf []byte, _ int64) (int, error) {
+	return len(buf) + 1, nil
+}
+
+func (invalidReadCountHandler) Size(string) (int64, error) { return 1, nil }
+
+type invalidMultiReadCountHandler struct{ invalidReadCountHandler }
+
+func (invalidMultiReadCountHandler) ReadAtMulti(_ string, _ [][]byte, _ []int64) ([]int, error) {
+	return []int{5}, nil
+}
+
+type panicReadHandler struct{}
+
+func (panicReadHandler) ReadAt(string, []byte, int64) (int, error) { panic("read panic") }
+func (panicReadHandler) Size(string) (int64, error)                { panic("size panic") }
+
+type panicError struct{}
+
+func (panicError) Error() string { panic("error formatting panic") }
+
+func TestVSIReadAtMultiRejectsInvalidByteCount(t *testing.T) {
+	handler := vsiHandler{KeySizerReaderAt: invalidReadCountHandler{}}
+	lens, err := handler.ReadAtMulti("", [][]byte{make([]byte, 4)}, []int64{0})
+	require.Error(t, err)
+	require.Equal(t, []int{0}, lens)
+
+	handler = vsiHandler{KeySizerReaderAt: invalidMultiReadCountHandler{}}
+	lens, err = handler.ReadAtMulti("", [][]byte{make([]byte, 4)}, []int64{0})
+	require.Error(t, err)
+	require.Nil(t, lens)
+}
+
+func TestVSIHandlerPanicsBecomeErrors(t *testing.T) {
+	reader := panicReadHandler{}
+	if n, err := callVSIReadAt(reader, "panic", make([]byte, 1), 0); err == nil || n != 0 {
+		t.Fatalf("ReadAt panic result = (%d, %v), want zero and error", n, err)
+	}
+	if size, err := callVSISize(reader, "panic"); err == nil || size != -1 {
+		t.Fatalf("Size panic result = (%d, %v), want -1 and error", size, err)
+	}
+	handler := vsiHandler{KeySizerReaderAt: reader}
+	lens, err := handler.ReadAtMulti("panic", [][]byte{make([]byte, 1)}, []int64{0})
+	require.Error(t, err)
+	require.Equal(t, []int{0}, lens)
+	require.NotEmpty(t, callbackErrorText(panicError{}))
+}
+
 func (re readErroringHandler) ReadAt(key string, buf []byte, off int64) (int, error) {
 	return 0, fmt.Errorf("not implemented")
 }
@@ -3891,7 +4073,7 @@ type debugLogger struct {
 
 func (dl *debugLogger) L(ec ErrorCategory, code int, msg string) error {
 	if ec >= CE_Warning {
-		return fmt.Errorf(msg)
+		return fmt.Errorf("%s", msg)
 	}
 	if ec == CE_Debug {
 		dl.logs += ",GOTESTDEBUG:" + msg
@@ -4607,11 +4789,14 @@ func TestViewshedSimpleHeight(t *testing.T) {
 func TestViewshedCreationOptions(t *testing.T) {
 
 	var (
-		driver  = GTiff
-		tmpname = tempfile()
+		driver = GTiff
+		tmpdir = t.TempDir()
 	)
-	defer os.Remove(tmpname)
-	vrtDs, err := Create(driver, tmpname, 1, Int8, 20, 20, CreationOption("TILED=YES", "BLOCKXSIZE=128", "BLOCKYSIZE=128"))
+	source := filepath.Join(tmpdir, "source.tif")
+	invalidWithLogger := filepath.Join(tmpdir, "invalid-with-logger.tif")
+	invalidWithoutLogger := filepath.Join(tmpdir, "invalid-without-logger.tif")
+	validOutput := filepath.Join(tmpdir, "valid.tif")
+	vrtDs, err := Create(driver, source, 1, Int8, 20, 20, CreationOption("TILED=YES", "BLOCKXSIZE=128", "BLOCKYSIZE=128"))
 	if err != nil {
 		t.Error(err)
 		return
@@ -4626,21 +4811,21 @@ func TestViewshedCreationOptions(t *testing.T) {
 
 	// Invalid - with error logger
 	ehc := eh()
-	ds, err := vrtDs.Bands()[0].Viewshed("none", 2, 2, 0, CreationOption("INVALID_OPT=BAR"), ErrLogger(ehc.ErrorHandler))
+	ds, err := vrtDs.Bands()[0].Viewshed(invalidWithLogger, 2, 2, 0, CreationOption("INVALID_OPT=BAR"), ErrLogger(ehc.ErrorHandler))
 	if err == nil {
 		ds.Close()
 	}
 	assert.Error(t, err)
 
 	// Invalid - no error logger
-	ds, err = vrtDs.Bands()[0].Viewshed("none", 2, 2, 0, CreationOption("INVALID_OPT=BAR"))
+	ds, err = vrtDs.Bands()[0].Viewshed(invalidWithoutLogger, 2, 2, 0, CreationOption("INVALID_OPT=BAR"))
 	if err == nil {
 		ds.Close()
 	}
 	assert.Error(t, err)
 
 	// Valid
-	ds, err = vrtDs.Bands()[0].Viewshed("none", 2, 2, 0, CreationOption("TILED=YES", "BLOCKXSIZE=128", "BLOCKYSIZE=128"))
+	ds, err = vrtDs.Bands()[0].Viewshed(validOutput, 2, 2, 0, CreationOption("TILED=YES", "BLOCKXSIZE=128", "BLOCKYSIZE=128"))
 	if err == nil {
 		ds.Close()
 	}

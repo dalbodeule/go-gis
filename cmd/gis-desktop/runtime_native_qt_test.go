@@ -1262,6 +1262,68 @@ func TestStalePreviewDoesNotReplaceRuntime(t *testing.T) {
 	}
 }
 
+func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
+	key := render.ChunkKey{Layer: "large", X: 3, Y: 4}
+	sourceMu := &sync.RWMutex{}
+	loaded := &demoRuntime{
+		sources:                   map[string]render.LayerSource{"large": {}},
+		sourcesMu:                 sourceMu,
+		viewportReadOnly:          true,
+		windowHits:                map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 77}}},
+		windowFeatureCounts:       map[render.ChunkKey]int{key: 1},
+		windowFeatureIDs:          map[render.ChunkKey][]uint64{key: {77}},
+		windowVisibleFeatureCount: 1,
+		windowPayloadBytes:        map[render.ChunkKey]int64{key: 128},
+		windowVisiblePayloadBytes: 128,
+		windowVisibleKeys:         map[render.ChunkKey]struct{}{key: {}},
+		windowFeatureNames:        map[uint64]string{77: "parcel"},
+		windowLabels:              map[render.ChunkKey][]render.LayerLabel{key: {{Text: "parcel"}}},
+		nextWindowFeatureID:       77,
+		readOnlyBaseLayers:        []core.Layer{{Name: "base"}},
+		readOnlyBaseFeatures:      []render.HitFeature{{FeatureID: 8}},
+		readOnlyBaseLabels:        []render.LayerLabel{{Text: "base"}},
+	}
+	current := &demoRuntime{
+		sources:              map[string]render.LayerSource{"old": {}},
+		sourcesMu:            &sync.RWMutex{},
+		viewportReadOnly:     true,
+		windowHits:           map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 1}}},
+		windowFeatureNames:   map[uint64]string{1: "old"},
+		readOnlyBaseFeatures: []render.HitFeature{{FeatureID: 1}},
+	}
+
+	current.mu.Lock()
+	current.adoptLoadedSpatialStateLocked(loaded)
+	current.mu.Unlock()
+	if _, ok := current.sources["large"]; !current.viewportReadOnly || current.sourcesMu != sourceMu || !ok {
+		t.Fatal("loaded render sources or viewport mode were not transferred")
+	}
+	if len(current.windowHits[key]) != 1 || current.windowHits[key][0].FeatureID != 77 ||
+		current.windowFeatureCounts[key] != 1 || current.windowFeatureIDs[key][0] != 77 ||
+		current.windowVisibleFeatureCount != 1 || current.windowPayloadBytes[key] != 128 ||
+		current.windowVisiblePayloadBytes != 128 || len(current.windowVisibleKeys) != 1 ||
+		current.windowFeatureNames[77] != "parcel" || current.windowLabels[key][0].Text != "parcel" ||
+		current.nextWindowFeatureID != 77 || len(current.readOnlyBaseLayers) != 1 ||
+		current.readOnlyBaseFeatures[0].FeatureID != 8 || current.readOnlyBaseLabels[0].Text != "base" {
+		t.Fatal("loaded viewport feature state was not transferred completely")
+	}
+
+	// Replacing a windowed project with a normal runtime must release every
+	// old window map and disable window-specific refresh behavior.
+	plain := &demoRuntime{sources: map[string]render.LayerSource{}, sourcesMu: &sync.RWMutex{}}
+	current.mu.Lock()
+	current.adoptLoadedSpatialStateLocked(plain)
+	current.mu.Unlock()
+	if current.viewportReadOnly || len(current.windowHits) != 0 || len(current.windowFeatureCounts) != 0 ||
+		len(current.windowFeatureIDs) != 0 || current.windowVisibleFeatureCount != 0 ||
+		len(current.windowPayloadBytes) != 0 || current.windowVisiblePayloadBytes != 0 ||
+		len(current.windowVisibleKeys) != 0 || len(current.windowFeatureNames) != 0 ||
+		len(current.windowLabels) != 0 || current.nextWindowFeatureID != 0 ||
+		len(current.readOnlyBaseLayers) != 0 || len(current.readOnlyBaseFeatures) != 0 || len(current.readOnlyBaseLabels) != 0 {
+		t.Fatal("replacing with a non-windowed runtime retained stale viewport state")
+	}
+}
+
 func TestLargeReadOnlyLoadPublishesStablePreview(t *testing.T) {
 	path := largeReadOnlyFixture(t)
 	var preview *demoRuntime
@@ -1301,6 +1363,24 @@ func TestLargeReadOnlyLoadPublishesStablePreview(t *testing.T) {
 	}
 	if preview.closeAttributeSource != nil || preview.attributeFeatureReader != nil {
 		t.Fatal("preview retained the full loader's attribute session")
+	}
+}
+
+func TestWindowedReadOnlyBaseLayerBudgetCheckedBeforeOpeningSources(t *testing.T) {
+	var nested any = "leaf"
+	for depth := 0; depth <= 64; depth++ {
+		nested = []any{nested}
+	}
+	baseLayers := []core.Layer{{
+		Name: "oversized-base",
+		Features: []core.Feature{{
+			ID: 1, Properties: map[string]any{"nested": nested},
+		}},
+	}}
+	runtime, eligible, err := tryLoadWindowedReadOnlyRuntimeWithBaseLayers(
+		context.Background(), []vectorSourceSpec{{Path: "source-does-not-exist.shp"}}, "", baseLayers, nil)
+	if err == nil || !eligible || runtime != nil || !strings.Contains(err.Error(), "read-only base project") {
+		t.Fatalf("windowed loader result runtime=%v eligible=%t err=%v; want early base budget rejection", runtime, eligible, err)
 	}
 }
 
@@ -1399,6 +1479,7 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 	}
 	names := runtime.service.LayerNames()
 	readableChunks := make(map[string]int, len(names))
+	firstReadableChunks := make(map[string]render.ChunkKey, len(names))
 	for _, name := range names {
 		_, sourceFeatureCount, countErr := runtime.attributePageReader(context.Background(), name, 0, 1)
 		if countErr != nil {
@@ -1439,6 +1520,7 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 					hitCount := len(runtime.windowHits[key])
 					if hitCount > 0 {
 						readableChunks[name]++
+						firstReadableChunks[name] = key
 						t.Logf("real source layer=%s bucket=%d first readable chunk=%v hits=%d vertices=%d", key.Layer, zoomBucket, key, hitCount, len(chunk.Vertices))
 					}
 				} else {
@@ -1450,6 +1532,53 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 			t.Errorf("real source layer %s yielded no features through zoom bucket 4", name)
 		}
 	}
+	const viewportMovesPerLayer = 128
+	for _, name := range names {
+		start, ok := firstReadableChunks[name]
+		if !ok {
+			continue
+		}
+		tileCount := 4 << start.ZoomBucket
+		for move := 0; move < viewportMovesPerLayer; move++ {
+			key := render.ChunkKey{
+				Layer: name, ZoomBucket: start.ZoomBucket,
+				X: (start.X + move) % tileCount,
+				Y: (start.Y + move*3) % tileCount,
+			}
+			runtime.mu.Lock()
+			runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{key})
+			runtime.mu.Unlock()
+			if _, err := runtime.builder(context.Background(), key); err != nil &&
+				!strings.Contains(err.Error(), "safety limit") &&
+				!strings.Contains(err.Error(), "payload budget") &&
+				!strings.Contains(err.Error(), "limit of") {
+				t.Fatalf("real source viewport move %d for %s (%v) failed unexpectedly: %v", move, name, key, err)
+			}
+			runtime.mu.Lock()
+			visibleKeys := len(runtime.windowVisibleKeys)
+			retainedChunks := len(runtime.windowFeatureCounts)
+			retainedHitChunks := len(runtime.windowHits)
+			retainedIDChunks := len(runtime.windowFeatureIDs)
+			retainedPayloadChunks := len(runtime.windowPayloadBytes)
+			retainedLabelChunks := len(runtime.windowLabels)
+			retainedNames := len(runtime.windowFeatureNames)
+			retainedFeatures := len(runtime.features)
+			visibleFeatures := runtime.windowVisibleFeatureCount
+			visiblePayloadBytes := runtime.windowVisiblePayloadBytes
+			if visibleKeys != 1 || retainedChunks > 1 || retainedHitChunks > 1 ||
+				retainedIDChunks > 1 || retainedPayloadChunks > 1 || retainedLabelChunks > 1 ||
+				retainedNames > maxReadOnlyVisibleFeatures || retainedFeatures > maxReadOnlyVisibleFeatures ||
+				visibleFeatures > maxReadOnlyVisibleFeatures || visiblePayloadBytes > maxReadOnlyVisibleBytes {
+				runtime.mu.Unlock()
+				t.Fatalf("real source viewport move %d for %s retained unbounded state: keys=%d chunks=%d hits=%d ids=%d payloads=%d labels=%d names=%d features=%d visible-features=%d bytes=%d",
+					move, name, visibleKeys, retainedChunks, retainedHitChunks, retainedIDChunks,
+					retainedPayloadChunks, retainedLabelChunks, retainedNames, retainedFeatures,
+					visibleFeatures, visiblePayloadBytes)
+			}
+			runtime.mu.Unlock()
+		}
+	}
+	t.Logf("real-source viewport moves=%d per layer", viewportMovesPerLayer)
 	if len(runtime.features) > maxReadOnlyVisibleFeatures || runtime.windowVisiblePayloadBytes > maxReadOnlyVisibleBytes {
 		t.Fatalf("real-source safety caps exceeded: hits=%d payload=%d", len(runtime.features), runtime.windowVisiblePayloadBytes)
 	}

@@ -4,6 +4,64 @@
 취약점 조회를 한곳에 모은다. 자동 검증 결과와 실제 사용자 환경의 결과를
 혼동하지 않도록 각 항목에 환경과 증거를 기록한다.
 
+`GO-2026-5970`은 잘못된 UTF-8 입력에서 `golang.org/x/text/unicode/norm.Iter`가 무한 루프에
+빠질 수 있다고 보고하며, 수정 경계는 `golang.org/x/text v0.39.0`이다. 저장소를 `v0.42.0`으로
+올렸다(Go 1.27.1 환경). 해당 모듈이 요구하는 `golang.org/x/sync`도 v0.23.0으로 갱신됐다.
+`norm.Iter`에 invalid/truncated UTF-8 네 입력을 주고 제한시간 안에 끝나며 매 iteration마다
+byte position이 전진하는 회귀 테스트를 추가했다. `go mod verify`, 일반/native 전체 테스트,
+Qt/native 데스크톱 테스트와 일반 `go vet`가 통과했다.
+초기 sandbox 환경의 `govulncheck` 실행은 `vuln.go.dev` DNS 조회 실패로 끝났다. 2026-10-02에
+승인된 네트워크 실행으로 공식 DB 검사를 완료했으며 결과와 후속 모듈 수정은 아래에 기록한다.
+공식 [Go 취약점 기록](https://pkg.go.dev/vuln/GO-2026-5970)과 이슈
+[#80142](https://github.com/golang/go/issues/80142)을 근거로 삼았다.
+
+2026-10-02 공식 DB 재검사(승인된 네트워크 실행): 루트 `./...`는 취약점 0건이었다.
+별도 nested module `third_party/godal`에서는 초기 스캔에서 gRPC, `x/net`, OpenTelemetry,
+`x/crypto` 및 Windows `x/sys` 구버전 취약점이 발견됐다. 이를 gRPC v1.83.2, `x/net` v0.58.0,
+`x/crypto` v0.56.0, `x/sys` v0.47.0, OTel SDK v1.44.0 및 호환 전이 버전으로 올렸다.
+최종 nested 스캔은 symbol-level 취약점 0건, package-level 추가 취약점 0건이었다.
+남은 module-level 결과는 GO-2026-5932 (`x/crypto/openpgp`, 수정 버전 없음) 하나이며,
+`go list -deps ./...`에는 OpenPGP 패키지가 없고 실제 사용 패키지는 cryptobyte/chacha20 계열이다.
+따라서 이는 현재 import 경로의 취약점으로 보고되지는 않지만, nested module의 요구 모듈에 대한
+DB 경고로 기록한다. [공식 advisory](https://pkg.go.dev/vuln/GO-2026-5932).
+
+2026-10-02 재실행에서 승인된 네트워크 권한으로 공식 DB 검사를 갱신했다. 루트 portable 및
+`-tags native` 검사는 각각 `No vulnerabilities found`; nested GODAL은 도달 가능한 취약점 0건과
+호출되지 않는 module-level 결과 1건(GO-2026-5932)으로 종료 코드 0을 반환했다. 이는 CI에 nested
+scan을 추가한 뒤 얻은 로컬 scan 증거이며, GitHub CI job 자체의 실행 결과와는 구분한다.
+
+업데이트 후 nested `go vet ./...`, `go test ./... -skip '^TestVSIGCSNoAuth$'`, race 테스트,
+`go mod verify`, `go mod tidy -diff`가 통과했다. 제외 테스트만 Google Cloud fixture가 필요해
+실행하지 못했다. 루트 `scripts/verify.sh`, `go mod verify`, `go mod tidy -diff`와 공식 DB scan도
+통과했다.
+
+전체 GODAL test가 repository root에 `none`이라는 이름의 GTiff를 남기던
+`TestViewshedCreationOptions`를 찾아, source/output 파일을 `t.TempDir()` 아래의 고유 경로로
+분리했다. 해당 테스트와 nested vet/test/race가 통과했고, 전체 nested test 후 root artifact가
+생성되지 않는 것을 확인했다.
+
+2026-10-02 재확인: 루트 및 `third_party/godal` 모듈 그래프 모두
+`golang.org/x/text v0.42.0`, `golang.org/x/sync v0.23.0`을 선택하며 취약 범위의 x/text 버전은
+없다. 구형 x/text v0.29.0 checksum도 루트 `go.sum`에서 제거했다. 공식 DB의 루트 및 nested
+모듈 결과는 위에 분리해 기록했다.
+
+같은 날 `GOGIS_TEST_REPEATED_VIEWPORT_ABOVE_INDEX_CAP=1` stress test를 다시 실행했다.
+1,000,001-point GeoJSON에서 128회 viewport 이동, 누적 1,952 window hit/label, peak RSS
+188 MiB로 통과했다(Apple M3, 단일 실행). 이 수치는 synthetic point fixture와 Go 프로세스의
+peak RSS이며 polygon-heavy 전국 실데이터, Qt/GPU 메모리 또는 UI frame rate를 보증하지 않는다.
+중첩 `third_party/godal` 전체 테스트도 `go test ./... -skip '^TestVSIGCSNoAuth$'`로 통과했다.
+제외한 테스트는 Google Cloud의 원격 fixture를 내려받아야 해 DNS 제한에서 실행할 수 없다.
+전체 테스트에서 기존 GDAL 0-pixel 폭 RasterIO debug callback이 새 dimension guard에 의해
+거부되는 회귀를 발견했다. 음수 크기는 계속 차단하면서 0폭 요청을 bounded buffer 검사와 함께
+허용하도록 수정했고 관련 RasterIO 및 callback 테스트가 통과했다.
+
+2026-10-02 bounded fuzz 재실행: core WKB decoder 679,603회, render WKB fast path 686,323회,
+GDAL GeoJSON geometry bounds 527,754회, GeoJSON properties 528,842회, GeoJSON sequence
+scanner 7,073회, PostGIS property byte estimator 51,754회 입력에서 모두 panic/failure 없이
+통과했다. 새 interesting input은 Go fuzz cache에 기록됐고 worktree에는 failure corpus가
+생성되지 않았다. 이 시간제한 실행들은 sanitizer/OOM stress나 native GDAL C/C++ fuzzing을
+대체하지 않는다.
+
 ## 자동 검증 현황 (2026-10-01, macOS ARM64)
 
 `GOCACHE=/private/tmp/gogis-go-cache ./scripts/verify.sh` 통과: 일반 Go 테스트와
@@ -11,12 +69,10 @@ vet, race 테스트, native 태그 테스트/race 테스트, native 빌드, Qt n
 QML 테스트 12개, `git diff --check`. 테스트 중 `Sans Serif` 대체 폰트 관련 Qt
 경고 1건이 있었지만 실패 테스트는 없었다. 별도의 키/토큰 형태 secret 패턴 검색은
 일치 항목이 없었다(휴리스틱 검색이며 secret scanner 전체 검사를 대체하지 않는다).
-`go mod verify`도 통과했으나, Go 취약점 DB는 DNS 차단으로 조회하지 못했으므로
-아래 온라인 검증은 여전히 남아 있다. `govulncheck`는 PATH에 설치되어 있지 않았지만
-로컬 module cache의 v1.8.0 source로 `/private/tmp/govulncheck`를 빌드했다. 최초 설치 방식은
-`proxy.golang.org` DNS 조회가 차단됐고, 캐시된 실행 파일로 재시도한 portable/native/qt,native
-분석도 모두 `vuln.go.dev/index/modules.json.gz` 조회 단계에서 막혔다. 따라서 취약점 결과는
-없음이 아니라 미검증이다.
+`go mod verify`도 통과했다. 최초 로컬 Go 취약점 DB 조회는 DNS 차단으로 실패했지만,
+2026-10-02 승인된 네트워크 실행에서 루트 및 nested GODAL 검사를 완료했다(위 결과 참조).
+현재 CI workflow는 portable/native 루트와 nested GODAL 모듈을 검사하도록 구성되어 있다;
+새 nested 검사 step은 아직 CI에서 실행된 결과가 없다.
 
 복잡 입력 회귀 확인으로 GeoJSON `GeometryCollection` 재귀를 64단계로 제한하고,
 65단계는 거부하는 테스트를 추가했다. GDAL GeoJSON geometry bounds 퍼즈 타깃은 약
@@ -55,6 +111,31 @@ geometry snapshot을 보유하지 않았다. 연속지적도는 거친 viewport 
 155 MiB, 테스트 본문은 약 1.75초였고 통과했다. 두 SHP에는 `.qix` sidecar가 없어 이 실행은
 공간 필터의 sequential-scan 조건도 포함한다. 단, 테스트는 각 레이어의 첫 readable chunk만
 만들며 실제 QML 화면·GPU scene graph를 띄우거나 crash report의 SIGABRT를 재현하지는 않는다.
+2026-10-02 테스트를 확장해 각 실제 SHP에서 128회씩, 총 256회 viewport chunk 이동 뒤에도
+활성 chunk·hit/ID/name/label map·feature/payload 상태가 상한 안에 남는지 매 이동마다 검사했다.
+최신 재실행은 일반 모드에서 테스트 본문 3.15초/peak RSS 170 MiB, race detector에서 8.91초/
+403 MiB였고 모두 통과했다. 과밀 창은 20,000-feature 안전 오류로 거부될 수 있으며, race 실행의
+높은 RSS는 sanitizer overhead를 포함한다. 이 결과는 실제 Go 로더의 반복 chunk·캐시 경로 검증이지 Qt
+화면/GPU 조작이나 GUI crash 원인 재현, 전국 규모 자원 상한의 증명은 아니다.
+
+2026-10-02 native 앱 직접 실행도 시도했다. 화면 세션이 없는 기본 platform plugin에서는
+`QQmlApplicationEngine.LoadData` 중 `Cannot create window: no screens available`로 abort했고,
+이 시점은 initial data loading 호출 전이라 SHP 처리 실패가 아니다. 같은 연속지적도 SHP를
+`QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software`로 실행하자 QML 앱은 12초 동안 abort나
+load-error 로그 없이 유지되어 timeout exit 124로 종료됐다. 이는 software/offscreen 시작 경로만
+확인하며 실제 window, GPU/scene graph, display-link crash 원인이나 RSS를 검증한 결과가 아니다.
+후속 화면 검증 시도에서는 macOS 세션이 잠겨 native app 제어가 불가능했다. 실제 GUI 창 및
+GPU 검증은 사용자가 Mac을 잠금 해제한 세션에서 다시 해야 한다.
+
+재현 시 `GOGIS_TEST_LARGE_VECTOR_SOURCES`에 SHP 경로 두 개 이상을 OS path-list 구분자로
+지정한다. 아래 예시는 macOS/Linux 기준이며 race flag를 빼면 일반 실행이다.
+
+```sh
+GOGIS_TEST_LARGE_VECTOR_SOURCES='/path/to/cadastre.shp:/path/to/control-points.shp' \
+  CGO_CXXFLAGS=-std=c++17 go test -race -tags 'qt native' ./cmd/gis-desktop \
+  -run '^TestWindowedReadOnlyLargeSourceIntegration$' -count=1 -v
+```
+
 대형 또는 feature count 미상 파일을 저장 경로가 없는 기존 editable project에 추가하면,
 기존 in-memory 레이어와 속성을 보존한 채 project 전체를 read-only viewport runtime으로
 전환한다. 신규 source는 chunk query로 읽으며 base layer hit-test와 attribute paging도 유지한다.
@@ -98,6 +179,36 @@ OGR feature 및 단일 WKB 크기를 알 수 있는 GDAL Go 바인딩이 없어,
 이어지지 않도록 처리했고, raster band/layer 목록 및 color table 복사 버퍼의 C 할당 실패와
 크기 산술 오버플로 검사도 추가했다. 이들 실패 경로를 실제 시스템 OOM으로 강제 주입한 것은
 아니며, 성공 경로 빌드와 native 테스트 통과만 확인했다.
+추가 검토에서 GDAL 호출마다 쓰는 작은 오류 컨텍스트도 `C.malloc` 결과를 확인하지 않고
+역참조한다는 점을 발견해, 동기 C 호출 중에만 보관되는 C-layout 값을 Go 소유 메모리로 옮겼다.
+native GDAL 테스트, `GOEXPERIMENT=cgocheck2` 검사, GDAL race 테스트가 통과했다. 강제 allocator
+실패 주입은 하지 않았으므로 이는 null 역참조 원인의 제거 근거이지, 전체 프로세스 OOM 안전성
+보증은 아니다.
+GDAL Go 바인딩에 남아 있던 `C.CString` 호출 중 외부 dataset 경로, plugin 이름, WKT 및 GeoJSON
+geometry 생성, 사용자 CRS, SQL query, scalar string field 문자열은 nil을 검사해 Go 오류로
+돌려주는 C-copy helper로 교체했다. helper는 Go 문자열을 동기 복사만 하고 C heap pointer를
+반환한다. `GDALOpenEx`뿐 아니라 rasterize/vector translate, VRT, grid/dem/viewshed/nearblack,
+geometry GML, GCP 처리, VSI, metadata, field/layer 처리의 문자열도 검사한다. 옵션 string array는
+pointer array와 각 원소 할당 오류를 확인한다. `createCGOContext`도 검사된 변환기를 사용하며
+할당 오류를 기록해 `close()`가 돌려준다. 단, 현 C wrapper는 `close()` 전에 native API를 실행하므로
+컨텍스트 옵션 할당 실패 시 native 호출을 사전 차단하지는 못한다. 강제 allocator 실패 주입은
+하지 않았고, 전체 프로세스 OOM 안전성을 보장하지 않는다.
+추가 C++ 검토에서 사용되지 않는 내부 driver registration helper의 unchecked `calloc` 및
+`snprintf`에 포인터 크기를 전달하던 버그를 수정했고, VSI callback 오류 메시지가 할당 실패로
+null일 때도 안전한 기본 문구를 사용한다.
+또한 VSI `ReadAtMulti` fallback의 요청 범위당 고루틴 생성은 `min(GOMAXPROCS × 4, 64)` worker로 제한했다.
+4,096개 범위 회귀 테스트로 동시 실행 상한과 결과 개수를 검증했다. 사용자 구현의 `KeyMultiReader`
+경로는 해당 구현이 자체 동시성을 제한해야 한다. C→Go VSI callback은 범위 개수(최대 65,536),
+개별 읽기 길이(최대 256 MiB), Go `int` 표현 가능성, nil buffer 및 int64 offset 범위를 검사한다.
+일반 `ReadAt`와 사용자 제공 `KeyMultiReader` 모두 결과 바이트 수가 요청 buffer 범위를 벗어나지 않는지
+검증한다.
+사용자 VSI handler의 `ReadAt`, `Size`, `ReadAtMulti` panic은 callback 경계에서 오류로 바꾸며,
+handler 반환 error의 `Error()`가 panic하는 경우도 C 경계로 전파하지 않는다. Size의 음수 응답도
+실패로 처리한다.
+GDAL Go API에서도 빈 Warp 입력·nil source dataset 및 좌표 변환의 불일치 slice 길이는 native
+호출이나 slice 인덱싱 전에 오류로 돌려주며, 빈 binary field는 nil data pointer와 길이 0으로 전달한다.
+RasterIO/GridCreate는 이제 지원하지 않는 buffer type, 빈/작은 buffer, 0/음수 또는 C int 범위를 벗어난
+dimension, stride/span 곱셈 overflow를 panic/포인터 역참조 전에 error로 반환한다.
 Window-backed read-only rendering은 concurrent chunk builder를 두 개로 제한한다. 이 제한은
 최대 두 개의 window 작업이 동시에 진행되도록 할 뿐, 각 작업의 WKB serialization·geometry
 decode·GEOS 출력 또는 전체 RSS에 정확한 byte 상한을 보장하지 않는다. Read-only window는
@@ -216,15 +327,46 @@ inspection 후 2,638 MiB에서 read-only runtime 구성 직후 2,639 MiB, 첫 vi
 100만 feature GeoJSON `godal.Open` 직후 2,223 MiB였다. 즉 재사용은 dataset 재오픈을
 줄이지만 window 전체 scan 중의 높은 native peak를 제거하지 못한다. 강제 OGRSQL spatial-filter 비교는
 전체 6.12초/첫 chunk 3.31초로 더 느렸지만 Go allocation은 5.63 MB/op/63,745회로
-감소했다. 기본 경로는 속도를 우선해 per-feature scan으로 유지했다. 두 방식 모두
-GeoJSON에 spatial index를 만들지 않으므로 각 viewport query가 최대 백만 피처를 다시
-스캔할 수 있다. 결과는 1M synthetic Point dataset 하나의 Mac benchmark이지 SHP,
+감소했다. 이전에는 두 GeoJSON window 방식 모두 매 viewport마다 per-feature envelope
+scan을 수행했다. 결과는 1M synthetic Point dataset 하나의 Mac benchmark이지 SHP,
 복잡한 polygon, 대화형 Qt frame rate의 대표값이 아니다.
 benchmark에서 모든 feature를 Go에 상주시킨 snapshot은 0개였고, `runtime.GC()` 후
 active runtime의 Go `HeapAlloc`은 약 1.13 MiB였다. 5.26 GiB peak는 Go retained heap과
 viewport payload로 설명되지 않는 GDAL/OGR 및 기타 native memory 사용을 보여준다. 이
 측정은 OOM 안전성을 보장하지 않는다. `ps`는 sandbox 권한상 차단되고
 `/usr/bin/time -l`도 제한됐지만, 프로세스 자체의 `getrusage` 측정은 가능했다.
+
+2026-10-02 baseline `BenchmarkGDALGeoJSONIndexedWindow1M`는 Apple M3에서 3회 조회 평균
+13.66 ms/op, 4.05 MB/op, 약 83.4k allocations/op를 기록했다. 1,000,000개 bbox를 선형
+순회해 3,969개 본문을 읽는 경로였다. 이후 이 후보 검색을 보완하기 위해 256×256 coarse
+grid를 추가했다. feature당 최대 64 cell 참조, 총 2,000,000 references, overflow feature
+비율, query cell 수 및 100,000 candidate 수를 제한한다. bounds가 너무 큰 feature는 항상
+검사하는 overflow 목록에 두며, grid/reference/candidate 제한에 닿거나 query 범위가 넓으면
+기존 선형 경로로 안전하게 fallback한다. per-session scratch의 dedupe bitmap/candidate buffer를
+재사용한다.
+
+같은 실행 묶음에서 baseline wide viewport는 14.43 ms/op, grid query는
+wide viewport(3,969 features) 12.17 ms/op였고,
+4.08 MB/op/83.4k allocations였고, 고배율 작은 viewport(1 feature)는 선형 3.61 ms/op에서
+grid 1.24 ms/op로 약 2.9배 빨라졌다. Grid는 처음 query 시 한 번 생성되며 별도 build
+benchmark는 18.54 ms/op, 4.93 MB/op였다. 이는 1M uniform-point synthetic 데이터와 Apple M3의
+단일 환경 측정이다. 첫 query 지연과 추가 약 5 MiB 상주 index를 치르고 반복 작은 viewport
+조회에서 이득을 얻는 tradeoff이며, complex polygon·전국 데이터·다른 OS에서의 결과는 보장하지
+않는다. Differential test는 linear bbox scan과 후보 결과가 일치하는지 및 dense-overflow/wide
+query fallback을 확인하며 cell을 가로지르는 bbox와 결정적 난수 128개 viewport를 대조한다.
+Grid 연결 뒤 1M GeoJSON desktop benchmark는 첫 window 43.60 ms,
+peak RSS 179.1 MiB를 기록했다(단일 실행; 이전 checkout 측정과 직접적인 회귀 비교는 아님).
+128회 반복 viewport test와 1,000,001-feature index-cap/tail-block test 모두 각각 1,952 retained
+hits/labels, peak RSS 189 MiB로 통과했다. native GDAL package vet/test/race 검증도 통과했다.
+전체 `GOCACHE=/tmp/gogis-go-cache ./scripts/verify.sh`도 portable/native test 및 race,
+native build, nested GODAL vet/test/race, Qt native와 QML 12개까지 통과했다.
+재현 명령:
+
+```sh
+GOCACHE=/private/tmp/gogis-go-cache go test -tags native ./drivers/gdal \
+  -run '^$' -bench '^BenchmarkGDALGeoJSON(Indexed|SpatialGrid)Window1M(Zoomed)?$' \
+  -benchmem -benchtime=3x -count=1
+```
 
 같은 100만 피처를 GDAL `VectorTranslate`로 `SPATIAL_INDEX=YES` GeoPackage로 만든
 후속 benchmark는 입력의 실제 `FeatureCount == 1,000,000`을 확인하고 변환 시간은
@@ -410,6 +552,10 @@ Go module 취약점 DB 검사는 GDAL/PROJ/GEOS/Qt의 네이티브 라이브러�
   악성 count 및 과도한 중첩 회귀 테스트와 10초 fuzz 실행(약 183만 입력)이 통과했다.
   Ubuntu CI는 같은 parser에 5초 bounded fuzz smoke test를 수행한다. 이는 전체 앱의
   RSS 상한이나 GDAL의 WKB 직렬화 전 native 할당 제한을 보장하지 않는다.
+- GDAL Go 바인딩의 `NewGeometryFromWKB`는 빈 slice에서 첫 원소를 참조해 panic할 수 있고,
+  길이를 C `int`로 직접 변환했다. 이제 빈 입력과 C API 길이 초과를 호출 전에 거부한다.
+  `WKBWithMaxSize`의 C 버퍼 해제도 지연 정리로 바꿔, GDAL context 오류 반환 시에도 버퍼가
+  남지 않게 했다. nil/빈 입력 회귀 테스트와 native GDAL race 테스트가 통과했다.
 - Hit-test uniform-grid의 보조 cell/span membership을 최대 1,048,576개로 제한했다.
   초과 시 부분 인덱스 배열과 map을 버리고 이미 보유한 geometry에 대한 선형 검색으로
   전환하므로 인덱스 빌드가 auxiliary memory를 계속 늘리지는 않는다. 초과 fallback의
@@ -443,3 +589,133 @@ Go module 취약점 DB 검사는 GDAL/PROJ/GEOS/Qt의 네이티브 라이브러�
 남아 있다 ([Qt licensing](https://doc.qt.io/qt-6/licensing.html),
 [Qt LGPL obligations](https://www.qt.io/development/open-source-lgpl-obligations),
 [GDAL license](https://gdal.org/en/stable/license.html)).
+
+## 2026-10-02 대용량/C 경계 후속 검증
+
+추가 C ABI 감사에서 Go slice 길이를 `C.int`로 바꾸는 컬러 테이블, overview,
+속성 list/binary, VSI read, GCP, raster band 경로를 찾았다. 모두 C `int` 범위를
+넘는 길이를 변환하기 전에 거부하도록 했고, helper의 경계 회귀 테스트를 추가했다.
+Raster I/O band count도 stride 및 native buffer 계산 전 확인한다. `third_party/godal`
+의 연관 테스트는 `-race`로 통과했고, Go GIS/native 전체 테스트, 전체 race 테스트,
+`go vet`, `go mod verify`, `cgocheck2` 대상 패키지 및 `git diff --check`도 통과했다.
+
+Qt/native opt-in stress test를 `CGO_CXXFLAGS=-std=c++17`로 실행했다. 1,000,001개
+feature에서 128회 viewport 이동 후 보유량 제한이 유지됐고 1,952 feature hit 및
+1,952 label hit, 프로세스 peak RSS 189 MiB를 기록했다. 이는 해당 synthetic
+GeoJSON/현재 macOS 실행의 측정치이며 대한민국 전역 데이터, GUI 상호작용, 임의의
+단일 feature geometry 또는 전체 시스템 OOM 상한을 보장하지 않는다. 기본 Qt
+test invocation은 C++17 compiler flag 없이 Qt 헤더 오류로 실패했으며 위 환경변수로
+다시 실행했을 때 통과했다.
+
+공식 [GO-2026-5970 기록](https://pkg.go.dev/vuln/GO-2026-5970)은 수정 버전을
+`golang.org/x/text v0.39.0`으로 표시하고, 저장소는 v0.42.0을 사용한다. 따라서 이
+특정 취약점의 알려진 vulnerable range 밖임을 확인했지만, `govulncheck` 데이터베이스
+접속은 DNS 제한으로 실패해 전체 온라인 취약점 재검색은 여전히 미검증이다.
+
+추가 module graph 감사에서 standalone `third_party/godal`은 별도 `go.mod`를 통해
+`x/text v0.22.0`을 선택했고, `go mod why golang.org/x/text/unicode/norm`에서
+`godal/cogify → cloud storage → x/net/idna → norm` 활성 import 경로가 확인됐다.
+이를 놓치지 않도록 nested graph도 `x/text v0.42.0`, `x/sync v0.23.0`으로 올렸고,
+이 버전들의 요구사항에 맞춰 nested module의 `go` directive를 1.26.0으로 맞췄다.
+Standalone godal C-boundary/VSI `-race` 테스트와 nested `go mod verify`가 통과했다.
+
+같은 날 bounded fuzz smoke test도 재실행했다: WKB render parser 약 896천,
+GeoJSON geometry bounds 약 1.79백만, GeoJSON property decoder 약 1.53백만,
+GeoJSON sequence scanner 약 6.8천 입력에서 panic/crash 없이 끝났다. 각 실행은
+10초 안팎의 단일 macOS ARM64 fuzz run이며 입력 공간 전체 검증이나 RSS quota를
+의미하지 않는다.
+
+추가 재검증에서 `GOCACHE=/private/tmp/gogis-go-build-cache ./scripts/verify.sh`가
+일반/native 테스트 및 race, vet, native 빌드, Qt/native 테스트와 QML 테스트
+(12/12)를 모두 통과했다. 뒤이은 sandbox 내 `govulncheck -tags native ./...` 재실행은
+`vuln.go.dev/index/modules.json.gz` DNS 조회 차단으로 결과를 반환하지 못했다. 이는 앞서
+승인된 네트워크 실행에서 확보한 루트/nested 결과를 무효화하지 않으며, 현재 checkout의
+수정된 CI workflow가 실제 실행된 결과는 아직 없다.
+
+대용량 merge 경로도 추가 점검했다. 기존에는 결과 feature slice와 duplicate-ID map을
+예약한 뒤 CRS/schema mismatch를 검사했다. 이제 메타데이터를 먼저 검증하며, 250,000개
+feature를 가진 schema 불일치 입력은 오류로 끝나면서 추가 할당 4 MiB 미만이다. 또한
+모든 ID를 먼저 검증하므로 마지막 ID가 중복인 경우 geometry/property 깊은 복사를
+시작하지 않는다. 10,000개 feature × 1 KiB WKB 입력의 late-duplicate 회귀 테스트도
+할당 4 MiB 미만을 확인했다. 두 오류 경로 모두 race 테스트를 통과했다. 현재 유효
+10K owned-merge benchmark는 3회 측정에서 188.8 µs/op, 352,944 B/op였고, 표본이
+적어 성능 추세값으로 해석하지 않는다. 변경 후 전체 `scripts/verify.sh`도 다시 통과했다.
+
+PostGIS `ReadLayer`도 대용량 입력 경계를 갖지 않고 전체 `ORDER BY id` 결과를
+materialize하던 것을 확인했다. 현재 query/reader는 100,000 feature와 128 MiB 추정
+payload에서 중단하고, geometry는 50,000 point/2 MiB stored size/8 MiB WKT, JSONB는
+8 MiB와 65,536 node/128 depth로 제한한다. 초과 시 조용히 잘라내지 않고 오류를
+반환한다. 관련 parser/query 단위 테스트와 전체 verify script는 통과했지만, 실제
+PostGIS 서버 통합 테스트는 DB 연결이 없어 확인하지 않았다. 이 경로의 한도는
+materialized API 보호용이며, 백만 행 PostGIS 테이블 viewport 지원을 의미하지 않는다.
+동일한 adapter audit에서 PostgreSQL identifier의 빈 component/63-byte 초과와
+negative BIGINT ID의 uint64 wrap도 막았으며, 각각 경계 단위 테스트와 전체 verify를 통과했다.
+PostGIS JSON budget parser는 10초 fuzz run에서 약 316천 입력을 panic/crash 없이 처리했다.
+
+## 2026-10-02 최종 재검증 후속
+
+현재 checkout에서 `GOCACHE=/tmp/gogis-go-cache ./scripts/verify.sh`를 다시 실행해
+포터블/native test 및 race, vet, native build, nested GODAL test/race, Qt/native desktop,
+QML 12/12를 모두 통과했다. 추가 opt-in viewport stress는 각각 1,000,000 및
+1,000,001 synthetic Point feature, 128회 이동, 1,952 total hit/label, peak RSS 189 MiB로
+통과했다. 앞선 기록의 sandbox DNS 차단과 달리, 승인된 네트워크 실행에서 현재 root
+포터블 및 native 태그 `govulncheck`는 모두 `No vulnerabilities found`를 반환했다.
+standalone `third_party/godal` 스캔은 reachable 0건이며, 사용 코드에서 호출되지 않는
+module-only advisory 1건을 보고했다.
+
+대용량 프로젝트 교체 검토에서는 `replaceWithLoadedMode`가 새 runtime의 render source와
+viewport-backed read-only map/window state를 이전하지 않는 문제를 발견했다. 이에 새 상태를
+함께 넘기고, 일반 runtime으로 교체할 때 이전 window hits/IDs/names/labels 및 base snapshot을
+놓도록 수정했다. 두 전환 방향을 확인하는 회귀 테스트와 Qt/native desktop race test가
+통과했다. 이 수정은 자동화된 runtime state 검증이며, 실제 GUI/GPU 동작을 대신하지 않는다.
+현재 Downloads의 세종시 연속지적도(208,015 polygons)와 지적도근점(11,971 points)을
+사용한 실데이터 통합도 다시 통과했다. 각 layer에서 128회 이동을 수행했고, 대형
+연속지적도는 bucket 4에서 8,962 hit/735,647 vertices, 도근점은 bucket 0에서 1 hit였으며
+프로세스 peak RSS는 171 MiB였다. 저배율에서 20,000-feature window cap으로 반환된
+오류들은 의도된 보호 동작으로 테스트가 확인했다.
+추가로 1,000,000-feature/128-move synthetic stress도 `-race`로 통과했으며, race
+instrumentation 포함 peak RSS는 545 MiB였다(일반 실행의 189 MiB와 직접 비교할 수 없음).
+WKB core/render 및 PostGIS JSON budget fuzz smoke는 각각 약 606K/271K/135K 실행,
+GeoJSON geometry-bounds/property fuzz는 각각 약 517K/452K 실행에서 panic/crash 없이
+종료했다. 각 fuzz run은 단일 macOS ARM64, 8초 제한의 smoke test이며 완전한 입력 공간
+검증은 아니다.
+이 1M synthetic viewport stress를 `scripts/verify.sh` 및 Windows의 `verify.ps1 -Native -Qt`
+기본 게이트에 연결했다. 현재 macOS에서 전체 `scripts/verify.sh`를 다시 실행해 해당
+스트레스 단계와 Qt/QML 12/12를 포함한 모든 게이트가 통과했다. Windows PowerShell 및
+Windows GIS/Qt 런타임은 이 호스트에서 실행하지 못했다.
+후속 `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...` cross-build는 exit code 0으로
+통과했다. 이는 portable Go 패키지의 Windows/amd64 컴파일만 확인하며, Windows CGO,
+GDAL/PROJ/GEOS, Qt 또는 GUI 실행을 검증하지 않는다.
+추가 동시성 감사에서 `refresh`가 `viewportReadOnly`를 runtime mutex 해제 후 읽는 race를
+찾았다. refresh 시작에서 렌더 상태 스냅샷을 mutex 안에서 취하도록 수정하고 concurrent
+mode-toggle 회귀 테스트를 추가했다. 테스트 단독 및 Qt/native 전체 desktop `-race`가
+통과했으며, 수정 후 전체 `scripts/verify.sh`도 다시 통과했다.
+이어 기존 workspace base layer를 보존하면서 큰 source를 추가하는 windowed read-only 경로가
+materialized fallback의 1M feature/256 MiB 합산 예산을 우회해 렌더 소스 구축 전에 추가 복사
+및 변환을 시작하는 것을 확인했다. base layer usage preflight를 source open/CRS 정렬보다 먼저
+적용하고, 과도한 중첩 속성의 base layer는 존재하지 않는 추가 source를 열기 전에 거부되는
+회귀 테스트를 넣었다. 수정 후 `scripts/verify.sh`를 다시 실행해 포터블/native test 및
+race, vet, native build, nested GODAL test/race, Qt/native desktop, 1M viewport stress,
+QML 12/12를 모두 통과했다.
+추가 메모리 점검에서 append 로더의 `Project()` 깊은 복제가 기존 project 전체 geometry와
+property payload를 다시 복사하는 것을 찾아, COW 편집 계약을 이용한 feature-header render
+snapshot으로 바꿨다. 10K synthetic WKT feature benchmark 3회 실행에서 snapshot은 1.369 ms,
+3.92 MB/30,003 allocs였고 render snapshot은 30.8 µs, 402 KB/3 allocs였다. 이는 약 13× 적은
+할당 바이트를 보인 단일 M3 측정이며 WKB/실데이터 전체 성능을 보장하지 않는다. 헤더/label은
+독립 복사하고 geometry/property는 불변 공유하며, 편집 COW 격리 테스트를 추가했다. 이 새
+변경 후 `scripts/verify.sh`를 다시 실행해 포터블/native test 및 race, vet, native build,
+nested GODAL 검사, Qt/native 데스크톱, 1M viewport stress, QML 12/12가 모두 통과했다.
+
+백만 feature metadata benchmark를 각기 새 프로세스에서 한 번씩 실행해 측정 경로를
+분리했다. raw `godal.Open` GeoJSON FeatureCollection benchmark는 open 이후 process
+peak RSS 2,637 MiB, GeoJSONSeq benchmark는 `FeatureCount` 후 2,408 MiB 및 `Bounds`
+후 4,750 MiB를 보였다. 이 두 benchmark는 GDAL driver API를 직접 호출하며 desktop
+loader 경로를 측정하지 않는다. 실제 `BenchmarkDesktopReadOnlyLoadGeoJSON1M`는 custom
+bounded stream reader로 1,000,000 features를 확인했고, 첫 viewport 27.95 ms,
+process peak RSS 174 MiB, retained Go heap 46.92 MiB를 기록했다. 이전 repeated-viewport
+stress run은 1,000,001 feature에서 189 MiB였다. 이 측정들은 별도 1회 실행이고
+synthetic point GeoJSON이므로, 실데이터/다각형 복잡도/OS 자원 차이를 대체하지 않는다.
+대형 GeoJSON vector 입력은 raw `godal.Open`으로 우회하지 말고 desktop의 bounded
+stream reader를 사용해야 한다. 공개 `GeometrySession` API가 같은 파일을 raw GDAL으로
+열던 우회도 발견해 `AttributeSession` 기반 bounded path로 바꾸고, `.geojson` 및
+`.geojsonl` 라우팅 회귀 테스트를 추가했다.

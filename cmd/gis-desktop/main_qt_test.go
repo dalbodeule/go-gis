@@ -388,6 +388,44 @@ func TestRefreshCancelsBuilderWhenAllLayersHidden(t *testing.T) {
 	}
 }
 
+func TestRefreshReadsViewportModeUnderRuntimeLock(t *testing.T) {
+	runtime := &demoRuntime{
+		scheduler:  render.NewScheduler(),
+		batchStore: render.NewBatchStore(),
+		planner:    render.NewChunkPlanner(),
+		visibility: render.NewLayerVisibility(),
+	}
+	viewport := render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1}
+	stop := make(chan struct{})
+	started := make(chan struct{})
+	mutatorDone := make(chan struct{})
+	go func() {
+		defer close(mutatorDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			runtime.mu.Lock()
+			runtime.viewportReadOnly = !runtime.viewportReadOnly
+			runtime.mu.Unlock()
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			time.Sleep(time.Microsecond)
+		}
+	}()
+	<-started
+	for i := 0; i < 250; i++ {
+		runtime.refresh(context.Background(), viewport)
+	}
+	close(stop)
+	<-mutatorDone
+}
+
 func TestApplyLayerVisibilityKeepsHitTestSnapshotImmutable(t *testing.T) {
 	runtime := &demoRuntime{
 		visibility:    render.NewLayerVisibility("roads", "buildings"),

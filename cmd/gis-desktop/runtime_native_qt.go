@@ -743,6 +743,15 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			closeSessions()
 		}
 	}()
+	baseFeatureCount, basePayloadBytes := 0, int64(0)
+	var budgetErr error
+	for _, layer := range baseLayers {
+		baseFeatureCount, basePayloadBytes, budgetErr = accumulateMaterializedRuntimeLayerUsage(
+			baseFeatureCount, basePayloadBytes, layer, maxDesktopMaterializedFeatures, maxDesktopMaterializedBytes)
+		if budgetErr != nil {
+			return nil, true, fmt.Errorf("read-only base project: %w", budgetErr)
+		}
+	}
 	layers := append([]core.Layer(nil), baseLayers...)
 	bindings := make(map[string]readOnlyLayerBinding)
 	unavailable := make(map[string]unavailableSource)
@@ -2510,9 +2519,10 @@ func (r *demoRuntime) startDataLoadPaths(paths []string) {
 			native.SetRenderStatus("Selected source is already loaded")
 			return
 		}
-		// Clone feature data only after filtering duplicate paths. Project() is
-		// intentionally detached for callers that will rebuild the runtime.
-		baseLayers = service.Project().Layers
+		// Snapshot only layer/feature headers after filtering duplicate paths.
+		// Geometry and property payloads are immutable and remain copy-on-write
+		// owned by the ProjectService, avoiding another full dataset clone.
+		baseLayers = service.ProjectRenderSnapshot().Layers
 	}
 	if appendLayers && readOnly && len(readOnlySources) == 0 {
 		cancel()
@@ -2750,6 +2760,29 @@ func runtimeInitialViewport(runtime *demoRuntime) render.Viewport {
 	return viewport
 }
 
+// adoptLoadedSpatialStateLocked transfers source ownership and window-backed
+// render state when a fully prepared runtime replaces the current project.
+// The caller must hold r.mu; these maps can retain substantial geometry/hit
+// data for large read-only projects.
+func (r *demoRuntime) adoptLoadedSpatialStateLocked(next *demoRuntime) {
+	r.sources = next.sources
+	r.sourcesMu = next.sourcesMu
+	r.viewportReadOnly = next.viewportReadOnly
+	r.windowHits = next.windowHits
+	r.windowFeatureCounts = next.windowFeatureCounts
+	r.windowFeatureIDs = next.windowFeatureIDs
+	r.windowVisibleFeatureCount = next.windowVisibleFeatureCount
+	r.windowPayloadBytes = next.windowPayloadBytes
+	r.windowVisiblePayloadBytes = next.windowVisiblePayloadBytes
+	r.windowVisibleKeys = next.windowVisibleKeys
+	r.windowFeatureNames = next.windowFeatureNames
+	r.windowLabels = next.windowLabels
+	r.nextWindowFeatureID = next.nextWindowFeatureID
+	r.readOnlyBaseLayers = next.readOnlyBaseLayers
+	r.readOnlyBaseFeatures = next.readOnlyBaseFeatures
+	r.readOnlyBaseLabels = next.readOnlyBaseLabels
+}
+
 func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGeneration uint64, preview bool) {
 	r.mu.Lock()
 	if expectedLoadGeneration != 0 && expectedLoadGeneration != r.loadGeneration {
@@ -2775,6 +2808,7 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.mapLabels = next.mapLabels
 	r.builder = next.builder
 	r.features = next.features
+	r.adoptLoadedSpatialStateLocked(next)
 	r.hitIndex = next.hitIndex
 	r.hitIndexReady = next.hitIndexReady
 	r.service = next.service

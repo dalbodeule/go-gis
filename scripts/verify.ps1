@@ -54,6 +54,18 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw 'native CLI build failed'
         }
+
+        Push-Location (Join-Path $RootDir 'third_party/godal')
+        try {
+            Invoke-Checked 'go' @('vet', './...')
+            Invoke-Checked 'go' @('test', './...', '-skip', '^TestVSIGCSNoAuth$')
+            if (-not $SkipRace) {
+                Invoke-Checked 'go' @('test', '-race', './...', '-skip', '^TestVSIGCSNoAuth$')
+            }
+        }
+        finally {
+            Pop-Location
+        }
     }
 
     if ($Qt) {
@@ -65,6 +77,16 @@ try {
             $qtTags = 'qt'
             if ($Native) { $qtTags = 'qt native' }
             Invoke-Checked 'go' @('test', '-tags', $qtTags, './cmd/gis-desktop')
+            if ($Native) {
+                $previousRepeatedViewportStress = $env:GOGIS_TEST_REPEATED_VIEWPORT_1M
+                try {
+                    $env:GOGIS_TEST_REPEATED_VIEWPORT_1M = '1'
+                    Invoke-Checked 'go' @('test', '-tags', $qtTags, './cmd/gis-desktop', '-run', '^TestWindowedReadOnlyRepeatedViewportMoves1M$', '-count=1')
+                }
+                finally {
+                    $env:GOGIS_TEST_REPEATED_VIEWPORT_1M = $previousRepeatedViewportStress
+                }
+            }
         }
         finally {
             $env:CGO_CXXFLAGS = $previousCxxFlags

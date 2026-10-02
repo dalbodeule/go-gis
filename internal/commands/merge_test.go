@@ -3,10 +3,25 @@ package commands
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 
 	"gogis/internal/core"
 )
+
+type cancelAfterErrChecksContext struct {
+	context.Context
+	checks int
+	after  int
+}
+
+func (ctx *cancelAfterErrChecksContext) Err() error {
+	if ctx.checks >= ctx.after {
+		return context.Canceled
+	}
+	ctx.checks++
+	return nil
+}
 
 func mergeLayer(name string, featureID uint64, crs string, fields []core.Field) core.Layer {
 	return core.Layer{
@@ -43,6 +58,69 @@ func TestMergeLayersRejectsSchemaCRSAndDuplicateIDs(t *testing.T) {
 	}
 	if _, err := MergeLayers(context.Background(), mergeLayer("a", 1, "EPSG:4326", fields), mergeLayer("b", 1, "EPSG:4326", fields)); !errors.Is(err, ErrDuplicateID) {
 		t.Fatalf("duplicate ID error = %v", err)
+	}
+}
+
+func TestMergeLayersRejectsMetadataBeforeLargeFeatureAllocations(t *testing.T) {
+	largeFeatures := make([]core.Feature, 250_000)
+	left := core.Layer{Name: "left", Fields: []core.Field{{Name: "a"}}, Features: largeFeatures}
+	right := core.Layer{Name: "right", Fields: []core.Field{{Name: "b"}}, Features: largeFeatures}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := MergeLayers(context.Background(), left, right); !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("large incompatible merge error = %v, want schema mismatch", err)
+	}
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if allocated > 4<<20 {
+		t.Fatalf("incompatible merge allocated %d bytes before rejecting metadata; want under 4 MiB", allocated)
+	}
+}
+
+func TestMergeLayersRejectsLateDuplicateBeforeCloningFeatures(t *testing.T) {
+	const featureCount = 10_000
+	geometry := make([]byte, 1<<10)
+	features := make([]core.Feature, featureCount)
+	for index := range features {
+		features[index] = core.Feature{ID: uint64(index + 1), Geometry: core.WKBGeometry{WKB: geometry}}
+	}
+	left := core.Layer{Name: "left", Features: features}
+	right := core.Layer{Name: "right", Features: []core.Feature{{ID: featureCount}}}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := MergeLayers(context.Background(), left, right); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("late duplicate merge error = %v, want duplicate ID", err)
+	}
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if allocated > 4<<20 {
+		t.Fatalf("late-duplicate merge allocated %d bytes before rejection; want under 4 MiB", allocated)
+	}
+}
+
+func TestAddMergeFeatureCountRejectsOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if got, ok := addMergeFeatureCount(maxInt-1, 1); !ok || got != maxInt {
+		t.Fatalf("valid boundary sum = %d, %t", got, ok)
+	}
+	if _, ok := addMergeFeatureCount(maxInt, 1); ok {
+		t.Fatal("overflowing merge feature count was accepted")
+	}
+}
+
+func TestMergeLayersChecksCancellationDuringLargeLayer(t *testing.T) {
+	features := make([]core.Feature, mergeCancellationCheckInterval*4)
+	for index := range features {
+		features[index].ID = uint64(index)
+	}
+	left := core.Layer{Name: "left", Features: features}
+	right := core.Layer{Name: "right", Features: []core.Feature{{ID: uint64(len(features))}}}
+	ctx := &cancelAfterErrChecksContext{Context: context.Background(), after: 2}
+
+	if _, err := MergeLayers(ctx, left, right); !errors.Is(err, context.Canceled) {
+		t.Fatalf("merge cancellation error = %v, want context.Canceled", err)
 	}
 }
 

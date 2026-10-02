@@ -2,10 +2,12 @@
 package postgis
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
@@ -18,6 +20,19 @@ import (
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
+var identifierPartPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+const maxPostgreSQLIdentifierBytes = 63
+
+const maxPostGISReadFeatures = 100_000
+const maxPostGISReadBytes = 128 << 20
+const maxPostGISFeatureBytes = 16 << 20
+const maxPostGISGeometryWKTBytes = 8 << 20
+const maxPostGISGeometryPoints = 50_000
+const maxPostGISGeometryStorageBytes = 2 << 20
+const maxPostGISPropertiesBytes = 8 << 20
+const maxPostGISPropertyNodes = 1 << 16
+const maxPostGISPropertyDepth = 128
 
 // Store reads and writes layers to a table with id, geometry, and JSONB
 // properties columns. Attribute columns are intentionally represented in the
@@ -31,7 +46,7 @@ var _ drivers.TransactionalStore = (*Store)(nil)
 
 // Open opens a pgx-backed database/sql connection.
 func Open(ctx context.Context, dsn, table string) (*Store, error) {
-	if !identifierPattern.MatchString(table) {
+	if !validTableIdentifier(table) {
 		return nil, fmt.Errorf("invalid PostGIS table identifier %q", table)
 	}
 	db, err := sql.Open("pgx", dsn)
@@ -54,6 +69,12 @@ func (s *Store) Begin(ctx context.Context) (drivers.Transaction, error) {
 }
 
 func (s *Store) begin(ctx context.Context) (*Transaction, error) {
+	if s == nil || s.DB == nil {
+		return nil, fmt.Errorf("PostGIS database is not configured")
+	}
+	if !validTableIdentifier(s.Table) {
+		return nil, fmt.Errorf("invalid PostGIS table identifier %q", s.Table)
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -66,6 +87,9 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 	if s == nil || s.DB == nil {
 		return core.Layer{}, fmt.Errorf("PostGIS database is not configured")
 	}
+	if !validTableIdentifier(s.Table) {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS table identifier %q", s.Table)
+	}
 	rows, err := s.DB.QueryContext(ctx, readLayerQuery(s.Table))
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("read PostGIS layer %q: %w", s.Table, err)
@@ -73,23 +97,60 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 	defer rows.Close()
 
 	layer := core.Layer{Name: tableName(s.Table), Editable: true}
+	var totalPayloadBytes int64
 	for rows.Next() {
+		if len(layer.Features) >= maxPostGISReadFeatures {
+			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d-feature in-memory read limit; use a bounded query or viewport reader", s.Table, maxPostGISReadFeatures)
+		}
 		var id int64
-		var wkt string
+		var wkt sql.NullString
 		var srid int
-		var properties []byte
-		if err := rows.Scan(&id, &wkt, &srid, &properties); err != nil {
+		var properties sql.NullString
+		var geometryPoints, geometryStorageBytes, propertiesBytes sql.NullInt64
+		if err := rows.Scan(&id, &wkt, &srid, &properties, &geometryPoints, &geometryStorageBytes, &propertiesBytes); err != nil {
 			return core.Layer{}, fmt.Errorf("scan PostGIS feature: %w", err)
 		}
+		featureID, err := postGISFeatureID(id)
+		if err != nil {
+			return core.Layer{}, err
+		}
+		if geometryPoints.Valid && geometryPoints.Int64 > maxPostGISGeometryPoints {
+			return core.Layer{}, fmt.Errorf("feature %d geometry exceeds the %d-point PostGIS read limit", id, maxPostGISGeometryPoints)
+		}
+		if geometryStorageBytes.Valid && geometryStorageBytes.Int64 > maxPostGISGeometryStorageBytes {
+			return core.Layer{}, fmt.Errorf("feature %d geometry exceeds the %d MiB PostGIS storage limit", id, maxPostGISGeometryStorageBytes>>20)
+		}
+		if !wkt.Valid {
+			return core.Layer{}, fmt.Errorf("feature %d geometry exceeds the %d MiB PostGIS WKT limit or is NULL", id, maxPostGISGeometryWKTBytes>>20)
+		}
+		if int64(len(wkt.String)) > maxPostGISGeometryWKTBytes {
+			return core.Layer{}, fmt.Errorf("feature %d geometry exceeds the %d MiB PostGIS WKT limit", id, maxPostGISGeometryWKTBytes>>20)
+		}
+		if propertiesBytes.Valid && propertiesBytes.Int64 > maxPostGISPropertiesBytes {
+			return core.Layer{}, fmt.Errorf("feature %d properties exceed the %d MiB PostGIS JSON limit", id, maxPostGISPropertiesBytes>>20)
+		}
 		decoded := map[string]any{}
-		if len(properties) != 0 {
-			if err := json.Unmarshal(properties, &decoded); err != nil {
+		var propertyEstimate int64
+		if properties.Valid && properties.String != "" {
+			propertyEstimate, err = estimatePostGISPropertyBytes([]byte(properties.String))
+			if err != nil {
+				return core.Layer{}, fmt.Errorf("feature %d properties: %w", id, err)
+			}
+			if err := json.Unmarshal([]byte(properties.String), &decoded); err != nil {
 				return core.Layer{}, fmt.Errorf("feature %d properties: %w", id, err)
 			}
 		}
+		featurePayloadBytes := int64(len(wkt.String))*2 + propertyEstimate + 128
+		if featurePayloadBytes > maxPostGISFeatureBytes {
+			return core.Layer{}, fmt.Errorf("feature %d exceeds the %d MiB decoded PostGIS feature limit", id, maxPostGISFeatureBytes>>20)
+		}
+		if featurePayloadBytes > maxPostGISReadBytes-totalPayloadBytes {
+			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d MiB in-memory read limit", s.Table, maxPostGISReadBytes>>20)
+		}
+		totalPayloadBytes += featurePayloadBytes
 		layer.Features = append(layer.Features, core.Feature{
-			ID:         uint64(id),
-			Geometry:   core.WKTGeometry{WKT: wkt},
+			ID:         featureID,
+			Geometry:   core.WKTGeometry{WKT: wkt.String},
 			Properties: decoded,
 		})
 		if layer.CRS.AuthorityCode == "" && srid > 0 {
@@ -210,7 +271,143 @@ func schemaQuery(table string) string {
 }
 
 func readLayerQuery(table string) string {
-	return fmt.Sprintf("SELECT id, ST_AsText(geom), ST_SRID(geom), properties FROM %s ORDER BY id", quoteIdentifier(table))
+	return fmt.Sprintf(`SELECT id,
+    CASE WHEN ST_NPoints(geom) <= %d AND pg_column_size(geom) <= %d THEN ST_AsText(geom) END,
+    ST_SRID(geom),
+    CASE WHEN octet_length(properties::text) <= %d THEN properties::text END,
+    ST_NPoints(geom), pg_column_size(geom), octet_length(properties::text)
+FROM %s ORDER BY id LIMIT %d`,
+		maxPostGISGeometryPoints, maxPostGISGeometryStorageBytes, maxPostGISPropertiesBytes,
+		quoteIdentifier(table), maxPostGISReadFeatures+1)
+}
+
+func validTableIdentifier(table string) bool {
+	if len(table) == 0 || len(table) > 2*maxPostgreSQLIdentifierBytes+1 {
+		return false
+	}
+	if !identifierPattern.MatchString(table) {
+		return false
+	}
+	parts := strings.Split(table, ".")
+	if len(parts) > 2 {
+		return false
+	}
+	for _, part := range parts {
+		if len(part) > maxPostgreSQLIdentifierBytes || !identifierPartPattern.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func postGISFeatureID(id int64) (uint64, error) {
+	if id < 0 {
+		return 0, fmt.Errorf("PostGIS feature ID %d is negative and cannot be represented", id)
+	}
+	return uint64(id), nil
+}
+
+func estimatePostGISPropertyBytes(data []byte) (int64, error) {
+	if len(data) > maxPostGISPropertiesBytes {
+		return 0, fmt.Errorf("JSON document exceeds the %d MiB byte limit", maxPostGISPropertiesBytes>>20)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	nodes := 0
+	const saturatedEstimate = int64(maxPostGISFeatureBytes) + 1
+	add := func(left, right int64) int64 {
+		if right < 0 || left > saturatedEstimate-right {
+			return saturatedEstimate
+		}
+		return left + right
+	}
+	var readValue func(depth int) (int64, error)
+	readValue = func(depth int) (int64, error) {
+		if depth > maxPostGISPropertyDepth {
+			return 0, fmt.Errorf("JSON nesting exceeds the %d-level limit", maxPostGISPropertyDepth)
+		}
+		nodes++
+		if nodes > maxPostGISPropertyNodes {
+			return 0, fmt.Errorf("JSON value count exceeds the %d-node limit", maxPostGISPropertyNodes)
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return 0, err
+		}
+		delim, isContainer := token.(json.Delim)
+		if !isContainer {
+			switch value := token.(type) {
+			case string:
+				return int64(len(value)) + 32, nil
+			case json.Number:
+				return int64(len(value)) + 32, nil
+			default:
+				return 32, nil
+			}
+		}
+		var estimate int64
+		switch delim {
+		case '{':
+			estimate = 128
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return 0, err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return 0, fmt.Errorf("object member name is not a string")
+				}
+				nodes++
+				if nodes > maxPostGISPropertyNodes {
+					return 0, fmt.Errorf("JSON value count exceeds the %d-node limit", maxPostGISPropertyNodes)
+				}
+				estimate = add(estimate, int64(len(key))+32)
+				childEstimate, err := readValue(depth + 1)
+				if err != nil {
+					return 0, err
+				}
+				estimate = add(estimate, childEstimate)
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				if err == nil {
+					err = fmt.Errorf("malformed JSON object")
+				}
+				return 0, err
+			}
+		case '[':
+			estimate = 24
+			for decoder.More() {
+				childEstimate, err := readValue(depth + 1)
+				if err != nil {
+					return 0, err
+				}
+				estimate = add(estimate, childEstimate)
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				if err == nil {
+					err = fmt.Errorf("malformed JSON array")
+				}
+				return 0, err
+			}
+		default:
+			return 0, fmt.Errorf("unexpected JSON delimiter %q", delim)
+		}
+		return estimate, nil
+	}
+	estimate, err := readValue(0)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return 0, fmt.Errorf("unexpected trailing JSON data")
+		}
+		return 0, err
+	}
+	return estimate, nil
 }
 
 func clearLayerQuery(table string) string {

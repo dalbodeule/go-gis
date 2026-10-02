@@ -94,6 +94,185 @@ type geoJSONTailBlock struct {
 	hasBounds    bool
 }
 
+const (
+	geoJSONSpatialGridAxis            = 256
+	geoJSONSpatialGridCells           = geoJSONSpatialGridAxis * geoJSONSpatialGridAxis
+	maxGeoJSONSpatialGridReferences   = 2_000_000
+	maxGeoJSONSpatialFeatureGridCells = 64
+	maxGeoJSONSpatialOverflowFeatures = 1_024
+	maxGeoJSONSpatialQueryCells       = geoJSONSpatialGridCells / 4
+	maxGeoJSONSpatialQueryCandidates  = 100_000
+)
+
+// geoJSONSpatialCandidateIndex is a bounded coarse grid over the already
+// retained per-feature bbox index. The AttributeSession lock serializes Query,
+// allowing its dedupe bitmap and candidate buffer to be reused without per-pan
+// million-entry allocations.
+type geoJSONSpatialCandidateIndex struct {
+	extent     [4]float64
+	cellWidth  float64
+	cellHeight float64
+	offsets    []uint32
+	ordinals   []uint32
+	overflow   []uint32
+	seen       []uint64
+	candidates []uint32
+}
+
+func newGeoJSONSpatialCandidateIndex(index []geoJSONFeatureIndex, extent [4]float64, hasExtent bool) *geoJSONSpatialCandidateIndex {
+	if !hasExtent || !validGeoJSONSpatialBounds(extent) || len(index) < 50_000 || uint64(len(index)) > uint64(^uint32(0)) {
+		return nil
+	}
+	width, height := extent[2]-extent[0], extent[3]-extent[1]
+	if math.IsNaN(width) || math.IsInf(width, 0) || math.IsNaN(height) || math.IsInf(height, 0) {
+		return nil
+	}
+	spatial := &geoJSONSpatialCandidateIndex{
+		extent: extent, offsets: make([]uint32, geoJSONSpatialGridCells+1),
+		seen: make([]uint64, (len(index)+63)/64),
+	}
+	if width > 0 {
+		spatial.cellWidth = width / geoJSONSpatialGridAxis
+	}
+	if height > 0 {
+		spatial.cellHeight = height / geoJSONSpatialGridAxis
+	}
+	counts := make([]uint32, geoJSONSpatialGridCells)
+	refs := 0
+	maxOverflow := max(maxGeoJSONSpatialOverflowFeatures, len(index)/16)
+	for ordinal, entry := range index {
+		if !entry.valid {
+			continue
+		}
+		if !validGeoJSONSpatialBounds(entry.bounds) {
+			return nil
+		}
+		x0, x1, y0, y1 := spatial.cellRange(entry.bounds)
+		cellCount := (x1 - x0 + 1) * (y1 - y0 + 1)
+		if cellCount > maxGeoJSONSpatialFeatureGridCells {
+			spatial.overflow = append(spatial.overflow, uint32(ordinal))
+			if len(spatial.overflow) > maxOverflow {
+				return nil
+			}
+			continue
+		}
+		if cellCount > maxGeoJSONSpatialGridReferences-refs {
+			return nil
+		}
+		refs += cellCount
+		for y := y0; y <= y1; y++ {
+			for x := x0; x <= x1; x++ {
+				cell := y*geoJSONSpatialGridAxis + x
+				counts[cell]++
+			}
+		}
+	}
+	for cell := 0; cell < geoJSONSpatialGridCells; cell++ {
+		spatial.offsets[cell+1] = spatial.offsets[cell] + counts[cell]
+	}
+	spatial.ordinals = make([]uint32, refs)
+	cursors := append([]uint32(nil), spatial.offsets[:geoJSONSpatialGridCells]...)
+	for ordinal, entry := range index {
+		if !entry.valid {
+			continue
+		}
+		x0, x1, y0, y1 := spatial.cellRange(entry.bounds)
+		if (x1-x0+1)*(y1-y0+1) > maxGeoJSONSpatialFeatureGridCells {
+			continue
+		}
+		for y := y0; y <= y1; y++ {
+			for x := x0; x <= x1; x++ {
+				cell := y*geoJSONSpatialGridAxis + x
+				position := cursors[cell]
+				spatial.ordinals[position] = uint32(ordinal)
+				cursors[cell]++
+			}
+		}
+	}
+	return spatial
+}
+
+func (spatial *geoJSONSpatialCandidateIndex) cellRange(bounds [4]float64) (x0, x1, y0, y1 int) {
+	x0 = spatial.cellCoordinate(bounds[0], spatial.extent[0], spatial.extent[2], spatial.cellWidth)
+	x1 = spatial.cellCoordinate(bounds[2], spatial.extent[0], spatial.extent[2], spatial.cellWidth)
+	y0 = spatial.cellCoordinate(bounds[1], spatial.extent[1], spatial.extent[3], spatial.cellHeight)
+	y1 = spatial.cellCoordinate(bounds[3], spatial.extent[1], spatial.extent[3], spatial.cellHeight)
+	return
+}
+
+func (spatial *geoJSONSpatialCandidateIndex) cellCoordinate(value, minimum, maximum, cellSize float64) int {
+	if cellSize == 0 || value <= minimum {
+		return 0
+	}
+	if value >= maximum {
+		return geoJSONSpatialGridAxis - 1
+	}
+	return max(0, min(geoJSONSpatialGridAxis-1, int((value-minimum)/cellSize)))
+}
+
+func validGeoJSONSpatialBounds(bounds [4]float64) bool {
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return bounds[0] <= bounds[2] && bounds[1] <= bounds[3]
+}
+
+func (spatial *geoJSONSpatialCandidateIndex) query(ctx context.Context, bounds [4]float64) ([]uint32, bool, error) {
+	spatial.candidates = spatial.candidates[:0]
+	if !validGeoJSONSpatialBounds(bounds) {
+		return nil, false, fmt.Errorf("invalid GeoJSON spatial candidate query bounds: %v", bounds)
+	}
+	if bounds[2] < spatial.extent[0] || bounds[0] > spatial.extent[2] ||
+		bounds[3] < spatial.extent[1] || bounds[1] > spatial.extent[3] {
+		return spatial.candidates, true, nil
+	}
+	x0, x1, y0, y1 := spatial.cellRange(bounds)
+	if (x1-x0+1)*(y1-y0+1) > maxGeoJSONSpatialQueryCells {
+		return nil, false, nil
+	}
+	clear(spatial.seen)
+	visited := 0
+	add := func(ordinal uint32) bool {
+		word, bit := ordinal/64, uint64(1)<<(ordinal%64)
+		if spatial.seen[word]&bit != 0 {
+			return true
+		}
+		spatial.seen[word] |= bit
+		spatial.candidates = append(spatial.candidates, ordinal)
+		return len(spatial.candidates) <= maxGeoJSONSpatialQueryCandidates
+	}
+	for y := y0; y <= y1; y++ {
+		for x := x0; x <= x1; x++ {
+			cell := y*geoJSONSpatialGridAxis + x
+			for position := spatial.offsets[cell]; position < spatial.offsets[cell+1]; position++ {
+				if visited&0x3fff == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+				}
+				visited++
+				if !add(spatial.ordinals[position]) {
+					return nil, false, nil
+				}
+			}
+		}
+	}
+	for index, ordinal := range spatial.overflow {
+		if index&0x3fff == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+		}
+		if !add(ordinal) {
+			return nil, false, nil
+		}
+	}
+	sort.Slice(spatial.candidates, func(i, j int) bool { return spatial.candidates[i] < spatial.candidates[j] })
+	return spatial.candidates, true, nil
+}
+
 const geoJSONTailBlockFeatureCount = 4096
 const maxGeoJSONTailIndexBlocks = 32_768
 
@@ -1020,6 +1199,13 @@ func readGeoJSONIndexedWindow(ctx context.Context, path string, overview LayerOv
 
 func readGeoJSONIndexedWindowWithTailBlocks(ctx context.Context, path string, overview LayerOverview, index []geoJSONFeatureIndex,
 	tailBlocks []geoJSONTailBlock, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	return readGeoJSONIndexedWindowWithSpatialIndex(ctx, path, overview, index, tailBlocks, nil,
+		bounds, includeProperties, maxFeatures, maxBytes)
+}
+
+func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, overview LayerOverview,
+	index []geoJSONFeatureIndex, tailBlocks []geoJSONTailBlock, spatialIndex *geoJSONSpatialCandidateIndex,
+	bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open GeoJSON %q: %w", path, err)
@@ -1028,35 +1214,58 @@ func readGeoJSONIndexedWindowWithTailBlocks(ctx context.Context, path string, ov
 	result := core.Layer{Name: overview.Name, CRS: overview.CRS, Editable: true}
 	var rawBuffer []byte
 	var payloadBytes int64
-	for ordinal, entry := range index {
+	var candidateOrdinals []uint32
+	useSpatialIndex := spatialIndex != nil
+	if useSpatialIndex {
+		candidateOrdinals, useSpatialIndex, err = spatialIndex.query(ctx, bounds)
+		if err != nil {
+			return core.Layer{}, err
+		}
+	}
+	readOrdinal := func(ordinal int) error {
+		entry := index[ordinal]
 		if ordinal&0x3fff == 0 {
 			if err := ctx.Err(); err != nil {
-				return core.Layer{}, err
+				return err
 			}
 		}
 		if !entry.valid || entry.bounds[2] < bounds[0] || entry.bounds[0] > bounds[2] || entry.bounds[3] < bounds[1] || entry.bounds[1] > bounds[3] {
-			continue
+			return nil
 		}
 		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
-			return core.Layer{}, fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
+			return fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
 		}
 		feature, err := readIndexedGeoJSONFeature(file, entry, ordinal+1, &rawBuffer)
 		if err != nil {
-			return core.Layer{}, err
+			return err
 		}
 		loaded, err := streamedGeoJSONCoreFeature(ordinal+1, &feature, includeProperties)
 		if err != nil {
-			return core.Layer{}, err
+			return err
 		}
 		if includeProperties && len(result.Fields) == 0 {
 			result.Fields = geoJSONFieldSchema(loaded.Properties)
 		}
 		featureBytes := estimateFeaturePayloadBytes(loaded)
 		if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
-			return core.Layer{}, fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
+			return fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
 		}
 		payloadBytes += featureBytes
 		result.Features = append(result.Features, loaded)
+		return nil
+	}
+	if useSpatialIndex {
+		for _, ordinal := range candidateOrdinals {
+			if err := readOrdinal(int(ordinal)); err != nil {
+				return core.Layer{}, err
+			}
+		}
+	} else {
+		for ordinal := range index {
+			if err := readOrdinal(ordinal); err != nil {
+				return core.Layer{}, err
+			}
+		}
 	}
 	if overview.FeatureCount > len(index) && len(index) > 0 {
 		last := index[len(index)-1]
