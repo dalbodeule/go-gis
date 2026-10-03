@@ -129,7 +129,7 @@ func TestOverviewDeduplicatesSharedPolygonEdgesWithoutDroppingFeatures(t *testin
 	}
 }
 
-func TestLineLabelUsesHalfLengthAndPolygonLabelUsesExplicitInteriorAnchor(t *testing.T) {
+func TestLineLabelUsesLongestSegmentCenterAndPolygonLabelUsesExplicitInteriorAnchor(t *testing.T) {
 	settings := core.LabelSettings{Enabled: true, Expression: "name", Placement: "free-angle", HeightMM: 2.5}
 	line, err := NewLayerSource(core.Layer{Name: "routes", Labels: settings, Features: []core.Feature{{
 		ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 1 1, 101 101)"},
@@ -138,8 +138,8 @@ func TestLineLabelUsesHalfLengthAndPolygonLabelUsesExplicitInteriorAnchor(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(line.Labels) != 1 || math.Abs(line.Labels[0].X-0.5) > 1e-12 || math.Abs(line.Labels[0].Y-0.5) > 1e-12 || line.Labels[0].Rotation != 45 {
-		t.Fatalf("line label placement = %+v, want geometric midpoint and 45-degree map tangent", line.Labels)
+	if len(line.Labels) != 1 || math.Abs(line.Labels[0].X-51.0/101) > 1e-12 || math.Abs(line.Labels[0].Y-51.0/101) > 1e-12 || line.Labels[0].Rotation != 45 {
+		t.Fatalf("line label placement = %+v, want longest-segment midpoint and 45-degree map tangent", line.Labels)
 	}
 
 	polygon, err := NewLayerSource(core.Layer{Name: "areas", Labels: settings, Features: []core.Feature{{

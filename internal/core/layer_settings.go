@@ -54,7 +54,7 @@ func (s LayerStyle) Validate() error {
 // Validate checks label placement, physical size, and scale range.
 func (s LabelSettings) Validate() error {
 	switch s.Placement {
-	case "center", "center-rotated", "free-angle":
+	case "center", "vertical", "center-rotated", "free-angle":
 	default:
 		return fmt.Errorf("%w: unsupported label placement %q", ErrInvalidLayerSettings, s.Placement)
 	}

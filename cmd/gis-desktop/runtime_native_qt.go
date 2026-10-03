@@ -1078,245 +1078,300 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		}
 		return binding.session.OpenAttributePage(ctx, binding.sourceName, offset, limit)
 	}
-	runtime.attributeFeatureReader = func(_ context.Context, layerName string, featureID uint64) (core.Feature, error) {
-		for _, layer := range baseLayers {
-			if layer.Name == layerName {
-				for _, feature := range layer.Features {
-					if feature.ID == featureID {
-						return feature, nil
-					}
-				}
-				return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
-			}
-		}
-		runtime.mu.Lock()
-		name, ok := runtime.windowFeatureNames[featureID]
-		runtime.mu.Unlock()
-		if !ok {
-			return core.Feature{}, fmt.Errorf("feature %d is outside the current render window", featureID)
-		}
-		return core.Feature{ID: featureID, Properties: map[string]any{"name": name}}, nil
-	}
-	baseBuilder := runtime.builder
-	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
-		runtime.mu.Lock()
-		binding, isWindowLayer := runtime.readOnlyBindings[key.Layer]
-		runtime.mu.Unlock()
-		if !isWindowLayer {
-			if _, missing := unavailable[key.Layer]; !missing && baseBuilder != nil {
-				return baseBuilder(ctx, key)
-			}
-		}
-		if !isWindowLayer {
-			if _, missing := unavailable[key.Layer]; missing {
-				return render.Chunk{Key: key}, nil
-			}
-			return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
-		}
-		runtime.mu.Lock()
-		_, visibleWindow := runtime.windowVisibleKeys[key]
-		visibleFeatureCount := runtime.windowVisibleFeatureCount
-		visiblePayloadBytes := runtime.windowVisiblePayloadBytes
-		runtime.mu.Unlock()
-		if visibleWindow && visibleFeatureCount >= maxReadOnlyVisibleFeatures {
-			return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
-		}
-		if visibleWindow && visiblePayloadBytes >= maxReadOnlyVisibleBytes {
-			return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
-		}
-		releaseWindowSlot, err := readOnlyWindowBuildSemaphore.acquire(ctx)
-		if err != nil {
-			return render.Chunk{}, err
-		}
-		defer releaseWindowSlot()
-		// Properties are needed for label expressions and for the selected
-		// feature's display name. The layer snapshot is chunk-scoped and dropped
-		// after vertex generation; the runtime retains only the small name map.
-		lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
-		chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
-		queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
-		if !ok {
-			return render.Chunk{Key: key}, nil
-		}
-		if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
-			queryBounds, err = (proj.Transformer{}).TransformBounds(ctx,
-				binding.layer.CRS, core.CRS{AuthorityCode: binding.sourceCRS}, queryBounds)
-			if err != nil {
-				return render.Chunk{}, fmt.Errorf("transform query bounds for %s: %w", key.Layer, err)
-			}
-		}
-		overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
-		forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
-		overview := lodBucket <= 1 || forceOverview
-		// Keep parcel edges in the normal overview. Dissolving every polygon
-		// removes the very network users need to inspect at city scale. Reserve
-		// the coverage-only boundary for an explicit budget retry.
-		polygonOverview := forceOverview && isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
-		if polygonOverview {
-			// The boundary dissolve removes interior parcel edges without dropping
-			// source features, preserving the complete outer coverage perimeter.
-			overviewStride = 1
-		}
-		window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
-			return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, !overview,
-				maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
-		})
-		if err != nil {
-			return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
-		}
-		window.DisplayRule = binding.layer.DisplayRule
-		if err := applyFeatureDisplayRule(ctx, &window); err != nil {
-			return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
-		}
-		if overview {
-			window = sampleReadOnlyOverviewFeatures(window, overviewStride)
-			if polygonOverview {
-				window, err = geosdriver.NewOperator().DissolvePolygonBoundariesForDisplay(ctx, window)
-				if err != nil {
-					return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon boundaries for %s: %w", key.Layer, err)
-				}
-			}
-		}
-		outlineOnly := overview
-		if !outlineOnly {
-			polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
-			polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
-			if polygonErr != nil {
-				return render.Chunk{}, polygonErr
-			}
-			if polygonVertices > maxReadOnlyWindowPolygonVertices {
-				// Keep rendering a dense tile's outlines when constrained triangulation
-				// would exceed its separate GEOS safety budget. The total window WKB,
-				// vertex batch, and native renderer limits still apply.
-				outlineOnly = true
-				native.RecordDiagnostic("render", fmt.Sprintf("outline-only layer=%s chunk=%v polygon_vertices=%d", key.Layer, key, polygonVertices))
-			}
-		}
-		window.Name, window.CRS = binding.layer.Name, core.CRS{AuthorityCode: binding.sourceCRS}
-		window.Fields, window.Style, window.Labels = binding.layer.Fields, binding.layer.Style, binding.layer.Labels
-		if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
-			window, err = (proj.Transformer{}).Transform(ctx,
-				core.CRS{AuthorityCode: binding.sourceCRS}, binding.layer.CRS, window)
-			if err != nil {
-				return render.Chunk{}, fmt.Errorf("transform %s window: %w", key.Layer, err)
-			}
-		}
-		if len(window.Features) == 0 {
-			runtime.mu.Lock()
-			runtime.removeWindowChunkLocked(key)
-			runtime.rebuildWindowFeaturesLocked()
-			runtime.mu.Unlock()
-			return render.Chunk{Key: key}, nil
-		}
-		payloadBytes := estimateReadOnlyWindowPayloadBytes(window)
-		if payloadBytes > maxReadOnlyWindowBytes {
-			return render.Chunk{}, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
-		}
-		window = window.WithDefaultPresentation()
-		featureNames := make(map[uint64]string, len(window.Features))
-		if !overview {
-			runtime.mu.Lock()
-			for index := range window.Features {
-				runtime.nextWindowFeatureID++
-				window.Features[index].ID = runtime.nextWindowFeatureID
-				name := fmt.Sprint(window.Features[index].Properties["name"])
-				if name == "<nil>" || name == "" {
-					name = fmt.Sprintf("%s feature #%d", key.Layer, runtime.nextWindowFeatureID)
-				}
-				featureNames[runtime.nextWindowFeatureID] = name
-			}
-			runtime.mu.Unlock()
-		}
-		if !overview {
-			if err := prepareLayerLabels(ctx, []core.Layer{window}); err != nil {
-				return render.Chunk{}, err
-			}
-		}
-		displayWindow := window
-		if key.ZoomBucket <= 1 || overview {
-			tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, lodBucket)
-			if forceOverview {
-				// A viewport-wide safety retry may simplify the dissolved boundary
-				// more aggressively; the original geometries remain available on zoom-in.
-				tolerance *= 4
-			}
-			if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
-				displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
-				if err != nil {
-					return render.Chunk{}, fmt.Errorf("simplify coarse-scale geometry for %s: %w", key.Layer, err)
-				}
-			}
-		}
-		var newSources map[string]render.LayerSource
-		var hits []render.HitFeature
-		if overview {
-			newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
-				[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
-			hits = nil // Overview geometry is generalized and has no feature hit target.
-		} else {
-			newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunk(
-				[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
-		}
-		if err != nil {
-			return render.Chunk{}, err
-		}
-		for _, label := range newSources[key.Layer].Labels {
-			if payloadBytes > maxReadOnlyWindowBytes-int64(len(label.Text)+64) {
-				return render.Chunk{}, fmt.Errorf("spatial window labels exceed the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
-			}
-			payloadBytes += int64(len(label.Text) + 64)
-		}
-		if !outlineOnly {
-			if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{displayWindow}, newSources, &key); err != nil {
-				return render.Chunk{}, err
-			}
-		}
-		runtime.mu.Lock()
-		for index := range window.Features {
-			if index < len(hits) {
-				hits[index].FeatureID = window.Features[index].ID
-			}
-		}
-		if _, visible := runtime.windowVisibleKeys[key]; visible {
-			runtime.removeWindowChunkLocked(key)
-			if !overview {
-				if runtime.windowVisibleFeatureCount+len(window.Features) > maxReadOnlyVisibleFeatures {
-					runtime.mu.Unlock()
-					return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
-				}
-				if runtime.windowVisiblePayloadBytes+payloadBytes > maxReadOnlyVisibleBytes {
-					runtime.mu.Unlock()
-					return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
-				}
-				runtime.windowVisibleFeatureCount += len(window.Features)
-				runtime.windowVisiblePayloadBytes += payloadBytes
-				runtime.windowFeatureCounts[key] = len(window.Features)
-				runtime.windowPayloadBytes[key] = payloadBytes
-				for id, name := range featureNames {
-					runtime.windowFeatureNames[id] = name
-				}
-				ids := make([]uint64, 0, len(featureNames))
-				for id := range featureNames {
-					ids = append(ids, id)
-				}
-				runtime.windowFeatureIDs[key] = ids
-				if len(hits) > 0 {
-					runtime.windowHits[key] = hits
-				}
-				if len(newSources[key.Layer].Labels) > 0 {
-					runtime.windowLabels[key] = newSources[key.Layer].Labels
-				}
-			}
-			runtime.rebuildWindowFeaturesLocked()
-		}
-		runtime.mu.Unlock()
-		return newSources[key.Layer].Builder(ctx, key)
-	}
+	runtime.attributeFeatureReader = runtime.readOnlyAttributeFeature
+	runtime.readOnlyBaseBuilder = runtime.builder
+	runtime.builder = runtime.buildReadOnlyWindowChunk
 	runtime.closeAttributeSource = closeSessions
 	runtime.readOnlySources = append([]vectorSourceSpec(nil), sources...)
 	runtime.readOnlyDisplayCRS = targetCRS
 	keep = true
 	return runtime, true, nil
+}
+
+func (runtime *demoRuntime) readOnlyAttributeFeature(_ context.Context, layerName string, featureID uint64) (core.Feature, error) {
+	for _, layer := range runtime.readOnlyBaseLayers {
+		if layer.Name == layerName {
+			for _, feature := range layer.Features {
+				if feature.ID == featureID {
+					return feature, nil
+				}
+			}
+			return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+		}
+	}
+	runtime.mu.Lock()
+	name, ok := runtime.windowFeatureNames[featureID]
+	runtime.mu.Unlock()
+	if !ok {
+		return core.Feature{}, fmt.Errorf("feature %d is outside the current render window", featureID)
+	}
+	return core.Feature{ID: featureID, Properties: map[string]any{"name": name}}, nil
+}
+
+// Bind window writes to the active runtime. A closure over the temporary
+// loading runtime would render geometry but leave labels and hit data there.
+func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+	baseBuilder := runtime.readOnlyBaseBuilder
+	runtime.mu.Lock()
+	binding, isWindowLayer := runtime.readOnlyBindings[key.Layer]
+	runtime.mu.Unlock()
+	if !isWindowLayer {
+		if _, missing := runtime.unavailableSources[key.Layer]; !missing && baseBuilder != nil {
+			return baseBuilder(ctx, key)
+		}
+	}
+	if !isWindowLayer {
+		if _, missing := runtime.unavailableSources[key.Layer]; missing {
+			return render.Chunk{Key: key}, nil
+		}
+		return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
+	}
+	runtime.mu.Lock()
+	_, visibleWindow := runtime.windowVisibleKeys[key]
+	visibleFeatureCount := runtime.windowVisibleFeatureCount
+	visiblePayloadBytes := runtime.windowVisiblePayloadBytes
+	runtime.mu.Unlock()
+	if visibleWindow && visibleFeatureCount >= maxReadOnlyVisibleFeatures {
+		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+	}
+	if visibleWindow && visiblePayloadBytes >= maxReadOnlyVisibleBytes {
+		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
+	}
+	releaseWindowSlot, err := readOnlyWindowBuildSemaphore.acquire(ctx)
+	if err != nil {
+		return render.Chunk{}, err
+	}
+	defer releaseWindowSlot()
+	// Properties are needed for label expressions and for the selected
+	// feature's display name. The layer snapshot is chunk-scoped and dropped
+	// after vertex generation; the runtime retains only the small name map.
+	lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
+	chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
+	queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
+	if !ok {
+		return render.Chunk{Key: key}, nil
+	}
+	if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+		queryBounds, err = (proj.Transformer{}).TransformBounds(ctx,
+			binding.layer.CRS, core.CRS{AuthorityCode: binding.sourceCRS}, queryBounds)
+		if err != nil {
+			return render.Chunk{}, fmt.Errorf("transform query bounds for %s: %w", key.Layer, err)
+		}
+	}
+	overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
+	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
+	overview := lodBucket <= 1 || forceOverview
+	// Keep parcel edges in the normal overview. Dissolving every polygon
+	// removes the very network users need to inspect at city scale. Reserve
+	// the coverage-only boundary for an explicit budget retry.
+	polygonOverview := forceOverview && isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
+	if polygonOverview {
+		// The boundary dissolve removes interior parcel edges without dropping
+		// source features, preserving the complete outer coverage perimeter.
+		overviewStride = 1
+	}
+	// Overview geometry can be simplified, but labels still need the source
+	// attributes. Keep geometry-only reads for unlabeled layers and for a
+	// forced dissolved boundary, which no longer has per-parcel anchors.
+	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview)
+	window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
+		return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
+			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+	})
+	if err != nil {
+		return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
+	}
+	window.DisplayRule = binding.layer.DisplayRule
+	if err := applyFeatureDisplayRule(ctx, &window); err != nil {
+		return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
+	}
+	if overview {
+		window = sampleReadOnlyOverviewFeatures(window, overviewStride)
+		if polygonOverview {
+			window, err = geosdriver.NewOperator().DissolvePolygonBoundariesForDisplay(ctx, window)
+			if err != nil {
+				return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon boundaries for %s: %w", key.Layer, err)
+			}
+		}
+	}
+	outlineOnly := overview
+	if !outlineOnly {
+		polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
+		polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
+		if polygonErr != nil {
+			return render.Chunk{}, polygonErr
+		}
+		if polygonVertices > maxReadOnlyWindowPolygonVertices {
+			// Keep rendering a dense tile's outlines when constrained triangulation
+			// would exceed its separate GEOS safety budget. The total window WKB,
+			// vertex batch, and native renderer limits still apply.
+			outlineOnly = true
+			native.RecordDiagnostic("render", fmt.Sprintf("outline-only layer=%s chunk=%v polygon_vertices=%d", key.Layer, key, polygonVertices))
+		}
+	}
+	window.Name, window.CRS = binding.layer.Name, core.CRS{AuthorityCode: binding.sourceCRS}
+	window.Fields, window.Style, window.Labels = binding.layer.Fields, binding.layer.Style, binding.layer.Labels
+	if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+		window, err = (proj.Transformer{}).Transform(ctx,
+			core.CRS{AuthorityCode: binding.sourceCRS}, binding.layer.CRS, window)
+		if err != nil {
+			return render.Chunk{}, fmt.Errorf("transform %s window: %w", key.Layer, err)
+		}
+	}
+	if len(window.Features) == 0 {
+		runtime.mu.Lock()
+		runtime.removeWindowChunkLocked(key)
+		runtime.rebuildWindowFeaturesLocked()
+		runtime.mu.Unlock()
+		return render.Chunk{Key: key}, nil
+	}
+	payloadBytes := estimateReadOnlyWindowPayloadBytes(window)
+	if payloadBytes > maxReadOnlyWindowBytes {
+		return render.Chunk{}, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
+	}
+	window = window.WithDefaultPresentation()
+	featureNames := make(map[uint64]string, len(window.Features))
+	if !overview {
+		runtime.mu.Lock()
+		for index := range window.Features {
+			runtime.nextWindowFeatureID++
+			window.Features[index].ID = runtime.nextWindowFeatureID
+			name := fmt.Sprint(window.Features[index].Properties["name"])
+			if name == "<nil>" || name == "" {
+				name = fmt.Sprintf("%s feature #%d", key.Layer, runtime.nextWindowFeatureID)
+			}
+			featureNames[runtime.nextWindowFeatureID] = name
+		}
+		runtime.mu.Unlock()
+	}
+	if includeProperties && binding.layer.Labels.Enabled {
+		if err := prepareReadOnlyWindowLabels(ctx, &window, overview); err != nil {
+			return render.Chunk{}, err
+		}
+	}
+	displayWindow := window
+	if key.ZoomBucket <= 1 || overview {
+		tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, lodBucket)
+		if forceOverview {
+			// A viewport-wide safety retry may simplify the dissolved boundary
+			// more aggressively; the original geometries remain available on zoom-in.
+			tolerance *= 4
+		}
+		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
+			displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
+			if err != nil {
+				return render.Chunk{}, fmt.Errorf("simplify coarse-scale geometry for %s: %w", key.Layer, err)
+			}
+		}
+	}
+	var newSources map[string]render.LayerSource
+	var hits []render.HitFeature
+	if overview {
+		newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
+			[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
+		hits = nil // Overview geometry is generalized and has no feature hit target.
+	} else {
+		newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunk(
+			[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
+	}
+	if err != nil {
+		return render.Chunk{}, err
+	}
+	var labelBytes int64
+	for _, label := range newSources[key.Layer].Labels {
+		if payloadBytes > maxReadOnlyWindowBytes-int64(len(label.Text)+64) {
+			return render.Chunk{}, fmt.Errorf("spatial window labels exceed the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
+		}
+		bytes := int64(len(label.Text) + 64)
+		payloadBytes += bytes
+		labelBytes += bytes
+	}
+	if !outlineOnly {
+		if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{displayWindow}, newSources, &key); err != nil {
+			return render.Chunk{}, err
+		}
+	}
+	runtime.mu.Lock()
+	for index := range window.Features {
+		if index < len(hits) {
+			hits[index].FeatureID = window.Features[index].ID
+		}
+	}
+	if _, visible := runtime.windowVisibleKeys[key]; visible {
+		runtime.removeWindowChunkLocked(key)
+		if !overview {
+			if runtime.windowVisibleFeatureCount+len(window.Features) > maxReadOnlyVisibleFeatures {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+			}
+			if !readOnlyVisiblePayloadFits(runtime.windowVisiblePayloadBytes, payloadBytes) {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
+			}
+			runtime.windowVisibleFeatureCount += len(window.Features)
+			runtime.windowVisiblePayloadBytes += payloadBytes
+			runtime.windowFeatureCounts[key] = len(window.Features)
+			runtime.windowPayloadBytes[key] = payloadBytes
+			for id, name := range featureNames {
+				runtime.windowFeatureNames[id] = name
+			}
+			ids := make([]uint64, 0, len(featureNames))
+			for id := range featureNames {
+				ids = append(ids, id)
+			}
+			runtime.windowFeatureIDs[key] = ids
+			if len(hits) > 0 {
+				runtime.windowHits[key] = hits
+			}
+		} else if labelBytes > 0 {
+			// Overview geometry is transient, but its small label payload is
+			// retained until this chunk leaves the viewport.
+			if !readOnlyVisiblePayloadFits(runtime.windowVisiblePayloadBytes, labelBytes) {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only labels exceed the %d MiB payload budget", maxReadOnlyVisibleBytes>>20)
+			}
+			runtime.windowVisiblePayloadBytes += labelBytes
+			runtime.windowPayloadBytes[key] = labelBytes
+		}
+		if len(newSources[key.Layer].Labels) > 0 {
+			runtime.windowLabels[key] = newSources[key.Layer].Labels
+		}
+		runtime.rebuildWindowFeaturesLocked()
+	}
+	runtime.mu.Unlock()
+	return newSources[key.Layer].Builder(ctx, key)
+}
+
+func readOnlyWindowNeedsProperties(labels core.LabelSettings, overview, polygonOverview bool) bool {
+	return !overview || (labels.Enabled && !polygonOverview)
+}
+
+const maxReadOnlyOverviewLabelsPerChunk = 32
+
+func prepareReadOnlyWindowLabels(ctx context.Context, window *core.Layer, overview bool) error {
+	if window == nil || !window.Labels.Enabled {
+		return nil
+	}
+	if !overview || len(window.Features) <= maxReadOnlyOverviewLabelsPerChunk {
+		return prepareLayerLabels(ctx, []core.Layer{*window})
+	}
+	// A coarse tile only has room for a few labels. Avoid running text scripts
+	// and GEOS PointOnSurface for every parcel that intersects it.
+	selected := *window
+	selected.Features = make([]core.Feature, 0, maxReadOnlyOverviewLabelsPerChunk)
+	indices := make([]int, 0, maxReadOnlyOverviewLabelsPerChunk)
+	for index := 0; index < maxReadOnlyOverviewLabelsPerChunk; index++ {
+		featureIndex := index * len(window.Features) / maxReadOnlyOverviewLabelsPerChunk
+		indices = append(indices, featureIndex)
+		selected.Features = append(selected.Features, window.Features[featureIndex])
+	}
+	if err := prepareLayerLabels(ctx, []core.Layer{selected}); err != nil {
+		return err
+	}
+	for index, featureIndex := range indices {
+		window.Features[featureIndex].Label = selected.Features[index].Label
+	}
+	return nil
 }
 
 func validateReadOnlyWindowMetadata(layerName, sourceCRS string, hasBounds bool) error {
@@ -1339,7 +1394,9 @@ const (
 	// citywide overview. Polygon fills are omitted at this scale, so outlines
 	// consume a fraction of the full-detail vertex budget.
 	maxReadOnlyWindowBytes  = 32 << 20
-	maxReadOnlyVisibleBytes = 32 << 20
+	// The viewport can retain several individually bounded windows. Keep its
+	// aggregate budget separate from the per-window allocation guard.
+	maxReadOnlyVisibleBytes = 128 << 20
 	// Bounds all retained polygon fill meshes in a materialized desktop project
 	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
 	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
@@ -1349,6 +1406,11 @@ const (
 	maxDesktopDXFExportFeatures    = 1_000_000
 	maxDesktopDXFExportBytes       = 768 << 20
 )
+
+func readOnlyVisiblePayloadFits(current, additional int64) bool {
+	return current >= 0 && additional >= 0 && current <= maxReadOnlyVisibleBytes &&
+		additional <= maxReadOnlyVisibleBytes-current
+}
 
 func isPolygonOverviewLayer(geometryType string) bool {
 	return strings.Contains(strings.ToUpper(geometryType), "POLYGON")
@@ -2601,7 +2663,7 @@ func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, 
 				}
 			}
 			rotation := 0.0
-			if settings.RotationField != "" {
+			if settings.RotationField != "" && (settings.Placement == "center-rotated" || settings.Placement == "free-angle") {
 				value, exists := feature.Properties[settings.RotationField]
 				if !exists {
 					return fmt.Errorf("layer %q feature %d rotation field %q is missing", layers[layerIndex].Name, feature.ID, settings.RotationField)
@@ -2612,6 +2674,25 @@ func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, 
 						return fmt.Errorf("layer %q feature %d rotation field %q must contain a finite number", layers[layerIndex].Name, feature.ID, settings.RotationField)
 					}
 					rotation = parsedRotation
+				}
+			}
+			switch settings.Placement {
+			case "center":
+				rotation = 0
+			case "vertical":
+				rotation = 90
+			case "free-angle":
+				if settings.RotationField == "" && feature.Geometry != nil {
+					anchor, segmentAngle, found, placementErr := render.LongestSegmentPlacement(feature.Geometry)
+					if placementErr != nil {
+						return fmt.Errorf("layer %q feature %d label angle: %w", layers[layerIndex].Name, feature.ID, placementErr)
+					}
+					if found {
+						rotation = segmentAngle
+						if !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+							label.X, label.Y, label.AnchorSet = anchor.X, anchor.Y, true
+						}
+					}
 				}
 			}
 			label.Rotation = rotation
@@ -3853,8 +3934,12 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.layerStyleMu = next.layerStyleMu
 	r.mapLabels = next.mapLabels
 	r.builder = next.builder
+	r.readOnlyBaseBuilder = next.readOnlyBaseBuilder
 	r.features = next.features
 	r.adoptLoadedSpatialStateLocked(next)
+	if r.viewportReadOnly {
+		r.builder = r.buildReadOnlyWindowChunk
+	}
 	r.hitIndex = next.hitIndex
 	r.hitIndexReady = next.hitIndexReady
 	r.service = next.service
@@ -3870,6 +3955,9 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.persist = next.persist
 	r.attributePageReader = next.attributePageReader
 	r.attributeFeatureReader = next.attributeFeatureReader
+	if r.viewportReadOnly {
+		r.attributeFeatureReader = r.readOnlyAttributeFeature
+	}
 	r.closeAttributeSource = next.closeAttributeSource
 	r.attributeGeneration++
 	r.attributeDispatchGeneration++

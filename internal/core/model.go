@@ -106,7 +106,7 @@ type LabelSettings struct {
 	Enabled       bool    `json:"enabled"`
 	Expression    string  `json:"expression"`
 	LuaScript     string  `json:"luaScript,omitempty"`
-	Placement     string  `json:"placement"` // center, center-rotated, or free-angle
+	Placement     string  `json:"placement"` // center (E-W), vertical (N-S), free-angle (longest segment), or legacy center-rotated
 	RotationField string  `json:"rotationField,omitempty"`
 	HeightMM      float64 `json:"heightMm"`
 	MinScale      float64 `json:"minScale,omitempty"`

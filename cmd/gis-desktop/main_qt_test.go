@@ -50,6 +50,81 @@ func TestViewportLayerLabelsCullOffscreenAndSampleDenseViews(t *testing.T) {
 	}
 }
 
+func TestViewportLabelLimitAtScaleBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		denominator float64
+		want        int
+	}{
+		{0, 200},
+		{999, 200},
+		{1_000, 200},
+		{5_000, 200},
+		{17_999, 200},
+		{18_000, 150},
+		{49_999, 150},
+		{50_000, 100},
+		{100_000, 50},
+		{math.NaN(), 200},
+	} {
+		if got := viewportLabelLimit(test.denominator); got != test.want {
+			t.Errorf("scale 1:%.0f limit = %d, want %d", test.denominator, got, test.want)
+		}
+	}
+}
+
+func TestViewportScaleBudgetAppliesAfterCollisionRemoval(t *testing.T) {
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
+	labels := make([]render.LayerLabel, 0, 800)
+	for index := 0; index < 400; index++ {
+		label := render.LayerLabel{FeatureID: uint64(index + 1), Text: "x", X: 0.05 + float64(index%20)*0.045, Y: 0.05 + float64(index/20)*0.045, HeightMM: 2.5}
+		labels = append(labels, label, label)
+	}
+	visible, safetyOmitted := viewportLayerLabels(labels, view, maxLayerLabelCount)
+	decluttered := declutterViewportLabelsAtScale(visible, view, 18_000)
+	selected, scaleOmitted := sampleLayerLabels(decluttered, viewportLabelLimit(18_000))
+	if safetyOmitted != 0 || len(decluttered) != 400 || len(selected) != 150 || scaleOmitted != 250 {
+		t.Fatalf("scale budget after collisions: safety=%d nonoverlapping=%d selected=%d scale-omitted=%d", safetyOmitted, len(decluttered), len(selected), scaleOmitted)
+	}
+}
+
+func TestDeclutterViewportLabelsKeepsSeparatedLabels(t *testing.T) {
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
+	labels := []render.LayerLabel{
+		{Text: "parcel 1", X: 0.5, Y: 0.5, HeightMM: 2.5},
+		{Text: "parcel 2", X: 0.502, Y: 0.5, HeightMM: 2.5},
+		{Text: "parcel 3", X: 0.8, Y: 0.5, HeightMM: 2.5},
+	}
+	got := declutterViewportLabels(labels, view)
+	if len(got) != 2 || got[0].Text != "parcel 1" || got[1].Text != "parcel 3" {
+		t.Fatalf("decluttered labels = %+v", got)
+	}
+	if got := declutterViewportLabels(labels, native.Viewport{}); len(got) != len(labels) {
+		t.Fatalf("invalid viewport should not discard labels: %+v", got)
+	}
+}
+
+func TestDeclutterViewportLabelsUsesMoreSpacingAtWideScale(t *testing.T) {
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
+	labels := []render.LayerLabel{
+		{Text: "1", X: 0.5, Y: 0.5, HeightMM: 2.5},
+		{Text: "2", X: 0.54, Y: 0.5, HeightMM: 2.5},
+	}
+	if got := declutterViewportLabelsAtScale(labels, view, 1000); len(got) != 2 {
+		t.Fatalf("close-scale labels = %+v, want both", got)
+	}
+	if got := declutterViewportLabelsAtScale(labels, view, 100000); len(got) != 1 {
+		t.Fatalf("wide-scale labels = %+v, want one", got)
+	}
+}
+
+func TestLabelScaleDenominatorMatchesProjectedViewport(t *testing.T) {
+	view := native.Viewport{Width: 1000, Zoom: 2}
+	got := labelScaleDenominator(view, [4]float64{0, 0, 1000, 1000}, "EPSG:5186")
+	if got != 1890 {
+		t.Fatalf("scale denominator = %v, want 1890", got)
+	}
+}
+
 func TestViewportBatchBudgetRetriesOnceWithGeneralizedOverview(t *testing.T) {
 	batchError := "viewport render batch exceeds the 2500000-vertex safety limit"
 	for _, test := range []struct {
@@ -214,6 +289,22 @@ func TestRetainVisibleWindowChunksReleasesOffscreenGeometry(t *testing.T) {
 	}
 	if _, ok := runtime.windowVisibleKeys[futureKey]; !ok {
 		t.Fatal("new viewport key was not recorded")
+	}
+}
+
+func TestRetainVisibleWindowChunksReleasesOffscreenOverviewLabels(t *testing.T) {
+	key := render.ChunkKey{Layer: "parcels", ZoomBucket: -7, X: 1, Y: 1}
+	runtime := &demoRuntime{
+		windowVisibleKeys:         map[render.ChunkKey]struct{}{key: {}},
+		windowPayloadBytes:        map[render.ChunkKey]int64{key: 80},
+		windowVisiblePayloadBytes: 80,
+		windowLabels:              map[render.ChunkKey][]render.LayerLabel{key: {{Text: "parcel"}}},
+	}
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked(nil)
+	runtime.mu.Unlock()
+	if runtime.windowVisiblePayloadBytes != 0 || len(runtime.windowLabels) != 0 || len(runtime.mapLabels) != 0 {
+		t.Fatalf("offscreen overview labels retained: bytes=%d labels=%v", runtime.windowVisiblePayloadBytes, runtime.windowLabels)
 	}
 }
 

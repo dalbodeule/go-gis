@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	goruntime "runtime"
 	"sort"
@@ -157,6 +158,7 @@ type demoRuntime struct {
 	layerStyleMu                *sync.RWMutex
 	mapLabels                   []render.LayerLabel
 	builder                     render.ChunkBuilder
+	readOnlyBaseBuilder         render.ChunkBuilder
 	mu                          sync.Mutex
 	cancel                      context.CancelFunc
 	loadCancel                  context.CancelFunc
@@ -372,10 +374,37 @@ func (r *demoRuntime) publishLayerTree() {
 }
 
 func (r *demoRuntime) publishLayerLabels() {
+	r.publishLayerLabelsWithStatus(true)
+}
+
+func (r *demoRuntime) publishLayerLabelsWithStatus(showLimitStatus bool) {
 	r.mu.Lock()
 	labels := append([]render.LayerLabel(nil), r.mapLabels...)
+	sourceCount := len(labels)
+	visibility := make(map[string]bool, len(r.visibleLayers))
+	for layer, visible := range r.visibleLayers {
+		visibility[layer] = visible
+	}
+	extent, crs := r.mapExtent, r.mapCRS
 	r.mu.Unlock()
-	labels, omitted := viewportLayerLabels(labels, native.CurrentViewport(), maxLayerLabelCount)
+	viewport := native.CurrentViewport()
+	denominator := labelScaleDenominator(viewport, extent, crs)
+	visibleLabels := labels[:0]
+	for _, label := range labels {
+		if visible, exists := visibility[label.Layer]; exists && !visible {
+			continue
+		}
+		if denominator > 0 && ((label.MinScale > 0 && denominator < label.MinScale) ||
+			(label.MaxScale > 0 && denominator > label.MaxScale)) {
+			continue
+		}
+		visibleLabels = append(visibleLabels, label)
+	}
+	labels, safetyOmitted := viewportLayerLabels(visibleLabels, viewport, maxLayerLabelCount)
+	beforeDeclutter := len(labels)
+	labels = declutterViewportLabelsAtScale(labels, viewport, denominator)
+	limit := viewportLabelLimit(denominator)
+	labels, scaleOmitted := sampleLayerLabels(labels, limit)
 	payload, err := marshalLayerLabels(labels)
 	if err != nil {
 		native.SetLayerLabelPayload("[]")
@@ -383,9 +412,116 @@ func (r *demoRuntime) publishLayerLabels() {
 		return
 	}
 	native.SetLayerLabelPayload(payload)
-	if omitted > 0 {
+	if showLimitStatus {
+		native.RecordDiagnostic("labels", fmt.Sprintf("published source=%d viewport=%d scale=1:%.0f limit=%d overlap_omitted=%d budget_omitted=%d", sourceCount, len(labels), denominator, limit, beforeDeclutter-len(labels)-scaleOmitted, safetyOmitted+scaleOmitted))
+	}
+	if showLimitStatus && safetyOmitted+scaleOmitted > 0 {
 		native.SetRenderStatus(fmt.Sprintf("Showing %d labels in the current view; zoom in for more", len(labels)))
 	}
+}
+
+func labelScaleDenominator(view native.Viewport, extent [4]float64, crs string) float64 {
+	if view.Width <= 0 || view.Zoom <= 0 || extent[2] <= extent[0] {
+		return 0
+	}
+	metersPerUnit := 1.0
+	if strings.EqualFold(crs, "EPSG:4326") {
+		latitude := (extent[1] + extent[3]) / 2
+		metersPerUnit = 111319.49 * math.Max(0.01, math.Cos(latitude*math.Pi/180))
+	}
+	return math.Round((extent[2] - extent[0]) / (view.Width * view.Zoom) * metersPerUnit * 96 / 0.0254)
+}
+
+// Screen-only density tiers. A larger denominator means a wider view with
+// less room for individual parcel labels. No view may show over 200 labels,
+// including when its approximate scale cannot be calculated.
+func viewportLabelLimit(denominator float64) int {
+	switch {
+	case denominator >= 100_000:
+		return 50
+	case denominator >= 50_000:
+		return 100
+	case denominator >= 18_000:
+		return 150
+	default:
+		return 200
+	}
+}
+
+// Keep the screen-space label budget useful at dense scales. This lightweight
+// grid is deliberately applied after viewport culling, so it does not retain
+// geometry or create QML Text objects for labels hidden behind their neighbors.
+func declutterViewportLabels(labels []render.LayerLabel, view native.Viewport) []render.LayerLabel {
+	return declutterViewportLabelsAtScale(labels, view, 0)
+}
+
+func declutterViewportLabelsAtScale(labels []render.LayerLabel, view native.Viewport, denominator float64) []render.LayerLabel {
+	if view.Width <= 0 || view.Height <= 0 || view.ViewportWidth <= 0 || view.ViewportHeight <= 0 || view.Zoom <= 0 {
+		return labels
+	}
+	const cellSize = 48.0
+	padding := 3.0
+	switch {
+	case denominator >= 100000:
+		padding = 24
+	case denominator >= 25000:
+		padding = 16
+	case denominator >= 5000:
+		padding = 8
+	}
+	type box struct{ left, top, right, bottom float64 }
+	occupied := make(map[[2]int][]box)
+	selected := make([]render.LayerLabel, 0, len(labels))
+	centerX := 0.5 - view.PanX/(view.Width*view.Zoom)
+	centerY := 0.5 + view.PanY/(view.Height*view.Zoom)
+	for _, label := range labels {
+		x := view.ViewportWidth/2 + (label.X-centerX)*view.Width*view.Zoom
+		y := view.ViewportHeight/2 - (label.Y-centerY)*view.Height*view.Zoom
+		if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+			continue
+		}
+		height := math.Max(8, label.HeightMM*96/25.4)
+		width := 0.0
+		for _, letter := range label.Text {
+			if letter < 128 {
+				width += height * 0.6
+			} else {
+				width += height
+			}
+		}
+		width = math.Max(width, height)
+		if label.Rotation != 0 {
+			// A conservative square also covers labels rotated by the QML delegate.
+			width, height = math.Hypot(width, height), math.Hypot(width, height)
+		}
+		// A maliciously long label must not span an unbounded number of cells.
+		width = math.Min(width, view.ViewportWidth*2)
+		height = math.Min(height, view.ViewportHeight*2)
+		candidate := box{x - width/2 - padding, y - height/2 - padding, x + width/2 + padding, y + height/2 + padding}
+		minX, maxX := int(math.Floor(candidate.left/cellSize)), int(math.Floor(candidate.right/cellSize))
+		minY, maxY := int(math.Floor(candidate.top/cellSize)), int(math.Floor(candidate.bottom/cellSize))
+		overlaps := false
+		for cx := minX; cx <= maxX && !overlaps; cx++ {
+			for cy := minY; cy <= maxY && !overlaps; cy++ {
+				for _, other := range occupied[[2]int{cx, cy}] {
+					if candidate.left < other.right && other.left < candidate.right && candidate.top < other.bottom && other.top < candidate.bottom {
+						overlaps = true
+						break
+					}
+				}
+			}
+		}
+		if overlaps {
+			continue
+		}
+		selected = append(selected, label)
+		for cx := minX; cx <= maxX; cx++ {
+			for cy := minY; cy <= maxY; cy++ {
+				occupied[[2]int{cx, cy}] = append(occupied[[2]int{cx, cy}], candidate)
+			}
+		}
+	}
+	return selected
 }
 
 // viewportLayerLabels bounds QML object creation to labels near the current
@@ -406,6 +542,30 @@ func viewportLayerLabels(labels []render.LayerLabel, viewport native.Viewport, l
 			}
 		}
 		labels = visible
+	}
+	// Window chunks finish out of order. Stable spatial order prevents their
+	// map iteration order from changing which label wins a crowded screen.
+	sort.Slice(labels, func(i, j int) bool {
+		if labels[i].Y != labels[j].Y {
+			return labels[i].Y < labels[j].Y
+		}
+		if labels[i].X != labels[j].X {
+			return labels[i].X < labels[j].X
+		}
+		if labels[i].Layer != labels[j].Layer {
+			return labels[i].Layer < labels[j].Layer
+		}
+		if labels[i].FeatureID != labels[j].FeatureID {
+			return labels[i].FeatureID < labels[j].FeatureID
+		}
+		return labels[i].Text < labels[j].Text
+	})
+	return sampleLayerLabels(labels, limit)
+}
+
+func sampleLayerLabels(labels []render.LayerLabel, limit int) ([]render.LayerLabel, int) {
+	if limit <= 0 {
+		return nil, len(labels)
 	}
 	if len(labels) <= limit {
 		return labels, 0
@@ -940,6 +1100,10 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	if previousCancel != nil {
 		previousCancel()
 	}
+	if viewportReadOnly && !keepCompleteFrame {
+		// Discard labels from old windows as soon as the new viewport is planned.
+		r.publishLayerLabelsWithStatus(false)
+	}
 	if len(keys) == 0 {
 		r.mu.Lock()
 		if r.scheduler != scheduler {
@@ -960,7 +1124,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		r.publishedRevision = batchStore.Revision()
 		native.SetSelection("", "", "", "No feature selected")
 		r.mu.Unlock()
-		r.publishLayerLabels()
+		r.publishLayerLabelsWithStatus(false)
 		scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		return
 	}
@@ -1028,6 +1192,20 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		// repeated work during bulk loads while keeping partial results responsive.
 		const progressivePublishInterval = 50 * time.Millisecond
 		firstPublish := false
+		lastLabelPublish := time.Time{}
+		publishLabelsIfDue := func() {
+			if !viewportReadOnly || requestContext.Err() != nil || (!lastLabelPublish.IsZero() && time.Since(lastLabelPublish) < 150*time.Millisecond) {
+				return
+			}
+			r.mu.Lock()
+			current := r.scheduler == scheduler && scheduler.Generation() == requestGeneration
+			hasLabels := len(r.mapLabels) > 0
+			r.mu.Unlock()
+			if current && hasLabels {
+				r.publishLayerLabelsWithStatus(false)
+				lastLabelPublish = time.Now()
+			}
+		}
 		var publishScratch []render.Vertex
 		dirty := true // BeginGeneration may have removed now-hidden chunks.
 		publishBatch := func(final bool) {
@@ -1076,6 +1254,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			if time.Since(lastPublish) >= progressivePublishInterval {
 				publishBatch(false)
 			}
+			// A retained complete frame suppresses geometry publication until the
+			// replacement is ready, but its new labels must not wait for that frame.
+			publishLabelsIfDue()
 		}
 		publishBatch(requestContext.Err() == nil && renderErr == "" && completed == len(requestKeys))
 		if requestContext.Err() != nil {
@@ -1171,7 +1352,7 @@ func (r *demoRuntime) retainVisibleWindowChunksLocked(keys []render.ChunkKey) {
 	for _, key := range keys {
 		r.windowVisibleKeys[key] = struct{}{}
 	}
-	for key := range r.windowFeatureCounts {
+	for key := range r.windowPayloadBytes {
 		if _, keep := r.windowVisibleKeys[key]; !keep {
 			r.removeWindowChunkLocked(key)
 		}

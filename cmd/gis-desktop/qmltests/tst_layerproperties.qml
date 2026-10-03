@@ -41,6 +41,35 @@ TestCase {
         compare(viewport.localPathFromUrl("/data/My Roads.shp"), "/data/My Roads.shp");
     }
 
+    function test_fullScreenKeepsWorkspacePanelsVisible() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var layers = findChild(appWindow, "layerList");
+        var addButton = findChild(appWindow, "addVectorFilesButton");
+        var status = findChild(appWindow, "renderStatusLabel");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        verify(viewport !== null && layers !== null && addButton !== null && status !== null && canvas !== null);
+        var layerCount = layerModel.count;
+        try {
+            appWindow.showMaximized();
+            tryVerify(function() { return appWindow.visibility === Window.Maximized; });
+            appWindow.showFullScreen();
+            tryVerify(function() { return appWindow.visibility === Window.FullScreen; });
+            tryVerify(function() {
+                var mapCenter = viewport.mapToItem(appWindow.contentItem, viewport.width / 2, viewport.height / 2);
+                var layerCenter = layers.mapToItem(appWindow.contentItem, layers.width / 2, layers.height / 2);
+                return layerModel.count === layerCount && viewport.visible && viewport.width > 0 && viewport.height > 0 &&
+                       layers.visible && layers.width > 0 && layers.height > 0 &&
+                       mapCenter.x >= 0 && mapCenter.x <= appWindow.contentItem.width &&
+                       layerCenter.x >= 0 && layerCenter.x <= appWindow.contentItem.width &&
+                       canvas.visible && addButton.visible && status.visible;
+            }, 2000, "fullscreen must retain layer pane, map, toolbar, and status");
+        } finally {
+            appWindow.showNormal();
+            tryVerify(function() { return appWindow.visibility === Window.Windowed; });
+        }
+    }
+
     function test_addVectorDialogSelectionRequestsLoad() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var viewport = findChild(appWindow, "mapViewport");
@@ -667,12 +696,19 @@ TestCase {
         var labelHint = findChild(appWindow, "labelVisibilityHint");
         verify(labelHint !== null);
         tryVerify(function() { return labelHint.text.indexOf("1 labels are available") >= 0; });
+        var labelRepeater = findChild(appWindow, "mapLabelRepeater");
+        verify(labelRepeater !== null);
+        tryCompare(labelRepeater, "count", 1);
+        var mapLabel = labelRepeater.itemAt(0);
+        verify(mapLabel !== null, "label delegate must be instantiated");
+        compare(mapLabel.text, "Sample");
+        tryVerify(function() { return mapLabel.visible; }, 1000, "label must be visible on the map");
         compare(labelRule.text, "return feature.visible == true");
         luaDialog.open();
         tryCompare(luaDialog, "visible", true);
         compare(labelRuleEditor.text, "return feature.visible == true");
         compare(labelLua.text, "return feature.label");
-        compare(labelPlacement.currentIndex, 1);
+        compare(labelPlacement.currentIndex, 3);
         compare(labelRotation.text, "angle");
         compare(labelHeight.text, "2");
         compare(labelMinScale.text, "500");
@@ -771,6 +807,11 @@ TestCase {
         var placement = findChild(appWindow, "labelPlacementField");
         var rotation = findChild(appWindow, "labelRotationField");
         var heightField = findChild(appWindow, "labelHeightField");
+        compare(placement.count, 4);
+        compare(placement.currentIndex, 0);
+        compare(rotation.visible, false, "rotation field is only needed for legacy field-angle settings");
+        placement.currentIndex = 3;
+        tryCompare(rotation, "visible", true);
         var placementX = placement.mapToItem(scroll, 0, 0).x;
         verify(Math.abs(rotation.mapToItem(scroll, 0, 0).x - placementX) < 1,
                "rotation and placement inputs should share a label column");
@@ -817,6 +858,31 @@ TestCase {
         compare(outlineOnly.checked, true);
         mouseClick(outlineOnly);
         compare(fillOpacity.text, "0.45");
+        dialog.close();
+    }
+
+    function test_labelOrientationChoicesPersistAndClearUnusedRotationField() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "layerSettingsDialog");
+        var placement = findChild(appWindow, "labelPlacementField");
+        var rotation = findChild(appWindow, "labelRotationField");
+        canvas.layerTreePayload = JSON.stringify([{name: "orientation", visible: true,
+            labels: {enabled: true, expression: "${name}", placement: "center-rotated", rotationField: "angle", heightMm: 2.5}}]);
+        tryVerify(function() { return findChild(appWindow, "layerModel").get(0).name === "orientation"; });
+        viewport.openLayerPropertiesForCategory("orientation", "labels");
+        tryCompare(dialog, "visible", true);
+        compare(placement.currentIndex, 3);
+        placement.currentIndex = 1;
+        dialog.submitLayer();
+        var northSouth = JSON.parse(canvas.layerSettingsPayload);
+        compare(northSouth.labels.placement, "vertical");
+        compare(northSouth.labels.rotationField, "");
+        placement.currentIndex = 2;
+        rotation.text = "";
+        dialog.submitLayer();
+        var free = JSON.parse(canvas.layerSettingsPayload);
+        compare(free.labels.placement, "free-angle");
         dialog.close();
     }
 }

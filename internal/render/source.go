@@ -1221,22 +1221,26 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 		features[index] = HitFeature{Layer: layer.Name, FeatureID: feature.ID, Vertices: normalized, Parts: hitParts}
 		if layer.Labels.Enabled && feature.Label != nil && feature.Label.Text != "" {
 			anchor := labelAnchor(normalized)
-			lineAngle := 0.0
 			lineGeometry := lineFlags[index] || isLineGeometry(feature.Geometry)
 			if feature.Label.AnchorSet {
 				anchor = Point{X: (feature.Label.X - minX) / spanX, Y: (feature.Label.Y - minY) / spanY}
 			} else if lineGeometry {
-				anchor, lineAngle, _ = labelLinePlacement(geometry)
+				anchor, _, _ = labelLinePlacement(geometry)
 			}
 			rotation := 0.0
 			switch layer.Labels.Placement {
+			case "vertical":
+				rotation = 90
 			case "center-rotated":
 				rotation = feature.Label.Rotation
 			case "free-angle":
 				rotation = feature.Label.Rotation
-				if layer.Labels.RotationField == "" {
-					if lineGeometry {
-						rotation = lineAngle
+				if layer.Labels.RotationField == "" && !feature.Label.AnchorSet {
+					if segmentAnchor, segmentAngle, found, err := LongestSegmentPlacement(feature.Geometry); err == nil && found {
+						rotation = segmentAngle
+						if lineGeometry {
+							anchor = Point{X: (segmentAnchor.X - minX) / spanX, Y: (segmentAnchor.Y - minY) / spanY}
+						}
 					}
 				}
 			}

@@ -357,6 +357,27 @@ func TestReadOnlyWindowPayloadEstimateSaturatesAtBudget(t *testing.T) {
 	}
 }
 
+func TestReadOnlyVisiblePayloadBudgetIsSeparateFromWindowBudget(t *testing.T) {
+	if maxReadOnlyWindowBytes != 32<<20 || maxReadOnlyVisibleBytes != 128<<20 {
+		t.Fatalf("read-only byte budgets: window=%d visible=%d", maxReadOnlyWindowBytes, maxReadOnlyVisibleBytes)
+	}
+	for _, test := range []struct {
+		current, additional int64
+		want                bool
+	}{
+		{32 << 20, 16 << 20, true},
+		{64 << 20, 32 << 20, true},
+		{96 << 20, 32 << 20, true},
+		{96 << 20, 32<<20 + 1, false},
+		{128 << 20, 1, false},
+		{-1, 1, false},
+	} {
+		if got := readOnlyVisiblePayloadFits(test.current, test.additional); got != test.want {
+			t.Errorf("visible payload current=%d additional=%d: got %t, want %t", test.current, test.additional, got, test.want)
+		}
+	}
+}
+
 func TestReadOnlyWindowSubdivisionRecursivelyMergesAndDeduplicates(t *testing.T) {
 	shared := core.Feature{
 		Geometry:   core.WKBGeometry{WKB: []byte{1, 2, 3}},
@@ -1436,6 +1457,41 @@ func TestDesktopDXFExportConnectsActiveLayerToExporter(t *testing.T) {
 	}
 }
 
+func TestDesktopDXFExportKeepsAllOverlappingLabels(t *testing.T) {
+	layer := core.Layer{
+		Name: "routes", Visible: true, Style: core.DefaultLayerStyle(),
+		Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "free-angle", HeightMM: 2.5},
+		Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 2 0, 2 10)"}, Properties: map[string]any{"name": "one"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 2 0, 2 10)"}, Properties: map[string]any{"name": "two"}},
+		},
+	}
+	runtime, err := buildDataRuntime(context.Background(), []core.Layer{layer}, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
+	if visible := declutterViewportLabelsAtScale(runtime.mapLabels, view, 100000); len(visible) != 1 {
+		t.Fatalf("display labels = %+v, want one after collision removal", visible)
+	}
+	path := filepath.Join(t.TempDir(), "all-labels.dxf")
+	if err := runtime.exportActiveLayerDXF(path, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"\n0\nTEXT\n", "\n1\none\n", "\n1\ntwo\n", "\n50\n90\n"} {
+		if !strings.Contains(string(data), expected) {
+			t.Fatalf("DXF missing %q despite two overlapping source labels", expected)
+		}
+	}
+	if got := strings.Count(string(data), "\n0\nTEXT\n"); got != 2 {
+		t.Fatalf("DXF TEXT count = %d, want both overlapping labels", got)
+	}
+}
+
 func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	style := core.DefaultLayerStyle()
 	updatedStyle := style
@@ -1742,6 +1798,211 @@ func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	t.Fatalf("fill mesh did not become visible after opacity update; expected fill color %#08x", want)
 }
 
+func TestReadOnlyOverviewKeepsAttributesForConfiguredLabels(t *testing.T) {
+	labels := core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}
+	if !readOnlyWindowNeedsProperties(labels, true, false) {
+		t.Fatal("labeled overview must read attributes")
+	}
+	if readOnlyWindowNeedsProperties(core.DefaultLabelSettings(), true, false) {
+		t.Fatal("unlabeled overview should retain geometry-only reads")
+	}
+	if readOnlyWindowNeedsProperties(labels, true, true) {
+		t.Fatal("dissolved polygon boundary has no parcel label anchors")
+	}
+	if !readOnlyWindowNeedsProperties(core.DefaultLabelSettings(), false, false) {
+		t.Fatal("detailed view needs attributes for feature inspection")
+	}
+	layers := []core.Layer{{Name: "parcels", Labels: labels, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))"},
+		Properties: map[string]any{"JIBUN": "54-60 대"},
+	}}}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	if got := layers[0].Features[0].Label; got == nil || got.Text != "54-60 대" {
+		t.Fatalf("overview label = %+v", got)
+	}
+}
+
+func TestReadOnlyOverviewLabelCandidatesStayBounded(t *testing.T) {
+	window := core.Layer{Labels: core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}}
+	for index := 0; index < 100; index++ {
+		window.Features = append(window.Features, core.Feature{ID: uint64(index), Properties: map[string]any{"JIBUN": fmt.Sprint(index)}})
+	}
+	if err := prepareReadOnlyWindowLabels(context.Background(), &window, true); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, feature := range window.Features {
+		if feature.Label != nil {
+			count++
+		}
+	}
+	if count != maxReadOnlyOverviewLabelsPerChunk || window.Features[0].Label.Text != "0" ||
+		window.Features[3].Label.Text != "3" || window.Features[96].Label.Text != "96" {
+		t.Fatalf("overview label candidates: count=%d first=%+v next=%+v last=%+v", count,
+			window.Features[0].Label, window.Features[3].Label, window.Features[96].Label)
+	}
+}
+
+func TestReadOnlyOverviewBuildsLabelsFromSourceAttributes(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "parcels.shp")
+	labels := core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}
+	layer := core.Layer{
+		Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "JIBUN", Type: core.FieldTypeText}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))"},
+			Properties: map[string]any{"JIBUN": "54-60"}}},
+	}
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path, Labels: labels}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(-7), "parcels", render.Point{X: 5, Y: 5})
+	key.ZoomBucket = -7
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys[key] = struct{}{}
+	runtime.mu.Unlock()
+	if _, err := runtime.builder(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	got := append([]render.LayerLabel(nil), runtime.windowLabels[key]...)
+	retained := runtime.windowPayloadBytes[key]
+	runtime.removeWindowChunkLocked(key)
+	released := runtime.windowVisiblePayloadBytes
+	runtime.mu.Unlock()
+	if len(got) == 0 || got[0].Text != "54-60" {
+		t.Fatalf("overview source labels = %+v", got)
+	}
+	if retained == 0 || released != 0 {
+		t.Fatalf("overview label payload accounting: retained=%d released=%d", retained, released)
+	}
+}
+
+func TestReplacedReadOnlyRuntimePublishesWindowLabelsToActiveRuntime(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "parcels.shp")
+	layer := core.Layer{
+		Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "JIBUN", Type: core.FieldTypeText}},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))"},
+			Properties: map[string]any{"JIBUN": "54-60"}}},
+	}
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path, Labels: core.LabelSettings{
+		Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5,
+	}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := newEmptyProjectRuntime()
+	active.replaceWithLoaded(loaded, 0)
+	defer active.closeAttributeSource()
+	active.mu.Lock()
+	if active.cancel != nil {
+		active.cancel()
+	}
+	active.scheduler.AdvanceGeneration()
+	key := chunkKeyForPoint(active.mapExtent, readOnlyWindowChunkSize(-7), "parcels", render.Point{X: 5, Y: 5})
+	key.ZoomBucket = -7
+	active.windowVisibleKeys[key] = struct{}{}
+	active.mu.Unlock()
+	if _, err := active.builder(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	active.mu.Lock()
+	labels := append([]render.LayerLabel(nil), active.mapLabels...)
+	active.mu.Unlock()
+	if len(labels) == 0 || labels[0].Text != "54-60" {
+		t.Fatalf("active runtime labels after build = %+v", labels)
+	}
+	if len(loaded.mapLabels) != 0 {
+		t.Fatalf("temporary runtime retained built labels: %+v", loaded.mapLabels)
+	}
+	active.mu.Lock()
+	active.windowFeatureNames[123] = "active parcel"
+	active.mu.Unlock()
+	feature, err := active.attributeFeatureReader(ctx, "parcels", 123)
+	if err != nil || feature.Properties["name"] != "active parcel" {
+		t.Fatalf("active runtime feature lookup = %+v, %v", feature, err)
+	}
+}
+
+func TestReadOnlySavedWorkspaceLabelsAtSavedView(t *testing.T) {
+	path := os.Getenv("GOGIS_TEST_LABEL_WORKSPACE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_LABEL_WORKSPACE to a local labeled .gogis project")
+	}
+	runtime, err := loadWorkspaceRuntime(context.Background(), path, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.workspaceView == nil {
+		t.Fatal("workspace has no saved view")
+	}
+	view := *runtime.workspaceView
+	bucket := readOnlyWindowZoomBucket(view.Zoom)
+	center := render.Point{
+		X: runtime.mapExtent[0] + view.CenterX*(runtime.mapExtent[2]-runtime.mapExtent[0]),
+		Y: runtime.mapExtent[1] + view.CenterY*(runtime.mapExtent[3]-runtime.mapExtent[1]),
+	}
+	found := false
+	for _, name := range runtime.service.LayerNames() {
+		layer, ok := runtime.service.LayerProperties(name)
+		if !ok || !layer.Labels.Enabled {
+			continue
+		}
+		key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(bucket), name, center)
+		key.ZoomBucket = bucket
+		runtime.mu.Lock()
+		runtime.windowVisibleKeys[key] = struct{}{}
+		runtime.mu.Unlock()
+		if _, err := runtime.builder(context.Background(), key); err != nil {
+			t.Fatalf("build %s saved-view chunk: %v", name, err)
+		}
+		runtime.mu.Lock()
+		labels := append([]render.LayerLabel(nil), runtime.windowLabels[key]...)
+		runtime.mu.Unlock()
+		for _, label := range labels {
+			if label.Text != "" {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no nonempty labels near saved view center %v at zoom %g", center, view.Zoom)
+	}
+	viewport := native.Viewport{Zoom: view.Zoom, Width: 1440, Height: 960, ViewportWidth: 1440, ViewportHeight: 960}
+	viewport.PanX = (0.5 - view.CenterX) * viewport.Width * viewport.Zoom
+	viewport.PanY = (view.CenterY - 0.5) * viewport.Height * viewport.Zoom
+	visible, _ := viewportLayerLabels(append([]render.LayerLabel(nil), runtime.mapLabels...), viewport, maxLayerLabelCount)
+	if len(visible) == 0 {
+		t.Fatalf("generated %d labels but none pass viewport culling at saved center %v zoom %g", len(runtime.mapLabels), center, view.Zoom)
+	}
+	inside := 0
+	for _, label := range visible {
+		x := viewport.ViewportWidth/2 + (label.X-view.CenterX)*viewport.Width*viewport.Zoom
+		y := viewport.ViewportHeight/2 - (label.Y-view.CenterY)*viewport.Height*viewport.Zoom
+		if x >= 0 && x <= viewport.ViewportWidth && y >= 0 && y <= viewport.ViewportHeight {
+			inside++
+		}
+	}
+	if inside == 0 {
+		t.Fatalf("generated %d labels, but none appear within the saved viewport", len(runtime.mapLabels))
+	}
+	t.Logf("saved view labels: generated=%d viewport=%d on-screen=%d decluttered=%d first=%+v", len(runtime.mapLabels), len(visible), inside, len(declutterViewportLabels(visible, viewport)), visible[0])
+}
+
 func TestConfiguredLabelsUseTemplateLuaRuleAndRenderPlacement(t *testing.T) {
 	layers := []core.Layer{{
 		Name: "roads",
@@ -1766,6 +2027,56 @@ func TestConfiguredLabelsUseTemplateLuaRuleAndRenderPlacement(t *testing.T) {
 	label := source.Labels[0]
 	if label.Text != "한강로 12" || label.FeatureID != 7 || label.Rotation != 30 || label.HeightMM != 2.5 || label.MinScale != 1000 || label.MaxScale != 50000 {
 		t.Fatalf("configured label = %#v", label)
+	}
+}
+
+func TestConfiguredLabelOrientationOptions(t *testing.T) {
+	for _, test := range []struct {
+		placement string
+		angle     float64
+		x, y      float64
+	}{
+		{placement: "center", angle: 0},
+		{placement: "vertical", angle: 90},
+		{placement: "free-angle", angle: 90, x: 10, y: 10},
+	} {
+		t.Run(test.placement, func(t *testing.T) {
+			layers := []core.Layer{{
+				Name: "road", Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: test.placement, HeightMM: 2.5},
+				Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 10 0, 10 20)"}, Properties: map[string]any{"name": "main"}}},
+			}}
+			if err := prepareLayerLabels(context.Background(), layers); err != nil {
+				t.Fatal(err)
+			}
+			label := layers[0].Features[0].Label
+			if label == nil || label.Rotation != test.angle {
+				t.Fatalf("prepared label = %+v, want rotation %g", label, test.angle)
+			}
+			if test.placement == "free-angle" && (!label.AnchorSet || label.X != test.x || label.Y != test.y) {
+				t.Fatalf("free-angle anchor = %+v, want longest-segment center", label)
+			}
+			source, err := render.NewLayerSource(layers[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(source.Labels) != 1 || source.Labels[0].Rotation != test.angle {
+				t.Fatalf("render labels = %+v, want rotation %g", source.Labels, test.angle)
+			}
+		})
+	}
+}
+
+func TestFreeAnglePolygonKeepsInteriorAnchor(t *testing.T) {
+	layers := []core.Layer{{
+		Name: "parcel", Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "free-angle", HeightMM: 2.5},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 5 0, 5 20, 0 20, 0 0))"}, Properties: map[string]any{"name": "parcel"}}},
+	}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	label := layers[0].Features[0].Label
+	if label == nil || !label.AnchorSet || label.Rotation != 90 || label.X <= 0 || label.X >= 5 || label.Y <= 0 || label.Y >= 20 {
+		t.Fatalf("polygon label = %+v, want an interior anchor and north-south angle", label)
 	}
 }
 

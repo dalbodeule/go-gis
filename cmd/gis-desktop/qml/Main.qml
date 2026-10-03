@@ -15,6 +15,16 @@ ApplicationWindow {
     minimumHeight: 640
     title: "GoGIS — Milestone B prototype"
     color: "#f4f6f8"
+    onVisibilityChanged: {
+        var requestedState = rootWindow.visibility;
+        Qt.callLater(function() {
+            console.info("GoGIS window-state=" + requestedState +
+                         " current=" + rootWindow.visibility +
+                         " size=" + rootWindow.width + "x" + rootWindow.height +
+                         " map=" + mapViewport.width + "x" + mapViewport.height +
+                         " layers=" + layerModel.count);
+        });
+    }
     property bool vertexEditMode: false
     property string language: typeof appLanguage === "undefined" ? "en" : appLanguage
     property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
@@ -996,6 +1006,7 @@ ApplicationWindow {
                 }
 
                 Repeater {
+                    objectName: "mapLabelRepeater"
                     model: mapLabelModel
                     delegate: Text {
                         z: 2
@@ -1711,6 +1722,7 @@ ApplicationWindow {
         property string displayRuleSource: ""
         property string activeCategory: "general"
         property string targetGeometryType: ""
+        property var labelPlacementValues: ["center", "vertical", "free-angle", "center-rotated"]
         property real previousFillOpacity: 0.35
         property real labelCaptionWidth: Math.min(180, Math.max(120, layerSettingsScroll.availableWidth * 0.25))
         onActiveCategoryChanged: {
@@ -1767,7 +1779,7 @@ ApplicationWindow {
             var labels = layer.labels || ({});
             labelsEnabledField.checked = labels.enabled === true;
             labelExpressionField.text = labels.expression || "";
-            labelPlacementField.currentIndex = Math.max(0, ["center", "center-rotated", "free-angle"].indexOf(labels.placement || "center"));
+            labelPlacementField.currentIndex = Math.max(0, labelPlacementValues.indexOf(labels.placement || "center"));
             labelRotationField.text = labels.rotationField || "";
             labelHeightField.text = String(labels.heightMm || 2.5);
             labelMinScaleField.text = String(labels.minScale || "");
@@ -1808,8 +1820,8 @@ ApplicationWindow {
                     enabled: labelsEnabledField.checked,
                     expression: labelExpressionField.text,
                     luaScript: labelLuaSource,
-                    placement: ["center", "center-rotated", "free-angle"][labelPlacementField.currentIndex],
-                    rotationField: labelRotationField.text,
+                    placement: labelPlacementValues[labelPlacementField.currentIndex],
+                    rotationField: labelPlacementField.currentIndex >= 2 ? labelRotationField.text : "",
                     heightMm: Number(labelHeightField.text),
                     minScale: Number(labelMinScaleField.text || 0),
                     maxScale: Number(labelMaxScaleField.text || 0),
@@ -2115,7 +2127,19 @@ ApplicationWindow {
                             return rootWindow.language === "ko" ? "현재 화면과 축척에서 표시 가능한 레이블 " + availableCount + "개입니다." : rootWindow.language === "jp" ? "現在の表示範囲と縮尺で表示可能なラベルは " + availableCount + " 件です。" : availableCount + " labels are available at the current view and scale.";
                         if (count > 0)
                             return rootWindow.language === "ko" ? "현재 축척이 레이블의 최소/최대 축척 범위 밖입니다. 축척 값을 확인하세요." : rootWindow.language === "jp" ? "現在の縮尺はラベルの最小/最大範囲外です。縮尺設定を確認してください。" : "The current scale is outside the labels' minimum/maximum scale range. Check those limits.";
-                        return rootWindow.language === "ko" ? "현재 화면에 표시할 레이블이 없습니다. 레이블 필드/템플릿과 축척 범위를 확인하거나 피처가 있는 곳으로 확대하세요." : rootWindow.language === "jp" ? "現在表示できるラベルがありません。フィールド、縮尺範囲、表示位置を確認してください。" : "No labels are available in this view. Check the label field/template and scale range, or zoom to the features.";
+                        // Go excludes out-of-scale labels before decluttering, so
+                        // an empty model can still mean a configured scale limit.
+                        for (var scaleIndex = 0; scaleIndex < layerModel.count; ++scaleIndex) {
+                            var scaleRow = layerModel.get(scaleIndex);
+                            if (scaleRow.name !== layerSettingsDialog.targetLayerName)
+                                continue;
+                            var configured = scaleRow.labels || ({});
+                            if ((configured.minScale > 0 && denominator < configured.minScale) ||
+                                    (configured.maxScale > 0 && denominator > configured.maxScale))
+                                return rootWindow.language === "ko" ? "현재 축척이 레이블의 최소/최대 축척 범위 밖입니다. 축척 값을 확인하세요." : rootWindow.language === "jp" ? "現在の縮尺はラベルの最小/最大範囲外です。縮尺設定を確認してください。" : "The current scale is outside the labels' minimum/maximum scale range. Check those limits.";
+                            break;
+                        }
+                        return rootWindow.language === "ko" ? "현재 표시 중인 레이블이 없습니다. 겹침 방지로 생략됐을 수 있으니 확대하거나 레이블 필드·축척 범위를 확인하세요. DXF 내보내기는 이 표시 생략을 적용하지 않습니다." : rootWindow.language === "jp" ? "表示中のラベルはありません。重なり防止で省略された可能性があります。拡大するかフィールド・縮尺範囲を確認してください。DXF出力には表示上の省略を適用しません。" : "No labels are displayed. Zoom in or check the field and scale range; collision removal may hide them. DXF export keeps every eligible label.";
                     }
                 }
                 RowLayout {
@@ -2158,13 +2182,17 @@ ApplicationWindow {
                         id: labelPlacementField
                         objectName: "labelPlacementField"
                         Layout.fillWidth: true
-                        model: [rootWindow.tr("Center"), rootWindow.tr("Center + rotation"), rootWindow.tr("Free angle")]
+                        model: rootWindow.language === "ko" ?
+                                   ["동–서 방향 수평", "남–북 방향 수평", "자유롭게 (가장 긴 선분 각도)", "속성 필드 각도 (기존 설정)"] :
+                               rootWindow.language === "jp" ?
+                                   ["東西方向・水平", "南北方向・垂直", "自由角度（最長線分）", "属性フィールドの角度（従来）"] :
+                                   ["East–west horizontal", "North–south vertical", "Free angle (longest segment)", "Attribute rotation (legacy)"]
                     }
                 }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
-                    visible: layerSettingsDialog.activeCategory === "labels"
+                    visible: layerSettingsDialog.activeCategory === "labels" && (labelPlacementField.currentIndex === 3 || (labelPlacementField.currentIndex === 2 && labelRotationField.text !== ""))
                     Label {
                         text: rootWindow.tr("Rotation field (optional)")
                         Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
@@ -2175,6 +2203,15 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         placeholderText: rootWindow.tr("Rotation field (optional)")
                     }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: "#65717d"
+                    visible: layerSettingsDialog.activeCategory === "labels" && labelPlacementField.currentIndex === 2 && labelRotationField.text !== ""
+                    text: rootWindow.language === "ko" ? "기존 회전 필드가 설정되어 있어 가장 긴 선분 각도보다 우선합니다. 선분 기준 각도를 쓰려면 필드를 지우세요." :
+                          rootWindow.language === "jp" ? "既存の回転フィールドが最長線分の角度より優先されます。線分の角度を使うにはフィールドを消してください。" :
+                          "The existing rotation field overrides the longest-segment angle. Clear it to use geometry-based rotation."
                 }
                 GridLayout {
                     Layout.fillWidth: true
