@@ -185,7 +185,7 @@ coverage boundary를 dissolve한다. 따라서 개요에서도 필지 외곽 전
 줄여 상세 뷰에서 필요 이상의 주변 geometry를 읽지 않는다.
 
 큰 SHP의 반복 공간 조회에는 QIX 공간 인덱스를 사용할 수 있다. 기본 설정은 피처 수
-100,000개 이상인 viewport 기반 읽기 전용 SHP를 OS 임시 디렉터리에 복사한 뒤 QIX를
+10,000개 이상인 viewport 기반 읽기 전용 SHP를 OS 임시 디렉터리에 복사한 뒤 QIX를
 만드는 것이다. 원본 파일은 변경하지 않으며, 복사본은 원본 경로·구성 파일 크기·수정 시각을
 기준으로 재사용한다. SHP와 DBF 등의 복사본만큼 임시 디스크 공간이 더 필요하다. 원본
 폴더에 `.qix`만 생성하려면 `--spatial-index-location=source`를 지정한다. 이 모드는 원본
@@ -193,13 +193,13 @@ coverage boundary를 dissolve한다. 따라서 개요에서도 필지 외곽 전
 없이 원본을 여는 경로로 계속한다.
 
 ```sh
-./build/gogis-desktop-native --spatial-index-threshold=100000 --spatial-index-location=cache
+./build/gogis-desktop-native --spatial-index-threshold=10000 --spatial-index-location=cache
 ./build/gogis-desktop-native --spatial-index-threshold=250000 --spatial-index-location=source
 ```
 
 `--spatial-index-threshold=0` 또는 `--spatial-index-location=off`로 자동 생성을 끌 수 있다.
 동일한 설정은 `GOGIS_SHAPEFILE_INDEX_THRESHOLD`와 `GOGIS_SHAPEFILE_INDEX_LOCATION`
-환경변수로 전달할 수도 있으며, 명령행 값이 환경변수보다 우선한다. 기본값은 `100000`과
+환경변수로 전달할 수도 있으며, 명령행 값이 환경변수보다 우선한다. 기본값은 `10000`과
 `cache`다. 임시 인덱스를 만들려면 GDAL이 사용하는 `.qix`가 SHP와 같은 폴더에 있어야
 하므로 cache 모드는 sidecar만 따로 두지 않고 관련 SHP 구성 파일을 임시 폴더에 복사한다.
 

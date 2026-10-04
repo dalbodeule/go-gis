@@ -1195,9 +1195,14 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	mapExtent, fitExtent := r.mapExtent, r.mapFitExtent
 	r.mu.Unlock()
 	lodBucket := readOnlyOverviewZoomBucket(zoomBucket, mapExtent, fitExtent)
+	windowWorkerLimit := scheduler.MaxWorkers()
+	if viewportReadOnly && lodBucket > 1 && !forceOverview {
+		windowWorkerLimit = min(windowWorkerLimit, maxReadOnlyDetailWorkers)
+	}
 	native.RecordDiagnostic("render", fmt.Sprintf(
-		"request generation=%d layers=%d chunks=%d pruned=%d zoom=%g lod=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
-		requestGeneration, len(visibleLayerNames), len(keys), prunedReadOnlyKeys, viewport.Zoom, lodBucket, forceOverview,
+		"request generation=%d layers=%d chunks=%d pruned=%d zoom=%g lod=%d workers=%d window_limit=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
+		requestGeneration, len(visibleLayerNames), len(keys), prunedReadOnlyKeys, viewport.Zoom, lodBucket,
+		scheduler.MaxWorkers(), windowWorkerLimit, forceOverview,
 		viewport.Center.X, viewport.Center.Y, viewport.ScreenWidth, viewport.ScreenHeight,
 		viewport.CanvasWidth, viewport.CanvasHeight, mapExtent[0], mapExtent[1], mapExtent[2], mapExtent[3],
 		fitExtent[0], fitExtent[1], fitExtent[2], fitExtent[3]))

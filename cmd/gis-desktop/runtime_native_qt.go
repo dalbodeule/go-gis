@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ import (
 
 type readOnlyLayerBinding struct {
 	session      *gdal.AttributeSession
+	windowPool   chan *gdal.AttributeSession
 	sourceName   string
 	layer        core.Layer
 	sourceCRS    string
@@ -109,10 +111,22 @@ func (semaphore *contextSemaphore) acquire(ctx context.Context) (func(), error) 
 }
 
 // Runtime replacement may leave canceled GEOS/native work winding down while
-// the new runtime starts. Share these gates across runtimes: at most four
-// coarse overview windows, and at most two potentially larger detail windows.
-var readOnlyWindowBuildSemaphore = newContextSemaphore(4)
-var readOnlyDetailBuildSemaphore = newContextSemaphore(2)
+// the new runtime starts. Share these gates across runtimes. Windows uses at
+// most half the logical CPUs (capped at eight for native-memory safety); other
+// hosts keep the established four. Detail windows remain limited to two.
+func readOnlyOverviewWorkerLimit() int {
+	return readOnlyOverviewWorkerLimitFor(goruntime.GOOS, goruntime.NumCPU())
+}
+
+func readOnlyOverviewWorkerLimitFor(goos string, logicalCPUs int) int {
+	if goos == "windows" {
+		return min(8, max(1, logicalCPUs/2))
+	}
+	return 4
+}
+
+var readOnlyWindowBuildSemaphore = newContextSemaphore(readOnlyOverviewWorkerLimit())
+var readOnlyDetailBuildSemaphore = newContextSemaphore(maxReadOnlyDetailWorkers)
 
 func loadRuntime(args []string) *demoRuntime {
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
@@ -917,6 +931,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		for _, overview := range selected {
 			indexFeatureCount = max(indexFeatureCount, overview.FeatureCount)
 		}
+		queryPath := source.Path
 		if activeShapefileIndexPolicy.threshold > 0 && activeShapefileIndexPolicy.location != "off" &&
 			indexFeatureCount >= activeShapefileIndexPolicy.threshold && strings.EqualFold(filepath.Ext(source.Path), ".shp") {
 			previousSession := session
@@ -928,6 +943,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				}
 				session = indexedSession
 				sessions[len(sessions)-1] = indexedSession
+				queryPath = indexedPath
 			}
 			if indexErr != nil {
 				if ctx.Err() != nil {
@@ -941,6 +957,38 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			} else {
 				native.RecordDiagnostic("spatial-index", fmt.Sprintf(
 					"using QIX index for %s (%d features); data source: %s", source.Path, indexFeatureCount, indexedPath))
+			}
+		}
+		// AttributeSession serializes reads on its retained GDAL dataset. Give
+		// indexed, dense SHP windows independent read-only datasets so the
+		// overview workers can query concurrently. Keep the
+		// original session for attribute pages and fall back to it if any clone
+		// cannot be opened. Every clone is closed with the runtime.
+		var windowPool chan *gdal.AttributeSession
+		if goruntime.GOOS == "windows" && indexFeatureCount >= 100_000 && strings.EqualFold(filepath.Ext(queryPath), ".shp") &&
+			gdal.HasShapefileSpatialIndex(queryPath) {
+			windowReaders := min(4, readOnlyOverviewWorkerLimit())
+			clones := make([]*gdal.AttributeSession, 0, windowReaders)
+			var cloneErr error
+			for range windowReaders {
+				var clone *gdal.AttributeSession
+				clone, cloneErr = gdal.OpenAttributeSession(queryPath, source.Encoding)
+				if cloneErr != nil {
+					break
+				}
+				clones = append(clones, clone)
+			}
+			if cloneErr != nil {
+				for _, clone := range clones {
+					_ = clone.Close()
+				}
+				native.RecordDiagnostic("render", fmt.Sprintf("parallel SHP readers unavailable for %s: %v", source.Path, cloneErr))
+			} else {
+				windowPool = make(chan *gdal.AttributeSession, windowReaders)
+				for _, clone := range clones {
+					windowPool <- clone
+					sessions = append(sessions, clone)
+				}
 			}
 		}
 		for _, overview := range selected {
@@ -1001,7 +1049,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			layer = layer.WithDefaultPresentation()
 			layers = append(layers, layer)
 			bindings[layer.Name] = readOnlyLayerBinding{
-				session: session, sourceName: overview.Name, layer: layer,
+				session: session, windowPool: windowPool, sourceName: overview.Name, layer: layer,
 				sourceCRS: sourceCRS, featureCount: overview.FeatureCount,
 			}
 			layerBounds[layer.Name] = targetBounds
@@ -1041,8 +1089,8 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	}
 	// Each window can spend its entire decoded-payload budget and run GEOS
 	// triangulation. The shared gates keep detail builds at two even when the
-	// scheduler uses four workers for smaller, city-scale overview windows.
-	runtime.scheduler = render.NewSchedulerWithMaxWorkers(4)
+	// scheduler uses more workers for smaller, city-scale overview windows.
+	runtime.scheduler = render.NewSchedulerWithMaxWorkers(readOnlyOverviewWorkerLimit())
 	runtime.windowHits = make(map[render.ChunkKey][]render.HitFeature)
 	runtime.windowFeatureCounts = make(map[render.ChunkKey]int)
 	runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
@@ -1185,10 +1233,21 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// forced dissolved boundary, which no longer has per-parcel anchors.
 	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview)
 	profileStarted := time.Now()
+	windowSession := binding.session
+	if binding.windowPool != nil {
+		select {
+		case windowSession = <-binding.windowPool:
+		case <-ctx.Done():
+			return render.Chunk{}, ctx.Err()
+		}
+	}
 	window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
-		return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
+		return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
 			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
 	})
+	if binding.windowPool != nil {
+		binding.windowPool <- windowSession
+	}
 	if err != nil {
 		return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
 	}
@@ -1382,9 +1441,10 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			return render.Chunk{}, err
 		}
 	}
-	if denseParcelOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" {
-		fmt.Fprintf(os.Stderr, "GoGIS overview profile: chunk=(%d,%d) features=%d query=%s union=%s simplify=%s fill=%s total=%s vertices=%d\n",
-			key.X, key.Y, queryFeatures, queryElapsed, unionElapsed, simplifyElapsed, fillElapsed,
+	if denseParcelOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" ||
+		!overview && os.Getenv("GOGIS_DETAIL_PROFILE") == "1" {
+		fmt.Fprintf(os.Stderr, "GoGIS window profile: layer=%s chunk=(%d,%d) features=%d query=%s union=%s simplify=%s fill=%s total=%s vertices=%d\n",
+			key.Layer, key.X, key.Y, queryFeatures, queryElapsed, unionElapsed, simplifyElapsed, fillElapsed,
 			time.Since(profileStarted), len(chunk.Vertices))
 	}
 	return chunk, err
@@ -2295,6 +2355,13 @@ func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer
 		if !ok {
 			return fmt.Errorf("render source for polygon layer %q is missing", layer.Name)
 		}
+		// A fully transparent fill contributes nothing to the scene graph.
+		// Preserve the source's outlines and skip GEOS triangulation entirely;
+		// changing opacity rebuilds this presentation source on demand.
+		fillColor := render.ColorForPolygonFill(layer.Style)
+		if fillColor&0xff == 0 {
+			continue
+		}
 		bounds := source.Extent
 		spanX, spanY := bounds[2]-bounds[0], bounds[3]-bounds[1]
 		if spanX <= 0 || spanY <= 0 {
@@ -2306,7 +2373,6 @@ func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer
 			}
 		}
 		fillByCell := make(map[[2]int][]render.Vertex)
-		fillColor := render.ColorForPolygonFill(layer.Style)
 		fillCapacities := estimatePolygonFillCapacities(layer, source, target)
 		estimatedVertices := 0
 		for _, capacity := range fillCapacities {

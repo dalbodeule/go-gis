@@ -9,6 +9,7 @@ import (
 )
 
 const maxReadOnlyOverviewFeatures = 240_000
+const maxReadOnlyDetailWorkers = 2
 
 func readOnlyWindowChunkSize(zoomBucket int) float64 {
 	// Coarse overviews use 1/32 windows. Larger cells at high zoom reduce

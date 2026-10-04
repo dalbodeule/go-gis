@@ -54,11 +54,31 @@ func TestContextSemaphoreHonorsCapacityAndCancellation(t *testing.T) {
 }
 
 func TestReadOnlyWindowBuildConcurrencyKeepsDetailBounded(t *testing.T) {
-	if got := cap(readOnlyWindowBuildSemaphore.permits); got != 4 {
-		t.Fatalf("total read-only build slots=%d, want 4", got)
+	if got := cap(readOnlyWindowBuildSemaphore.permits); got != readOnlyOverviewWorkerLimit() {
+		t.Fatalf("total read-only build slots=%d, want %d", got, readOnlyOverviewWorkerLimit())
 	}
 	if got := cap(readOnlyDetailBuildSemaphore.permits); got != 2 {
 		t.Fatalf("detail build slots=%d, want 2", got)
+	}
+}
+
+func TestReadOnlyOverviewWorkerLimit(t *testing.T) {
+	for _, test := range []struct {
+		goos        string
+		logicalCPUs int
+		want        int
+	}{
+		{"windows", 1, 1},
+		{"windows", 4, 2},
+		{"windows", 12, 6},
+		{"windows", 16, 8},
+		{"windows", 32, 8},
+		{"darwin", 16, 4},
+		{"linux", 16, 4},
+	} {
+		if got := readOnlyOverviewWorkerLimitFor(test.goos, test.logicalCPUs); got != test.want {
+			t.Errorf("worker limit for %s/%d = %d, want %d", test.goos, test.logicalCPUs, got, test.want)
+		}
 	}
 }
 
@@ -499,7 +519,10 @@ func TestDenseReadOnlyOverviewParallelWorkerComparison(t *testing.T) {
 	runtime.planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
 	keys := runtime.planner.VisibleKeys(viewport, name)
 	keys = filterReadOnlyKeysByLayerBounds(keys, runtime.mapExtent, runtime.planner.ChunkSize, runtime.layerBounds)
-	const sampleCount = 128
+	sampleCount := 128
+	if os.Getenv("GOGIS_TEST_OVERVIEW_PARALLEL_FULL") == "1" {
+		sampleCount = len(keys)
+	}
 	if len(keys) < sampleCount {
 		t.Fatalf("need %d overview windows, got %d", sampleCount, len(keys))
 	}
@@ -555,12 +578,207 @@ func TestDenseReadOnlyOverviewParallelWorkerComparison(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstVertices != secondVertices || firstNonempty != secondNonempty {
-		t.Fatalf("2/4 workers changed overview result: vertices=%d/%d nonempty=%d/%d",
-			firstVertices, secondVertices, firstNonempty, secondNonempty)
+	halfWorkers := max(1, goruntime.NumCPU()/2)
+	halfElapsed, halfVertices, halfNonempty, err := build(halfWorkers)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("indexed overview %d windows (%d nonempty): two workers=%s four workers=%s vertices=%d",
-		len(sampled), firstNonempty, firstElapsed.Round(time.Millisecond), secondElapsed.Round(time.Millisecond), firstVertices)
+	if firstVertices != secondVertices || firstNonempty != secondNonempty ||
+		firstVertices != halfVertices || firstNonempty != halfNonempty {
+		t.Fatalf("2/4/%d workers changed overview result: vertices=%d/%d/%d nonempty=%d/%d/%d",
+			halfWorkers, firstVertices, secondVertices, halfVertices, firstNonempty, secondNonempty, halfNonempty)
+	}
+	t.Logf("indexed overview %d windows (%d nonempty): two workers=%s four workers=%s half cores (%d workers)=%s vertices=%d",
+		len(sampled), firstNonempty, firstElapsed.Round(time.Millisecond), secondElapsed.Round(time.Millisecond),
+		halfWorkers, halfElapsed.Round(time.Millisecond), firstVertices)
+}
+
+func TestDenseReadOnlyWindowQuerySessionComparison(t *testing.T) {
+	if goruntime.GOOS != "windows" {
+		t.Skip("parallel indexed SHP window readers are enabled on Windows")
+	}
+	if os.Getenv("GOGIS_TEST_QUERY_SESSIONS") != "1" {
+		t.Skip("set GOGIS_TEST_QUERY_SESSIONS=1 with GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	}
+	path := os.Getenv("GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DENSE_POLYGON_SOURCE to an indexed large polygon SHP")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	readerCount := min(4, readOnlyOverviewWorkerLimit())
+	if pool := runtime.readOnlyBindings[name].windowPool; pool == nil || cap(pool) != readerCount || len(pool) != readerCount {
+		t.Fatalf("indexed dense SHP window pool = %v; want %d ready readers", pool, readerCount)
+	}
+	viewport := render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 0.9,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 509, CanvasHeight: 726}
+	chunkSize := readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	runtime.planner.ChunkSize = chunkSize
+	keys := filterReadOnlyKeysByLayerBounds(runtime.planner.VisibleKeys(viewport, name),
+		runtime.mapExtent, chunkSize, runtime.layerBounds)
+	const sampleCount = 128
+	if len(keys) < sampleCount {
+		t.Fatalf("need %d windows, got %d", sampleCount, len(keys))
+	}
+	sampled := make([]render.ChunkKey, 0, sampleCount)
+	for index := 0; index < sampleCount; index++ {
+		sampled = append(sampled, keys[index*len(keys)/sampleCount])
+	}
+	const parallelSessions = 4
+	sessions := make([]*gdal.AttributeSession, parallelSessions)
+	for index := range sessions {
+		sessions[index], err = gdal.OpenAttributeSession(path, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sessions[index].Close()
+	}
+	query := func(workers int) (time.Duration, int, error) {
+		jobs := make(chan render.ChunkKey, len(sampled))
+		for _, key := range sampled {
+			jobs <- key
+		}
+		close(jobs)
+		type result struct {
+			count int
+			err   error
+		}
+		results := make(chan result, len(sampled))
+		var group sync.WaitGroup
+		started := time.Now()
+		for worker := 0; worker < workers; worker++ {
+			group.Add(1)
+			go func(session *gdal.AttributeSession) {
+				defer group.Done()
+				for key := range jobs {
+					bounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
+					if !ok {
+						results <- result{}
+						continue
+					}
+					layer, queryErr := session.OpenWindowWithLimits(ctx, runtime.readOnlyBindings[name].sourceName,
+						bounds, false, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+					results <- result{len(layer.Features), queryErr}
+				}
+			}(sessions[worker])
+		}
+		group.Wait()
+		close(results)
+		count := 0
+		for item := range results {
+			if item.err != nil {
+				return 0, 0, item.err
+			}
+			count += item.count
+		}
+		return time.Since(started), count, nil
+	}
+	oneElapsed, oneCount, err := query(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourElapsed, fourCount, err := query(parallelSessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oneCount != fourCount {
+		t.Fatalf("one/four GDAL sessions returned %d/%d features", oneCount, fourCount)
+	}
+	t.Logf("indexed query %d windows: one session=%s four sessions=%s features=%d",
+		len(sampled), oneElapsed.Round(time.Millisecond), fourElapsed.Round(time.Millisecond), oneCount)
+}
+
+func TestReadOnlyDetailWorkspaceTransparentFillRealSource(t *testing.T) {
+	path := os.Getenv("GOGIS_TEST_DETAIL_WORKSPACE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DETAIL_WORKSPACE to a local multi-layer workspace")
+	}
+	previousIndexPolicy := activeShapefileIndexPolicy
+	configureShapefileIndexPolicy(nil)
+	defer func() { activeShapefileIndexPolicy = previousIndexPolicy }()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+	runtime, err := loadWorkspaceRuntime(ctx, path, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.workspaceView == nil {
+		t.Fatal("workspace has no saved viewport")
+	}
+	view := runtime.workspaceView
+	viewport := render.Viewport{
+		Center: render.Point{X: view.CenterX, Y: view.CenterY}, Zoom: view.Zoom,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 1166, CanvasHeight: 234,
+	}
+	if lod := readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom),
+		runtime.mapExtent, runtime.mapFitExtent); lod <= 1 {
+		t.Fatalf("workspace viewport semantic LOD=%d, want detail", lod)
+	}
+	planner := runtime.planner
+	planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	keys := make([]render.ChunkKey, 0)
+	for _, name := range runtime.service.LayerNames() {
+		if runtime.visibility.IsVisible(name) {
+			keys = append(keys, planner.VisibleKeys(viewport, name)...)
+		}
+	}
+	keys = filterReadOnlyKeysByLayerBounds(keys, runtime.mapExtent, planner.ChunkSize, runtime.layerBounds)
+	if len(keys) == 0 {
+		t.Fatal("saved viewport planned no detail windows")
+	}
+	if requested := os.Getenv("GOGIS_TEST_DETAIL_WINDOW_LIMIT"); requested != "" {
+		limit, parseErr := strconv.Atoi(requested)
+		if parseErr != nil || limit < 1 {
+			t.Fatalf("invalid GOGIS_TEST_DETAIL_WINDOW_LIMIT %q", requested)
+		}
+		if limit < len(keys) {
+			selected := make([]render.ChunkKey, 0, limit)
+			for index := range limit {
+				selected = append(selected, keys[index*len(keys)/limit])
+			}
+			keys = selected
+		}
+	}
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{}, len(keys))
+	for _, key := range keys {
+		runtime.windowVisibleKeys[key] = struct{}{}
+	}
+	runtime.mu.Unlock()
+	started := time.Now()
+	vertices, zeroAlphaFills, completed := 0, 0, 0
+	fillByLayer := make(map[string]int)
+	for result := range runtime.scheduler.RequestUnique(ctx, keys, runtime.builder) {
+		completed++
+		if result.Err != nil {
+			t.Fatalf("build detail window %v: %v", result.Key, result.Err)
+		}
+		vertices += len(result.Chunk.Vertices)
+		for _, vertex := range result.Chunk.Vertices {
+			if vertex.Kind == render.VertexFill {
+				fillByLayer[result.Key.Layer]++
+				if vertex.Color&0xff == 0 {
+					zeroAlphaFills++
+				}
+			}
+		}
+	}
+	t.Logf("detail workspace windows=%d completed=%d vertices=%d fills=%v zero_alpha_fills=%d elapsed=%s workers=%d detail_limit=%d",
+		len(keys), completed, vertices, fillByLayer, zeroAlphaFills, time.Since(started).Round(time.Millisecond),
+		runtime.scheduler.MaxWorkers(), cap(readOnlyDetailBuildSemaphore.permits))
+	if err := ctx.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if vertices == 0 || zeroAlphaFills != 0 {
+		t.Fatalf("detail workspace vertices=%d zero-alpha fills=%d", vertices, zeroAlphaFills)
+	}
 }
 
 func TestDenseReadOnlyParcelOutlineFeasibility(t *testing.T) {
@@ -2380,6 +2598,22 @@ func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	before, err := runtime.builder(context.Background(), render.ChunkKey{Layer: "areas", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeOutlines := 0
+	for _, vertex := range before.Vertices {
+		if vertex.Kind == render.VertexFill {
+			t.Fatal("fully transparent polygon generated an invisible fill mesh")
+		}
+		if vertex.Kind == render.VertexLine {
+			beforeOutlines++
+		}
+	}
+	if beforeOutlines == 0 {
+		t.Fatal("transparent polygon lost its visible outline")
+	}
 	updated := style
 	updated.FillOpacity = 0.6
 	payload, err := json.Marshal(layerSettingsRequest{
@@ -2469,8 +2703,8 @@ func TestReadOnlyPolygonFillOpacityChangeUpdatesWindowBuilder(t *testing.T) {
 	}
 	beforeFills, beforeZeroAlpha := countFills(before)
 	afterFills, afterZeroAlpha := countFills(after)
-	if beforeFills == 0 || beforeZeroAlpha != beforeFills || afterFills == 0 || afterZeroAlpha != 0 {
-		t.Fatalf("read-only fill alpha before=%d/%d after=%d/%d; expected visible fill after style update",
+	if beforeFills != 0 || beforeZeroAlpha != 0 || afterFills == 0 || afterZeroAlpha != 0 {
+		t.Fatalf("read-only fill alpha before=%d/%d after=%d/%d; expected no invisible mesh before and visible fill after style update",
 			beforeZeroAlpha, beforeFills, afterZeroAlpha, afterFills)
 	}
 	if got := runtime.readOnlyBindings[name].layer.Style.FillOpacity; got != updated.FillOpacity {
@@ -3204,8 +3438,8 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 	if !runtime.viewportReadOnly || len(runtime.features) != 0 {
 		t.Fatalf("large source runtime viewport=%t initial hits=%d", runtime.viewportReadOnly, len(runtime.features))
 	}
-	if workers := runtime.scheduler.MaxWorkers(); workers != 4 {
-		t.Fatalf("read-only render workers = %d, want bounded concurrency of 4", workers)
+	if workers := runtime.scheduler.MaxWorkers(); workers != readOnlyOverviewWorkerLimit() {
+		t.Fatalf("read-only render workers = %d, want bounded concurrency of %d", workers, readOnlyOverviewWorkerLimit())
 	}
 	names := runtime.service.LayerNames()
 	readableChunks := make(map[string]int, len(names))

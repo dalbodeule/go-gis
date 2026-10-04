@@ -339,3 +339,78 @@ these are not equivalent live UI timings. A separate four-worker builder
 experiment took about 13 s, but did not retain the viewport batch. Windows
 scene-graph memory, visual contrast, and end-to-end startup latency still
 require a live check before claiming the regression is fully resolved.
+
+## Follow-up: parallel indexed SHP readers and Windows workers (2026-10-05)
+
+The hybrid overview restored equivalent detail on both systems: the same
+208,015-feature Sejong SHP produced 6,496,211 vertices on Windows and
+6,496,207 on macOS, including an identical 5,954,265 fill vertices. Windows
+still took 12.525 s to build its live 1,024-window frame versus 3.470 s on
+macOS. Sequential Windows stage profiling over 600 nonempty windows assigned
+9.376 s to GDAL queries, 2.488 s to simplification, and 9.341 s to fill
+generation. These stage sums are sequential CPU work, not live wall time.
+
+`AttributeSession.OpenWindowWithLimits` locks its retained GDAL dataset for
+the whole query, so the four overview workers previously serialized spatial
+reads for each layer. On Windows, for indexed SHP layers with at least 100,000 features,
+open up to four additional read-only GDAL sessions on the actual indexed path
+and circulate them through a cancellation-aware window-query pool. Keep the
+original session for attribute reads. Each clone has its own dataset and
+internal lock; it is returned to the pool immediately after the window query,
+and all clones close with the runtime. If any clone cannot open, close the
+partial pool and use the original session. This changes neither source files
+nor geometry, CRS, encoding, or exports. macOS, Linux, and other formats retain
+their existing single-session behavior.
+
+On Windows, cap the overview scheduler and cross-runtime build gate at
+`min(8, max(1, logical CPUs / 2))`; retain the two-window detail gate. macOS
+and Linux keep four overview workers. The read pool remains capped at four
+datasets even with more builders, bounding extra GDAL handles and native
+memory. On this 12-logical-CPU Windows host, four independent query sessions
+read 128 sampled indexed windows in 0.539 s versus 1.319 s through one
+session, with the same 30,713 returned features. The full 1,024-window
+builder comparison returned the same 6,496,211 vertices with two/four/six
+workers in 12.247/7.339/5.794 s. These are CPU-side test timings without
+Qt publication or scene-graph expansion; final live UI and working-set
+measurements remain necessary before claiming the cross-platform latency
+gap is closed. Higher-core Windows machines may use eight builders and need
+separate memory validation.
+
+## Follow-up: avoid invisible detail fill work (2026-10-05)
+
+The three-layer Windows detail view at semantic LOD 5 took 48.931 s to
+complete 135 windows. Its scheduler was configured for six workers on a
+12-logical-CPU host, but detailed read-only windows were still gated at two
+concurrent builds to bound decoded geometry and GEOS memory. The render log
+did not expose this distinction. Report both `workers` and `window_limit` in
+each request so a future trace makes the active window limit clear.
+
+The same frame generated 682,491 cadastral fill vertices with zero alpha.
+Those triangles are invisible yet require fill-capacity estimation, GEOS
+triangulation, clipping, and scene-graph transfer. Skip fill generation when
+the effective fill color alpha is zero. Keep outline generation and source
+geometry unchanged. A later opacity/style change rebuilds the fill mesh,
+which is covered by materialized and read-only regression tests. The change
+applies only to a fully invisible fill, not the user's partially transparent
+fill settings. The exact three-layer Windows improvement remains to be
+measured in the live app before claiming a speedup.
+
+The user-provided three-layer `TEST.gogis` exposed a larger detail-view
+bottleneck. With the app's former 100,000-feature QIX threshold, the 208,015
+parcel SHP was indexed but the 77,352-feature building SHP and 11,971-feature
+survey-point SHP were not. Stage profiling showed building queries taking
+roughly 1-2 s per window while fill generation took milliseconds. On 24
+representative detail windows, the CPU-side build took 9.142 s after invisible
+fills were omitted. Applying the existing cache-mode QIX policy at 10,000
+features indexed all three sources and reduced that same 24-window build to
+0.211 s with the same 100,240 vertices and zero invisible fills. Lower the
+default viewport-read-only SHP index threshold to 10,000; preserve CLI and
+environment overrides. First use may copy SHP components and create the
+temporary index, adding startup time and disk use; subsequent opens reuse the
+fingerprinted cache. This test does not include Qt scene-graph publication,
+and the full three-layer live timing still requires validation.
+With the new default and the reused QIX caches, all 135 detail windows in the
+same workspace completed CPU-side in 1.883 s, producing 759,607 vertices,
+including the unchanged 132,429 visible building-fill vertices and no
+zero-alpha fill vertices. The previous live 48.931 s included Qt publication,
+so it is not a like-for-like speedup ratio; a new live run remains necessary.
