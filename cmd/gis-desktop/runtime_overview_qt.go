@@ -2,7 +2,11 @@
 
 package main
 
-import "math"
+import (
+	"math"
+
+	"gogis/internal/render"
+)
 
 const maxReadOnlyOverviewFeatures = 240_000
 
@@ -14,7 +18,10 @@ func readOnlyWindowChunkSize(zoomBucket int) float64 {
 		return math.Max(0.0078125, math.Ldexp(0.03125, -max(0, zoomBucket)))
 	}
 	if zoomBucket >= 7 {
-		return math.Ldexp(0.0078125, -(zoomBucket - 5))
+		// The extra high-zoom plateau bounds GDAL window-query overhead when
+		// distant point outliers make the normalized data extent much larger
+		// than the parcel area. Subdivision still caps dense individual windows.
+		return math.Ldexp(0.0078125, -max(2, zoomBucket-6))
 	}
 	return math.Ldexp(0.0078125, -(zoomBucket - 4))
 }
@@ -74,4 +81,37 @@ func readOnlyOverviewStrideForFeatureCount(zoomBucket, featureCount int) int {
 		featureStride++
 	}
 	return max(stride, featureStride)
+}
+
+// A read-only source has a known extent before its geometry is loaded. Avoid
+// scheduling GDAL queries for tiles that cannot contain any of that layer's
+// features, while keeping layers with missing/invalid metadata fail-open.
+func filterReadOnlyKeysByLayerBounds(keys []render.ChunkKey, extent [4]float64, size float64,
+	layerBounds map[string][4]float64) []render.ChunkKey {
+	if size <= 0 || extent[0] >= extent[2] || extent[1] >= extent[3] {
+		return keys
+	}
+	spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
+	retained := keys[:0]
+	for _, key := range keys {
+		bounds, known := layerBounds[key.Layer]
+		if !known || bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+			retained = append(retained, key)
+			continue
+		}
+		x0, y0 := math.Max(0, float64(key.X)*size), math.Max(0, float64(key.Y)*size)
+		x1, y1 := math.Min(1, float64(key.X+1)*size), math.Min(1, float64(key.Y+1)*size)
+		if x0 >= x1 || y0 >= y1 {
+			continue
+		}
+		world := [4]float64{
+			extent[0] + x0*spanX, extent[1] + y0*spanY,
+			extent[0] + x1*spanX, extent[1] + y1*spanY,
+		}
+		if world[0] <= bounds[2] && world[2] >= bounds[0] &&
+			world[1] <= bounds[3] && world[3] >= bounds[1] {
+			retained = append(retained, key)
+		}
+	}
+	return retained
 }

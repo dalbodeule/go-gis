@@ -1012,6 +1012,13 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	planner := r.planner
 	visibility := r.visibility
 	viewportReadOnly := r.viewportReadOnly
+	mapExtentForKeys := r.mapExtent
+	layerBoundsForKeys := make(map[string][4]float64, len(r.layerBounds))
+	if viewportReadOnly {
+		for name, bounds := range r.layerBounds {
+			layerBoundsForKeys[name] = bounds
+		}
+	}
 	forceOverview := r.forceOverviewNext
 	r.forceOverviewNext = false
 	visibleLayerNames := visibility.VisibleLayers()
@@ -1045,6 +1052,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	keyBuffer := scheduler.AcquireChunkKeyBuffer(0)
 	keys := keyBuffer.Keys
 	chunkPlanExceeded := false
+	prunedReadOnlyKeys := 0
 	for _, layer := range visibleLayerNames {
 		var withinLimit bool
 		keys, withinLimit = planner.VisibleKeysIntoLimit(keys, viewport, layer, render.MaxViewportChunkKeys)
@@ -1052,6 +1060,11 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			chunkPlanExceeded = true
 			break
 		}
+	}
+	if viewportReadOnly && !chunkPlanExceeded {
+		planned := len(keys)
+		keys = filterReadOnlyKeysByLayerBounds(keys, mapExtentForKeys, planner.ChunkSize, layerBoundsForKeys)
+		prunedReadOnlyKeys = planned - len(keys)
 	}
 	keyBuffer.Keys = keys
 	if chunkPlanExceeded {
@@ -1074,6 +1087,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				hiddenKeys = nil
 				break
 			}
+		}
+		if viewportReadOnly {
+			hiddenKeys = filterReadOnlyKeysByLayerBounds(hiddenKeys, mapExtentForKeys, planner.ChunkSize, layerBoundsForKeys)
 		}
 	}
 	// Preserve current-view chunks for visible layers and a small cache for
@@ -1180,8 +1196,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	r.mu.Unlock()
 	lodBucket := readOnlyOverviewZoomBucket(zoomBucket, mapExtent, fitExtent)
 	native.RecordDiagnostic("render", fmt.Sprintf(
-		"request generation=%d layers=%d chunks=%d zoom=%g lod=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
-		requestGeneration, len(visibleLayerNames), len(keys), viewport.Zoom, lodBucket, forceOverview,
+		"request generation=%d layers=%d chunks=%d pruned=%d zoom=%g lod=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
+		requestGeneration, len(visibleLayerNames), len(keys), prunedReadOnlyKeys, viewport.Zoom, lodBucket, forceOverview,
 		viewport.Center.X, viewport.Center.Y, viewport.ScreenWidth, viewport.ScreenHeight,
 		viewport.CanvasWidth, viewport.CanvasHeight, mapExtent[0], mapExtent[1], mapExtent[2], mapExtent[3],
 		fitExtent[0], fitExtent[1], fitExtent[2], fitExtent[3]))
@@ -1192,6 +1208,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		completed := 0
 		renderedVertices := 0
 		nonemptyChunks := 0
+		fillVerticesByLayer := make(map[string]int, len(visibleLayerNames))
+		zeroAlphaFillVertices := 0
 		centerVertices := 0
 		validVertices := 0
 		var occupiedCells [16 * 16]bool
@@ -1277,7 +1295,14 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			if len(result.Chunk.Vertices) > 0 {
 				nonemptyChunks++
 			}
+			chunkFillVertices := 0
 			for _, vertex := range result.Chunk.Vertices {
+				if vertex.Kind == render.VertexFill {
+					chunkFillVertices++
+					if vertex.Color&0xff == 0 {
+						zeroAlphaFillVertices++
+					}
+				}
 				if math.IsNaN(float64(vertex.X)) || math.IsInf(float64(vertex.X), 0) ||
 					math.IsNaN(float64(vertex.Y)) || math.IsInf(float64(vertex.Y), 0) {
 					continue
@@ -1295,6 +1320,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 					yCell := min(15, int(vertex.Y*16))
 					occupiedCells[yCell*16+xCell] = true
 				}
+			}
+			if chunkFillVertices > 0 {
+				fillVerticesByLayer[result.Key.Layer] += chunkFillVertices
 			}
 			dirty = true
 			if time.Since(lastPublish) >= progressivePublishInterval {
@@ -1363,10 +1391,11 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 					occupiedCount++
 				}
 			}
+			fillSummary, _ := json.Marshal(fillVerticesByLayer)
 			native.RecordDiagnostic("render", fmt.Sprintf(
-				"ready generation=%d chunks=%d nonempty=%d vertices=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
-				requestGeneration, completed, nonemptyChunks, renderedVertices, vertexMinX, vertexMinY, vertexMaxX, vertexMaxY,
-				centerVertices, validVertices, occupiedCount,
+				"ready generation=%d chunks=%d nonempty=%d vertices=%d fill_vertices_by_layer=%s zero_alpha_fills=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
+				requestGeneration, completed, nonemptyChunks, renderedVertices, string(fillSummary), zeroAlphaFillVertices,
+				vertexMinX, vertexMinY, vertexMaxX, vertexMaxY, centerVertices, validVertices, occupiedCount,
 				time.Since(renderStartedAt).Milliseconds(),
 				stats.CacheHits-renderStatsBefore.CacheHits, stats.ChunksBuilt-renderStatsBefore.ChunksBuilt,
 			))
@@ -2091,19 +2120,31 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	runtime.layerStyles[request.Name] = updated.Style
 	styleMu.Unlock()
 	presentationChanged := labelsChanged || displayRuleChanged
-	if presentationChanged && hasReadOnlyWindow {
+	if (styleChanged || presentationChanged) && hasReadOnlyWindow {
 		runtime.mu.Lock()
 		binding, exists := runtime.readOnlyBindings[request.Name]
 		if exists {
+			binding.layer.Style = updated.Style
 			binding.layer.Labels = updated.Labels
 			binding.layer.DisplayRule = updated.DisplayRule
 			runtime.readOnlyBindings[request.Name] = binding
-			for key := range runtime.windowVisibleKeys {
-				if key.Layer == request.Name {
-					runtime.removeWindowChunkLocked(key)
+			for index := range runtime.readOnlySources {
+				source := &runtime.readOnlySources[index]
+				if source.Name == request.Name || (source.Name == "" && source.Path == current.SourcePath &&
+					(source.LayerName == "" || source.LayerName == current.SourceLayerName)) {
+					source.Style = updated.Style
+					source.Labels = updated.Labels
+					source.DisplayRule = updated.DisplayRule
 				}
 			}
-			runtime.rebuildWindowFeaturesLocked()
+			if presentationChanged {
+				for key := range runtime.windowVisibleKeys {
+					if key.Layer == request.Name {
+						runtime.removeWindowChunkLocked(key)
+					}
+				}
+				runtime.rebuildWindowFeaturesLocked()
+			}
 		}
 		runtime.mu.Unlock()
 	}

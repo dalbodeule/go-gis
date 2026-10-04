@@ -109,9 +109,10 @@ func (semaphore *contextSemaphore) acquire(ctx context.Context) (func(), error) 
 }
 
 // Runtime replacement may leave canceled GEOS/native work winding down while
-// the new runtime starts. Share this gate across runtimes so their per-runtime
-// worker limits cannot multiply the large temporary window allocations.
-var readOnlyWindowBuildSemaphore = newContextSemaphore(2)
+// the new runtime starts. Share these gates across runtimes: at most four
+// coarse overview windows, and at most two potentially larger detail windows.
+var readOnlyWindowBuildSemaphore = newContextSemaphore(4)
+var readOnlyDetailBuildSemaphore = newContextSemaphore(2)
 
 func loadRuntime(args []string) *demoRuntime {
 	input, layerName, sourceCRS, targetCRS := desktopInputArgs(args)
@@ -1039,9 +1040,9 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		runtime.mapFitExtent = extent
 	}
 	// Each window can spend its entire decoded-payload budget and run GEOS
-	// triangulation. Limit concurrency so per-window temporary allocations do
-	// not multiply across the scheduler's normal worker pool.
-	runtime.scheduler = render.NewSchedulerWithMaxWorkers(2)
+	// triangulation. The shared gates keep detail builds at two even when the
+	// scheduler uses four workers for smaller, city-scale overview windows.
+	runtime.scheduler = render.NewSchedulerWithMaxWorkers(4)
 	runtime.windowHits = make(map[render.ChunkKey][]render.HitFeature)
 	runtime.windowFeatureCounts = make(map[render.ChunkKey]int)
 	runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
@@ -1137,6 +1138,16 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	if visibleWindow && visiblePayloadBytes >= maxReadOnlyVisibleBytes {
 		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
 	}
+	lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
+	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
+	overview := lodBucket <= 1 || forceOverview
+	if !overview {
+		releaseDetailSlot, detailErr := readOnlyDetailBuildSemaphore.acquire(ctx)
+		if detailErr != nil {
+			return render.Chunk{}, detailErr
+		}
+		defer releaseDetailSlot()
+	}
 	releaseWindowSlot, err := readOnlyWindowBuildSemaphore.acquire(ctx)
 	if err != nil {
 		return render.Chunk{}, err
@@ -1145,7 +1156,6 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// Properties are needed for label expressions and for the selected
 	// feature's display name. The layer snapshot is chunk-scoped and dropped
 	// after vertex generation; the runtime retains only the small name map.
-	lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
 	chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
 	queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
 	if !ok {
@@ -1159,13 +1169,11 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 	}
 	overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
-	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
-	overview := lodBucket <= 1 || forceOverview
 	// At municipality scale, most cadastral polygons are smaller than a
 	// physical pixel. Merge dense coverage into a filled polygon so the map
 	// remains visible; individual parcel edges return when zoomed in.
-	filledCoverageOverview := lodBucket <= 0 && binding.featureCount >= 100_000 &&
-		isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name]) && !forceOverview
+	filledCoverageOverview := useFilledCoverageOverview(lodBucket, binding.featureCount,
+		runtime.layerGeometryTypes[binding.layer.Name], forceOverview)
 	polygonOverview := (forceOverview || filledCoverageOverview) &&
 		isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
 	if polygonOverview {
@@ -1373,6 +1381,55 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			time.Since(profileStarted), len(chunk.Vertices))
 	}
 	return chunk, err
+}
+
+func useFilledCoverageOverview(lodBucket, featureCount int, geometryType string, forceOverview bool) bool {
+	return lodBucket <= 1 && featureCount >= 100_000 &&
+		isPolygonOverviewLayer(geometryType) && !forceOverview
+}
+
+// selectVisibleParcelOutlines keeps boundaries of parcels large enough to
+// resolve at this display LOD. Every polygon is still eligible for fill; this
+// only limits transient outline vertices in the city-scale scene graph.
+func selectVisibleParcelOutlines(ctx context.Context, layer core.Layer, normalized []render.HitFeature,
+	extent [4]float64, tolerance float64) (core.Layer, error) {
+	if len(normalized) != len(layer.Features) {
+		return core.Layer{}, fmt.Errorf("parcel outline source has %d features for %d geometries", len(normalized), len(layer.Features))
+	}
+	spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
+	if spanX <= 0 || spanY <= 0 || math.IsNaN(tolerance) || math.IsInf(tolerance, 0) {
+		return core.Layer{}, fmt.Errorf("invalid parcel outline selection extent or tolerance")
+	}
+	result := layer
+	result.Features = make([]core.Feature, 0, len(layer.Features)/4)
+	minimumSide := 5 * tolerance
+	minimumArea := 100 * tolerance * tolerance
+	for index, feature := range layer.Features {
+		if index%64 == 0 {
+			if err := ctx.Err(); err != nil {
+				return core.Layer{}, err
+			}
+		}
+		if feature.Geometry == nil || !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+			result.Features = append(result.Features, feature)
+			continue
+		}
+		points := normalized[index].Vertices
+		if len(points) == 0 {
+			continue
+		}
+		minX, minY := math.Inf(1), math.Inf(1)
+		maxX, maxY := math.Inf(-1), math.Inf(-1)
+		for _, point := range points {
+			minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+			maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+		}
+		width, height := (maxX-minX)*spanX, (maxY-minY)*spanY
+		if tolerance <= 0 || (width >= minimumSide && height >= minimumSide && width*height >= minimumArea) {
+			result.Features = append(result.Features, feature)
+		}
+	}
+	return result, nil
 }
 
 func readOnlyWindowNeedsProperties(labels core.LabelSettings, overview, polygonOverview bool) bool {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"gogis/drivers/gdal"
+	geosdriver "gogis/drivers/geos"
 	projdriver "gogis/drivers/proj"
 	"gogis/internal/core"
 	"gogis/internal/render"
@@ -50,6 +51,15 @@ func TestContextSemaphoreHonorsCapacityAndCancellation(t *testing.T) {
 	third()
 	second()
 	second() // release callbacks are idempotent
+}
+
+func TestReadOnlyWindowBuildConcurrencyKeepsDetailBounded(t *testing.T) {
+	if got := cap(readOnlyWindowBuildSemaphore.permits); got != 4 {
+		t.Fatalf("total read-only build slots=%d, want 4", got)
+	}
+	if got := cap(readOnlyDetailBuildSemaphore.permits); got != 2 {
+		t.Fatalf("detail build slots=%d, want 2", got)
+	}
 }
 
 func TestMoveSelectedVertexUpdatesProjectAndRenderSource(t *testing.T) {
@@ -153,7 +163,8 @@ func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
 		bucket int
 		size   float64
 	}{{0.5, -1, 0.03125}, {1, 0, 0.03125}, {2, 1, 0.015625}, {4, 2, 0.0078125}, {16, 4, 0.0078125},
-		{64, 6, 0.001953125}, {128, 7, 0.001953125}, {math.Inf(1), 0, 0.03125}} {
+		{64, 6, 0.001953125}, {128, 7, 0.001953125}, {256, 8, 0.001953125},
+		{512, 9, 0.0009765625}, {math.Inf(1), 0, 0.03125}} {
 		if bucket := readOnlyWindowZoomBucket(test.zoom); bucket != test.bucket {
 			t.Errorf("zoom bucket for %v = %d, want %d", test.zoom, bucket, test.bucket)
 		}
@@ -161,8 +172,66 @@ func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
 			t.Errorf("chunk size for bucket %d = %v, want %v", test.bucket, size, test.size)
 		}
 	}
-	if size := readOnlyWindowChunkSize(100); size != 0.0000002384185791015625 {
-		t.Fatalf("extreme zoom chunk size = %v, want minimum size 1/4194304", size)
+	if size := readOnlyWindowChunkSize(100); size != 0.000000476837158203125 {
+		t.Fatalf("extreme zoom chunk size = %v, want minimum size 1/2097152", size)
+	}
+}
+
+func TestReadOnlyKeyPruningSkipsTilesOutsideLayerExtent(t *testing.T) {
+	extent := [4]float64{211_407.24, 43_257.02, 2_287_874.9, 459_484.82}
+	bounds := map[string][4]float64{
+		"parcels":   {211_407.24, 423_223.66, 236_805.50, 459_484.82},
+		"buildings": {211_761.86, 423_384.00, 236_739.80, 459_353.81},
+		"points":    {212_159.77, 43_257.02, 2_287_874.9, 459_421.8},
+	}
+	viewport := render.Viewport{
+		Center: render.Point{X: 0.010537, Y: 0.956298}, Zoom: 24.684293245689016,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 1166, CanvasHeight: 234,
+	}
+	planner := render.NewChunkPlanner()
+	planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	planner.Domain = [4]float64{0, 0, 1, 1}
+	planner.HasDomain = true
+	var keys []render.ChunkKey
+	for _, name := range []string{"parcels", "buildings", "points"} {
+		keys = planner.VisibleKeysInto(keys, viewport, name)
+	}
+	planned := len(keys)
+	keys = filterReadOnlyKeysByLayerBounds(keys, extent, planner.ChunkSize, bounds)
+	if planned < 200 || len(keys) >= planned-50 {
+		t.Fatalf("outlier-extent key pruning kept %d/%d keys; expected many known-empty polygon tiles to be removed", len(keys), planned)
+	}
+	for _, key := range keys {
+		window, ok := renderChunkBounds(extent, planner.ChunkSize, key)
+		if !ok || window[0] > bounds[key.Layer][2] || window[2] < bounds[key.Layer][0] ||
+			window[1] > bounds[key.Layer][3] || window[3] < bounds[key.Layer][1] {
+			t.Fatalf("kept disjoint key %v with window %v", key, window)
+		}
+	}
+	unknown := []render.ChunkKey{{Layer: "unindexed", X: 0, Y: 0}}
+	if got := filterReadOnlyKeysByLayerBounds(unknown, extent, planner.ChunkSize, bounds); len(got) != 1 {
+		t.Fatal("unknown layer extent must remain fail-open")
+	}
+}
+
+func TestDensePolygonCoverageRemainsFilledAtMunicipalityScale(t *testing.T) {
+	for _, test := range []struct {
+		lod, count int
+		geometry   string
+		forced     bool
+		want       bool
+	}{
+		{lod: 0, count: 208_015, geometry: "Polygon", want: true},
+		{lod: 1, count: 208_015, geometry: "Polygon", want: true},
+		{lod: 2, count: 208_015, geometry: "Polygon"},
+		{lod: 1, count: 99_999, geometry: "Polygon"},
+		{lod: 1, count: 208_015, geometry: "Point"},
+		{lod: 1, count: 208_015, geometry: "Polygon", forced: true},
+	} {
+		if got := useFilledCoverageOverview(test.lod, test.count, test.geometry, test.forced); got != test.want {
+			t.Errorf("filled overview at lod=%d features=%d geometry=%s forced=%t = %t, want %t",
+				test.lod, test.count, test.geometry, test.forced, got, test.want)
+		}
 	}
 }
 
@@ -224,13 +293,24 @@ func TestDenseReadOnlyOverviewRealSourceSamples(t *testing.T) {
 	if runtime.readOnlyBindings[name].featureCount < 100_000 {
 		t.Fatalf("source has too few features for the dense overview: %d", runtime.readOnlyBindings[name].featureCount)
 	}
+	zoom := 0.9
+	if requested := os.Getenv("GOGIS_TEST_OVERVIEW_ZOOM"); requested != "" {
+		parsed, parseErr := strconv.ParseFloat(requested, 64)
+		if parseErr != nil || parsed <= 0 || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			t.Fatalf("invalid GOGIS_TEST_OVERVIEW_ZOOM %q", requested)
+		}
+		zoom = parsed
+	}
 	viewport := render.Viewport{
-		Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 0.9,
+		Center: render.Point{X: 0.5, Y: 0.5}, Zoom: zoom,
 		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 509, CanvasHeight: 726,
 	}
 	planner := runtime.planner
-	planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	rawBucket := readOnlyWindowZoomBucket(viewport.Zoom)
+	semanticLOD := readOnlyOverviewZoomBucket(rawBucket, runtime.mapExtent, runtime.mapFitExtent)
+	planner.ChunkSize = readOnlyWindowChunkSize(rawBucket)
 	keys := planner.VisibleKeys(viewport, name)
+	t.Logf("dense overview viewport zoom=%g raw-bucket=%d semantic-lod=%d", zoom, rawBucket, semanticLOD)
 	started := time.Now()
 	testedChunks, filledChunks, vertices, fillVertices := 0, 0, 0, 0
 	var fillAreaByQuadrant [4]float64
@@ -362,6 +442,258 @@ func TestDenseReadOnlyOverviewRealSourceSamples(t *testing.T) {
 		t.Fatalf("overview coverage is incomplete or exceeds the batch budget: filled_chunks=%d fill_vertices=%d vertices=%d",
 			filledChunks, fillVertices, vertices)
 	}
+}
+
+func TestDenseReadOnlyOverviewParallelWorkerComparison(t *testing.T) {
+	if os.Getenv("GOGIS_TEST_OVERVIEW_PARALLEL") != "1" {
+		t.Skip("set GOGIS_TEST_OVERVIEW_PARALLEL=1 with GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	}
+	path := os.Getenv("GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DENSE_POLYGON_SOURCE to an indexed large polygon SHP")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	if runtime.readOnlyBindings[name].featureCount < 100_000 {
+		t.Fatal("parallel comparison needs a dense polygon source")
+	}
+	viewport := render.Viewport{
+		Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 0.9,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 509, CanvasHeight: 726,
+	}
+	runtime.planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	keys := runtime.planner.VisibleKeys(viewport, name)
+	keys = filterReadOnlyKeysByLayerBounds(keys, runtime.mapExtent, runtime.planner.ChunkSize, runtime.layerBounds)
+	const sampleCount = 128
+	if len(keys) < sampleCount {
+		t.Fatalf("need %d overview windows, got %d", sampleCount, len(keys))
+	}
+	sampled := make([]render.ChunkKey, 0, sampleCount)
+	for index := 0; index < sampleCount; index++ {
+		sampled = append(sampled, keys[index*len(keys)/sampleCount])
+	}
+	previousSemaphore := readOnlyWindowBuildSemaphore
+	defer func() { readOnlyWindowBuildSemaphore = previousSemaphore }()
+	build := func(workers int) (time.Duration, int, int, error) {
+		readOnlyWindowBuildSemaphore = newContextSemaphore(workers)
+		jobs := make(chan render.ChunkKey, len(sampled))
+		for _, key := range sampled {
+			jobs <- key
+		}
+		close(jobs)
+		type result struct {
+			vertices int
+			err      error
+		}
+		results := make(chan result, len(sampled))
+		var group sync.WaitGroup
+		started := time.Now()
+		for range workers {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				for key := range jobs {
+					chunk, buildErr := runtime.builder(ctx, key)
+					results <- result{vertices: len(chunk.Vertices), err: buildErr}
+				}
+			}()
+		}
+		group.Wait()
+		close(results)
+		totalVertices, nonempty := 0, 0
+		for item := range results {
+			if item.err != nil {
+				return 0, 0, 0, item.err
+			}
+			totalVertices += item.vertices
+			if item.vertices > 0 {
+				nonempty++
+			}
+		}
+		return time.Since(started), totalVertices, nonempty, nil
+	}
+	firstElapsed, firstVertices, firstNonempty, err := build(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondElapsed, secondVertices, secondNonempty, err := build(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstVertices != secondVertices || firstNonempty != secondNonempty {
+		t.Fatalf("2/4 workers changed overview result: vertices=%d/%d nonempty=%d/%d",
+			firstVertices, secondVertices, firstNonempty, secondNonempty)
+	}
+	t.Logf("indexed overview %d windows (%d nonempty): two workers=%s four workers=%s vertices=%d",
+		len(sampled), firstNonempty, firstElapsed.Round(time.Millisecond), secondElapsed.Round(time.Millisecond), firstVertices)
+}
+
+func TestDenseReadOnlyParcelOutlineFeasibility(t *testing.T) {
+	if os.Getenv("GOGIS_TEST_PARCEL_OUTLINES") != "1" {
+		t.Skip("set GOGIS_TEST_PARCEL_OUTLINES=1 with GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	}
+	path := os.Getenv("GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DENSE_POLYGON_SOURCE to an indexed large polygon SHP")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	binding := runtime.readOnlyBindings[name]
+	viewport := render.Viewport{
+		Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 0.9,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 509, CanvasHeight: 726,
+	}
+	chunkSize := readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	runtime.planner.ChunkSize = chunkSize
+	keys := runtime.planner.VisibleKeys(viewport, name)
+	keys = filterReadOnlyKeysByLayerBounds(keys, runtime.mapExtent, chunkSize, runtime.layerBounds)
+	const sampleCount = 1024
+	if len(keys) < sampleCount {
+		t.Fatalf("need %d overview windows, got %d", sampleCount, len(keys))
+	}
+	jobs := make(chan render.ChunkKey, sampleCount)
+	for index := 0; index < sampleCount; index++ {
+		jobs <- keys[index*len(keys)/sampleCount]
+	}
+	close(jobs)
+	type result struct {
+		features        int
+		vertices        int
+		fillVertices    int
+		hybridVertices  int
+		outlineFeatures int
+		selected        [3]int
+		outlineHint     [3]int
+		err             error
+	}
+	results := make(chan result, sampleCount)
+	tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, -1)
+	var group sync.WaitGroup
+	started := time.Now()
+	for range 4 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			operator := geosdriver.NewOperator()
+			for key := range jobs {
+				bounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
+				if !ok {
+					results <- result{}
+					continue
+				}
+				window, _, buildErr := openReadOnlyWindowWithSubdivision(ctx, bounds, func(bounds [4]float64) (core.Layer, error) {
+					return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, false,
+						maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+				})
+				if buildErr != nil || len(window.Features) == 0 {
+					results <- result{err: buildErr}
+					continue
+				}
+				features := len(window.Features)
+				window.Name, window.CRS = name, core.CRS{AuthorityCode: binding.sourceCRS}
+				window.Style = binding.layer.Style
+				window, buildErr = operator.SimplifyForDisplay(ctx, window, tolerance)
+				if buildErr != nil {
+					results <- result{err: buildErr}
+					continue
+				}
+				sources, _, buildErr := render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
+					[]core.Layer{window}, runtime.mapExtent, chunkSize, key)
+				if buildErr != nil {
+					results <- result{err: buildErr}
+					continue
+				}
+				var selected, outlineHint [3]int
+				for _, hit := range sources[name].Features {
+					minX, minY := math.Inf(1), math.Inf(1)
+					maxX, maxY := math.Inf(-1), math.Inf(-1)
+					for _, point := range hit.Vertices {
+						minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+						maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+					}
+					pixelWidth := (maxX - minX) * viewport.CanvasWidth * viewport.Zoom
+					pixelHeight := (maxY - minY) * viewport.CanvasHeight * viewport.Zoom
+					for index, minimumArea := range []float64{1, 4, 16} {
+						if pixelWidth >= 1 && pixelHeight >= 1 && pixelWidth*pixelHeight >= minimumArea {
+							selected[index]++
+							outlineHint[index] += 2 * len(hit.Vertices)
+						}
+					}
+				}
+				buildErr = attachPolygonFillGeometryForChunk(ctx, []core.Layer{window}, sources, &key)
+				if buildErr != nil {
+					results <- result{err: buildErr}
+					continue
+				}
+				chunk, buildErr := sources[name].Builder(ctx, key)
+				fillVertices := 0
+				for _, vertex := range chunk.Vertices {
+					if vertex.Kind == render.VertexFill {
+						fillVertices++
+					}
+				}
+				outlineLayer, buildErr := selectVisibleParcelOutlines(ctx, window, sources[name].Features,
+					runtime.mapExtent, tolerance)
+				if buildErr != nil {
+					results <- result{err: buildErr}
+					continue
+				}
+				outlineVertices := 0
+				if len(outlineLayer.Features) > 0 {
+					outlineSources, _, outlineErr := render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
+						[]core.Layer{outlineLayer}, runtime.mapExtent, chunkSize, key)
+					if outlineErr == nil {
+						outline, err := outlineSources[name].Builder(ctx, key)
+						outlineErr = err
+						outlineVertices = len(outline.Vertices)
+					}
+					if outlineErr != nil {
+						results <- result{err: outlineErr}
+						continue
+					}
+				}
+				results <- result{features: features, vertices: len(chunk.Vertices), fillVertices: fillVertices,
+					hybridVertices: fillVertices + outlineVertices, outlineFeatures: len(outlineLayer.Features),
+					selected: selected, outlineHint: outlineHint, err: buildErr}
+			}
+		}()
+	}
+	group.Wait()
+	close(results)
+	features, vertices, fillVertices, hybridVertices, outlineFeatures := 0, 0, 0, 0, 0
+	var selected, outlineHint [3]int
+	for item := range results {
+		if item.err != nil {
+			t.Fatal(item.err)
+		}
+		features += item.features
+		vertices += item.vertices
+		fillVertices += item.fillVertices
+		hybridVertices += item.hybridVertices
+		outlineFeatures += item.outlineFeatures
+		for index := range selected {
+			selected[index] += item.selected[index]
+			outlineHint[index] += item.outlineHint[index]
+		}
+	}
+	t.Logf("simplified parcels %d windows: query_features=%d vertices=%d fill_vertices=%d elapsed=%s tolerance=%g",
+		sampleCount, features, vertices, fillVertices, time.Since(started).Round(time.Millisecond), tolerance)
+	t.Logf("screen-selected parcel outlines: minimum pixel areas 1/4/16 selected=%v outline_vertex_hints=%v",
+		selected, outlineHint)
+	t.Logf("hybrid parcel overview: filled_features=%d outlined_features=%d vertices=%d fill_vertices=%d",
+		features, outlineFeatures, hybridVertices, fillVertices)
 }
 
 func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
@@ -2040,6 +2372,82 @@ func TestPolygonFillCanBeEnabledAfterLoadingWithZeroOpacity(t *testing.T) {
 	t.Fatalf("fill mesh did not become visible after opacity update; expected fill color %#08x", want)
 }
 
+func TestReadOnlyPolygonFillOpacityChangeUpdatesWindowBuilder(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "parcels.shp")
+	if err := (gdal.Writer{}).Write(ctx, path, core.Layer{
+		Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{
+			WKT: "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))",
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	style := core.DefaultLayerStyle()
+	style.FillOpacity = 0
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path, Style: style}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	properties, ok := runtime.service.LayerProperties(name)
+	if !ok {
+		t.Fatalf("missing read-only layer %q", name)
+	}
+	key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(0), name, render.Point{X: 2, Y: 2})
+	before, err := runtime.builder(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := properties.Style
+	updated.FillOpacity = 0.6
+	displayName := properties.DisplayName
+	if displayName == "" {
+		displayName = name
+	}
+	payload, err := json.Marshal(layerSettingsRequest{
+		Name: name, DisplayName: displayName, SourcePath: properties.SourcePath,
+		SourceLayerName: properties.SourceLayerName, SourceEncoding: properties.SourceEncoding,
+		SourceCRS: properties.SourceCRS, Visible: properties.Visible, Style: updated,
+		Labels: properties.Labels, DisplayRule: properties.DisplayRule,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(payload)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := runtime.builder(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countFills := func(chunk render.Chunk) (int, int) {
+		fills, zeroAlpha := 0, 0
+		for _, vertex := range chunk.Vertices {
+			if vertex.Kind == render.VertexFill {
+				fills++
+				if vertex.Color&0xff == 0 {
+					zeroAlpha++
+				}
+			}
+		}
+		return fills, zeroAlpha
+	}
+	beforeFills, beforeZeroAlpha := countFills(before)
+	afterFills, afterZeroAlpha := countFills(after)
+	if beforeFills == 0 || beforeZeroAlpha != beforeFills || afterFills == 0 || afterZeroAlpha != 0 {
+		t.Fatalf("read-only fill alpha before=%d/%d after=%d/%d; expected visible fill after style update",
+			beforeZeroAlpha, beforeFills, afterZeroAlpha, afterFills)
+	}
+	if got := runtime.readOnlyBindings[name].layer.Style.FillOpacity; got != updated.FillOpacity {
+		t.Fatalf("window binding fill opacity=%g, want %g", got, updated.FillOpacity)
+	}
+	if len(runtime.readOnlySources) != 1 || runtime.readOnlySources[0].Style.FillOpacity != updated.FillOpacity {
+		t.Fatalf("reload source kept stale style: %#v", runtime.readOnlySources)
+	}
+}
+
 func TestReadOnlyOverviewKeepsAttributesForConfiguredLabels(t *testing.T) {
 	labels := core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}
 	if !readOnlyWindowNeedsProperties(labels, true, false) {
@@ -2763,8 +3171,8 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 	if !runtime.viewportReadOnly || len(runtime.features) != 0 {
 		t.Fatalf("large source runtime viewport=%t initial hits=%d", runtime.viewportReadOnly, len(runtime.features))
 	}
-	if workers := runtime.scheduler.MaxWorkers(); workers != 2 {
-		t.Fatalf("read-only render workers = %d, want bounded concurrency of 2", workers)
+	if workers := runtime.scheduler.MaxWorkers(); workers != 4 {
+		t.Fatalf("read-only render workers = %d, want bounded concurrency of 4", workers)
 	}
 	names := runtime.service.LayerNames()
 	readableChunks := make(map[string]int, len(names))

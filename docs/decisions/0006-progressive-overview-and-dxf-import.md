@@ -226,3 +226,85 @@ vertices and the four quadrants' fill area. All fill triangles have one
 consistent winding; loss of only outer quadrants is not explained by a
 per-region winding change. This remains an experimental rendering fix until
 the script-built Windows executable is visually checked.
+
+## Follow-up: Windows dense-cadastre windows at city and detail scales (2026-10-04)
+
+A three-layer Windows run with the 208,015-feature Sejong polygon SHP and
+far-away point coordinates showed 294 chunks and 810,521 source vertices at
+semantic LOD 5, taking 129,965 ms to become ready. The QSG renderer is shared
+by macOS and Windows; there is no separate macOS map drawing implementation.
+The total data extent was much larger than the preferred parcel fit extent,
+so the physical zoom was 575 even though the parcel area occupies a small
+fraction of normalized coordinates.
+
+At semantic LOD 1, a dense cadastral window can exceed the polygon fill
+triangulation budget and deliberately fall back to outlines. Extend the
+display-only filled coverage dissolve from LOD 0 through LOD 1 for polygon
+layers of at least 100,000 features. This keeps small parcels visible as a
+continuous filled area at municipality scale; individual parcel geometry and
+selection return at LOD 2. A forced safety overview remains boundary-only.
+
+For physical zoom bucket 8 and above, keep one additional chunk-size plateau
+before halving the window dimensions. At bucket 9, this doubles each side of
+a GDAL query window and reduces the number of tiny indexed queries. Existing
+per-window feature, byte, and polygon-complexity guards and subdivision still
+apply. Live Windows visual and timing checks are required before claiming the
+reported view is fixed; the 1:11,704 diagnostic frame is distinct from the
+1:272,674 screenshot.
+
+The ready diagnostic now reports fill-vertex counts per layer and zero-alpha
+fills. This separates a deliberate outline-only fallback or saved transparent
+style from a downstream Qt draw failure without copying user geometry into
+logs.
+
+## Follow-up: zero-alpha read-only style and empty outlier windows (2026-10-04)
+
+The subsequent Windows Ready frame at 1:272,674 reported 138,780 fill
+vertices for the 208,015-feature cadastral SHP, and exactly 138,780
+zero-alpha fills. This proves the absence of green fill is a style-alpha
+problem, not a missing QSG draw. The read-only window builder used a copied
+layer style in `readOnlyBindings`, but applying a style-only layer-settings
+change updated only the project service and `layerStyles`. The copied binding
+and saved read-only source specification retained the former opacity zero.
+Synchronize both when a read-only layer's style/presentation changes, so
+immediate redraw and later source rebuilds use the same settings. An explicit
+zero-opacity/outline-only choice remains valid and is not overridden.
+
+The same frame planned 306 chunks but only 56 had geometry, taking 51,265 ms.
+The far-away point extent makes the normalized world much larger than the
+two polygon layer bounds. Before scheduling a read-only chunk, discard it when
+its world-space tile is disjoint from that layer's known metadata bounds;
+unknown bounds remain fail-open. This does not drop source features or change
+the visible layer extent. A real Windows timing comparison after rebuilding
+is still needed before claiming a speedup.
+
+## Follow-up: bounded parallel overview builds on Windows (2026-10-04)
+
+The next single-layer Windows frame showed the complete county and no
+zero-alpha fills, but building 1,024 QIX-backed overview windows still took
+42,653 ms. On 16 sampled nonempty windows, the geometry union dominated
+the query, simplification, and fill stages. A reproducible, opt-in native
+comparison on the same indexed source built 128 sampled windows (76 nonempty)
+with identical 27,313 output vertices: two workers took 4.623 s and four
+workers took 2.121 s. These are builder timings, not a live UI benchmark.
+
+Allow four simultaneous read-only window builds and four scheduler workers
+for responsive coverage overviews. Keep a separate two-slot gate for detailed
+windows, acquired before the shared four-slot gate, so zoomed-in geometry
+retains its previous concurrency and memory bound. Each window still has its
+existing decoded-geometry byte and feature limits. More concurrent overview
+unions may raise transient native memory use; verify the full SHP on Windows
+before treating the sampled speedup as a production result. No new native
+dependency or coverage-union shortcut is introduced: coverage union assumes
+valid, non-overlapping polygons, which has not been established for this SHP.
+
+The next live Windows run completed the same 1,024 windows, 600 nonempty
+windows, and 206,849 vertices in 28,066 ms, versus 42,653 ms before the
+bounded-parallel change (about 34% less wall time). A read-only experiment on
+the indexed source compared just GDAL window queries plus GEOS coverage
+union at 1/32, 1/16, and 1/8 normalized window sizes with four workers. The
+three configurations took 17.6 s for 1,024 windows, 16.1 s for 256 windows,
+and 15.9 s for 64 windows in one run. This excludes simplification, mesh
+creation, and Qt publication, and does not prove equivalent rendered output.
+The modest core-stage gain does not justify increasing per-window native
+memory and delaying partial publication, so retain 1/32 coarse windows.
