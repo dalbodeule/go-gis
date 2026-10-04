@@ -70,6 +70,117 @@ TestCase {
         }
     }
 
+    function test_fullScreenPreservesPannedMapCenterAndScale() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var oldPayload = canvas.layerTreePayload;
+        var oldBounds = viewport.dataBounds;
+        var oldCRS = viewport.dataCRS;
+        var oldMetadata = viewport.hasMapMetadata;
+        var oldZoom = viewport.mapZoom;
+        var oldPanX = viewport.panX;
+        var oldPanY = viewport.panY;
+        function centerX() { return 0.5 - viewport.panX / (canvas.width * viewport.mapZoom); }
+        function centerY() { return 0.5 + viewport.panY / (canvas.height * viewport.mapZoom); }
+        function unitsPerPixel() { return 1 / (canvas.width * viewport.mapZoom); }
+        try {
+            canvas.layerTreePayload = JSON.stringify([{name: "fullscreen-map", visible: true}]);
+            tryCompare(layerModel, "count", 1);
+            viewport.dataBounds = [0, 0, 1000, 1000];
+            viewport.dataCRS = "EPSG:5186";
+            viewport.hasMapMetadata = true;
+            viewport.mapZoom = 2276.520688194071;
+            viewport.panX = (0.5 - 0.62) * canvas.width * viewport.mapZoom;
+            viewport.panY = (0.57 - 0.5) * canvas.height * viewport.mapZoom;
+            var x = centerX(), y = centerY(), resolution = unitsPerPixel();
+            appWindow.showMaximized();
+            tryVerify(function() { return appWindow.visibility === Window.Maximized; });
+            appWindow.showFullScreen();
+            tryVerify(function() { return appWindow.visibility === Window.FullScreen; });
+            wait(200);
+            compare(canvas.viewGeneration, viewport.viewportGeneration);
+            verify(Math.abs(centerX() - x) < 0.000001, "fullscreen changed map X center");
+            verify(Math.abs(centerY() - y) < 0.000001, "fullscreen changed map Y center");
+            verify(Math.abs(unitsPerPixel() - resolution) < 1e-9, "fullscreen changed map scale");
+        } finally {
+            appWindow.showNormal();
+            tryVerify(function() { return appWindow.visibility === Window.Windowed; });
+            canvas.layerTreePayload = oldPayload;
+            viewport.dataBounds = oldBounds;
+            viewport.dataCRS = oldCRS;
+            viewport.hasMapMetadata = oldMetadata;
+            viewport.mapZoom = oldZoom;
+            viewport.panX = oldPanX;
+            viewport.panY = oldPanY;
+        }
+    }
+
+    function test_resizingDeeplyPannedMapKeepsWorldCenterAndScale() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var oldWidth = appWindow.width;
+        var oldHeight = appWindow.height;
+        var oldPayload = canvas.layerTreePayload;
+        var oldBounds = viewport.dataBounds;
+        var oldCRS = viewport.dataCRS;
+        var oldMetadata = viewport.hasMapMetadata;
+        var oldZoom = viewport.mapZoom;
+        var oldPanX = viewport.panX;
+        var oldPanY = viewport.panY;
+        var oldCursorValid = viewport.cursorValid;
+        function worldCenter() {
+            return [viewport.dataBounds[0] + (0.5 - viewport.panX / (canvas.width * viewport.mapZoom)) *
+                    (viewport.dataBounds[2] - viewport.dataBounds[0]),
+                    viewport.dataBounds[1] + (0.5 + viewport.panY / (canvas.height * viewport.mapZoom)) *
+                    (viewport.dataBounds[3] - viewport.dataBounds[1])];
+        }
+        function unitsPerPixel() {
+            return (viewport.dataBounds[2] - viewport.dataBounds[0]) / (canvas.width * viewport.mapZoom);
+        }
+        try {
+            canvas.layerTreePayload = JSON.stringify([{name: "resize-map", visible: true}]);
+            tryCompare(layerModel, "count", 1);
+            viewport.dataBounds = [0, 0, 1000, 1000];
+            viewport.dataCRS = "EPSG:5186";
+            viewport.hasMapMetadata = true;
+            viewport.mapZoom = 2200;
+            viewport.panX = (0.5 - 0.8) * canvas.width * viewport.mapZoom;
+            viewport.panY = (0.2 - 0.5) * canvas.height * viewport.mapZoom;
+            viewport.cursorValid = true;
+            var centerBefore = worldCenter();
+            var unitsBefore = unitsPerPixel();
+            var viewportWidthBefore = viewport.width;
+            var viewportHeightBefore = viewport.height;
+            appWindow.width = oldWidth + 360;
+            appWindow.height = oldHeight + 114;
+            tryVerify(function() { return viewport.width > viewportWidthBefore && viewport.height > viewportHeightBefore; });
+            var centerAfter = worldCenter();
+            verify(Math.abs(centerAfter[0] - centerBefore[0]) < 0.0001, "resize changed map X center");
+            verify(Math.abs(centerAfter[1] - centerBefore[1]) < 0.0001, "resize changed map Y center");
+            verify(Math.abs(unitsPerPixel() - unitsBefore) < 1e-9, "resize changed map scale");
+            compare(viewport.cursorValid, false);
+            appWindow.width = oldWidth;
+            appWindow.height = oldHeight;
+            tryVerify(function() { return viewport.width === viewportWidthBefore && viewport.height === viewportHeightBefore; });
+            centerAfter = worldCenter();
+            verify(Math.abs(centerAfter[0] - centerBefore[0]) < 0.0001, "restore changed map X center");
+            verify(Math.abs(centerAfter[1] - centerBefore[1]) < 0.0001, "restore changed map Y center");
+        } finally {
+            appWindow.width = oldWidth;
+            appWindow.height = oldHeight;
+            canvas.layerTreePayload = oldPayload;
+            viewport.dataBounds = oldBounds;
+            viewport.dataCRS = oldCRS;
+            viewport.hasMapMetadata = oldMetadata;
+            viewport.mapZoom = oldZoom;
+            viewport.panX = oldPanX;
+            viewport.panY = oldPanY;
+            viewport.cursorValid = oldCursorValid;
+        }
+    }
+
     function test_addVectorDialogSelectionRequestsLoad() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var viewport = findChild(appWindow, "mapViewport");
@@ -478,8 +589,8 @@ TestCase {
         var choice = findChild(appWindow, "dxfEncodingChoice");
         verify(canvas && projectDialog && projectCRS && encodingDialog && choice);
 
-        projectCRS.text = "EPSG:5179";
         projectDialog.open();
+        projectCRS.text = "EPSG:5179";
         projectDialog.accept();
         compare(JSON.parse(canvas.layerSettingsPayload).operation, "project-crs");
         compare(JSON.parse(canvas.layerSettingsPayload).projectCrs, "EPSG:5179");
@@ -495,6 +606,125 @@ TestCase {
         compare(choice.currentValue, "ares-shift-jis");
         encodingDialog.close();
         appWindow.language = "en";
+    }
+
+    function test_projectCRSPickerShowsCommonNearbyAndSearchableCatalog() {
+        var dialog = findChild(appWindow, "projectCRSDialog");
+        var field = findChild(appWindow, "projectCRSField");
+        var tabs = findChild(appWindow, "crsCategoryTabs");
+        var common = findChild(appWindow, "commonCRSList");
+        var nearby = findChild(appWindow, "nearbyCRSList");
+        var country = findChild(appWindow, "countryCRSChoice");
+        var all = findChild(appWindow, "allCRSList");
+        var search = findChild(appWindow, "crsSearchField");
+        var details = findChild(appWindow, "selectedCRSDetails");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(dialog && field && tabs && common && nearby && country && all && search && details);
+        var previousCatalog = dialog.catalogResponse;
+        var previousCRS = viewport.dataCRS;
+        try {
+            dialog.catalogResponse = {available: true, entries: [
+                {code: "EPSG:5186", name: "Korea 2000 / Central Belt", area: "Republic of Korea", kind: "projected"},
+                {code: "EPSG:5179", name: "Korea 2000 / Unified CS", area: "Republic of Korea", kind: "projected"},
+                {code: "EPSG:5187", name: "Korea 2000 / East Belt", area: "Republic of Korea", kind: "projected"},
+                {code: "EPSG:6677", name: "JGD2011 / Japan Plane Rectangular CS IX", area: "Japan", kind: "projected"},
+                {code: "EPSG:5070", name: "NAD83 / Conus Albers", area: "United States", kind: "projected"},
+                {code: "EPSG:32643", name: "WGS 84 / UTM zone 43N", area: "India", kind: "projected"},
+                {code: "EPSG:26916", name: "NAD83 / UTM zone 16N", area: "United States - Indiana", kind: "projected"},
+                {code: "EPSG:32652", name: "WGS 84 / UTM zone 52N", area: "Asia", kind: "projected"},
+                {code: "EPSG:4326", name: "WGS 84", area: "World", kind: "geographic"}
+            ]};
+            viewport.dataCRS = "EPSG:6677";
+            dialog.open();
+            tryCompare(dialog, "visible", true);
+            compare(country.currentIndex, 1);
+            compare(field.text, "EPSG:6677");
+            verify(common.count >= 3);
+            tabs.currentIndex = 1;
+            country.currentIndex = 0;
+            tryCompare(nearby, "count", 3);
+            country.currentIndex = 1;
+            tryCompare(nearby, "count", 1);
+            compare(nearby.model[0].code, "EPSG:6677");
+            country.currentIndex = 3;
+            tryCompare(nearby, "count", 2);
+            country.currentIndex = 10;
+            tryCompare(nearby, "count", 1);
+            compare(nearby.model[0].code, "EPSG:32643");
+            tabs.currentIndex = 2;
+            search.text = "east belt";
+            tryCompare(all, "count", 1);
+            tryVerify(function() { return all.itemAtIndex(0) !== null; });
+            mouseClick(all.itemAtIndex(0));
+            compare(field.text, "EPSG:5187");
+            verify(details.text.indexOf("East Belt") >= 0);
+            dialog.accept();
+            compare(JSON.parse(canvas.layerSettingsPayload).projectCrs, "EPSG:5187");
+        } finally {
+            dialog.close();
+            dialog.catalogResponse = previousCatalog;
+            viewport.dataCRS = previousCRS;
+        }
+    }
+
+    function test_colorPickerChangesStyleColorWithoutTypingHex() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "layerSettingsDialog");
+        var picker = findChild(appWindow, "layerColorPicker");
+        var presets = findChild(appWindow, "presetColorRepeater");
+        var customPicker = findChild(appWindow, "nativeLayerColorPicker");
+        var hexField = findChild(appWindow, "presetHexField");
+        var applyColor = findChild(appWindow, "applyPickedColorButton");
+        var pointField = findChild(appWindow, "pointColorField");
+        var lineField = findChild(appWindow, "lineColorField");
+        var polygonField = findChild(appWindow, "polygonColorField");
+        verify(picker && presets && customPicker && hexField && applyColor && pointField && lineField && polygonField);
+        canvas.layerTreePayload = JSON.stringify([{name: "colors", visible: true, geometryType: "GEOMETRYCOLLECTION"}]);
+        tryVerify(function() {
+            var model = findChild(appWindow, "layerModel");
+            return model.count === 1 && model.get(0).name === "colors";
+        });
+        viewport.openLayerPropertiesForCategory("colors", "symbology");
+        tryCompare(dialog, "visible", true);
+        try {
+            var cases = [
+                {button: "pointColorPickerButton", field: pointField, selected: "#80123456", color: "#123456"},
+                {button: "lineColorPickerButton", field: lineField, color: "#abcdef"},
+                {button: "polygonColorPickerButton", field: polygonField, color: "#654321"}
+            ];
+            for (var i = 0; i < cases.length; ++i) {
+                var button = findChild(appWindow, cases[i].button);
+                verify(button && button.visible);
+                mouseClick(button);
+                compare(picker.targetField, cases[i].field);
+                if (i === 0) {
+                    compare(presets.count, 10);
+                    hexField.text = "#12";
+                    compare(applyColor.enabled, false);
+                    mouseClick(presets.itemAt(2));
+                    compare(picker.selectedColor, "#d1495b");
+                    compare(applyColor.enabled, true);
+                    mouseClick(findChild(appWindow, "customColorPickerButton"));
+                    customPicker.selectedColor = "#80123456";
+                    customPicker.accept();
+                    compare(picker.selectedColor, "#123456");
+                }
+                picker.selectedColor = cases[i].selected || cases[i].color;
+                picker.accept();
+                compare(cases[i].field.text.toLowerCase(), cases[i].color);
+                compare(cases[i].field.readOnly, true);
+            }
+            dialog.submitLayer();
+            var style = JSON.parse(canvas.layerSettingsPayload).style;
+            compare(style.pointColor, "#123456");
+            compare(style.lineColor, "#abcdef");
+            compare(style.polygonColor, "#654321");
+        } finally {
+            picker.reject();
+            dialog.close();
+        }
     }
 
     function test_statusCoordinatesUseFourDecimalsAndDigitGrouping() {
@@ -520,6 +750,68 @@ TestCase {
         viewport.cursorX = oldCursorX;
         viewport.cursorY = oldCursorY;
         viewport.cursorValid = oldCursorValid;
+    }
+
+    function test_primaryStatusKeepsCRSCoordinatesAndScaleVisible() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var crs = findChild(appWindow, "crsStatusLabel");
+        var coordinates = findChild(appWindow, "coordinateStatusLabel");
+        var scale = findChild(appWindow, "scaleStatusLabel");
+        var dialog = findChild(appWindow, "coordinateNavigationDialog");
+        var navButton = findChild(appWindow, "openCoordinateNavigationButton");
+        verify(viewport && canvas && layerModel && crs && coordinates && scale && dialog && navButton);
+        var oldPayload = canvas.layerTreePayload;
+        var oldBounds = viewport.dataBounds;
+        var oldCRS = viewport.dataCRS;
+        var oldZoom = viewport.mapZoom;
+        var oldPanX = viewport.panX;
+        var oldPanY = viewport.panY;
+        var oldValid = viewport.cursorValid;
+        var oldLanguage = appWindow.language;
+        try {
+            canvas.layerTreePayload = JSON.stringify([{name: "status-map", visible: true}]);
+            tryCompare(layerModel, "count", 1);
+            viewport.dataBounds = [0, 0, 1000, 1000];
+            viewport.dataCRS = "EPSG:5186";
+            viewport.mapZoom = 1;
+            viewport.panX = 0;
+            viewport.panY = 0;
+            viewport.cursorValid = false;
+            appWindow.language = "ko";
+            compare(crs.text, "EPSG:5186");
+            compare(coordinates.text, "중심  X 500.0000  Y 500.0000");
+            verify(scale.text.indexOf("≈ 1:") === 0);
+            verify(coordinates.width >= coordinates.implicitWidth, "primary coordinates should not be elided at normal width");
+            var rightEdge = scale.mapToItem(appWindow.contentItem, scale.width, 0);
+            verify(rightEdge.x <= appWindow.contentItem.width, "scale must remain inside the window");
+            viewport.cursorX = canvas.x + canvas.width / 2;
+            viewport.cursorY = canvas.y + canvas.height / 2;
+            viewport.cursorValid = true;
+            compare(coordinates.text, "커서  X 500.0000  Y 500.0000");
+            mouseClick(navButton);
+            tryVerify(function() { return dialog.visible; });
+            var xInput = findChild(appWindow, "coordinateXInput");
+            var yInput = findChild(appWindow, "coordinateYInput");
+            verify(xInput && yInput);
+            xInput.text = "200";
+            yInput.text = "300";
+            mouseClick(findChild(appWindow, "coordinateGoButton"));
+            tryVerify(function() { return !dialog.visible; });
+            viewport.cursorValid = false;
+            compare(coordinates.text, "중심  X 200.0000  Y 300.0000");
+        } finally {
+            dialog.close();
+            canvas.layerTreePayload = oldPayload;
+            viewport.dataBounds = oldBounds;
+            viewport.dataCRS = oldCRS;
+            viewport.mapZoom = oldZoom;
+            viewport.panX = oldPanX;
+            viewport.panY = oldPanY;
+            viewport.cursorValid = oldValid;
+            appWindow.language = oldLanguage;
+        }
     }
 
     function test_vertexHandleDragEmitsFeatureVertexEdit() {

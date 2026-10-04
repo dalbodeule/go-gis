@@ -358,8 +358,11 @@ func TestReadOnlyWindowPayloadEstimateSaturatesAtBudget(t *testing.T) {
 }
 
 func TestReadOnlyVisiblePayloadBudgetIsSeparateFromWindowBudget(t *testing.T) {
-	if maxReadOnlyWindowBytes != 32<<20 || maxReadOnlyVisibleBytes != 128<<20 {
+	if maxReadOnlyWindowBytes != 32<<20 || maxReadOnlyVisibleBytes != 256<<20 {
 		t.Fatalf("read-only byte budgets: window=%d visible=%d", maxReadOnlyWindowBytes, maxReadOnlyVisibleBytes)
+	}
+	if maxReadOnlyWindowFeatures != 20_000 || maxReadOnlyVisibleFeatures != 300_000 {
+		t.Fatalf("read-only feature budgets: window=%d visible=%d", maxReadOnlyWindowFeatures, maxReadOnlyVisibleFeatures)
 	}
 	for _, test := range []struct {
 		current, additional int64
@@ -368,12 +371,35 @@ func TestReadOnlyVisiblePayloadBudgetIsSeparateFromWindowBudget(t *testing.T) {
 		{32 << 20, 16 << 20, true},
 		{64 << 20, 32 << 20, true},
 		{96 << 20, 32 << 20, true},
-		{96 << 20, 32<<20 + 1, false},
-		{128 << 20, 1, false},
+		{96 << 20, 32<<20 + 1, true},
+		{224 << 20, 32 << 20, true},
+		{224 << 20, 32<<20 + 1, false},
+		{256 << 20, 1, false},
 		{-1, 1, false},
 	} {
 		if got := readOnlyVisiblePayloadFits(test.current, test.additional); got != test.want {
 			t.Errorf("visible payload current=%d additional=%d: got %t, want %t", test.current, test.additional, got, test.want)
+		}
+	}
+}
+
+func TestReadOnlyVisibleFeatureBudgetAcceptsUpToThreeHundredThousand(t *testing.T) {
+	for _, test := range []struct {
+		current, additional int
+		want                bool
+	}{
+		{50_000, 1, true},
+		{80_000, 20_000, true},
+		{99_999, 1, true},
+		{100_000, 1, true},
+		{200_000, 20_000, true},
+		{280_000, 20_000, true},
+		{300_000, 1, false},
+		{280_000, 20_001, false},
+		{-1, 1, false},
+	} {
+		if got := readOnlyVisibleFeaturesFit(test.current, test.additional); got != test.want {
+			t.Errorf("visible features current=%d additional=%d: got %t, want %t", test.current, test.additional, got, test.want)
 		}
 	}
 }
@@ -1829,7 +1855,7 @@ func TestReadOnlyOverviewLabelCandidatesStayBounded(t *testing.T) {
 	for index := 0; index < 100; index++ {
 		window.Features = append(window.Features, core.Feature{ID: uint64(index), Properties: map[string]any{"JIBUN": fmt.Sprint(index)}})
 	}
-	if err := prepareReadOnlyWindowLabels(context.Background(), &window, true); err != nil {
+	if err := prepareReadOnlyWindowLabels(context.Background(), &window, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	count := 0
@@ -1842,6 +1868,29 @@ func TestReadOnlyOverviewLabelCandidatesStayBounded(t *testing.T) {
 		window.Features[3].Label.Text != "3" || window.Features[96].Label.Text != "96" {
 		t.Fatalf("overview label candidates: count=%d first=%+v next=%+v last=%+v", count,
 			window.Features[0].Label, window.Features[3].Label, window.Features[96].Label)
+	}
+}
+
+func TestReadOnlyCityScaleLabelCandidatesStayBounded(t *testing.T) {
+	for _, test := range []struct {
+		lod, want int
+	}{{2, 8}, {3, 32}, {4, 128}, {5, 200}} {
+		window := core.Layer{Labels: core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}}
+		for index := 0; index < 200; index++ {
+			window.Features = append(window.Features, core.Feature{ID: uint64(index), Properties: map[string]any{"JIBUN": fmt.Sprint(index)}})
+		}
+		if err := prepareReadOnlyWindowLabels(context.Background(), &window, false, test.lod); err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, feature := range window.Features {
+			if feature.Label != nil {
+				count++
+			}
+		}
+		if count != test.want {
+			t.Errorf("LOD %d label candidates = %d, want %d", test.lod, count, test.want)
+		}
 	}
 }
 
@@ -2610,6 +2659,101 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 	}
 	if peakRSS, ok := benchmarkProcessMaxRSSBytes(); ok {
 		t.Logf("real source combined-layer test process peak-RSS-MiB=%d", peakRSS/(1<<20))
+	}
+}
+
+func TestWindowedReadOnlyCityScaleFeatureBudgetRealSource(t *testing.T) {
+	paths := filepath.SplitList(os.Getenv("GOGIS_TEST_LARGE_VECTOR_SOURCES"))
+	if len(paths) < 2 || paths[0] == "" || paths[1] == "" {
+		t.Skip("set GOGIS_TEST_LARGE_VECTOR_SOURCES to the parcel and survey-point SHPs")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sources := make([]vectorSourceSpec, 0, len(paths))
+	for index, path := range paths {
+		source := vectorSourceSpec{Path: path}
+		if os.Getenv("GOGIS_TEST_CITY_LABELS") == "1" {
+			switch index {
+			case 0:
+				source.Labels = core.LabelSettings{Enabled: true, Expression: "${JIBUN}", Placement: "center", HeightMM: 2.5}
+			case 1:
+				source.Labels = core.LabelSettings{Enabled: true, Expression: "${DOGEUN_POI}", Placement: "center", HeightMM: 2.5}
+			}
+		}
+		sources = append(sources, source)
+	}
+	runtime, err := loadReadOnlyDataRuntimeWithBaseLayers(ctx, sources, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	data, fit := runtime.mapExtent, runtime.mapFitExtent
+	const canvasWidth, canvasHeight = 1600.0, 1000.0
+	width, height := canvasWidth, canvasHeight
+	if requested := os.Getenv("GOGIS_TEST_CITY_VIEWPORT_MULTIPLIER"); requested != "" {
+		multiplier, parseErr := strconv.ParseFloat(requested, 64)
+		if parseErr != nil || multiplier <= 0 || multiplier > 4 || math.IsInf(multiplier, 0) || math.IsNaN(multiplier) {
+			t.Fatalf("invalid GOGIS_TEST_CITY_VIEWPORT_MULTIPLIER %q", requested)
+		}
+		width *= multiplier
+		height *= multiplier
+	}
+	denominator := 52_716.0
+	if requested := os.Getenv("GOGIS_TEST_CITY_SCALE_DENOMINATOR"); requested != "" {
+		denominator, err = strconv.ParseFloat(requested, 64)
+		if err != nil || denominator <= 0 || math.IsInf(denominator, 0) || math.IsNaN(denominator) {
+			t.Fatalf("invalid GOGIS_TEST_CITY_SCALE_DENOMINATOR %q", requested)
+		}
+	}
+	viewport := render.Viewport{
+		Center: render.Point{
+			X: ((fit[0]+fit[2])/2 - data[0]) / (data[2] - data[0]),
+			Y: ((fit[1]+fit[3])/2 - data[1]) / (data[3] - data[1]),
+		},
+		Zoom:        (data[2] - data[0]) / (canvasWidth * denominator * 0.0254 / 96),
+		ScreenWidth: width, ScreenHeight: height, CanvasWidth: canvasWidth, CanvasHeight: canvasHeight,
+	}
+	planner := runtime.planner
+	rawBucket := readOnlyWindowZoomBucket(viewport.Zoom)
+	t.Logf("city-scale zoom=%g raw-bucket=%d semantic-lod=%d", viewport.Zoom, rawBucket, readOnlyOverviewZoomBucket(rawBucket, runtime.mapExtent, runtime.mapFitExtent))
+	planner.ChunkSize = readOnlyWindowChunkSize(rawBucket)
+	var keys []render.ChunkKey
+	for _, name := range runtime.service.LayerNames() {
+		keys = append(keys, planner.VisibleKeys(viewport, name)...)
+	}
+	if len(keys) == 0 {
+		t.Fatal("city-scale viewport planned no chunks")
+	}
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{}, len(keys))
+	for _, key := range keys {
+		runtime.windowVisibleKeys[key] = struct{}{}
+	}
+	runtime.mu.Unlock()
+	var vertices int
+	for _, key := range keys {
+		chunk, err := runtime.builder(ctx, key)
+		if err != nil {
+			t.Fatalf("city-scale chunk %v of %d: %v", key, len(keys), err)
+		}
+		vertices += len(chunk.Vertices)
+	}
+	runtime.mu.Lock()
+	features, payload := runtime.windowVisibleFeatureCount, runtime.windowVisiblePayloadBytes
+	labels := len(runtime.mapLabels)
+	runtime.mu.Unlock()
+	t.Logf("city-scale viewport: scale=1:%.0f chunks=%d retained-features=%d retained-payload-MiB=%.1f vertices=%d labels=%d", denominator, len(keys), features, float64(payload)/(1<<20), vertices, labels)
+	if features == 0 || features > maxReadOnlyVisibleFeatures || payload > maxReadOnlyVisibleBytes {
+		t.Fatalf("city-scale viewport exceeded bounds: features=%d payload=%d", features, payload)
+	}
+	if vertices > render.MaxBatchVertices {
+		t.Fatalf("city-scale viewport exceeds vertex batch limit: vertices=%d limit=%d", vertices, render.MaxBatchVertices)
+	}
+	if os.Getenv("GOGIS_TEST_CITY_LABELS") == "1" && labels == 0 {
+		t.Fatal("city-scale labeled viewport generated no labels")
+	}
+	if peakRSS, ok := benchmarkProcessMaxRSSBytes(); ok {
+		t.Logf("city-scale test process peak-RSS-MiB=%d", peakRSS/(1<<20))
 	}
 }
 

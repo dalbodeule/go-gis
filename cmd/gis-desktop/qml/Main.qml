@@ -414,10 +414,7 @@ ApplicationWindow {
             Button {
                 objectName: "projectCRSButton"
                 text: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project CRS"
-                onClicked: {
-                    projectCRSField.text = mapViewport.dataCRS || "";
-                    projectCRSDialog.open();
-                }
+                onClicked: projectCRSDialog.open()
             }
             Button {
                 objectName: "toggleVertexEditButton"
@@ -512,25 +509,365 @@ ApplicationWindow {
         modal: true
         title: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project coordinate reference system"
         standardButtons: Dialog.Apply | Dialog.Cancel
-        width: Math.min(480, rootWindow.width - 48)
+        width: Math.min(650, rootWindow.width - 48)
+        height: Math.min(630, rootWindow.height - 48)
         anchors.centerIn: Overlay.overlay
+        property var catalogResponse: {
+            if (typeof appCRSCatalogJSON === "undefined")
+                return {available: false, error: "", entries: []};
+            try {
+                return JSON.parse(appCRSCatalogJSON);
+            } catch (error) {
+                return {available: false, error: String(error), entries: []};
+            }
+        }
+        property var commonCodes: ["EPSG:5186", "EPSG:5179", "EPSG:4326", "EPSG:3857", "EPSG:32652"]
+        property var countryOptions: [
+            {ko: "대한민국", jp: "韓国", en: "South Korea", aliases: ["korea"], featured: ["EPSG:5186", "EPSG:5179"]},
+            {ko: "일본", jp: "日本", en: "Japan", aliases: ["japan"], featured: ["EPSG:6677"]},
+            {ko: "중국", jp: "中国", en: "China", aliases: ["china"], featured: ["EPSG:4497"]},
+            {ko: "미국", jp: "アメリカ", en: "United States", aliases: ["united states", "usa"], featured: ["EPSG:5070"]},
+            {ko: "영국", jp: "イギリス", en: "United Kingdom", aliases: ["united kingdom", "great britain"], featured: ["EPSG:27700"]},
+            {ko: "독일", jp: "ドイツ", en: "Germany", aliases: ["germany"], featured: ["EPSG:25832"]},
+            {ko: "프랑스", jp: "フランス", en: "France", aliases: ["france"], featured: ["EPSG:2154"]},
+            {ko: "호주", jp: "オーストラリア", en: "Australia", aliases: ["australia"], featured: ["EPSG:7855"]},
+            {ko: "캐나다", jp: "カナダ", en: "Canada", aliases: ["canada"], featured: ["EPSG:3347"]},
+            {ko: "브라질", jp: "ブラジル", en: "Brazil", aliases: ["brazil"], featured: ["EPSG:5880"]},
+            {ko: "인도", jp: "インド", en: "India", aliases: ["india"], featured: ["EPSG:32643"]},
+            {ko: "뉴질랜드", jp: "ニュージーランド", en: "New Zealand", aliases: ["new zealand"], featured: ["EPSG:2193"]}
+        ]
+        function catalogEntry(code) {
+            var entries = catalogResponse.entries || [];
+            for (var i = 0; i < entries.length; ++i) {
+                if (entries[i].code === code)
+                    return entries[i];
+            }
+            return null;
+        }
+        function entriesForCodes(codes) {
+            var result = [];
+            for (var i = 0; i < codes.length; ++i) {
+                var entry = catalogEntry(codes[i]);
+                if (entry)
+                    result.push(entry);
+                else if (!catalogResponse.available)
+                    result.push({code: codes[i], name: codes[i]});
+            }
+            return result;
+        }
+        function areaMatchesCountry(area, country) {
+            for (var i = 0; i < country.aliases.length; ++i) {
+                var words = new RegExp("\\b" + country.aliases[i] + "\\b", "i");
+                if (words.test(area))
+                    return true;
+            }
+            return false;
+        }
+        function countryIndexForCurrentCRS() {
+            var current = catalogEntry(mapViewport.dataCRS);
+            var area = current ? (current.area || "") : "";
+            for (var i = 0; i < countryOptions.length; ++i) {
+                if (areaMatchesCountry(area, countryOptions[i]))
+                    return i;
+            }
+            return 0;
+        }
+        function countryEntries(index) {
+            var country = countryOptions[index];
+            if (!country)
+                return [];
+            var result = entriesForCodes(country.featured);
+            var seen = {};
+            for (var i = 0; i < result.length; ++i)
+                seen[result[i].code] = true;
+            if (!catalogResponse.available)
+                return result;
+            var entries = catalogResponse.entries || [];
+            for (var entryIndex = 0; entryIndex < entries.length && result.length < 80; ++entryIndex) {
+                var entry = entries[entryIndex];
+                if (entry.kind !== "projected" || seen[entry.code])
+                    continue;
+                if (areaMatchesCountry(entry.area || "", country)) {
+                    result.push(entry);
+                    seen[entry.code] = true;
+                }
+            }
+            return result;
+        }
+        function searchEntries(query) {
+            if (!catalogResponse.available)
+                return [];
+            var needle = query.trim().toLowerCase();
+            var entries = catalogResponse.entries || [];
+            if (needle === "")
+                return entries;
+            return entries.filter(function(entry) {
+                return entry.code.toLowerCase().indexOf(needle) >= 0 ||
+                       entry.name.toLowerCase().indexOf(needle) >= 0 ||
+                       (entry.area || "").toLowerCase().indexOf(needle) >= 0;
+            });
+        }
+        onOpened: {
+            projectCRSField.text = mapViewport.dataCRS || "";
+            crsCategoryTabs.currentIndex = 0;
+            countryChoice.currentIndex = countryIndexForCurrentCRS();
+            crsSearchField.text = "";
+        }
         contentItem: ColumnLayout {
-            spacing: 10
+            spacing: 8
             Label {
                 Layout.fillWidth: true
-                text: rootWindow.language === "ko" ? "EPSG 코드 등을 입력하세요. 적용하면 프로젝트의 모든 레이어를 이 좌표계로 변환합니다. 원본 파일은 변경하지 않습니다." : rootWindow.language === "jp" ? "EPSGコードなどを入力してください。適用すると、元ファイルを変更せず全レイヤーをこの座標系に変換します。" : "Enter an authority code such as EPSG:5186. Applying reprojects all project layers; source files are not modified."
+                text: rootWindow.language === "ko" ? "좌표계를 선택하거나 EPSG 코드를 입력하세요. 적용하면 모든 프로젝트 레이어를 재투영하며 원본 파일은 변경하지 않습니다." : rootWindow.language === "jp" ? "座標系を選択するかEPSGコードを入力してください。適用すると全レイヤーを再投影します。元ファイルは変更しません。" : "Select a CRS or enter an EPSG code. Applying reprojects all project layers without changing source files."
                 wrapMode: Text.WordWrap
             }
-            TextField {
-                id: projectCRSField
-                objectName: "projectCRSField"
+            RowLayout {
                 Layout.fillWidth: true
-                placeholderText: "EPSG:5186 (example)"
+                Label {
+                    text: rootWindow.language === "ko" ? "선택한 좌표계" : rootWindow.language === "jp" ? "選択した座標系" : "Selected CRS"
+                }
+                TextField {
+                    id: projectCRSField
+                    objectName: "projectCRSField"
+                    Layout.fillWidth: true
+                    placeholderText: "EPSG:5186"
+                }
+            }
+            Label {
+                objectName: "selectedCRSDetails"
+                Layout.fillWidth: true
+                property var entry: projectCRSDialog.catalogEntry(projectCRSField.text.trim().toUpperCase())
+                text: entry ? entry.name + (entry.area ? " · " + entry.area : "") :
+                      (rootWindow.language === "ko" ? "목록 외 코드: 적용할 때 유효성을 확인합니다." :
+                       rootWindow.language === "jp" ? "一覧外のコードは適用時に検証します。" :
+                       "Codes outside the catalog are validated when applied.")
+                color: "#526779"
+                elide: Text.ElideRight
+                ToolTip.visible: selectedCRSMouse.containsMouse
+                ToolTip.text: text
+                MouseArea { id: selectedCRSMouse; anchors.fill: parent; hoverEnabled: true }
+            }
+            TabBar {
+                id: crsCategoryTabs
+                objectName: "crsCategoryTabs"
+                Layout.fillWidth: true
+                TabButton { text: rootWindow.language === "ko" ? "자주 사용" : rootWindow.language === "jp" ? "よく使う" : "Common" }
+                TabButton { text: rootWindow.language === "ko" ? "국가별 추천" : rootWindow.language === "jp" ? "国別の候補" : "By country" }
+                TabButton { text: rootWindow.language === "ko" ? "전체 EPSG 검색" : rootWindow.language === "jp" ? "全EPSGを検索" : "Search all EPSG" }
+            }
+            StackLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                currentIndex: crsCategoryTabs.currentIndex
+                ListView {
+                    objectName: "commonCRSList"
+                    clip: true
+                    model: projectCRSDialog.entriesForCodes(projectCRSDialog.commonCodes)
+                    delegate: ItemDelegate {
+                        width: ListView.view.width
+                        text: modelData.code + "  " + modelData.name
+                        highlighted: projectCRSField.text === modelData.code
+                        ToolTip.visible: hovered && !!modelData.area
+                        ToolTip.text: modelData.area || ""
+                        onClicked: projectCRSField.text = modelData.code
+                    }
+                    ScrollBar.vertical: ScrollBar {}
+                }
+                ColumnLayout {
+                    ComboBox {
+                        id: countryChoice
+                        objectName: "countryCRSChoice"
+                        Layout.fillWidth: true
+                        model: projectCRSDialog.countryOptions
+                        textRole: rootWindow.language === "ko" ? "ko" : rootWindow.language === "jp" ? "jp" : "en"
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        text: rootWindow.language === "ko" ? "설치된 PROJ의 사용 지역 기준 추천입니다. 다른 좌표계는 전체 EPSG 검색에서 찾으세요." : rootWindow.language === "jp" ? "インストール済みPROJの使用地域に基づく候補です。ほかの座標系は全EPSG検索を使用してください。" : "Suggestions use the installed PROJ area of use. Search all EPSG for other systems."
+                        color: "#65717d"
+                        wrapMode: Text.WordWrap
+                    }
+                    ListView {
+                        objectName: "nearbyCRSList"
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        model: projectCRSDialog.countryEntries(countryChoice.currentIndex)
+                        delegate: ItemDelegate {
+                            width: ListView.view.width
+                            text: modelData.code + "  " + modelData.name
+                            highlighted: projectCRSField.text === modelData.code
+                            ToolTip.visible: hovered && !!modelData.area
+                            ToolTip.text: modelData.area || ""
+                            onClicked: projectCRSField.text = modelData.code
+                        }
+                        ScrollBar.vertical: ScrollBar {}
+                    }
+                }
+                ColumnLayout {
+                    TextField {
+                        id: crsSearchField
+                        objectName: "crsSearchField"
+                        Layout.fillWidth: true
+                        placeholderText: rootWindow.language === "ko" ? "EPSG 코드, 이름 또는 사용 지역 검색" : rootWindow.language === "jp" ? "EPSGコード、名前、地域を検索" : "Search code, name, or area"
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: !projectCRSDialog.catalogResponse.available
+                        text: rootWindow.language === "ko" ? "전체 목록은 PROJ가 포함된 desktop-native 빌드에서 사용할 수 있습니다." : rootWindow.language === "jp" ? "全リストにはPROJ対応のdesktop-nativeビルドが必要です。" : "The full catalog requires the PROJ-enabled desktop-native build."
+                        wrapMode: Text.WordWrap
+                    }
+                    ListView {
+                        id: allCRSList
+                        objectName: "allCRSList"
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        model: projectCRSDialog.searchEntries(crsSearchField.text)
+                        delegate: ItemDelegate {
+                            width: ListView.view.width
+                            text: modelData.code + "  " + modelData.name
+                            highlighted: projectCRSField.text === modelData.code
+                            ToolTip.visible: hovered && !!modelData.area
+                            ToolTip.text: modelData.area || ""
+                            onClicked: projectCRSField.text = modelData.code
+                        }
+                        ScrollBar.vertical: ScrollBar {}
+                    }
+                    Label {
+                        text: rootWindow.language === "ko" ? allCRSList.count + "개 좌표계" : rootWindow.language === "jp" ? allCRSList.count + "件" : allCRSList.count + " CRSs"
+                    }
+                }
             }
         }
         onAccepted: {
-            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "project-crs", projectCrs: projectCRSField.text});
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "project-crs", projectCrs: projectCRSField.text.trim().toUpperCase()});
             mapCanvas.layerSettingsGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: layerColorPicker
+        objectName: "layerColorPicker"
+        title: rootWindow.language === "ko" ? "레이어 색상 선택" : rootWindow.language === "jp" ? "レイヤーの色を選択" : "Choose layer color"
+        modal: true
+        width: Math.min(470, rootWindow.width - 48)
+        anchors.centerIn: Overlay.overlay
+        property var targetField: null
+        property string selectedColor: "#2b6cb0"
+        property var presetColors: ["#2b6cb0", "#356b53", "#d1495b", "#e09f3e",
+                                    "#7b2cbf", "#00a6a6", "#5a6772", "#202124",
+                                    "#ffffff", "#f4d35e"]
+        function normalizedSelectedColor() {
+            var value = selectedColor.toLowerCase();
+            if (/^#[0-9a-f]{8}$/.test(value))
+                value = "#" + value.slice(-6);
+            return /^#[0-9a-f]{6}$/.test(value) ? value : "";
+        }
+        function rgbHex(color) {
+            function channel(value) {
+                return ("0" + Math.round(Math.max(0, Math.min(1, value)) * 255).toString(16)).slice(-2);
+            }
+            return "#" + channel(color.r) + channel(color.g) + channel(color.b);
+        }
+        onSelectedColorChanged: presetHexField.text = selectedColor
+        onOpened: presetHexField.text = selectedColor
+        contentItem: ColumnLayout {
+            spacing: 12
+            Label {
+                text: rootWindow.language === "ko" ? "빠른 선택" : rootWindow.language === "jp" ? "プリセット" : "Preset colors"
+                font.bold: true
+            }
+            Flow {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 32
+                spacing: 8
+                Repeater {
+                    id: presetColorRepeater
+                    objectName: "presetColorRepeater"
+                    model: layerColorPicker.presetColors
+                    delegate: Rectangle {
+                        width: 32
+                        height: 32
+                        radius: 4
+                        color: modelData
+                        border.color: layerColorPicker.selectedColor.toLowerCase() === modelData ? "#173c53" : "#8694a0"
+                        border.width: layerColorPicker.selectedColor.toLowerCase() === modelData ? 3 : 1
+                        ToolTip.visible: presetMouse.containsMouse
+                        ToolTip.text: modelData
+                        MouseArea {
+                            id: presetMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: {
+                                layerColorPicker.selectedColor = modelData;
+                                // Also repair an invalid manual value when the
+                                // user reselects the already active preset.
+                                presetHexField.text = modelData;
+                            }
+                        }
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Rectangle {
+                    Layout.preferredWidth: 48
+                    Layout.preferredHeight: 32
+                    radius: 4
+                    color: layerColorPicker.selectedColor
+                    border.color: "#8694a0"
+                }
+                TextField {
+                    id: presetHexField
+                    objectName: "presetHexField"
+                    Layout.fillWidth: true
+                    placeholderText: "#RRGGBB"
+                    validator: RegularExpressionValidator { regularExpression: /^#[0-9a-fA-F]{6}$/ }
+                    onTextEdited: {
+                        if (acceptableInput)
+                            layerColorPicker.selectedColor = text.toLowerCase();
+                    }
+                }
+                Button {
+                    objectName: "customColorPickerButton"
+                    text: rootWindow.language === "ko" ? "상세 색상…" : rootWindow.language === "jp" ? "その他の色…" : "More colors…"
+                    onClicked: {
+                        nativeLayerColorPicker.selectedColor = layerColorPicker.selectedColor;
+                        nativeLayerColorPicker.open();
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: rootWindow.tr("Cancel")
+                    onClicked: layerColorPicker.reject()
+                }
+                Button {
+                    objectName: "applyPickedColorButton"
+                    text: rootWindow.language === "ko" ? "색상 선택" : rootWindow.language === "jp" ? "色を選択" : "Use color"
+                    enabled: presetHexField.acceptableInput
+                    onClicked: layerColorPicker.accept()
+                }
+            }
+        }
+        onAccepted: {
+            if (targetField && normalizedSelectedColor() !== "")
+                targetField.text = normalizedSelectedColor();
+            targetField = null;
+        }
+        onRejected: targetField = null
+    }
+
+    QuickDialogs.ColorDialog {
+        id: nativeLayerColorPicker
+        objectName: "nativeLayerColorPicker"
+        title: layerColorPicker.title
+        onAccepted: {
+            var color = layerColorPicker.rgbHex(selectedColor);
+            layerColorPicker.selectedColor = color;
+            presetHexField.text = color;
         }
     }
 
@@ -606,6 +943,8 @@ ApplicationWindow {
                 property real panX: 0
                 property real panY: 0
                 property real mapZoom: 1.0
+                property real previousViewportWidth: 0
+                property real previousViewportHeight: 0
                 property string selectedLayer: ""
                 property string selectedFeature: ""
                 property string selectedStatus: "No feature selected"
@@ -806,11 +1145,46 @@ ApplicationWindow {
                     return zoomToFullExtent();
                 }
 
+                function preserveViewOnResize() {
+                    var oldWidth = previousViewportWidth;
+                    var oldHeight = previousViewportHeight;
+                    // Full-screen transitions can briefly expose a zero-sized
+                    // viewport. Keep the last valid dimensions so the final
+                    // resize still preserves the map's world center.
+                    if (width <= 0 || height <= 0)
+                        return;
+                    previousViewportWidth = width;
+                    previousViewportHeight = height;
+                    if (oldWidth <= 0 || oldHeight <= 0 ||
+                            !hasMapMetadata || layerModel.count === 0 || mapZoom <= 0)
+                        return;
+                    var aspect = mapMeterAspectRatio(dataBounds, dataCRS);
+                    var oldCanvasWidth = Math.min(oldWidth, oldHeight * aspect);
+                    var oldCanvasHeight = Math.min(oldHeight, oldWidth / aspect);
+                    var newCanvasWidth = Math.min(width, height * aspect);
+                    var newCanvasHeight = Math.min(height, width / aspect);
+                    if (oldCanvasWidth <= 0 || oldCanvasHeight <= 0 || newCanvasWidth <= 0 || newCanvasHeight <= 0)
+                        return;
+                    // Zoom is relative to the extent-sized canvas, not the viewport.
+                    // Resizing without adjusting it shifts a deeply panned map away
+                    // from the screen and changes the displayed metres per pixel.
+                    var centerX = 0.5 - panX / (oldCanvasWidth * mapZoom);
+                    var centerY = 0.5 + panY / (oldCanvasHeight * mapZoom);
+                    var resizedZoom = mapZoom * oldCanvasWidth / newCanvasWidth;
+                    mapZoom = resizedZoom;
+                    panX = (0.5 - centerX) * newCanvasWidth * resizedZoom;
+                    panY = (centerY - 0.5) * newCanvasHeight * resizedZoom;
+                    cursorValid = false;
+                    viewportGeneration += 1;
+                }
+
                 onWidthChanged: {
+                    preserveViewOnResize();
                     if (pendingInitialLayerFit)
                         Qt.callLater(function() { mapViewport.fitInitialMapExtent(); });
                 }
                 onHeightChanged: {
+                    preserveViewOnResize();
                     if (pendingInitialLayerFit)
                         Qt.callLater(function() { mapViewport.fitInitialMapExtent(); });
                 }
@@ -824,7 +1198,11 @@ ApplicationWindow {
                     var ny = 0.5 - (cursorY - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * zoom);
                     var x = bounds[0] + nx * (bounds[2] - bounds[0]);
                     var y = bounds[1] + ny * (bounds[3] - bounds[1]);
-                    function formatCoordinate(value) {
+                    return formatMapCoordinate(x, y);
+                }
+
+                function formatMapCoordinate(x, y) {
+                    function formatValue(value) {
                         var fixed = Number(value).toFixed(4);
                         var parts = fixed.split(".");
                         var integer = parts[0];
@@ -836,7 +1214,27 @@ ApplicationWindow {
                         integer = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
                         return sign + integer + "." + parts[1];
                     }
-                    return "X " + formatCoordinate(x) + "  Y " + formatCoordinate(y);
+                    return "X " + formatValue(x) + "  Y " + formatValue(y);
+                }
+
+                function centerMapCoordinateValues() {
+                    if (layerModel.count === 0 || mapCanvas.width <= 0 || mapCanvas.height <= 0 || mapZoom <= 0)
+                        return null;
+                    var bounds = dataBounds;
+                    if (bounds.length < 4 || bounds[2] <= bounds[0] || bounds[3] <= bounds[1])
+                        return null;
+                    var nx = 0.5 - panX / (mapCanvas.width * mapZoom);
+                    var ny = 0.5 + panY / (mapCanvas.height * mapZoom);
+                    return [bounds[0] + nx * (bounds[2] - bounds[0]),
+                            bounds[1] + ny * (bounds[3] - bounds[1])];
+                }
+
+                function statusCoordinateText() {
+                    if (cursorValid)
+                        return (rootWindow.language === "ko" ? "커서  " : rootWindow.language === "jp" ? "カーソル  " : "Cursor  ") + currentMapCoordinate();
+                    var center = centerMapCoordinateValues();
+                    return (rootWindow.language === "ko" ? "중심  " : rootWindow.language === "jp" ? "中心  " : "Center  ") +
+                           (center ? formatMapCoordinate(center[0], center[1]) : "—");
                 }
 
                 function luaFieldAccess(name) {
@@ -855,8 +1253,8 @@ ApplicationWindow {
                 }
 
                 function currentScaleText() {
-                    if (mapCanvas.width <= 0 || mapZoom <= 0)
-                        return "Scale —";
+                    if (layerModel.count === 0 || mapCanvas.width <= 0 || mapZoom <= 0)
+                        return "—";
                     var bounds = dataBounds;
                     var xUnitsPerPixel = (bounds[2] - bounds[0]) / (mapCanvas.width * mapZoom);
                     var metersPerUnit = 1.0;
@@ -866,8 +1264,8 @@ ApplicationWindow {
                     }
                     var denominator = xUnitsPerPixel * metersPerUnit * 96 / 0.0254;
                     if (!isFinite(denominator) || denominator <= 0)
-                        return "Scale —";
-                    return "Approx. 1:" + Math.max(1, Math.round(denominator)).toLocaleString();
+                        return "—";
+                    return "≈ 1:" + Math.max(1, Math.round(denominator)).toLocaleString();
                 }
 
                 function currentScaleDenominator() {
@@ -903,18 +1301,21 @@ ApplicationWindow {
                 }
 
                 function goToCoordinate() {
-                    var x = Number(coordinateXInput.text);
-                    var y = Number(coordinateYInput.text);
-                    if (!isFinite(x) || !isFinite(y) || dataBounds.length < 4 || dataBounds[2] === dataBounds[0] || dataBounds[3] === dataBounds[1]) {
-                        coordinateNavigationStatus.text = "Enter valid map coordinates";
-                        return;
+                    var xText = coordinateXInput.text.trim();
+                    var yText = coordinateYInput.text.trim();
+                    var x = Number(xText);
+                    var y = Number(yText);
+                    if (!xText || !yText || !isFinite(x) || !isFinite(y) || dataBounds.length < 4 || dataBounds[2] === dataBounds[0] || dataBounds[3] === dataBounds[1]) {
+                        coordinateNavigationStatus.text = rootWindow.language === "ko" ? "유효한 지도 좌표를 입력하세요." : rootWindow.language === "jp" ? "有効な地図座標を入力してください。" : "Enter valid map coordinates.";
+                        return false;
                     }
                     var nx = (x - dataBounds[0]) / (dataBounds[2] - dataBounds[0]);
                     var ny = (y - dataBounds[1]) / (dataBounds[3] - dataBounds[1]);
                     panX = (0.5 - nx) * mapCanvas.width * mapZoom;
                     panY = (ny - 0.5) * mapCanvas.height * mapZoom;
                     viewportGeneration += 1;
-                    coordinateNavigationStatus.text = "Centered at " + x + ", " + y;
+                    coordinateNavigationStatus.text = "";
+                    return true;
                 }
 
                 function requestAttributePage(page) {
@@ -945,6 +1346,10 @@ ApplicationWindow {
                     }
                     property real viewportPanX: mapViewport.panX
                     property real viewportPanY: mapViewport.panY
+                    // Native render planning must observe the final pan and
+                    // zoom after a resize, even when the canvas item itself
+                    // does not change size along one axis.
+                    property int viewGeneration: mapViewport.viewportGeneration
                     width: Math.min(parent.width, parent.height * mapAspectRatio)
                     height: Math.min(parent.height, parent.width / mapAspectRatio)
                     x: (parent.width - width) / 2 + mapViewport.panX
@@ -1632,75 +2037,188 @@ ApplicationWindow {
     }
 
     footer: ToolBar {
-        RowLayout {
+        implicitHeight: 86
+        ColumnLayout {
             anchors.fill: parent
-            anchors.leftMargin: 12
-            anchors.rightMargin: 12
-            Button {
-                objectName: "openDiagnosticLogsButton"
-                text: rootWindow.tr("Logs")
-                onClicked: diagnosticLogDialog.open()
+            anchors.margins: 5
+            spacing: 4
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 40
+                color: "#eaf2f6"
+                radius: 5
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 12
+                    spacing: 16
+                    ColumnLayout {
+                        Layout.preferredWidth: 145
+                        spacing: 0
+                        Label {
+                            text: rootWindow.language === "ko" ? "좌표계" : rootWindow.language === "jp" ? "座標系" : "CRS"
+                            color: "#526779"
+                            font.pixelSize: 10
+                        }
+                        Label {
+                            objectName: "crsStatusLabel"
+                            text: mapViewport.dataCRS || "—"
+                            color: "#173c53"
+                            font.pixelSize: 14
+                            font.bold: true
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: 250
+                        spacing: 0
+                        Label {
+                            text: rootWindow.language === "ko" ? "현재 좌표" : rootWindow.language === "jp" ? "現在座標" : "Current coordinates"
+                            color: "#526779"
+                            font.pixelSize: 10
+                        }
+                        Label {
+                            objectName: "coordinateStatusLabel"
+                            text: mapViewport.statusCoordinateText()
+                            color: "#173c53"
+                            font.pixelSize: 14
+                            font.bold: true
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                            ToolTip.visible: coordinateStatusMouse.containsMouse
+                            ToolTip.text: text
+                            MouseArea { id: coordinateStatusMouse; anchors.fill: parent; hoverEnabled: true }
+                        }
+                    }
+                    ColumnLayout {
+                        Layout.preferredWidth: 165
+                        spacing: 0
+                        Label {
+                            text: rootWindow.language === "ko" ? "축척" : rootWindow.language === "jp" ? "縮尺" : "Scale"
+                            color: "#526779"
+                            font.pixelSize: 10
+                        }
+                        Label {
+                            objectName: "scaleStatusLabel"
+                            text: mapViewport.currentScaleText()
+                            color: "#173c53"
+                            font.pixelSize: 14
+                            font.bold: true
+                            ToolTip.visible: scaleStatusMouse.containsMouse
+                            ToolTip.text: rootWindow.language === "ko" ? "96 DPI 기준의 근사 축척입니다." : rootWindow.language === "jp" ? "96 DPI に基づく概算縮尺です。" : "Approximate scale based on 96 DPI."
+                            MouseArea { id: scaleStatusMouse; anchors.fill: parent; hoverEnabled: true }
+                        }
+                    }
+                }
             }
-            BusyIndicator {
-                objectName: "loadBusyIndicator"
-                running: rootWindow.statusIsBusy(mapViewport.renderStatus)
-                visible: running
-                implicitWidth: 22
-                implicitHeight: 22
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                spacing: 8
+                Button {
+                    objectName: "openDiagnosticLogsButton"
+                    text: rootWindow.tr("Logs")
+                    onClicked: diagnosticLogDialog.open()
+                }
+                BusyIndicator {
+                    objectName: "loadBusyIndicator"
+                    running: rootWindow.statusIsBusy(mapViewport.renderStatus)
+                    visible: running
+                    implicitWidth: 22
+                    implicitHeight: 22
+                }
+                Label {
+                    objectName: "renderStatusLabel"
+                    text: rootWindow.localizedStatus(mapViewport.renderStatus)
+                    color: rootWindow.statusColor(mapViewport.renderStatus)
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 80
+                    elide: Text.ElideRight
+                    ToolTip.visible: renderStatusMouse.containsMouse
+                    ToolTip.text: text
+                    MouseArea { id: renderStatusMouse; anchors.fill: parent; hoverEnabled: true }
+                }
+                Button {
+                    objectName: "openCoordinateNavigationButton"
+                    text: rootWindow.language === "ko" ? "좌표 이동" : rootWindow.language === "jp" ? "座標へ移動" : "Go to coordinates"
+                    onClicked: coordinateNavigationDialog.open()
+                }
+                Button {
+                    text: rootWindow.tr("Cancel loading/render")
+                    enabled: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
+                    visible: enabled
+                    onClicked: mapCanvas.cancelGeneration += 1
+                }
+                Label {
+                    objectName: "layerCountStatusLabel"
+                    text: (rootWindow.language === "ko" ? "레이어 " : rootWindow.language === "jp" ? "レイヤー " : "Layers ") + layerModel.count
+                    color: "#65717d"
+                }
+                Label {
+                    objectName: "memoryStatusLabel"
+                    visible: rootWindow.width >= 1150
+                    text: rootWindow.memorySummary(mapCanvas.processMemoryBytes, mapCanvas.goHeapBytes, mapCanvas.memoryStatusAvailable, mapCanvas.processMemoryKind)
+                    color: "#65717d"
+                    font.pixelSize: 11
+                    Layout.maximumWidth: 260
+                    elide: Text.ElideRight
+                    ToolTip.visible: memoryMouse.containsMouse
+                    ToolTip.text: language === "ko" ? "프로세스 메모리에는 Go/GDAL/Qt가 포함됩니다. GPU 메모리는 포함되지 않습니다. macOS CGO 데스크톱은 현재 RSS를 표시합니다." : language === "jp" ? "プロセスメモリにはGo/GDAL/Qtを含みます。GPUメモリは含みません。macOSのCGOデスクトップは現在のRSSを表示します。" : "Process memory includes Go/GDAL/Qt, but excludes GPU memory. The macOS CGO desktop shows current RSS."
+                    MouseArea { id: memoryMouse; anchors.fill: parent; hoverEnabled: true }
+                }
             }
+        }
+    }
+
+    Dialog {
+        id: coordinateNavigationDialog
+        objectName: "coordinateNavigationDialog"
+        title: rootWindow.language === "ko" ? "좌표 이동" : rootWindow.language === "jp" ? "座標へ移動" : "Go to coordinates"
+        modal: true
+        standardButtons: Dialog.Close
+        width: Math.min(rootWindow.width - 40, 360)
+        anchors.centerIn: parent
+        onOpened: {
+            var center = mapViewport.centerMapCoordinateValues();
+            coordinateXInput.text = center ? center[0].toFixed(4) : "";
+            coordinateYInput.text = center ? center[1].toFixed(4) : "";
+            coordinateNavigationStatus.text = "";
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
             Label {
-                objectName: "renderStatusLabel"
-                text: rootWindow.localizedStatus(mapViewport.renderStatus)
-                color: rootWindow.statusColor(mapViewport.renderStatus)
-                Layout.maximumWidth: 390
-                elide: Text.ElideRight
+                text: mapViewport.dataCRS || "—"
+                color: "#526779"
             }
             TextField {
                 id: coordinateXInput
-                Layout.preferredWidth: 115
+                objectName: "coordinateXInput"
+                Layout.fillWidth: true
                 placeholderText: rootWindow.tr("X coordinate")
+                onAccepted: if (mapViewport.goToCoordinate()) coordinateNavigationDialog.close()
             }
             TextField {
                 id: coordinateYInput
-                Layout.preferredWidth: 115
+                objectName: "coordinateYInput"
+                Layout.fillWidth: true
                 placeholderText: rootWindow.tr("Y coordinate")
-                onAccepted: mapViewport.goToCoordinate()
-            }
-            Button {
-                text: rootWindow.tr("Go")
-                onClicked: mapViewport.goToCoordinate()
+                onAccepted: if (mapViewport.goToCoordinate()) coordinateNavigationDialog.close()
             }
             Label {
                 id: coordinateNavigationStatus
-                color: "#65717d"
+                objectName: "coordinateNavigationStatus"
+                Layout.fillWidth: true
+                color: "#b42318"
+                wrapMode: Text.WordWrap
+                visible: text !== ""
             }
             Button {
-                text: rootWindow.tr("Cancel loading/render")
-                enabled: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
-                onClicked: mapCanvas.cancelGeneration += 1
-            }
-            Item {
-                Layout.fillWidth: true
-            }
-            Label {
-                objectName: "memoryStatusLabel"
-                visible: rootWindow.width >= 1200
-                text: rootWindow.memorySummary(mapCanvas.processMemoryBytes, mapCanvas.goHeapBytes, mapCanvas.memoryStatusAvailable, mapCanvas.processMemoryKind)
-                color: "#65717d"
-                font.pixelSize: 11
-                Layout.maximumWidth: 240
-                elide: Text.ElideRight
-                ToolTip.visible: memoryMouse.containsMouse
-                ToolTip.text: language === "ko" ? "프로세스 메모리에는 Go/GDAL/Qt가 포함됩니다. GPU 메모리는 포함되지 않습니다. macOS CGO 데스크톱은 현재 RSS를 표시합니다." : language === "jp" ? "プロセスメモリにはGo/GDAL/Qtを含みます。GPUメモリは含みません。macOSのCGOデスクトップは現在のRSSを表示します。" : "Process memory includes Go/GDAL/Qt, but excludes GPU memory. The macOS CGO desktop shows current RSS."
-                MouseArea { id: memoryMouse; anchors.fill: parent; hoverEnabled: true }
-            }
-            Label {
-                text: "Layers: " + layerModel.count + "  ·  " + (mapViewport.dataCRS || "CRS unknown") + "  ·  " + mapViewport.currentMapCoordinate()
-                color: "#65717d"
-            }
-            Label {
-                text: mapViewport.currentScaleText()
-                color: "#65717d"
+                objectName: "coordinateGoButton"
+                text: rootWindow.tr("Go")
+                Layout.alignment: Qt.AlignRight
+                onClicked: if (mapViewport.goToCoordinate()) coordinateNavigationDialog.close()
             }
         }
     }
@@ -1747,6 +2265,12 @@ ApplicationWindow {
             if (kind === "line")
                 return type.indexOf("LINE") >= 0 || type.indexOf("POLYGON") >= 0;
             return type.indexOf("POLYGON") >= 0;
+        }
+
+        function pickColor(field) {
+            layerColorPicker.targetField = field;
+            layerColorPicker.selectedColor = field.text;
+            layerColorPicker.open();
         }
 
         function loadLayer() {
@@ -1991,11 +2515,27 @@ ApplicationWindow {
                         text: rootWindow.tr("Point color")
                         visible: layerSettingsDialog.styleAppliesTo("point")
                     }
-                    TextField {
-                        id: pointColorField
-                        objectName: "pointColorField"
+                    RowLayout {
                         Layout.fillWidth: true
                         visible: layerSettingsDialog.styleAppliesTo("point")
+                        TextField {
+                            id: pointColorField
+                            objectName: "pointColorField"
+                            Layout.fillWidth: true
+                            readOnly: true
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 24; Layout.preferredHeight: 24
+                            color: pointColorField.text
+                            border.color: "#65717d"
+                            radius: 3
+                            MouseArea { anchors.fill: parent; onClicked: layerSettingsDialog.pickColor(pointColorField) }
+                        }
+                        Button {
+                            objectName: "pointColorPickerButton"
+                            text: rootWindow.language === "ko" ? "색 선택…" : rootWindow.language === "jp" ? "色を選択…" : "Choose…"
+                            onClicked: layerSettingsDialog.pickColor(pointColorField)
+                        }
                     }
                     Label {
                         text: rootWindow.tr("Point size (mm)")
@@ -2012,11 +2552,27 @@ ApplicationWindow {
                         text: rootWindow.tr("Line color")
                         visible: layerSettingsDialog.styleAppliesTo("line")
                     }
-                    TextField {
-                        id: lineColorField
-                        objectName: "lineColorField"
+                    RowLayout {
                         Layout.fillWidth: true
                         visible: layerSettingsDialog.styleAppliesTo("line")
+                        TextField {
+                            id: lineColorField
+                            objectName: "lineColorField"
+                            Layout.fillWidth: true
+                            readOnly: true
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 24; Layout.preferredHeight: 24
+                            color: lineColorField.text
+                            border.color: "#65717d"
+                            radius: 3
+                            MouseArea { anchors.fill: parent; onClicked: layerSettingsDialog.pickColor(lineColorField) }
+                        }
+                        Button {
+                            objectName: "lineColorPickerButton"
+                            text: rootWindow.language === "ko" ? "색 선택…" : rootWindow.language === "jp" ? "色を選択…" : "Choose…"
+                            onClicked: layerSettingsDialog.pickColor(lineColorField)
+                        }
                     }
                     Label {
                         text: rootWindow.tr("Line width (mm)")
@@ -2033,11 +2589,27 @@ ApplicationWindow {
                         text: rootWindow.tr("Polygon color")
                         visible: layerSettingsDialog.styleAppliesTo("polygon")
                     }
-                    TextField {
-                        id: polygonColorField
-                        objectName: "polygonColorField"
+                    RowLayout {
                         Layout.fillWidth: true
                         visible: layerSettingsDialog.styleAppliesTo("polygon")
+                        TextField {
+                            id: polygonColorField
+                            objectName: "polygonColorField"
+                            Layout.fillWidth: true
+                            readOnly: true
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 24; Layout.preferredHeight: 24
+                            color: polygonColorField.text
+                            border.color: "#65717d"
+                            radius: 3
+                            MouseArea { anchors.fill: parent; onClicked: layerSettingsDialog.pickColor(polygonColorField) }
+                        }
+                        Button {
+                            objectName: "polygonColorPickerButton"
+                            text: rootWindow.language === "ko" ? "색 선택…" : rootWindow.language === "jp" ? "色を選択…" : "Choose…"
+                            onClicked: layerSettingsDialog.pickColor(polygonColorField)
+                        }
                     }
                     Label {
                         text: rootWindow.tr("Fill opacity (0–1)")

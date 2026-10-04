@@ -32,9 +32,9 @@ const MaxChunkVertices = 2 * 1024 * 1024
 
 // MaxBatchVertices bounds the flattened viewport payload before adapters copy
 // it into native memory. Qt can expand each source vertex into as many as three
-// scene-graph vertices. The 8 Mi source budget allows municipality-wide parcel
-// networks while keeping a strict bound on all native copies and GPU geometry.
-const MaxBatchVertices = 8 * 1024 * 1024
+// scene-graph vertices. The 12 Mi source budget allows larger municipality-wide
+// parcel networks while keeping a strict bound on native copies and GPU geometry.
+const MaxBatchVertices = 12 * 1024 * 1024
 
 // maxFullLayerChunkGridAxis bounds work when a builder prepares every
 // normalized cell. Single-target viewport builders do not use this full-grid

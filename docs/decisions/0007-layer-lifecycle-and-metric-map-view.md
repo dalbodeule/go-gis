@@ -35,6 +35,12 @@ was no project-layer removal action.
   meter-based data. For EPSG:4326, use the extent-center latitude to adjust
   longitude degrees to approximate meters; a single 2D canvas cannot be
   exactly metric over an entire geographic extent.
+- Preserve the current world-space center and metres-per-pixel when the map
+  viewport changes size, including maximize and full-screen transitions. The
+  extent-sized canvas changes dimensions, so its normalized zoom and pan must
+  be recalculated before requesting new visible chunks. Observe parent viewport
+  size independently of canvas size, since the canvas may remain unchanged on
+  its non-limiting axis.
 - Close the layer context menu on outside click or Escape. Remove a layer only
   after confirmation; rebuild the project from remaining layers while leaving
   source files untouched. Rebuilt in-memory layers must serve attributes from

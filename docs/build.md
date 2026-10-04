@@ -445,6 +445,8 @@ GDAL은 MIT 기반이지만 GDAL binary의 optional drivers/dependencies는 별�
 
 현재 single-file audit의 상세 상태와 배포 전에 사람의 개입이 필요한 검증은
 [보안·배포·사용자 후속 확인](verification/deferred-user-validation.md)에 모았다.
+OS별 portable 폴더, macOS 앱 번들, Windows 설치파일, Linux AppImage의 선택과
+검증 게이트는 [데스크톱 배포 결정](decisions/0013-desktop-distribution.md)에 정리했다.
 
 배포 전에는 다음을 실제 대상 OS에서 확인합니다.
 

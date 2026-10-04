@@ -50,8 +50,8 @@ static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm
                   offsetof(GoGISVertex, kind) == 16,
               "Go render.Vertex field offsets changed");
 std::vector<GoGISVertex> g_vertices;
-constexpr size_t kMaxSourceVertexCount = 8 * 1024 * 1024;
-constexpr size_t kMaxSceneGraphVertices = 24 * 1024 * 1024;
+constexpr size_t kMaxSourceVertexCount = 12 * 1024 * 1024;
+constexpr size_t kMaxSceneGraphVertices = 36 * 1024 * 1024;
 constexpr size_t kRetainedVertexCapacityFloor = 64 * 1024;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
@@ -263,6 +263,23 @@ public:
         // QObject from its render polling goroutine.
         click_timer_.setInterval(16);
         QObject::connect(&click_timer_, &QTimer::timeout, this, [this]() {
+            const auto view_generation = property("viewGeneration").toULongLong();
+            if (view_generation != view_generation_) {
+                update_viewport_snapshot(this);
+                view_generation_ = view_generation;
+                g_viewport_generation.fetch_add(1, std::memory_order_relaxed);
+            }
+            // A viewport can grow along its non-limiting axis without changing
+            // the extent-sized canvas geometry. Capture that resize too, or
+            // render planning continues to use the old screen dimensions.
+            const auto* viewport = parentItem();
+            const double viewport_width = viewport != nullptr ? viewport->width() : width();
+            const double viewport_height = viewport != nullptr ? viewport->height() : height();
+            if (viewport_width != g_viewport_width.load(std::memory_order_relaxed) ||
+                viewport_height != g_viewport_height.load(std::memory_order_relaxed)) {
+                update_viewport_snapshot(this);
+                g_viewport_generation.fetch_add(1, std::memory_order_relaxed);
+            }
             const double logical_pixels_per_mm = property("logicalPixelsPerMm").toDouble();
             if (std::isfinite(logical_pixels_per_mm) && logical_pixels_per_mm > 0.0) {
                 g_logical_pixels_per_mm.store(logical_pixels_per_mm, std::memory_order_relaxed);
@@ -652,6 +669,7 @@ private:
     QSGGeometry geometry_;
     QSGVertexColorMaterial material_;
     QTimer click_timer_;
+    unsigned long long view_generation_ = 0;
     unsigned long long selection_generation_ = 0;
     unsigned long long attribute_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;

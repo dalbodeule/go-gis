@@ -1131,7 +1131,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	visibleFeatureCount := runtime.windowVisibleFeatureCount
 	visiblePayloadBytes := runtime.windowVisiblePayloadBytes
 	runtime.mu.Unlock()
-	if visibleWindow && visibleFeatureCount >= maxReadOnlyVisibleFeatures {
+	if visibleWindow && !readOnlyVisibleFeaturesFit(visibleFeatureCount, 1) {
 		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
 	}
 	if visibleWindow && visiblePayloadBytes >= maxReadOnlyVisibleBytes {
@@ -1245,13 +1245,19 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		runtime.mu.Unlock()
 	}
 	if includeProperties && binding.layer.Labels.Enabled {
-		if err := prepareReadOnlyWindowLabels(ctx, &window, overview); err != nil {
+		if err := prepareReadOnlyWindowLabels(ctx, &window, overview, lodBucket); err != nil {
 			return render.Chunk{}, err
 		}
 	}
 	displayWindow := window
-	if key.ZoomBucket <= 1 || overview {
+	// At city scale, keep individual parcel edges and hit targets while
+	// removing sub-pixel bends from the transient display copy. The original
+	// source geometry is unchanged for editing and export.
+	detailSimplification := !overview && lodBucket >= 2 && lodBucket <= 4
+	if overview || detailSimplification {
 		tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, lodBucket)
+		// At these scales the existing overview tolerance is still sub-pixel;
+		// retain topology and parcel boundaries without keeping every bend.
 		if forceOverview {
 			// A viewport-wide safety retry may simplify the dissolved boundary
 			// more aggressively; the original geometries remain available on zoom-in.
@@ -1300,7 +1306,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	if _, visible := runtime.windowVisibleKeys[key]; visible {
 		runtime.removeWindowChunkLocked(key)
 		if !overview {
-			if runtime.windowVisibleFeatureCount+len(window.Features) > maxReadOnlyVisibleFeatures {
+			if !readOnlyVisibleFeaturesFit(runtime.windowVisibleFeatureCount, len(window.Features)) {
 				runtime.mu.Unlock()
 				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
 			}
@@ -1348,20 +1354,37 @@ func readOnlyWindowNeedsProperties(labels core.LabelSettings, overview, polygonO
 
 const maxReadOnlyOverviewLabelsPerChunk = 32
 
-func prepareReadOnlyWindowLabels(ctx context.Context, window *core.Layer, overview bool) error {
+func readOnlyWindowLabelLimit(overview bool, lodBucket int) int {
+	if overview {
+		return maxReadOnlyOverviewLabelsPerChunk
+	}
+	switch {
+	case lodBucket <= 2:
+		return 8
+	case lodBucket == 3:
+		return 32
+	case lodBucket == 4:
+		return 128
+	default:
+		return 0 // Close views retain all eligible labels.
+	}
+}
+
+func prepareReadOnlyWindowLabels(ctx context.Context, window *core.Layer, overview bool, lodBucket int) error {
 	if window == nil || !window.Labels.Enabled {
 		return nil
 	}
-	if !overview || len(window.Features) <= maxReadOnlyOverviewLabelsPerChunk {
+	limit := readOnlyWindowLabelLimit(overview, lodBucket)
+	if limit <= 0 || len(window.Features) <= limit {
 		return prepareLayerLabels(ctx, []core.Layer{*window})
 	}
-	// A coarse tile only has room for a few labels. Avoid running text scripts
-	// and GEOS PointOnSurface for every parcel that intersects it.
+	// At wide scales a tile only has room for a few labels. Avoid running text
+	// scripts and GEOS PointOnSurface for every parcel that intersects it.
 	selected := *window
-	selected.Features = make([]core.Feature, 0, maxReadOnlyOverviewLabelsPerChunk)
-	indices := make([]int, 0, maxReadOnlyOverviewLabelsPerChunk)
-	for index := 0; index < maxReadOnlyOverviewLabelsPerChunk; index++ {
-		featureIndex := index * len(window.Features) / maxReadOnlyOverviewLabelsPerChunk
+	selected.Features = make([]core.Feature, 0, limit)
+	indices := make([]int, 0, limit)
+	for index := 0; index < limit; index++ {
+		featureIndex := index * len(window.Features) / limit
 		indices = append(indices, featureIndex)
 		selected.Features = append(selected.Features, window.Features[featureIndex])
 	}
@@ -1389,14 +1412,14 @@ const (
 	maxReadOnlyWindowPolygonVertices = 250_000
 	// Bounds retained hit-test geometry across the active viewport. When a view
 	// exceeds this cap the affected chunk fails visibly and users can zoom in.
-	maxReadOnlyVisibleFeatures = 50_000
+	maxReadOnlyVisibleFeatures = 300_000
 	// Keep enough geometry-only features to preserve the parcel network in a
 	// citywide overview. Polygon fills are omitted at this scale, so outlines
 	// consume a fraction of the full-detail vertex budget.
-	maxReadOnlyWindowBytes  = 32 << 20
+	maxReadOnlyWindowBytes = 32 << 20
 	// The viewport can retain several individually bounded windows. Keep its
 	// aggregate budget separate from the per-window allocation guard.
-	maxReadOnlyVisibleBytes = 128 << 20
+	maxReadOnlyVisibleBytes = 256 << 20
 	// Bounds all retained polygon fill meshes in a materialized desktop project
 	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
 	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
@@ -1410,6 +1433,11 @@ const (
 func readOnlyVisiblePayloadFits(current, additional int64) bool {
 	return current >= 0 && additional >= 0 && current <= maxReadOnlyVisibleBytes &&
 		additional <= maxReadOnlyVisibleBytes-current
+}
+
+func readOnlyVisibleFeaturesFit(current, additional int) bool {
+	return current >= 0 && additional >= 0 && current <= maxReadOnlyVisibleFeatures &&
+		additional <= maxReadOnlyVisibleFeatures-current
 }
 
 func isPolygonOverviewLayer(geometryType string) bool {

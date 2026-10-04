@@ -10,7 +10,7 @@ import (
 )
 
 func TestViewportBatchBudgetFitsQtSceneGraphExpansionLimit(t *testing.T) {
-	const maxQtSceneGraphVertices = 24 * 1024 * 1024
+	const maxQtSceneGraphVertices = 36 * 1024 * 1024
 	const maxExpandedVerticesPerSourceVertex = 3
 	if expanded := MaxBatchVertices * maxExpandedVerticesPerSourceVertex; expanded > maxQtSceneGraphVertices {
 		t.Fatalf("viewport source budget %d may expand to %d Qt vertices, exceeding %d",

@@ -55,10 +55,11 @@ func main() {
 	engine := qml.NewQQmlApplicationEngine()
 	rootContext := engine.RootContext()
 	for name, value := range map[string]string{
-		"appLanguage":    language,
-		"appVersion":     appVersion,
-		"appRuntime":     goruntime.Version(),
-		"appBuildTarget": goruntime.GOOS + "/" + goruntime.GOARCH,
+		"appLanguage":       language,
+		"appVersion":        appVersion,
+		"appRuntime":        goruntime.Version(),
+		"appBuildTarget":    goruntime.GOOS + "/" + goruntime.GOARCH,
+		"appCRSCatalogJSON": desktopCRSCatalogJSON(),
 	} {
 		variant := qt.NewQVariant14(value)
 		rootContext.SetContextProperty2(name, variant)
