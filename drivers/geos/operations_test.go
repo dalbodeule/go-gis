@@ -108,6 +108,43 @@ func TestDissolvePolygonBoundariesForDisplayDropsSharedParcelEdge(t *testing.T) 
 	}
 }
 
+func TestDissolvePolygonCoverageForDisplayKeepsFillArea(t *testing.T) {
+	geosContext := geoslib.NewContext()
+	left, err := geosContext.NewGeomFromWKT("POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := geosContext.NewGeomFromWKT("POLYGON ((2 0, 4 0, 4 2, 2 2, 2 0))")
+	if err != nil {
+		left.Destroy()
+		t.Fatal(err)
+	}
+	layer := core.Layer{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{
+		{Geometry: core.WKBGeometry{WKB: left.ToWKB()}},
+		{Geometry: core.WKBGeometry{WKB: right.ToWKB()}},
+	}}
+	left.Destroy()
+	right.Destroy()
+	result, err := NewOperator().DissolvePolygonCoverageForDisplay(context.Background(), layer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Features) != 1 || !strings.Contains(result.Features[0].Geometry.GeometryType(), "POLYGON") {
+		t.Fatalf("coverage features = %#v, want one fillable polygon", result.Features)
+	}
+	coverage, err := geosContext.NewGeomFromWKB(result.Features[0].Geometry.(core.WKBGeometry).WKB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coverage.Destroy()
+	if got := coverage.Area(); math.Abs(got-8) > 1e-9 {
+		t.Fatalf("coverage area = %v, want 8", got)
+	}
+	if len(layer.Features) != 2 {
+		t.Fatal("coverage dissolve mutated the source layer")
+	}
+}
+
 func TestOverviewUnionGridRespectsCRSUnits(t *testing.T) {
 	for _, test := range []struct {
 		crs  string

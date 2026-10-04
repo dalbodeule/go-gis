@@ -116,6 +116,17 @@ func (o *Operator) SimplifyForDisplay(ctx context.Context, layer core.Layer, tol
 // rendering only: parcel-level borders and feature interaction are omitted,
 // while the source layer remains unchanged for detailed zooms and queries.
 func (o *Operator) DissolvePolygonBoundariesForDisplay(ctx context.Context, layer core.Layer) (output core.Layer, err error) {
+	return o.dissolvePolygonForDisplay(ctx, layer, true)
+}
+
+// DissolvePolygonCoverageForDisplay preserves the unioned polygon area so a
+// municipality-wide overview can show continuous fill instead of sub-pixel
+// parcel triangles. The source geometries are not modified.
+func (o *Operator) DissolvePolygonCoverageForDisplay(ctx context.Context, layer core.Layer) (output core.Layer, err error) {
+	return o.dissolvePolygonForDisplay(ctx, layer, false)
+}
+
+func (o *Operator) dissolvePolygonForDisplay(ctx context.Context, layer core.Layer, boundaryOnly bool) (output core.Layer, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			output = core.Layer{}
@@ -166,14 +177,17 @@ func (o *Operator) DissolvePolygonBoundariesForDisplay(ctx context.Context, laye
 	if union == nil {
 		return core.Layer{}, fmt.Errorf("dissolve polygon coverage for overview")
 	}
-	boundary := union.Boundary()
-	union.Destroy()
-	if boundary == nil {
-		return core.Layer{}, fmt.Errorf("extract dissolved polygon boundary for overview")
+	geometry := union
+	if boundaryOnly {
+		geometry = union.Boundary()
+		union.Destroy()
+		if geometry == nil {
+			return core.Layer{}, fmt.Errorf("extract dissolved polygon boundary for overview")
+		}
 	}
 	result := layer
-	result.Features = []core.Feature{{Geometry: core.WKBGeometry{WKB: boundary.ToWKB()}}}
-	boundary.Destroy()
+	result.Features = []core.Feature{{Geometry: core.WKBGeometry{WKB: geometry.ToWKB()}}}
+	geometry.Destroy()
 	return result, nil
 }
 

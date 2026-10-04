@@ -658,7 +658,7 @@ func TestRefreshVisibleLayerPublishesVerticesAndReusesCacheAfterToggle(t *testin
 	firstDiagnosticCount := diagnosticEntryCount(t, native.DiagnosticLogJSON())
 	runtime.refresh(context.Background(), viewport)
 	firstReady := waitForRenderDiagnostic(t, firstDiagnosticCount, "ready generation=1")
-	if strings.Contains(firstReady, "vertices=0") {
+	if strings.Contains(firstReady, " vertices=0 ") {
 		t.Fatalf("initial visible-layer render produced no vertices: %s", firstReady)
 	}
 
@@ -671,7 +671,7 @@ func TestRefreshVisibleLayerPublishesVerticesAndReusesCacheAfterToggle(t *testin
 	secondDiagnosticCount := diagnosticEntryCount(t, native.DiagnosticLogJSON())
 	runtime.refresh(context.Background(), viewport)
 	secondReady := waitForRenderDiagnostic(t, secondDiagnosticCount, "ready generation=3")
-	if strings.Contains(secondReady, "vertices=0") {
+	if strings.Contains(secondReady, " vertices=0 ") {
 		t.Fatalf("visible-layer restoration did not publish cached geometry: %s", secondReady)
 	}
 	var cacheHits int

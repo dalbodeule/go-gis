@@ -166,6 +166,204 @@ func TestReadOnlyWindowChunkSizeKeepsQueryWindowsBounded(t *testing.T) {
 	}
 }
 
+func TestDenseReadOnlyOverviewKeepsDissolvedPolygonFill(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "parcels.shp")
+	layer := core.Layer{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((2 0, 4 0, 4 2, 2 2, 2 0))"}},
+	}}
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	binding := runtime.readOnlyBindings["parcels"]
+	binding.featureCount = 100_000 // Exercise the dense-layer presentation with a small redistributable fixture.
+	runtime.readOnlyBindings["parcels"] = binding
+	key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(-1), "parcels", render.Point{X: 2, Y: 1})
+	key.ZoomBucket = -1
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys[key] = struct{}{}
+	runtime.mu.Unlock()
+	chunk, err := runtime.builder(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillVertices := 0
+	for _, vertex := range chunk.Vertices {
+		if vertex.Kind == render.VertexFill {
+			fillVertices++
+		}
+	}
+	if fillVertices == 0 {
+		t.Fatal("dense overview lost the continuous polygon fill")
+	}
+}
+
+func TestDenseReadOnlyOverviewRealSourceSamples(t *testing.T) {
+	path := os.Getenv("GOGIS_TEST_DENSE_POLYGON_SOURCE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DENSE_POLYGON_SOURCE to a local large polygon SHP")
+	}
+	timeout := 60 * time.Second
+	if os.Getenv("GOGIS_TEST_OVERVIEW_FULL") == "1" {
+		timeout = 180 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	if runtime.readOnlyBindings[name].featureCount < 100_000 {
+		t.Fatalf("source has too few features for the dense overview: %d", runtime.readOnlyBindings[name].featureCount)
+	}
+	viewport := render.Viewport{
+		Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 0.9,
+		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 509, CanvasHeight: 726,
+	}
+	planner := runtime.planner
+	planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
+	keys := planner.VisibleKeys(viewport, name)
+	started := time.Now()
+	testedChunks, filledChunks, vertices, fillVertices := 0, 0, 0, 0
+	var fillAreaByQuadrant [4]float64
+	var signedFillAreaByQuadrant [4][2]float64
+	var fillAreaByCell [16][16]float64
+	sampleLimit := 16
+	fullViewport := os.Getenv("GOGIS_TEST_OVERVIEW_FULL") == "1"
+	var batchStore *render.BatchStore
+	if fullViewport {
+		sampleLimit = len(keys)
+		batchStore = render.NewBatchStore()
+		batchStore.BeginGenerationWithVisible(1, keys)
+	} else if requested := os.Getenv("GOGIS_TEST_OVERVIEW_SAMPLE_LIMIT"); requested != "" {
+		parsed, parseErr := strconv.Atoi(requested)
+		if parseErr != nil || parsed < 1 || parsed > 16 {
+			t.Fatalf("invalid GOGIS_TEST_OVERVIEW_SAMPLE_LIMIT %q", requested)
+		}
+		sampleLimit = parsed
+	}
+	for _, key := range keys {
+		if !fullViewport && (key.X < 0 || key.Y < 0 || key.X%8 != 4 || key.Y%8 != 4) {
+			continue
+		}
+		if testedChunks >= sampleLimit {
+			break
+		}
+		testedChunks++
+		chunk, err := runtime.builder(ctx, key)
+		if err != nil {
+			t.Fatalf("build overview chunk %v: %v", key, err)
+		}
+		vertices += len(chunk.Vertices)
+		if fullViewport {
+			if applied, err := batchStore.ApplyImmutableChecked(render.ChunkResult{Generation: 1, Key: key, Chunk: chunk}); !applied || err != nil {
+				t.Fatalf("apply overview chunk %v to display batch: applied=%t err=%v", key, applied, err)
+			}
+		}
+		chunkHasFill := false
+		for _, vertex := range chunk.Vertices {
+			if vertex.Kind == render.VertexFill {
+				fillVertices++
+				chunkHasFill = true
+			}
+		}
+		if fullViewport {
+			for index := 0; index+2 < len(chunk.Vertices); index += 3 {
+				a, b, c := chunk.Vertices[index], chunk.Vertices[index+1], chunk.Vertices[index+2]
+				if a.Kind != render.VertexFill || b.Kind != render.VertexFill || c.Kind != render.VertexFill {
+					break
+				}
+				signedArea := (float64(b.X-a.X)*float64(c.Y-a.Y) - float64(b.Y-a.Y)*float64(c.X-a.X)) / 2
+				area := math.Abs(signedArea)
+				x, y := (float64(a.X)+float64(b.X)+float64(c.X))/3, (float64(a.Y)+float64(b.Y)+float64(c.Y))/3
+				quadrant := 0
+				if x >= 0.5 {
+					quadrant++
+				}
+				if y >= 0.5 {
+					quadrant += 2
+				}
+				fillAreaByQuadrant[quadrant] += area
+				if signedArea < 0 {
+					signedFillAreaByQuadrant[quadrant][0] += area
+				} else {
+					signedFillAreaByQuadrant[quadrant][1] += area
+				}
+				cellX, cellY := min(15, max(0, int(x*16))), min(15, max(0, int(y*16)))
+				fillAreaByCell[cellY][cellX] += area
+			}
+		}
+		if chunkHasFill {
+			filledChunks++
+		}
+	}
+	t.Logf("dense overview samples: planned_chunks=%d tested_chunks=%d filled_chunks=%d vertices=%d fill_vertices=%d elapsed=%s",
+		len(keys), testedChunks, filledChunks, vertices, fillVertices, time.Since(started))
+	if fullViewport {
+		t.Logf("fill area by quadrant (normalized): %v", fillAreaByQuadrant)
+		t.Logf("fill area by quadrant, negative/positive winding: %v", signedFillAreaByQuadrant)
+		_, flattened := batchStore.Current()
+		if len(flattened) != vertices {
+			t.Fatalf("final display batch vertices=%d, built=%d", len(flattened), vertices)
+		}
+		var flattenedAreaByQuadrant [4]float64
+		for index := 0; index < len(flattened); {
+			if flattened[index].Kind != render.VertexFill {
+				index += 2
+				continue
+			}
+			if index+2 >= len(flattened) || flattened[index+1].Kind != render.VertexFill || flattened[index+2].Kind != render.VertexFill {
+				t.Fatalf("incomplete fill triangle at flattened vertex %d", index)
+			}
+			a, b, c := flattened[index], flattened[index+1], flattened[index+2]
+			area := math.Abs(float64(b.X-a.X)*float64(c.Y-a.Y)-float64(b.Y-a.Y)*float64(c.X-a.X)) / 2
+			x, y := (float64(a.X)+float64(b.X)+float64(c.X))/3, (float64(a.Y)+float64(b.Y)+float64(c.Y))/3
+			quadrant := 0
+			if x >= 0.5 {
+				quadrant++
+			}
+			if y >= 0.5 {
+				quadrant += 2
+			}
+			flattenedAreaByQuadrant[quadrant] += area
+			index += 3
+		}
+		for quadrant := range fillAreaByQuadrant {
+			if math.Abs(flattenedAreaByQuadrant[quadrant]-fillAreaByQuadrant[quadrant]) > 1e-8 {
+				t.Fatalf("display batch quadrant %d fill area=%.9f, built=%.9f", quadrant, flattenedAreaByQuadrant[quadrant], fillAreaByQuadrant[quadrant])
+			}
+		}
+		for _, row := range fillAreaByCell {
+			var line strings.Builder
+			for _, area := range row {
+				switch {
+				case area > 0.0005:
+					line.WriteByte('#')
+				case area > 0.00005:
+					line.WriteByte('+')
+				case area > 0.000005:
+					line.WriteByte('.')
+				default:
+					line.WriteByte(' ')
+				}
+			}
+			t.Log(line.String())
+		}
+	}
+	if filledChunks < min(4, max(1, sampleLimit/2)) || fillVertices == 0 || vertices > render.MaxBatchVertices {
+		t.Fatalf("overview coverage is incomplete or exceeds the batch budget: filled_chunks=%d fill_vertices=%d vertices=%d",
+			filledChunks, fillVertices, vertices)
+	}
+}
+
 func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
 	for _, test := range []struct{ bucket, stride int }{{-7, 256}, {-2, 8}, {-1, 1}, {0, 1}, {1, 1}, {2, 1}} {
 		if got := readOnlyOverviewStride(test.bucket); got != test.stride {
@@ -297,16 +495,34 @@ func TestReadOnlyZoomedOutBuilderSimplifiesPolygonFill(t *testing.T) {
 	name := runtime.service.LayerNames()[0]
 	build := func(bucket int) render.Chunk {
 		t.Helper()
-		chunk, buildErr := runtime.builder(context.Background(), render.ChunkKey{Layer: name, ZoomBucket: bucket, X: 16, Y: 0})
+		key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(bucket), name, render.Point{X: 0.5, Y: 0.005})
+		key.ZoomBucket = bucket
+		chunk, buildErr := runtime.builder(context.Background(), key)
 		if buildErr != nil {
 			t.Fatalf("build zoom bucket %d: %v", bucket, buildErr)
 		}
 		return chunk
 	}
-	full := build(0)
+	full := build(2)
 	overview := build(-7)
 	if len(full.Vertices) == 0 || len(overview.Vertices) == 0 {
 		t.Fatalf("missing polygon render vertices: full=%d overview=%d", len(full.Vertices), len(overview.Vertices))
+	}
+	countFillVertices := func(vertices []render.Vertex) int {
+		count := 0
+		for _, vertex := range vertices {
+			if vertex.Kind == render.VertexFill {
+				count++
+			}
+		}
+		return count
+	}
+	fullFillVertices, overviewFillVertices := countFillVertices(full.Vertices), countFillVertices(overview.Vertices)
+	if fullFillVertices == 0 || overviewFillVertices == 0 {
+		t.Fatalf("missing polygon fill vertices: full=%d overview=%d", fullFillVertices, overviewFillVertices)
+	}
+	if overviewFillVertices >= fullFillVertices {
+		t.Fatalf("overview fill was not simplified: full=%d overview=%d", fullFillVertices, overviewFillVertices)
 	}
 	if len(overview.Vertices) >= len(full.Vertices) {
 		t.Fatalf("overview did not simplify fill: full=%d overview=%d", len(full.Vertices), len(overview.Vertices))

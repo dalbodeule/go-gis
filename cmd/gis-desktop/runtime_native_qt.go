@@ -1161,10 +1161,13 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
 	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
 	overview := lodBucket <= 1 || forceOverview
-	// Keep parcel edges in the normal overview. Dissolving every polygon
-	// removes the very network users need to inspect at city scale. Reserve
-	// the coverage-only boundary for an explicit budget retry.
-	polygonOverview := forceOverview && isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
+	// At municipality scale, most cadastral polygons are smaller than a
+	// physical pixel. Merge dense coverage into a filled polygon so the map
+	// remains visible; individual parcel edges return when zoomed in.
+	filledCoverageOverview := lodBucket <= 0 && binding.featureCount >= 100_000 &&
+		isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name]) && !forceOverview
+	polygonOverview := (forceOverview || filledCoverageOverview) &&
+		isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
 	if polygonOverview {
 		// The boundary dissolve removes interior parcel edges without dropping
 		// source features, preserving the complete outer coverage perimeter.
@@ -1174,6 +1177,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// attributes. Keep geometry-only reads for unlabeled layers and for a
 	// forced dissolved boundary, which no longer has per-parcel anchors.
 	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview)
+	profileStarted := time.Now()
 	window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
 		return binding.session.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
 			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
@@ -1181,6 +1185,9 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	if err != nil {
 		return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
 	}
+	queryElapsed := time.Since(profileStarted)
+	queryFeatures := len(window.Features)
+	var unionElapsed, simplifyElapsed, fillElapsed time.Duration
 	window.DisplayRule = binding.layer.DisplayRule
 	if err := applyFeatureDisplayRule(ctx, &window); err != nil {
 		return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
@@ -1188,13 +1195,23 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	if overview {
 		window = sampleReadOnlyOverviewFeatures(window, overviewStride)
 		if polygonOverview {
-			window, err = geosdriver.NewOperator().DissolvePolygonBoundariesForDisplay(ctx, window)
-			if err != nil {
-				return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon boundaries for %s: %w", key.Layer, err)
+			started := time.Now()
+			operator := geosdriver.NewOperator()
+			if filledCoverageOverview {
+				window, err = operator.DissolvePolygonCoverageForDisplay(ctx, window)
+			} else {
+				window, err = operator.DissolvePolygonBoundariesForDisplay(ctx, window)
 			}
+			if err != nil {
+				return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon coverage for %s: %w", key.Layer, err)
+			}
+			unionElapsed = time.Since(started)
 		}
 	}
-	outlineOnly := overview
+	// Overview geometry is simplified and may be sampled, but still gets a fill
+	// mesh when it fits the bounded triangulation budget. Dense windows fall back
+	// to outlines below.
+	outlineOnly := false
 	if !outlineOnly {
 		polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
 		polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
@@ -1264,10 +1281,12 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			tolerance *= 4
 		}
 		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
+			started := time.Now()
 			displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
 			if err != nil {
 				return render.Chunk{}, fmt.Errorf("simplify coarse-scale geometry for %s: %w", key.Layer, err)
 			}
+			simplifyElapsed = time.Since(started)
 		}
 	}
 	var newSources map[string]render.LayerSource
@@ -1293,9 +1312,11 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		labelBytes += bytes
 	}
 	if !outlineOnly {
+		started := time.Now()
 		if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{displayWindow}, newSources, &key); err != nil {
 			return render.Chunk{}, err
 		}
+		fillElapsed = time.Since(started)
 	}
 	runtime.mu.Lock()
 	for index := range window.Features {
@@ -1345,7 +1366,13 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		runtime.rebuildWindowFeaturesLocked()
 	}
 	runtime.mu.Unlock()
-	return newSources[key.Layer].Builder(ctx, key)
+	chunk, err := newSources[key.Layer].Builder(ctx, key)
+	if filledCoverageOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" {
+		fmt.Fprintf(os.Stderr, "GoGIS overview profile: chunk=(%d,%d) features=%d query=%s union=%s simplify=%s fill=%s total=%s vertices=%d\n",
+			key.X, key.Y, queryFeatures, queryElapsed, unionElapsed, simplifyElapsed, fillElapsed,
+			time.Since(profileStarted), len(chunk.Vertices))
+	}
+	return chunk, err
 }
 
 func readOnlyWindowNeedsProperties(labels core.LabelSettings, overview, polygonOverview bool) bool {
@@ -1414,8 +1441,8 @@ const (
 	// exceeds this cap the affected chunk fails visibly and users can zoom in.
 	maxReadOnlyVisibleFeatures = 300_000
 	// Keep enough geometry-only features to preserve the parcel network in a
-	// citywide overview. Polygon fills are omitted at this scale, so outlines
-	// consume a fraction of the full-detail vertex budget.
+	// citywide overview. Simplified polygon fills are generated when they fit
+	// the per-window and project vertex budgets; denser windows fall back to outlines.
 	maxReadOnlyWindowBytes = 32 << 20
 	// The viewport can retain several individually bounded windows. Keep its
 	// aggregate budget separate from the per-window allocation guard.

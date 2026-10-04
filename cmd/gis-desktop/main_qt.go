@@ -1179,20 +1179,33 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	mapExtent, fitExtent := r.mapExtent, r.mapFitExtent
 	r.mu.Unlock()
 	lodBucket := readOnlyOverviewZoomBucket(zoomBucket, mapExtent, fitExtent)
-	native.RecordDiagnostic("render", fmt.Sprintf("request generation=%d layers=%d chunks=%d zoom=%g lod=%d forced_overview=%t",
-		requestGeneration, len(visibleLayerNames), len(keys), viewport.Zoom, lodBucket, forceOverview))
+	native.RecordDiagnostic("render", fmt.Sprintf(
+		"request generation=%d layers=%d chunks=%d zoom=%g lod=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
+		requestGeneration, len(visibleLayerNames), len(keys), viewport.Zoom, lodBucket, forceOverview,
+		viewport.Center.X, viewport.Center.Y, viewport.ScreenWidth, viewport.ScreenHeight,
+		viewport.CanvasWidth, viewport.CanvasHeight, mapExtent[0], mapExtent[1], mapExtent[2], mapExtent[3],
+		fitExtent[0], fitExtent[1], fitExtent[2], fitExtent[3]))
 
 	go func(requestKeys []render.ChunkKey, keyBuffer *render.ChunkKeyBuffer, scheduler *render.Scheduler) {
 		defer scheduler.ReleaseChunkKeyBuffer(keyBuffer)
 		results := scheduler.RequestUnique(requestContext, requestKeys, builder)
 		completed := 0
 		renderedVertices := 0
+		nonemptyChunks := 0
+		centerVertices := 0
+		validVertices := 0
+		var occupiedCells [16 * 16]bool
+		vertexMinX, vertexMinY := float32(math.Inf(1)), float32(math.Inf(1))
+		vertexMaxX, vertexMaxY := float32(math.Inf(-1)), float32(math.Inf(-1))
 		renderErr := ""
 		lastPublish := time.Now()
 		// Publishing flattens and copies the complete visible batch. Limit that
 		// repeated work during bulk loads while keeping partial results responsive.
 		const progressivePublishInterval = 50 * time.Millisecond
+		const maxProgressiveReadOnlyVertices = 30_000
+		const maxProgressiveReadOnlyPublishes = 8
 		firstPublish := false
+		progressivePublishes := 0
 		lastLabelPublish := time.Time{}
 		publishLabelsIfDue := func() {
 			if !viewportReadOnly || requestContext.Err() != nil || (!lastLabelPublish.IsZero() && time.Since(lastLabelPublish) < 150*time.Millisecond) {
@@ -1211,6 +1224,13 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		dirty := true // BeginGeneration may have removed now-hidden chunks.
 		publishBatch := func(final bool) {
 			if !dirty || requestContext.Err() != nil || (keepCompleteFrame && !final) {
+				return
+			}
+			// A citywide layer can grow to millions of source vertices. Repeatedly
+			// flattening, copying, and rebuilding every intermediate frame makes
+			// the render thread fall behind the worker; publish the final batch once.
+			if viewportReadOnly && !final &&
+				(renderedVertices > maxProgressiveReadOnlyVertices || progressivePublishes >= maxProgressiveReadOnlyPublishes) {
 				return
 			}
 			r.mu.Lock()
@@ -1236,6 +1256,9 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				r.publishedRevision = revision
 				dirty = false
 				lastPublish = time.Now()
+				if viewportReadOnly && !final {
+					progressivePublishes++
+				}
 			}
 			r.mu.Unlock()
 		}
@@ -1251,6 +1274,28 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				continue
 			}
 			renderedVertices += len(result.Chunk.Vertices)
+			if len(result.Chunk.Vertices) > 0 {
+				nonemptyChunks++
+			}
+			for _, vertex := range result.Chunk.Vertices {
+				if math.IsNaN(float64(vertex.X)) || math.IsInf(float64(vertex.X), 0) ||
+					math.IsNaN(float64(vertex.Y)) || math.IsInf(float64(vertex.Y), 0) {
+					continue
+				}
+				vertexMinX = min(vertexMinX, vertex.X)
+				vertexMinY = min(vertexMinY, vertex.Y)
+				vertexMaxX = max(vertexMaxX, vertex.X)
+				vertexMaxY = max(vertexMaxY, vertex.Y)
+				validVertices++
+				if vertex.X >= 0.45 && vertex.X <= 0.55 && vertex.Y >= 0.45 && vertex.Y <= 0.55 {
+					centerVertices++
+				}
+				if vertex.X >= 0 && vertex.X <= 1 && vertex.Y >= 0 && vertex.Y <= 1 {
+					xCell := min(15, int(vertex.X*16))
+					yCell := min(15, int(vertex.Y*16))
+					occupiedCells[yCell*16+xCell] = true
+				}
+			}
 			dirty = true
 			if time.Since(lastPublish) >= progressivePublishInterval {
 				publishBatch(false)
@@ -1312,9 +1357,17 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			}
 			r.mu.Unlock()
 			stats := scheduler.Stats()
+			occupiedCount := 0
+			for _, occupied := range occupiedCells {
+				if occupied {
+					occupiedCount++
+				}
+			}
 			native.RecordDiagnostic("render", fmt.Sprintf(
-				"ready generation=%d chunks=%d vertices=%d elapsed_ms=%d cache_hits=%d chunks_built=%d",
-				requestGeneration, completed, renderedVertices, time.Since(renderStartedAt).Milliseconds(),
+				"ready generation=%d chunks=%d nonempty=%d vertices=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
+				requestGeneration, completed, nonemptyChunks, renderedVertices, vertexMinX, vertexMinY, vertexMaxX, vertexMaxY,
+				centerVertices, validVertices, occupiedCount,
+				time.Since(renderStartedAt).Milliseconds(),
 				stats.CacheHits-renderStatsBefore.CacheHits, stats.ChunksBuilt-renderStatsBefore.ChunksBuilt,
 			))
 		}

@@ -52,6 +52,9 @@ static_assert(offsetof(GoGISVertex, color) == 8 && offsetof(GoGISVertex, size_mm
 std::vector<GoGISVertex> g_vertices;
 constexpr size_t kMaxSourceVertexCount = 12 * 1024 * 1024;
 constexpr size_t kMaxSceneGraphVertices = 36 * 1024 * 1024;
+// Keep every unindexed draw comfortably below the 16-bit vertex range used
+// by some scene-graph batching paths. Each batch ends on a triangle boundary.
+constexpr size_t kSceneGraphBatchVertices = 60'000;
 constexpr size_t kRetainedVertexCapacityFloor = 64 * 1024;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
@@ -255,6 +258,9 @@ public:
         : QQuickItem(parent),
           geometry_(QSGGeometry::defaultAttributes_ColoredPoint2D(), 0),
           material_() {
+        // Keep the bounded child meshes as separate GPU draws. Qt's default
+        // renderer can otherwise merge compatible QSGGeometryNodes again.
+        material_.setFlag(QSGMaterial::NoBatching);
         setFlag(ItemHasContents, true);
         update_viewport_snapshot(this);
 
@@ -450,14 +456,11 @@ public:
 
 protected:
     QSGNode* updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) override {
-        auto* node = static_cast<QSGGeometryNode*>(oldNode);
+        auto* node = oldNode;
+        const bool new_node = node == nullptr;
         if (node == nullptr) {
             try {
-                auto created_node = std::make_unique<QSGGeometryNode>();
-                created_node->setGeometry(&geometry_);
-                created_node->setMaterial(&material_);
-                created_node->setFlag(QSGNode::OwnsMaterial, false);
-                created_node->setFlag(QSGNode::OwnsGeometry, false);
+                auto created_node = std::make_unique<QSGNode>();
                 node = created_node.release();
             } catch (const std::bad_alloc&) {
                 set_render_status_safely("Render error: insufficient memory for scene-graph node");
@@ -480,7 +483,7 @@ protected:
             const float item_scale = std::max(0.0001f, static_cast<float>(this->scale()));
             const float logical_pixels_per_mm = static_cast<float>(
                 g_logical_pixels_per_mm.load(std::memory_order_relaxed));
-            if (source_generation != rendered_generation_ || width != rendered_width_ ||
+            if (new_node || source_generation != rendered_generation_ || width != rendered_width_ ||
                 height != rendered_height_ || item_scale != rendered_scale_ ||
                 logical_pixels_per_mm != rendered_pixels_per_mm_) {
                 const size_t source_vertex_count = g_vertices.size();
@@ -636,10 +639,51 @@ protected:
             }
         }
         if (geometry_changed) {
-            geometry_.setDrawingMode(QSGGeometry::DrawTriangles);
-            node->markDirty(QSGNode::DirtyGeometry);
-            if (rendered_vertex_count_ > 0) {
+            while (auto* child = node->firstChild()) {
+                node->removeChildNode(child);
+                delete child;
+            }
+            bool batched = true;
+            size_t batch_count = 0;
+            try {
+                const auto* source = geometry_.vertexDataAsColoredPoint2D();
+                for (size_t start = 0; start < rendered_vertex_count_;) {
+                    const size_t count = std::min(kSceneGraphBatchVertices, rendered_vertex_count_ - start);
+                    auto batch_node = std::make_unique<QSGGeometryNode>();
+                    auto batch_geometry = std::make_unique<QSGGeometry>(
+                        QSGGeometry::defaultAttributes_ColoredPoint2D(), static_cast<int>(count));
+                    std::memcpy(batch_geometry->vertexDataAsColoredPoint2D(), source + start,
+                                count * sizeof(QSGGeometry::ColoredPoint2D));
+                    batch_geometry->setDrawingMode(QSGGeometry::DrawTriangles);
+                    batch_node->setGeometry(batch_geometry.release());
+                    batch_node->setFlag(QSGNode::OwnsGeometry, true);
+                    batch_node->setMaterial(&material_);
+                    batch_node->setFlag(QSGNode::OwnsMaterial, false);
+                    batch_node->markDirty(QSGNode::DirtyGeometry);
+                    node->appendChildNode(batch_node.release());
+                    ++batch_count;
+                    start += count;
+                }
+            } catch (const std::bad_alloc&) {
+                batched = false;
+                set_render_status_safely("Render error: insufficient memory for scene-graph batches");
+            } catch (...) {
+                batched = false;
+                set_render_status_safely("Render error: scene-graph batching failed");
+            }
+            if (!batched) {
+                while (auto* child = node->firstChild()) {
+                    node->removeChildNode(child);
+                    delete child;
+                }
+            } else if (rendered_vertex_count_ > 0) {
                 trace_load_event("scenegraph", rendered_stage_, rendered_vertex_count_);
+                if (perf_trace_enabled()) {
+                    std::fprintf(stderr,
+                                 "GoGIS perf: scenegraph-batches stage=%s nodes=%zu canvas=%.0fx%.0f scale=%.3f\n",
+                                 stage_name(rendered_stage_), batch_count, rendered_width_, rendered_height_,
+                                 rendered_scale_);
+                }
             }
         }
         return node;

@@ -25,11 +25,6 @@ func startDesktopOutputCapture() error {
 		originalStdoutHandle = 0
 		originalStdout = nil
 	}
-	originalStderrHandle, err := windows.GetStdHandle(windows.STD_ERROR_HANDLE)
-	if err != nil {
-		originalStderrHandle = 0
-		originalStderr = nil
-	}
 	if err := windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, windows.Handle(stdoutWriter.Fd())); err != nil {
 		closeOutputPipes(stdoutReader, stdoutWriter, stderrReader, stderrWriter)
 		return fmt.Errorf("redirect stdout handle: %w", err)
