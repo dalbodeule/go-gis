@@ -308,3 +308,34 @@ and 15.9 s for 64 windows in one run. This excludes simplification, mesh
 creation, and Qt publication, and does not prove equivalent rendered output.
 The modest core-stage gain does not justify increasing per-window native
 memory and delaying partial publication, so retain 1/32 coarse windows.
+
+## Follow-up: retain screen-resolvable parcel boundaries (2026-10-05)
+
+The same 208,015-feature SHP at approximately 1:208,000 and semantic LOD -1
+produced exactly 206,849 vertices on both macOS and Windows. Their map
+canvases were almost identical in logical pixels (513x732 and 509x726), so
+monitor resolution and an OS-specific renderer did not explain the missing
+detail. The display-only coverage union removed *all* parcel interior edges
+on both systems. The earlier 9,219,615-vertex per-parcel view retained those
+edges but caused excessive scene-graph expansion and memory use.
+
+Replace the default dense-polygon coverage union with an ephemeral hybrid
+overview. Query and simplify each parcel once, triangulate every parcel for
+fill, and emit interior boundaries only for parcels whose bounding boxes are
+resolvable at the semantic LOD. The threshold is derived from the existing
+world-unit simplification tolerance, not the host DPI, so chunk cache keys
+remain valid across window resizes and both OSes get the same geometry. A
+forced safety retry still dissolves to a boundary-only overview. Source data,
+exports, and zoomed-in selection remain unchanged.
+
+On the indexed Sejong SHP, the whole-extent native test generated 6,496,211
+vertices (5,954,265 fill vertices) across 1,225 planned windows, with 600
+nonempty windows. The selected parcel boundaries used roughly 542,000
+vertices and the full output stayed under the 12M batch limit. The normalized
+fill area was approximately 0.506 across all four quadrants, matching the
+previous dissolved coverage's area. The sequential CPU-side build completed
+in 23.4 s, compared with 56.3 s for the earlier dissolved integration test;
+these are not equivalent live UI timings. A separate four-worker builder
+experiment took about 13 s, but did not retain the viewport batch. Windows
+scene-graph memory, visual contrast, and end-to-end startup latency still
+require a live check before claiming the regression is fully resolved.

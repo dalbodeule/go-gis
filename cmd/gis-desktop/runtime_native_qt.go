@@ -1169,16 +1169,15 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 	}
 	overviewStride := readOnlyOverviewStrideForFeatureCount(lodBucket, binding.featureCount)
-	// At municipality scale, most cadastral polygons are smaller than a
-	// physical pixel. Merge dense coverage into a filled polygon so the map
-	// remains visible; individual parcel edges return when zoomed in.
-	filledCoverageOverview := useFilledCoverageOverview(lodBucket, binding.featureCount,
+	// Dense cadastral overviews retain each parcel's fill while selecting
+	// resolvable interior boundaries for the display batch.
+	denseParcelOverview := useDenseParcelOverview(lodBucket, binding.featureCount,
 		runtime.layerGeometryTypes[binding.layer.Name], forceOverview)
-	polygonOverview := (forceOverview || filledCoverageOverview) &&
+	polygonOverview := (forceOverview || denseParcelOverview) &&
 		isPolygonOverviewLayer(runtime.layerGeometryTypes[binding.layer.Name])
 	if polygonOverview {
-		// The boundary dissolve removes interior parcel edges without dropping
-		// source features, preserving the complete outer coverage perimeter.
+		// All parcels contribute to the overview fill. The forced safety retry
+		// alone dissolves them to a low-cost boundary.
 		overviewStride = 1
 	}
 	// Overview geometry can be simplified, but labels still need the source
@@ -1202,14 +1201,10 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	if overview {
 		window = sampleReadOnlyOverviewFeatures(window, overviewStride)
-		if polygonOverview {
+		if polygonOverview && !denseParcelOverview {
 			started := time.Now()
 			operator := geosdriver.NewOperator()
-			if filledCoverageOverview {
-				window, err = operator.DissolvePolygonCoverageForDisplay(ctx, window)
-			} else {
-				window, err = operator.DissolvePolygonBoundariesForDisplay(ctx, window)
-			}
+			window, err = operator.DissolvePolygonBoundariesForDisplay(ctx, window)
 			if err != nil {
 				return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon coverage for %s: %w", key.Layer, err)
 			}
@@ -1279,6 +1274,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// removing sub-pixel bends from the transient display copy. The original
 	// source geometry is unchanged for editing and export.
 	detailSimplification := !overview && lodBucket >= 2 && lodBucket <= 4
+	displayTolerance := 0.0
 	if overview || detailSimplification {
 		tolerance := readOnlyOverviewSimplificationTolerance(runtime.mapFitExtent, lodBucket)
 		// At these scales the existing overview tolerance is still sub-pixel;
@@ -1288,6 +1284,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			// more aggressively; the original geometries remain available on zoom-in.
 			tolerance *= 4
 		}
+		displayTolerance = tolerance
 		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
 			started := time.Now()
 			displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
@@ -1375,7 +1372,17 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	runtime.mu.Unlock()
 	chunk, err := newSources[key.Layer].Builder(ctx, key)
-	if filledCoverageOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" {
+	if err != nil {
+		return render.Chunk{}, err
+	}
+	if denseParcelOverview && !outlineOnly {
+		chunk, err = buildDenseParcelOverviewChunk(ctx, key, displayWindow, newSources[key.Layer],
+			runtime.mapExtent, chunkSize, displayTolerance, chunk)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+	}
+	if denseParcelOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" {
 		fmt.Fprintf(os.Stderr, "GoGIS overview profile: chunk=(%d,%d) features=%d query=%s union=%s simplify=%s fill=%s total=%s vertices=%d\n",
 			key.X, key.Y, queryFeatures, queryElapsed, unionElapsed, simplifyElapsed, fillElapsed,
 			time.Since(profileStarted), len(chunk.Vertices))
@@ -1383,7 +1390,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	return chunk, err
 }
 
-func useFilledCoverageOverview(lodBucket, featureCount int, geometryType string, forceOverview bool) bool {
+func useDenseParcelOverview(lodBucket, featureCount int, geometryType string, forceOverview bool) bool {
 	return lodBucket <= 1 && featureCount >= 100_000 &&
 		isPolygonOverviewLayer(geometryType) && !forceOverview
 }
@@ -1430,6 +1437,47 @@ func selectVisibleParcelOutlines(ctx context.Context, layer core.Layer, normaliz
 		}
 	}
 	return result, nil
+}
+
+func buildDenseParcelOverviewChunk(ctx context.Context, key render.ChunkKey, layer core.Layer,
+	source render.LayerSource, extent [4]float64, chunkSize, tolerance float64,
+	full render.Chunk) (render.Chunk, error) {
+	outlineLayer, err := selectVisibleParcelOutlines(ctx, layer, source.Features, extent, tolerance)
+	if err != nil {
+		return render.Chunk{}, err
+	}
+	var outline []render.Vertex
+	if len(outlineLayer.Features) > 0 {
+		outlineLayer.Labels = core.LabelSettings{}
+		outlineSources, _, err := render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
+			[]core.Layer{outlineLayer}, extent, chunkSize, key)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+		outlineChunk, err := outlineSources[key.Layer].Builder(ctx, key)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+		outline = outlineChunk.Vertices
+	}
+	fillCount := 0
+	for _, vertex := range full.Vertices {
+		if vertex.Kind == render.VertexFill {
+			fillCount++
+		}
+	}
+	if fillCount > render.MaxChunkVertices-len(outline) {
+		return render.Chunk{}, fmt.Errorf("parcel overview exceeds the %d-vertex chunk limit", render.MaxChunkVertices)
+	}
+	vertices := make([]render.Vertex, 0, fillCount+len(outline))
+	for _, vertex := range full.Vertices {
+		if vertex.Kind == render.VertexFill {
+			vertices = append(vertices, vertex)
+		}
+	}
+	vertices = append(vertices, outline...)
+	full.Vertices = vertices
+	return full, nil
 }
 
 func readOnlyWindowNeedsProperties(labels core.LabelSettings, overview, polygonOverview bool) bool {

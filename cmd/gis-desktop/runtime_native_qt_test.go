@@ -214,7 +214,7 @@ func TestReadOnlyKeyPruningSkipsTilesOutsideLayerExtent(t *testing.T) {
 	}
 }
 
-func TestDensePolygonCoverageRemainsFilledAtMunicipalityScale(t *testing.T) {
+func TestDenseParcelOverviewAtMunicipalityScale(t *testing.T) {
 	for _, test := range []struct {
 		lod, count int
 		geometry   string
@@ -228,14 +228,38 @@ func TestDensePolygonCoverageRemainsFilledAtMunicipalityScale(t *testing.T) {
 		{lod: 1, count: 208_015, geometry: "Point"},
 		{lod: 1, count: 208_015, geometry: "Polygon", forced: true},
 	} {
-		if got := useFilledCoverageOverview(test.lod, test.count, test.geometry, test.forced); got != test.want {
-			t.Errorf("filled overview at lod=%d features=%d geometry=%s forced=%t = %t, want %t",
+		if got := useDenseParcelOverview(test.lod, test.count, test.geometry, test.forced); got != test.want {
+			t.Errorf("dense parcel overview at lod=%d features=%d geometry=%s forced=%t = %t, want %t",
 				test.lod, test.count, test.geometry, test.forced, got, test.want)
 		}
 	}
 }
 
-func TestDenseReadOnlyOverviewKeepsDissolvedPolygonFill(t *testing.T) {
+func TestSelectVisibleParcelOutlinesKeepsOnlyResolvableBoundaries(t *testing.T) {
+	layer := core.Layer{Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"}},
+	}}
+	normalized := []render.HitFeature{
+		{Vertices: []render.Point{{X: 0, Y: 0}, {X: 0.2, Y: 0.2}}},
+		{Vertices: []render.Point{{X: 0, Y: 0}, {X: 0.01, Y: 0.01}}},
+	}
+	selected, err := selectVisibleParcelOutlines(context.Background(), layer, normalized,
+		[4]float64{0, 0, 100, 100}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected.Features) != 1 || selected.Features[0].ID != 1 || len(layer.Features) != 2 {
+		t.Fatalf("selected %v; source has %d features", selected.Features, len(layer.Features))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := selectVisibleParcelOutlines(ctx, layer, normalized, [4]float64{0, 0, 100, 100}, 1); err != context.Canceled {
+		t.Fatalf("canceled selection error = %v", err)
+	}
+}
+
+func TestDenseReadOnlyOverviewKeepsParcelFillAndVisibleBoundaries(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "parcels.shp")
 	layer := core.Layer{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{
@@ -262,14 +286,19 @@ func TestDenseReadOnlyOverviewKeepsDissolvedPolygonFill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fillVertices := 0
+	fillVertices, lineVertices := 0, 0
 	for _, vertex := range chunk.Vertices {
 		if vertex.Kind == render.VertexFill {
 			fillVertices++
+		} else if vertex.Kind == render.VertexLine {
+			lineVertices++
 		}
 	}
 	if fillVertices == 0 {
-		t.Fatal("dense overview lost the continuous polygon fill")
+		t.Fatal("dense overview lost the parcel fill")
+	}
+	if lineVertices == 0 {
+		t.Fatal("dense overview lost the screen-resolvable parcel boundaries")
 	}
 }
 
@@ -694,6 +723,10 @@ func TestDenseReadOnlyParcelOutlineFeasibility(t *testing.T) {
 		selected, outlineHint)
 	t.Logf("hybrid parcel overview: filled_features=%d outlined_features=%d vertices=%d fill_vertices=%d",
 		features, outlineFeatures, hybridVertices, fillVertices)
+	if hybridVertices <= fillVertices || hybridVertices >= vertices || hybridVertices > render.MaxBatchVertices {
+		t.Fatalf("hybrid batch did not retain bounded parcel boundaries: full=%d hybrid=%d fill=%d",
+			vertices, hybridVertices, fillVertices)
+	}
 }
 
 func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
