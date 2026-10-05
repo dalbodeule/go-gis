@@ -154,6 +154,46 @@ func TestLineLabelUsesLongestSegmentCenterAndPolygonLabelUsesExplicitInteriorAnc
 	}
 }
 
+func TestFreeAnglePolygonUsesLongestSegmentEvenWithExplicitInteriorAnchor(t *testing.T) {
+	layer, err := NewLayerSource(core.Layer{
+		Name: "parcels", Labels: core.LabelSettings{Enabled: true, Placement: "free-angle"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 4 0, 4 20, 0 20, 0 0))"},
+			Label: &core.Label{Text: "parcel", X: 2, Y: 10, AnchorSet: true}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layer.Labels) != 1 || layer.Labels[0].Rotation != 90 {
+		t.Fatalf("free-angle polygon label = %+v, want longest-segment angle 90 while retaining interior anchor", layer.Labels)
+	}
+	if math.Abs(layer.Labels[0].X-0.5) > 1e-12 || math.Abs(layer.Labels[0].Y-0.5) > 1e-12 {
+		t.Fatalf("free-angle polygon anchor = (%v,%v), want interior point (0.5,0.5)", layer.Labels[0].X, layer.Labels[0].Y)
+	}
+}
+
+func TestPointLabelPlacementOffsetsUseEightCompassDirections(t *testing.T) {
+	for _, test := range []struct {
+		placement string
+		x, y      float64
+	}{
+		{"N", 0, -2}, {"NE", 2, -2}, {"E", 2, 0}, {"SE", 2, 2},
+		{"S", 0, 2}, {"SW", -2, 2}, {"W", -2, 0}, {"NW", -2, -2},
+	} {
+		t.Run(test.placement, func(t *testing.T) {
+			layer, err := NewLayerSource(core.Layer{
+				Name: "controls", Labels: core.LabelSettings{Enabled: true, Placement: "center", PointPlacement: test.placement, PointOffsetMM: 2},
+				Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (5 7)"}, Label: &core.Label{Text: "CP", AnchorSet: true, X: 5, Y: 7}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(layer.Labels) != 1 || layer.Labels[0].OffsetXMM != test.x || layer.Labels[0].OffsetYMM != test.y {
+				t.Fatalf("point label offsets = %+v, want (%g,%g) mm", layer.Labels, test.x, test.y)
+			}
+		})
+	}
+}
+
 func TestParseWKBStandardXYFastPath(t *testing.T) {
 	data, err := hex.DecodeString("0000000002000000023ff0000000000000400000000000000040080000000000004010000000000000")
 	if err != nil {

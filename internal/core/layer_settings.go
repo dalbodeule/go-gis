@@ -21,7 +21,7 @@ func DefaultLayerStyle() LayerStyle {
 }
 
 func DefaultLabelSettings() LabelSettings {
-	return LabelSettings{Placement: "center", HeightMM: 2.5}
+	return LabelSettings{Placement: "center", PointPlacement: "NE", PointOffsetMM: 1.5, HeightMM: 2.5}
 }
 
 // WithDefaultPresentation fills unset presentation values after a data driver
@@ -57,6 +57,16 @@ func (s LabelSettings) Validate() error {
 	case "center", "vertical", "center-rotated", "free-angle":
 	default:
 		return fmt.Errorf("%w: unsupported label placement %q", ErrInvalidLayerSettings, s.Placement)
+	}
+	if s.PointPlacement != "" {
+		switch s.PointPlacement {
+		case "N", "NE", "E", "SE", "S", "SW", "W", "NW":
+		default:
+			return fmt.Errorf("%w: unsupported point label placement %q", ErrInvalidLayerSettings, s.PointPlacement)
+		}
+	}
+	if !finite(s.PointOffsetMM) || s.PointOffsetMM < 0 || s.PointOffsetMM > 100 {
+		return fmt.Errorf("%w: point label offset must be within [0,100] mm", ErrInvalidLayerSettings)
 	}
 	if s.Enabled && strings.TrimSpace(s.Expression) == "" && strings.TrimSpace(s.LuaScript) == "" {
 		return fmt.Errorf("%w: enabled labels need an expression or Lua script", ErrInvalidLayerSettings)

@@ -5,14 +5,13 @@ package geos
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"gogis/internal/core"
 )
 
-// PointOnSurface returns an XY coordinate inside a polygonal geometry. The
-// point is suitable for placing labels on concave polygons and polygons with
-// holes, unlike a vertex average or ordinary centroid.
+// PointOnSurface returns a representative XY coordinate on a geometry. For
+// polygons the point is interior, making it suitable for concave polygons and
+// polygons with holes; for points and lines GEOS returns a point on the input.
 func (o *Operator) PointOnSurface(ctx context.Context, geometry core.Geometry) ([2]float64, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return [2]float64{}, false, err
@@ -22,9 +21,6 @@ func (o *Operator) PointOnSurface(ctx context.Context, geometry core.Geometry) (
 		return [2]float64{}, false, err
 	}
 	defer input.Destroy()
-	if !strings.Contains(strings.ToUpper(input.Type()), "POLYGON") {
-		return [2]float64{}, false, nil
-	}
 	point := input.PointOnSurface()
 	if point == nil || point.IsEmpty() {
 		if point != nil {

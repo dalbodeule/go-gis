@@ -71,6 +71,8 @@ type LayerLabel struct {
 	Y         float64 `json:"y"`
 	Rotation  float64 `json:"rotation"`
 	HeightMM  float64 `json:"heightMm"`
+	OffsetXMM float64 `json:"offsetXmm,omitempty"`
+	OffsetYMM float64 `json:"offsetYmm,omitempty"`
 	MinScale  float64 `json:"minScale"`
 	MaxScale  float64 `json:"maxScale"`
 }
@@ -1235,7 +1237,7 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				rotation = feature.Label.Rotation
 			case "free-angle":
 				rotation = feature.Label.Rotation
-				if layer.Labels.RotationField == "" && !feature.Label.AnchorSet {
+				if layer.Labels.RotationField == "" {
 					if segmentAnchor, segmentAngle, found, err := LongestSegmentPlacement(feature.Geometry); err == nil && found {
 						rotation = segmentAngle
 						if lineGeometry {
@@ -1249,6 +1251,14 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 				X: anchor.X, Y: anchor.Y, Rotation: rotation, HeightMM: layer.Labels.HeightMM,
 				MinScale: layer.Labels.MinScale, MaxScale: layer.Labels.MaxScale,
 			})
+			if isPointGeometry(feature.Geometry) {
+				last := &labels[len(labels)-1]
+				placement, offset := layer.Labels.PointPlacement, layer.Labels.PointOffsetMM
+				if placement == "" {
+					placement, offset = "NE", 1.5
+				}
+				last.OffsetXMM, last.OffsetYMM = pointLabelOffset(placement, offset)
+			}
 		}
 	}
 	geometryType := ""
@@ -1287,6 +1297,38 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 			return Chunk{Key: key, Vertices: vertices}, nil
 		},
 	}
+}
+
+func pointLabelOffset(placement string, offsetMM float64) (float64, float64) {
+	if offsetMM <= 0 {
+		return 0, 0
+	}
+	// QML screen coordinates increase downward; the stored map label itself
+	// remains anchored to the point and this physical offset is applied by UI.
+	switch placement {
+	case "N":
+		return 0, -offsetMM
+	case "NE":
+		return offsetMM, -offsetMM
+	case "E":
+		return offsetMM, 0
+	case "SE":
+		return offsetMM, offsetMM
+	case "S":
+		return 0, offsetMM
+	case "SW":
+		return -offsetMM, offsetMM
+	case "W":
+		return -offsetMM, 0
+	case "NW":
+		return -offsetMM, -offsetMM
+	default:
+		return offsetMM, -offsetMM
+	}
+}
+
+func isPointGeometry(geometry core.Geometry) bool {
+	return geometry != nil && strings.Contains(strings.ToUpper(geometry.GeometryType()), "POINT")
 }
 
 func labelAnchor(points []Point) Point {

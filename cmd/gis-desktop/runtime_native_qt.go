@@ -2876,7 +2876,7 @@ func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, 
 				return fmt.Errorf("prepared label text exceeds the %d-byte project safety limit", maxTotalBytes)
 			}
 			label := core.Label{Text: text, Height: settings.HeightMM}
-			if feature.Geometry != nil && strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+			if feature.Geometry != nil {
 				if geometryOperator == nil {
 					geometryOperator = geosdriver.NewOperator()
 				}
@@ -2889,7 +2889,7 @@ func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, 
 				}
 			}
 			rotation := 0.0
-			if settings.RotationField != "" && (settings.Placement == "center-rotated" || settings.Placement == "free-angle") {
+			if settings.RotationField != "" && settings.Placement == "center-rotated" {
 				value, exists := feature.Properties[settings.RotationField]
 				if !exists {
 					return fmt.Errorf("layer %q feature %d rotation field %q is missing", layers[layerIndex].Name, feature.ID, settings.RotationField)
@@ -2908,7 +2908,7 @@ func prepareLayerLabelsCoreWithBudget(ctx context.Context, layers []core.Layer, 
 			case "vertical":
 				rotation = 90
 			case "free-angle":
-				if settings.RotationField == "" && feature.Geometry != nil {
+				if feature.Geometry != nil {
 					anchor, segmentAngle, found, placementErr := render.LongestSegmentPlacement(feature.Geometry)
 					if placementErr != nil {
 						return fmt.Errorf("layer %q feature %d label angle: %w", layers[layerIndex].Name, feature.ID, placementErr)
@@ -3153,6 +3153,10 @@ func layerMetadataOnly(layers []core.Layer) []core.Layer {
 }
 
 func (r *demoRuntime) saveDataset(destination, profile string) {
+	r.saveDatasetWithOptions(destination, profile, "")
+}
+
+func (r *demoRuntime) saveDatasetWithOptions(destination, profile, options string) {
 	if destination == "" {
 		native.SetRenderStatus("Save cancelled")
 		return
@@ -3162,7 +3166,7 @@ func (r *demoRuntime) saveDataset(destination, profile string) {
 		return
 	}
 	if strings.EqualFold(filepath.Ext(destination), ".dxf") {
-		if err := r.exportActiveLayerDXF(destination, profile); err != nil {
+		if err := r.exportProjectLayersDXFWithOptions(destination, profile, options); err != nil {
 			native.SetRenderStatus("DXF export failed: " + err.Error())
 			return
 		}
@@ -3202,91 +3206,159 @@ func (r *demoRuntime) saveDataset(destination, profile string) {
 	native.SetRenderStatus("Saved " + destination)
 }
 
-func (r *demoRuntime) exportActiveLayerDXF(destination, profile string) error {
+func (r *demoRuntime) exportProjectLayersDXF(destination, profile string) error {
+	return r.exportProjectLayersDXFWithOptions(destination, profile, "")
+}
+
+type desktopDXFLayerOption struct {
+	Name     string `json:"name"`
+	CADName  string `json:"cadName"`
+	Include  *bool  `json:"include"`
+	Geometry *bool  `json:"geometry"`
+	Labels   *bool  `json:"labels"`
+}
+
+func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, optionsJSON string) error {
 	r.mu.Lock()
 	service := r.service
 	readOnly := r.readOnly
 	displayCRS := r.readOnlyDisplayCRS
 	sources := append([]vectorSourceSpec(nil), r.readOnlySources...)
+	layerBounds := make(map[string][4]float64, len(r.layerBounds))
+	for name, bounds := range r.layerBounds {
+		layerBounds[name] = bounds
+	}
+	layerGeometryTypes := make(map[string]string, len(r.layerGeometryTypes))
+	for name, geometryType := range r.layerGeometryTypes {
+		layerGeometryTypes[name] = geometryType
+	}
 	r.mu.Unlock()
 	if service == nil {
 		return fmt.Errorf("no project is loaded")
 	}
-	layerName := native.CurrentActiveLayer()
-	if layerName == "" {
-		names := service.LayerNames()
-		if len(names) == 0 {
-			return fmt.Errorf("no layers are available")
+	properties := service.ProjectLayerProperties()
+	options := map[string]desktopDXFLayerOption{}
+	if optionsJSON != "" {
+		var submitted []desktopDXFLayerOption
+		if err := json.Unmarshal([]byte(optionsJSON), &submitted); err != nil {
+			return fmt.Errorf("invalid DXF layer options: %w", err)
 		}
-		layerName = names[0]
-	}
-	properties, ok := service.LayerProperties(layerName)
-	if !ok {
-		names := service.LayerNames()
-		if len(names) > 0 {
-			layerName = names[0]
-			properties, ok = service.LayerProperties(layerName)
+		if len(submitted) != len(properties) {
+			return fmt.Errorf("project layers changed; reopen the DXF export settings")
+		}
+		for _, option := range submitted {
+			if option.Name == "" || option.Include == nil {
+				return fmt.Errorf("DXF layer options are incomplete")
+			}
+			if _, exists := options[option.Name]; exists {
+				return fmt.Errorf("duplicate DXF layer selection %q", option.Name)
+			}
+			options[option.Name] = option
 		}
 	}
-	if !ok {
-		return fmt.Errorf("active layer %q was not found", layerName)
-	}
-	var layer core.Layer
-	if readOnly {
-		var source *vectorSourceSpec
-		for index := range sources {
-			if sources[index].Name == layerName || (sources[index].Path == properties.SourcePath &&
-				(sources[index].LayerName == "" || sources[index].LayerName == properties.SourceLayerName)) {
-				source = &sources[index]
-				break
+	specs := make([]dxf.LayerSpec, 0, len(properties))
+	selected := make([]core.Layer, 0, len(properties))
+	for _, property := range properties {
+		option, found := options[property.Name]
+		if optionsJSON != "" && !found {
+			return fmt.Errorf("project layers changed; reopen the DXF export settings")
+		}
+		if found && !*option.Include {
+			continue
+		}
+		name := strings.TrimSpace(property.DisplayName)
+		if name == "" {
+			name = property.Name
+		}
+		geometry, labels := true, true
+		if found {
+			name = strings.TrimSpace(option.CADName)
+			if name == "" {
+				return fmt.Errorf("CAD layer name for %q is empty", property.Name)
+			}
+			if option.Geometry != nil {
+				geometry = *option.Geometry
+			}
+			if option.Labels != nil {
+				labels = *option.Labels
 			}
 		}
-		if source == nil {
-			return fmt.Errorf("source for layer %q is unavailable", layerName)
+		if !geometry && !labels {
+			return fmt.Errorf("layer %q exports neither geometry nor labels", property.Name)
 		}
-		sourceLayerName := properties.SourceLayerName
-		if sourceLayerName == "" {
-			sourceLayerName = source.LayerName
-		}
-		loaded, err := (gdal.Reader{Encoding: source.Encoding}).OpenWithLimits(
-			context.Background(), source.Path, sourceLayerName, maxDesktopDXFExportFeatures, maxDesktopDXFExportBytes)
-		if err != nil {
-			return fmt.Errorf("read layer for export: %w", err)
-		}
-		layer = loaded
-		if source.SourceCRS != "" {
-			layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
-		}
-		targetCRS := properties.CRS.AuthorityCode
-		if targetCRS == "" {
-			targetCRS = displayCRS
-		}
-		if targetCRS != "" && layer.CRS.AuthorityCode != "" && !strings.EqualFold(targetCRS, layer.CRS.AuthorityCode) {
-			layer, err = (proj.Transformer{}).Transform(context.Background(), layer.CRS, core.CRS{AuthorityCode: targetCRS}, layer)
+		bounds, hasBounds := layerBounds[property.Name]
+		specs = append(specs, dxf.LayerSpec{Name: name, GeometryType: layerGeometryTypes[property.Name],
+			PointLabelPlacement: property.Labels.PointPlacement, PointLabelOffsetMM: property.Labels.PointOffsetMM, LabelHeightMM: property.Labels.HeightMM,
+			Bounds: bounds, HasBounds: hasBounds, SkipGeometry: !geometry, SkipLabels: !labels,
+			FillPolygons: property.Style.FillOpacity > 0})
+		selected = append(selected, property)
+	}
+	if len(selected) == 0 {
+		return fmt.Errorf("select at least one layer for DXF export")
+	}
+	load := func(index int) (core.Layer, error) {
+		property := selected[index]
+		layerName := property.Name
+		var layer core.Layer
+		if readOnly && property.SourcePath != "" {
+			var source *vectorSourceSpec
+			for index := range sources {
+				if sources[index].Name == layerName || (sources[index].Path == property.SourcePath &&
+					(sources[index].LayerName == "" || sources[index].LayerName == property.SourceLayerName)) {
+					source = &sources[index]
+					break
+				}
+			}
+			if source == nil {
+				return core.Layer{}, fmt.Errorf("source for layer %q is unavailable", layerName)
+			}
+			sourceLayerName := property.SourceLayerName
+			if sourceLayerName == "" {
+				sourceLayerName = source.LayerName
+			}
+			loaded, err := (gdal.Reader{Encoding: source.Encoding}).OpenWithLimits(
+				context.Background(), source.Path, sourceLayerName, maxDesktopDXFExportFeatures, maxDesktopDXFExportBytes)
 			if err != nil {
-				return fmt.Errorf("transform layer for export: %w", err)
+				return core.Layer{}, fmt.Errorf("read layer for export: %w", err)
+			}
+			layer = loaded
+			if source.SourceCRS != "" {
+				layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
+			}
+			targetCRS := property.CRS.AuthorityCode
+			if targetCRS == "" {
+				targetCRS = displayCRS
+			}
+			if targetCRS != "" && layer.CRS.AuthorityCode != "" && !strings.EqualFold(targetCRS, layer.CRS.AuthorityCode) {
+				layer, err = (proj.Transformer{}).Transform(context.Background(), layer.CRS, core.CRS{AuthorityCode: targetCRS}, layer)
+				if err != nil {
+					return core.Layer{}, fmt.Errorf("transform layer for export: %w", err)
+				}
+			}
+		} else {
+			var ok bool
+			layer, ok = service.ProjectLayerRenderSnapshot(layerName)
+			if !ok {
+				return core.Layer{}, fmt.Errorf("layer %q data was not found", layerName)
 			}
 		}
-	} else {
-		layer, ok = service.ProjectLayerRenderSnapshot(layerName)
-		if !ok {
-			return fmt.Errorf("layer %q data was not found", layerName)
+		layer.Name = property.Name
+		layer.DisplayName = property.DisplayName
+		layer.Labels = property.Labels
+		layer.DisplayRule = property.DisplayRule
+		if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
+			return core.Layer{}, fmt.Errorf("apply feature display filter: %w", err)
 		}
-	}
-	layer.Name = properties.Name
-	layer.DisplayName = properties.DisplayName
-	layer.Labels = properties.Labels
-	layer.DisplayRule = properties.DisplayRule
-	if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
-		return fmt.Errorf("apply feature display filter: %w", err)
-	}
-	if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
-		return fmt.Errorf("prepare layer labels: %w", err)
+		if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
+			return core.Layer{}, fmt.Errorf("prepare layer labels: %w", err)
+		}
+		return layer, nil
 	}
 	if profile == "" {
 		profile = "ares-utf8"
 	}
-	if err := (dxf.Exporter{}).Export(context.Background(), destination, layer, profile); err != nil {
+	triangulator := geosdriver.NewOperator()
+	if err := (dxf.Exporter{Triangulate: triangulator.ConstrainedTriangles}).ExportProject(context.Background(), destination, specs, load, profile); err != nil {
 		return err
 	}
 	return nil

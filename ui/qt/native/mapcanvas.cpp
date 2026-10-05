@@ -121,6 +121,7 @@ std::atomic<unsigned long long> g_load_generation{0};
 std::mutex g_save_mutex;
 std::string g_save_path;
 std::string g_save_profile;
+std::string g_save_options;
 std::atomic<unsigned long long> g_save_generation{0};
 std::mutex g_selection_mutex;
 std::string g_selection_layer;
@@ -431,6 +432,7 @@ public:
                 std::lock_guard<std::mutex> lock(g_save_mutex);
                 g_save_path = property("savePath").toString().toStdString();
                 g_save_profile = property("saveProfile").toString().toStdString();
+                g_save_options = property("saveOptions").toString().toStdString();
                 g_save_generation.store(save_generation, std::memory_order_relaxed);
             }
 
@@ -1054,4 +1056,18 @@ extern "C" void gogis_save_profile(char* buffer, int buffer_length) {
     const auto copy_length = std::min<size_t>(g_save_profile.size(), static_cast<size_t>(buffer_length - 1));
     std::memcpy(buffer, g_save_profile.data(), copy_length);
     buffer[copy_length] = '\0';
+}
+
+extern "C" int gogis_save_options(char* buffer, int buffer_length) {
+    std::lock_guard<std::mutex> lock(g_save_mutex);
+    if (g_save_options.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return -1;
+    }
+    const auto needed = static_cast<int>(g_save_options.size());
+    if (buffer == nullptr || buffer_length <= needed) {
+        return needed;
+    }
+    std::memcpy(buffer, g_save_options.data(), g_save_options.size());
+    buffer[needed] = '\0';
+    return needed;
 }

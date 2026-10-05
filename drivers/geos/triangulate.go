@@ -13,7 +13,7 @@ import (
 )
 
 // Triangle contains the three XY vertices of a constrained polygon triangle.
-type Triangle [3][2]float64
+type Triangle = [3][2]float64
 
 const maxConstrainedTriangulationCoordinates = 250_000
 const maxConstrainedTriangulationWKBBytes = 8 << 20

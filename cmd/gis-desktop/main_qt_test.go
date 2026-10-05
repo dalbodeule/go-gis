@@ -103,6 +103,18 @@ func TestDeclutterViewportLabelsKeepsSeparatedLabels(t *testing.T) {
 	}
 }
 
+func TestDeclutterViewportLabelsAccountsForPointOffset(t *testing.T) {
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
+	labels := []render.LayerLabel{
+		{Text: "control", X: 0.48, Y: 0.5, OffsetXMM: 20, HeightMM: 2.5},
+		{Text: "parcel", X: 0.55, Y: 0.5, HeightMM: 2.5},
+	}
+	got := declutterViewportLabels(labels, view)
+	if len(got) != 1 || got[0].Text != "control" {
+		t.Fatalf("offset-aware decluttering retained %+v; want only the first label whose offset overlaps the second", got)
+	}
+}
+
 func TestDeclutterViewportLabelsUsesMoreSpacingAtWideScale(t *testing.T) {
 	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 1000, ViewportHeight: 1000, Zoom: 1}
 	labels := []render.LayerLabel{

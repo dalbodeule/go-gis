@@ -103,15 +103,17 @@ type LayerStyle struct {
 // physical millimeters. Expression is a field name or safe property template;
 // LuaScript is reserved for an explicitly enabled, sandboxed label evaluator.
 type LabelSettings struct {
-	Enabled       bool    `json:"enabled"`
-	Expression    string  `json:"expression"`
-	LuaScript     string  `json:"luaScript,omitempty"`
-	Placement     string  `json:"placement"` // center (E-W), vertical (N-S), free-angle (longest segment), or legacy center-rotated
-	RotationField string  `json:"rotationField,omitempty"`
-	HeightMM      float64 `json:"heightMm"`
-	MinScale      float64 `json:"minScale,omitempty"`
-	MaxScale      float64 `json:"maxScale,omitempty"`
-	Rule          string  `json:"rule,omitempty"`
+	Enabled        bool    `json:"enabled"`
+	Expression     string  `json:"expression"`
+	LuaScript      string  `json:"luaScript,omitempty"`
+	Placement      string  `json:"placement"` // center (E-W), vertical (N-S), free-angle (longest segment), or legacy center-rotated
+	RotationField  string  `json:"rotationField,omitempty"`
+	PointPlacement string  `json:"pointPlacement,omitempty"` // compass direction: N, NE, E, SE, S, SW, W, NW
+	PointOffsetMM  float64 `json:"pointOffsetMm,omitempty"`
+	HeightMM       float64 `json:"heightMm"`
+	MinScale       float64 `json:"minScale,omitempty"`
+	MaxScale       float64 `json:"maxScale,omitempty"`
+	Rule           string  `json:"rule,omitempty"`
 }
 
 // Clone returns a detached copy suitable for edit snapshots.

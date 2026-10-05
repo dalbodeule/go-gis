@@ -222,11 +222,17 @@ driver로도 수행할 수 있습니다. 예를 들어 샘플 GeoJSON을 변환�
 다시 읽고 geometry 수와 extent를 인식하는지 확인합니다. 이 검사는 ARES Commander의 실제 화면·한글 글꼴
 호환성을 대체하지 않으며, ARES 검증은 대상 앱에서 별도로 수행해야 합니다.
 
-Native desktop에서는 **Export active layer to DXF**로 활성 레이어를 UTF-8 DXF로
-내보낼 수 있습니다. 내보내기 전에 레이어의 Lua 표시 필터와 레이블을 계산합니다.
-읽기 전용 viewport source는 전체 피처를 다시 읽으며, 최대 1,000,000개 피처와
-768 MiB의 디코딩된 geometry/attribute payload까지만 허용합니다. 한도를 넘으면
+Native desktop에서는 **프로젝트 레이어를 DXF로 내보내기**로 프로젝트의 모든 레이어를
+하나의 DXF에 내보냅니다. CAD 레이어명은 작업에서 설정한 표시 이름을 사용하며,
+레이블은 해당 CAD 레이어에 기록합니다. 내보내기 전에 각 레이어의 Lua 표시 필터와
+레이블을 계산합니다. 읽기 전용 viewport source는 레이어별로 전체 피처를 다시 읽으며,
+각 레이어당 최대 1,000,000개 피처와 768 MiB의 디코딩된 geometry/attribute payload까지만 허용합니다. 한도를 넘으면
 오류를 표시하고 부분 파일은 내보내지 않습니다.
+저장 위치를 선택하기 전에 레이어별 포함 여부, CAD 레이어 이름, 도형과 레이블
+내보내기 여부를 지정할 수 있습니다. 기본값은 모든 레이어의 도형·레이블을
+내보내는 것입니다. 점은 POINT, 선과 폴리곤 경계는 LWPOLYLINE, 레이블은 TEXT가
+됩니다. 불투명도가 있는 폴리곤은 구멍을 보존하도록 삼각분할한 DXF `SOLID`로
+채우며, Z 좌표와 화면의 세부 심볼 스타일은 DXF에 기록하지 않습니다.
 
 ```sh
 go run -tags native ./cmd/gis-cli convert \

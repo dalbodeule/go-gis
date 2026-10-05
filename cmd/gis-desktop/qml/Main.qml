@@ -31,9 +31,9 @@ ApplicationWindow {
     property string runtimeText: typeof appRuntime === "undefined" ? "Go runtime" : appRuntime
     property string buildTargetText: typeof appBuildTarget === "undefined" ? "desktop" : appBuildTarget
     property var translations: ({
-        en: ({"Add vector files": "Add vector files", "Open workspace": "Open workspace", "Attributes": "Attributes", "Edit vertices": "Edit vertices", "Finish vertex edit": "Finish vertex edit", "Save GeoPackage": "Save GeoPackage", "Save workspace": "Save workspace", "About GoGIS": "About GoGIS", "Layers": "Layers", "No layers yet": "No layers yet", "Add vector files or open a workspace to begin.": "Add vector files or open a workspace to begin.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "Drag to pan · Scroll to zoom · Click a feature to inspect", "General": "General", "Data source": "Data source", "Symbology": "Symbology", "Labels and expressions": "Labels and expressions", "Layer properties": "Layer properties", "Version": "Version", "Build": "Build", "Runtime": "Runtime", "License": "License", "Close": "Close", "Layer": "Layer", "Layer visible": "Layer visible", "Browse…": "Browse…", "Layer in source": "Layer in source", "Shapefile encoding": "Shapefile encoding", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator", "Display rule — return true to show this feature's label": "Display rule — return true to show this feature's label", "Label text — return string, number, or nil": "Label text — return string, number, or nil", "Insert label example": "Insert label example", "Insert rule example": "Insert rule example", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties"}),
-        ko: ({"Add vector files": "벡터 파일 추가", "Open workspace": "작업공간 열기", "Attributes": "속성 테이블", "Edit vertices": "정점 편집", "Finish vertex edit": "정점 편집 종료", "Save GeoPackage": "GeoPackage 저장", "Save workspace": "작업공간 저장", "About GoGIS": "GoGIS 정보", "Layers": "레이어", "No layers yet": "레이어가 없습니다", "Add vector files or open a workspace to begin.": "벡터 파일을 추가하거나 작업공간을 열어 시작하세요.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "드래그: 이동 · 휠: 확대/축소 · 피처 클릭: 정보 확인", "General": "일반", "Data source": "데이터 원본", "Symbology": "심볼로지", "Labels and expressions": "레이블 및 표현식", "Layer properties": "레이어 속성", "Version": "버전", "Build": "빌드", "Runtime": "실행 환경", "License": "라이선스", "Close": "닫기", "Layer": "레이어", "Layer visible": "레이어 표시", "Browse…": "찾아보기…", "Layer in source": "원본 내부 레이어", "Shapefile encoding": "Shapefile 인코딩", "Point color": "점 색상", "Point size (mm)": "점 크기 (mm)", "Line color": "선 색상", "Line width (mm)": "선 두께 (mm)", "Polygon color": "폴리곤 색상", "Fill opacity (0–1)": "채우기 불투명도 (0–1)", "Show labels": "레이블 표시", "Label field / template": "레이블 필드 / 템플릿", "Placement": "배치", "Rotation field (optional)": "회전 필드 (선택)", "Text height (mm)": "글자 높이 (mm)", "Minimum scale denominator": "최소 축척 분모", "Maximum scale denominator": "최대 축척 분모", "Display rule — return true to show this feature's label": "표시 규칙 — 레이블 표시 시 true 반환", "Label text — return string, number, or nil": "레이블 문자열 — 문자열, 숫자 또는 nil 반환", "Insert label example": "레이블 예제 삽입", "Insert rule example": "규칙 예제 삽입", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "스크립트는 피처마다 실행됩니다. 읽기 전용 `feature` 테이블로 속성에 접근합니다. 공백이 있는 필드는 feature[\"필드 이름\"] 형식을 사용하세요.", "Layer settings": "레이어 설정", "Source path": "원본 경로", "Data properties": "데이터 속성"}),
-        jp: ({"Add vector files": "ベクターファイルを追加", "Open workspace": "ワークスペースを開く", "Attributes": "属性テーブル", "Edit vertices": "頂点を編集", "Finish vertex edit": "頂点編集を終了", "Save GeoPackage": "GeoPackageを保存", "Save workspace": "ワークスペースを保存", "About GoGIS": "GoGISについて", "Layers": "レイヤー", "No layers yet": "レイヤーがありません", "Add vector files or open a workspace to begin.": "ベクターファイルを追加するか、ワークスペースを開いてください。", "Drag to pan · Scroll to zoom · Click a feature to inspect": "ドラッグ: 移動 · ホイール: 拡大/縮小 · 地物をクリック: 情報表示", "General": "一般", "Data source": "データソース", "Symbology": "シンボロジ", "Labels and expressions": "ラベルと式", "Layer properties": "レイヤーのプロパティ", "Version": "バージョン", "Build": "ビルド", "Runtime": "ランタイム", "License": "ライセンス", "Close": "閉じる", "Layer": "レイヤー", "Layer visible": "レイヤーを表示", "Browse…": "参照…", "Layer in source": "ソース内レイヤー", "Shapefile encoding": "Shapefileの文字コード", "Point color": "ポイント色", "Point size (mm)": "ポイントサイズ (mm)", "Line color": "ライン色", "Line width (mm)": "ライン幅 (mm)", "Polygon color": "ポリゴン色", "Fill opacity (0–1)": "塗りの不透明度 (0–1)", "Show labels": "ラベルを表示", "Label field / template": "ラベルフィールド / テンプレート", "Placement": "配置", "Rotation field (optional)": "回転フィールド (任意)", "Text height (mm)": "文字の高さ (mm)", "Minimum scale denominator": "最小縮尺分母", "Maximum scale denominator": "最大縮尺分母", "Display rule — return true to show this feature's label": "表示ルール — ラベル表示時にtrueを返す", "Label text — return string, number, or nil": "ラベル文字列 — 文字列、数値、またはnilを返す", "Insert label example": "ラベル例を挿入", "Insert rule example": "ルール例を挿入", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "スクリプトは地物ごとに実行されます。読み取り専用の`feature`テーブルから属性を参照できます。空白を含むフィールド名はfeature[\"フィールド名\"]を使用します。", "Layer settings": "レイヤー設定", "Source path": "ソースパス", "Data properties": "データ属性"})
+        en: ({"Add vector files": "Add vector files", "Open workspace": "Open workspace", "Attributes": "Attributes", "Edit vertices": "Edit vertices", "Finish vertex edit": "Finish vertex edit", "Save GeoPackage": "Save GeoPackage", "Save workspace": "Save workspace", "About GoGIS": "About GoGIS", "Layers": "Layers", "No layers yet": "No layers yet", "Add vector files or open a workspace to begin.": "Add vector files or open a workspace to begin.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "Drag to pan · Scroll to zoom · Click a feature to inspect", "General": "General", "Data source": "Data source", "Symbology": "Symbology", "Labels and expressions": "Labels and expressions", "Layer properties": "Layer properties", "Version": "Version", "Build": "Build", "Runtime": "Runtime", "License": "License", "Close": "Close", "Layer": "Layer", "Layer visible": "Layer visible", "Browse…": "Browse…", "Layer in source": "Layer in source", "Shapefile encoding": "Shapefile encoding", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Point label position": "Point label position", "Point label offset (mm)": "Point label offset (mm)", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator", "Display rule — return true to show this feature's label": "Display rule — return true to show this feature's label", "Label text — return string, number, or nil": "Label text — return string, number, or nil", "Insert label example": "Insert label example", "Insert rule example": "Insert rule example", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties"}),
+        ko: ({"Add vector files": "벡터 파일 추가", "Open workspace": "작업공간 열기", "Attributes": "속성 테이블", "Edit vertices": "정점 편집", "Finish vertex edit": "정점 편집 종료", "Save GeoPackage": "GeoPackage 저장", "Save workspace": "작업공간 저장", "About GoGIS": "GoGIS 정보", "Layers": "레이어", "No layers yet": "레이어가 없습니다", "Add vector files or open a workspace to begin.": "벡터 파일을 추가하거나 작업공간을 열어 시작하세요.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "드래그: 이동 · 휠: 확대/축소 · 피처 클릭: 정보 확인", "General": "일반", "Data source": "데이터 원본", "Symbology": "심볼로지", "Labels and expressions": "레이블 및 표현식", "Layer properties": "레이어 속성", "Version": "버전", "Build": "빌드", "Runtime": "실행 환경", "License": "라이선스", "Close": "닫기", "Layer": "레이어", "Layer visible": "레이어 표시", "Browse…": "찾아보기…", "Layer in source": "원본 내부 레이어", "Shapefile encoding": "Shapefile 인코딩", "Point color": "점 색상", "Point size (mm)": "점 크기 (mm)", "Line color": "선 색상", "Line width (mm)": "선 두께 (mm)", "Polygon color": "폴리곤 색상", "Fill opacity (0–1)": "채우기 불투명도 (0–1)", "Show labels": "레이블 표시", "Label field / template": "레이블 필드 / 템플릿", "Placement": "배치", "Point label position": "점 레이블 위치", "Point label offset (mm)": "점에서 레이블 간격 (mm)", "Rotation field (optional)": "회전 필드 (선택)", "Text height (mm)": "글자 높이 (mm)", "Minimum scale denominator": "최소 축척 분모", "Maximum scale denominator": "최대 축척 분모", "Display rule — return true to show this feature's label": "표시 규칙 — 레이블 표시 시 true 반환", "Label text — return string, number, or nil": "레이블 문자열 — 문자열, 숫자 또는 nil 반환", "Insert label example": "레이블 예제 삽입", "Insert rule example": "규칙 예제 삽입", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "스크립트는 피처마다 실행됩니다. 읽기 전용 `feature` 테이블로 속성에 접근합니다. 공백이 있는 필드는 feature[\"필드 이름\"] 형식을 사용하세요.", "Layer settings": "레이어 설정", "Source path": "원본 경로", "Data properties": "데이터 속성"}),
+        jp: ({"Add vector files": "ベクターファイルを追加", "Open workspace": "ワークスペースを開く", "Attributes": "属性テーブル", "Edit vertices": "頂点を編集", "Finish vertex edit": "頂点編集を終了", "Save GeoPackage": "GeoPackageを保存", "Save workspace": "ワークスペースを保存", "About GoGIS": "GoGISについて", "Layers": "レイヤー", "No layers yet": "レイヤーがありません", "Add vector files or open a workspace to begin.": "ベクターファイルを追加するか、ワークスペースを開いてください。", "Drag to pan · Scroll to zoom · Click a feature to inspect": "ドラッグ: 移動 · ホイール: 拡大/縮小 · 地物をクリック: 情報表示", "General": "一般", "Data source": "データソース", "Symbology": "シンボロジ", "Labels and expressions": "ラベルと式", "Layer properties": "レイヤーのプロパティ", "Version": "バージョン", "Build": "ビルド", "Runtime": "ランタイム", "License": "ライセンス", "Close": "閉じる", "Layer": "レイヤー", "Layer visible": "レイヤーを表示", "Browse…": "参照…", "Layer in source": "ソース内レイヤー", "Shapefile encoding": "Shapefileの文字コード", "Point color": "ポイント色", "Point size (mm)": "ポイントサイズ (mm)", "Line color": "ライン色", "Line width (mm)": "ライン幅 (mm)", "Polygon color": "ポリゴン色", "Fill opacity (0–1)": "塗りの不透明度 (0–1)", "Show labels": "ラベルを表示", "Label field / template": "ラベルフィールド / テンプレート", "Placement": "配置", "Point label position": "ポイントラベル位置", "Point label offset (mm)": "ポイントからのラベル間隔 (mm)", "Rotation field (optional)": "回転フィールド (任意)", "Text height (mm)": "文字の高さ (mm)", "Minimum scale denominator": "最小縮尺分母", "Maximum scale denominator": "最大縮尺分母", "Display rule — return true to show this feature's label": "表示ルール — ラベル表示時にtrueを返す", "Label text — return string, number, or nil": "ラベル文字列 — 文字列、数値、またはnilを返す", "Insert label example": "ラベル例を挿入", "Insert rule example": "ルール例を挿入", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "スクリプトは地物ごとに実行されます。読み取り専用の`feature`テーブルから属性を参照できます。空白を含むフィールド名はfeature[\"フィールド名\"]を使用します。", "Layer settings": "レイヤー設定", "Source path": "ソースパス", "Data properties": "データ属性"})
     })
     property var translationOverrides: ({
         en: ({"Desktop GIS": "Desktop GIS", "Layer properties": "Layer properties", "Select original layer source": "Select original layer source", "Add vector files as layers": "Add vector files as layers", "Save GoGIS workspace": "Save GoGIS workspace", "Open GoGIS workspace": "Open GoGIS workspace", "Drop SHP, GeoPackage, or GeoJSON": "Drop SHP, GeoPackage, or GeoJSON", "Display name": "Display name", "Original source path": "Original source path", "Internal layer name": "Internal layer name", "Auto encoding": "Auto encoding", "Selected feature": "Selected feature", "Feature name": "Feature name", "Save": "Save", "Cancel": "Cancel", "Previous": "Previous", "Next": "Next", "No attribute records in this layer": "No attribute records in this layer", "X coordinate": "X coordinate", "Y coordinate": "Y coordinate", "Go": "Go", "Cancel loading/render": "Cancel loading/render", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator"}),
@@ -44,8 +44,7 @@ ApplicationWindow {
     property var luaTranslations: ({
         en: ({
             "Lua label editor": "Lua label editor",
-            "Export active layer to DXF": "Export active layer to DXF",
-            "Export active layer as DXF (UTF-8)": "Export active layer as DXF (UTF-8)",
+            "Export project layers to DXF": "Export project layers to DXF",
             "Feature display filter — return true to draw this feature": "Feature display filter — return true to draw this feature",
             "Insert field into display filter…": "Insert field into display filter…",
             "Feature display filter hides features from the map only; source data stays unchanged.": "Feature display filter hides features from the map only; source data stays unchanged.",
@@ -59,8 +58,7 @@ ApplicationWindow {
         }),
         ko: ({
             "Lua label editor": "Lua 레이블 편집기",
-            "Export active layer to DXF": "활성 레이어를 DXF로 내보내기",
-            "Export active layer as DXF (UTF-8)": "활성 레이어 DXF 내보내기 (UTF-8)",
+            "Export project layers to DXF": "프로젝트 레이어를 DXF로 내보내기",
             "Feature display filter — return true to draw this feature": "피처 표시 필터 — 그릴 피처는 true 반환",
             "Insert field into display filter…": "표시 필터에 필드 삽입…",
             "Feature display filter hides features from the map only; source data stays unchanged.": "피처 표시 필터는 지도에서만 숨기며 원본 데이터는 바뀌지 않습니다.",
@@ -74,8 +72,7 @@ ApplicationWindow {
         }),
         jp: ({
             "Lua label editor": "Luaラベルエディター",
-            "Export active layer to DXF": "アクティブレイヤーをDXFにエクスポート",
-            "Export active layer as DXF (UTF-8)": "アクティブレイヤーをDXFにエクスポート (UTF-8)",
+            "Export project layers to DXF": "プロジェクトのレイヤーをDXFにエクスポート",
             "Feature display filter — return true to draw this feature": "地物表示フィルター — 描画する地物はtrueを返す",
             "Insert field into display filter…": "表示フィルターにフィールドを挿入…",
             "Feature display filter hides features from the map only; source data stays unchanged.": "地物表示フィルターは地図上で非表示にするだけで、元データは変更しません。",
@@ -428,9 +425,12 @@ ApplicationWindow {
             }
             Button {
                 objectName: "exportDxfButton"
-                text: rootWindow.tr("Export active layer to DXF")
+                text: rootWindow.tr("Export project layers to DXF")
                 enabled: layerModel.count > 0
-                onClicked: dxfEncodingDialog.open()
+                onClicked: {
+                    dxfLayerOptions.clear();
+                    dxfEncodingDialog.open();
+                }
             }
             Button {
                 text: rootWindow.tr("Save workspace")
@@ -1404,6 +1404,7 @@ ApplicationWindow {
                     }
                     property string savePath: ""
                     property string saveProfile: ""
+                    property string saveOptions: ""
                     property int saveGeneration: 0
                     scale: mapViewport.mapZoom
                     transformOrigin: Item.Center
@@ -1415,8 +1416,8 @@ ApplicationWindow {
                     model: mapLabelModel
                     delegate: Text {
                         z: 2
-                        x: mapCanvas.x + mapCanvas.width / 2 + (model.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2
-                        y: mapCanvas.y + mapCanvas.height / 2 - (model.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2
+                        x: mapCanvas.x + mapCanvas.width / 2 + (model.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2 + Number(model.offsetXmm || 0) * mapCanvas.logicalPixelsPerMm
+                        y: mapCanvas.y + mapCanvas.height / 2 - (model.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2 + Number(model.offsetYmm || 0) * mapCanvas.logicalPixelsPerMm
                         rotation: mapViewport.screenRotation(model.rotation)
                         text: model.text
                         textFormat: Text.PlainText
@@ -2241,6 +2242,7 @@ ApplicationWindow {
         property string activeCategory: "general"
         property string targetGeometryType: ""
         property var labelPlacementValues: ["center", "vertical", "free-angle", "center-rotated"]
+        property var pointLabelPlacementValues: ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         property real previousFillOpacity: 0.35
         property real labelCaptionWidth: Math.min(180, Math.max(120, layerSettingsScroll.availableWidth * 0.25))
         onActiveCategoryChanged: {
@@ -2305,6 +2307,8 @@ ApplicationWindow {
             labelExpressionField.text = labels.expression || "";
             labelPlacementField.currentIndex = Math.max(0, labelPlacementValues.indexOf(labels.placement || "center"));
             labelRotationField.text = labels.rotationField || "";
+            pointLabelPlacementField.currentIndex = Math.max(0, pointLabelPlacementValues.indexOf(labels.pointPlacement || "NE"));
+            pointLabelOffsetField.text = String(labels.pointOffsetMm === undefined ? 1.5 : labels.pointOffsetMm);
             labelHeightField.text = String(labels.heightMm || 2.5);
             labelMinScaleField.text = String(labels.minScale || "");
             labelMaxScaleField.text = String(labels.maxScale || "");
@@ -2345,7 +2349,9 @@ ApplicationWindow {
                     expression: labelExpressionField.text,
                     luaScript: labelLuaSource,
                     placement: labelPlacementValues[labelPlacementField.currentIndex],
-                    rotationField: labelPlacementField.currentIndex >= 2 ? labelRotationField.text : "",
+                    rotationField: labelPlacementField.currentIndex === 3 ? labelRotationField.text : "",
+                    pointPlacement: pointLabelPlacementValues[pointLabelPlacementField.currentIndex],
+                    pointOffsetMm: Number(pointLabelOffsetField.text || 0),
                     heightMm: Number(labelHeightField.text),
                     minScale: Number(labelMinScaleField.text || 0),
                     maxScale: Number(labelMaxScaleField.text || 0),
@@ -2764,7 +2770,7 @@ ApplicationWindow {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
-                    visible: layerSettingsDialog.activeCategory === "labels" && (labelPlacementField.currentIndex === 3 || (labelPlacementField.currentIndex === 2 && labelRotationField.text !== ""))
+                    visible: layerSettingsDialog.activeCategory === "labels" && labelPlacementField.currentIndex === 3
                     Label {
                         text: rootWindow.tr("Rotation field (optional)")
                         Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
@@ -2776,14 +2782,39 @@ ApplicationWindow {
                         placeholderText: rootWindow.tr("Rotation field (optional)")
                     }
                 }
-                Label {
+                RowLayout {
                     Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    color: "#65717d"
-                    visible: layerSettingsDialog.activeCategory === "labels" && labelPlacementField.currentIndex === 2 && labelRotationField.text !== ""
-                    text: rootWindow.language === "ko" ? "기존 회전 필드가 설정되어 있어 가장 긴 선분 각도보다 우선합니다. 선분 기준 각도를 쓰려면 필드를 지우세요." :
-                          rootWindow.language === "jp" ? "既存の回転フィールドが最長線分の角度より優先されます。線分の角度を使うにはフィールドを消してください。" :
-                          "The existing rotation field overrides the longest-segment angle. Clear it to use geometry-based rotation."
+                    spacing: 8
+                    visible: layerSettingsDialog.activeCategory === "labels" && layerSettingsDialog.styleAppliesTo("point")
+                    Label {
+                        text: rootWindow.tr("Point label position")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
+                    }
+                    ComboBox {
+                        id: pointLabelPlacementField
+                        objectName: "pointLabelPlacementField"
+                        Layout.fillWidth: true
+                        model: rootWindow.language === "ko" ?
+                                   ["위", "오른쪽 위", "오른쪽", "오른쪽 아래", "아래", "왼쪽 아래", "왼쪽", "왼쪽 위"] :
+                               rootWindow.language === "jp" ?
+                                   ["上", "右上", "右", "右下", "下", "左下", "左", "左上"] :
+                                   ["Top", "Top right", "Right", "Bottom right", "Bottom", "Bottom left", "Left", "Top left"]
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    visible: layerSettingsDialog.activeCategory === "labels" && layerSettingsDialog.styleAppliesTo("point")
+                    Label {
+                        text: rootWindow.tr("Point label offset (mm)")
+                        Layout.preferredWidth: layerSettingsDialog.labelCaptionWidth
+                    }
+                    TextField {
+                        id: pointLabelOffsetField
+                        objectName: "pointLabelOffsetField"
+                        Layout.fillWidth: true
+                        inputMethodHints: Qt.ImhFormattedNumbersOnly
+                    }
                 }
                 GridLayout {
                     Layout.fillWidth: true
@@ -3121,16 +3152,18 @@ ApplicationWindow {
     Platform.FileDialog {
         id: dxfExportDialog
         objectName: "dxfExportDialog"
-        title: rootWindow.language === "ko" ? "DXF 인코딩 선택" : rootWindow.language === "jp" ? "DXFの文字コード" : "DXF text encoding"
+        title: rootWindow.language === "ko" ? "DXF 저장 위치" : rootWindow.language === "jp" ? "DXF保存先" : "Save DXF"
         fileMode: Platform.FileDialog.SaveFile
         nameFilters: ["DXF (*.dxf)"]
         property string selectedProfile: "ares-utf8"
+        property string selectedOptions: ""
         onAccepted: {
             var path = mapViewport.localPathFromUrl(file);
             if (!path.toLowerCase().endsWith(".dxf"))
                 path += ".dxf";
             mapCanvas.savePath = path;
             mapCanvas.saveProfile = selectedProfile;
+            mapCanvas.saveOptions = selectedOptions;
             mapCanvas.saveGeneration += 1;
         }
     }
@@ -3139,15 +3172,62 @@ ApplicationWindow {
         id: dxfEncodingDialog
         objectName: "dxfEncodingDialog"
         modal: true
-        title: rootWindow.language === "ko" ? "DXF 인코딩 선택" : rootWindow.language === "jp" ? "DXFの文字コード" : "DXF text encoding"
+        title: rootWindow.language === "ko" ? "DXF 내보내기 설정" : rootWindow.language === "jp" ? "DXF書き出し設定" : "DXF export settings"
         standardButtons: Dialog.Ok | Dialog.Cancel
-        width: Math.min(420, rootWindow.width - 48)
+        width: Math.min(640, rootWindow.width - 48)
         anchors.centerIn: Overlay.overlay
+        property string validationMessage: ""
+        ListModel { id: dxfLayerOptions; objectName: "dxfLayerOptionsModel" }
         onOpened: {
             dxfEncodingChoice.currentIndex = 0;
+            if (dxfLayerOptions.count === 0) {
+                for (var i = 0; i < layerModel.count; ++i) {
+                    var layer = layerModel.get(i);
+                    dxfLayerOptions.append({name: layer.name,
+                        cadName: layer.displayName || layer.name,
+                        included: true, geometryEnabled: true, labelsEnabled: true,
+                        geometryType: layer.geometryType || ""});
+                }
+            }
+            validationMessage = "";
         }
         onAccepted: {
+            var plan = [];
+            var seen = {};
+            var included = 0;
+            for (var i = 0; i < dxfLayerOptions.count; ++i) {
+                var option = dxfLayerOptions.get(i);
+                var cadName = option.cadName.trim();
+                if (option.included) {
+                    included++;
+                    if (cadName === "" || (!option.geometryEnabled && !option.labelsEnabled)) {
+                        validationMessage = rootWindow.language === "ko" ? "선택한 레이어에는 CAD 이름과 도형/레이블 중 하나가 필요합니다." : "Selected layers need a CAD name and geometry or labels.";
+                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        return;
+                    }
+                    if (cadName.length > 255 || /[<>\/\\\":;?*|=,']/.test(cadName)) {
+                        validationMessage = rootWindow.language === "ko" ? "CAD 레이어 이름에 허용되지 않는 문자 또는 길이가 있습니다: " + cadName : "Invalid CAD layer name: " + cadName;
+                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        return;
+                    }
+                    var key = cadName.toUpperCase();
+                    if (seen[key]) {
+                        validationMessage = rootWindow.language === "ko" ? "CAD 레이어 이름이 중복됩니다: " + cadName : "Duplicate CAD layer name: " + cadName;
+                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        return;
+                    }
+                    seen[key] = true;
+                }
+                plan.push({name: option.name, cadName: cadName, include: option.included,
+                    geometry: option.geometryEnabled, labels: option.labelsEnabled});
+            }
+            if (included === 0) {
+                validationMessage = rootWindow.language === "ko" ? "내보낼 레이어를 하나 이상 선택하세요." : "Select at least one layer.";
+                Qt.callLater(function() { dxfEncodingDialog.open(); });
+                return;
+            }
             dxfExportDialog.selectedProfile = dxfEncodingChoice.currentValue;
+            dxfExportDialog.selectedOptions = JSON.stringify(plan);
             dxfExportDialog.open();
         }
         contentItem: ColumnLayout {
@@ -3176,6 +3256,68 @@ ApplicationWindow {
                     {label: "CP949 (Korean CAD)", profile: "ares-cp949"},
                     {label: "Shift-JIS (Japanese CAD)", profile: "ares-shift-jis"}
                 ]
+            }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "2D 도형: 점→POINT(원형 십자 표시), 선·폴리곤 경계→LWPOLYLINE. 채우기가 설정된 폴리곤은 SOLID 삼각형으로 채웁니다. Z 좌표는 제외하며 레이블은 같은 CAD 레이어의 TEXT입니다." : rootWindow.language === "jp" ? "2D図形: 点→POINT（円と十字の記号）、線・ポリゴン境界→LWPOLYLINE。塗り設定のあるポリゴンはSOLID三角形で塗ります。Z座標は除外し、ラベルは同じCADレイヤーのTEXTです。" : "2D geometry: points → POINT with a circle-and-cross marker; lines and polygon outlines → LWPOLYLINE. Filled polygons use SOLID triangles. Z coordinates are omitted; labels become TEXT on the same CAD layer."
+                wrapMode: Text.WordWrap
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(340, Math.max(100, dxfLayerOptions.count * 115))
+                clip: true
+                ColumnLayout {
+                    width: parent.width
+                    Repeater {
+                        model: dxfLayerOptions
+                        delegate: ColumnLayout {
+                            Layout.fillWidth: true
+                            CheckBox {
+                                text: model.cadName + " (" + model.geometryType + ")"
+                                checked: model.included
+                                onToggled: dxfLayerOptions.setProperty(index, "included", checked)
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                leftPadding: 20
+                                color: "#526578"
+                                text: rootWindow.language === "ko"
+                                    ? "도형 해석: " + (/point/i.test(model.geometryType) ? "점 → POINT" : /polygon/i.test(model.geometryType) ? "폴리곤 경계 → LWPOLYLINE" : /line/i.test(model.geometryType) ? "선 → LWPOLYLINE" : "원본 형상에 따라 POINT/LWPOLYLINE")
+                                    : "Geometry mapping: " + (/point/i.test(model.geometryType) ? "points → POINT" : /polygon/i.test(model.geometryType) ? "polygon outlines → LWPOLYLINE" : /line/i.test(model.geometryType) ? "lines → LWPOLYLINE" : "POINT/LWPOLYLINE by source shape")
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                enabled: model.included
+                                Label { text: rootWindow.language === "ko" ? "CAD 이름" : "CAD name" }
+                                TextField {
+                                    Layout.fillWidth: true
+                                    text: model.cadName
+                                    onTextChanged: dxfLayerOptions.setProperty(index, "cadName", text)
+                                }
+                            }
+                            RowLayout {
+                                enabled: model.included
+                                CheckBox {
+                                    text: rootWindow.language === "ko" ? "도형" : "Geometry"
+                                    checked: model.geometryEnabled
+                                    onToggled: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
+                                }
+                                CheckBox {
+                                    text: rootWindow.language === "ko" ? "레이블" : "Labels"
+                                    checked: model.labelsEnabled
+                                    onToggled: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: dxfEncodingDialog.validationMessage !== ""
+                color: "#b42318"
+                text: dxfEncodingDialog.validationMessage
+                wrapMode: Text.WordWrap
             }
         }
     }

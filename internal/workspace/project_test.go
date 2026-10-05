@@ -21,7 +21,7 @@ func TestWorkspaceRoundTripPreservesLayerSettingsWithoutFeatures(t *testing.T) {
 	project := core.Project{Name: "field work", CRS: core.CRS{AuthorityCode: "EPSG:5179"}, Layers: []core.Layer{{
 		Name: "roads", DisplayName: "Road centerlines", SourcePath: "../data/roads.shp", SourceLayerName: "roads", SourceEncoding: "CP949",
 		CRS: core.CRS{AuthorityCode: "EPSG:5179"}, Visible: false, Style: core.DefaultLayerStyle(),
-		Labels:      core.LabelSettings{Enabled: true, Expression: "${name}", Rule: `return feature.active == true`, LuaScript: `return feature.name .. " #" .. feature.id`, Placement: "center-rotated", RotationField: "angle", HeightMM: 2.5, MinScale: 1000, MaxScale: 50000},
+		Labels:      core.LabelSettings{Enabled: true, Expression: "${name}", Rule: `return feature.active == true`, LuaScript: `return feature.name .. " #" .. feature.id`, Placement: "center-rotated", RotationField: "angle", PointPlacement: "SW", PointOffsetMM: 3.25, HeightMM: 2.5, MinScale: 1000, MaxScale: 50000},
 		DisplayRule: `return feature.active == true`,
 		Features:    []core.Feature{{ID: 1}},
 	}}}

@@ -491,7 +491,9 @@ Python의 `qgis.core`/`pyproj`를 확인했으나 사용할 수 있는 QGIS/PyQG
 
 ## ARES Commander 2027 실제 파일 확인
 
-자동 사전검증 및 GDAL 재읽기는 통과했지만 ARES 실제 앱 결과는 아직 없다.
+자동 사전검증 및 GDAL 재읽기는 통과했다. Windows ARES 실제 앱에서는 기존
+HATCH 채움 도면이 건물 표시 시 무한 로딩으로 멈췄다. SOLID 삼각형으로 바꾼
+새 출력과 `*ACTIVE` 초기 뷰포트는 아직 Windows ARES에서 재확인해야 한다.
 검증 호스트는 macOS 27.2이며 ARES 앱을 찾지 못했다. Graebert가 게시한 ARES
 Commander 2027 SP1 macOS 지원 목록은 14, 15, 26이므로 현재 호스트에서 성공을
 가정하지 않는다. 공식 시스템 요구사항과 배포 OS는
@@ -499,8 +501,8 @@ Commander 2027 SP1 macOS 지원 목록은 14, 15, 26이므로 현재 호스트�
 
 지원되는 Windows/macOS/Linux ARES Commander 2027에서 다음 두 파일을 각각 연다.
 
-- `testdata/ares/sample-utf8.dxf` — SHA-256 `75e9325afdd626a505f5bcf5ef8ca02f6b8d919c55700c155d6eff8e9f0b720a`
-- `testdata/ares/sample-cp949.dxf` — SHA-256 `63a7484b44cd9f55d4251f2f58f0c1711212bdf484512dfaf4e94f544f0c5a06`
+- `testdata/ares/sample-utf8.dxf` — SHA-256 `8b0bc5d41d8b343bedcecb60324630939954ad5a0ea83d6c4c6ad3a57a5f6d3f`
+- `testdata/ares/sample-cp949.dxf` — SHA-256 `fdadb149f2e46445e4564e27d7e07e79fb3ffaf7a3b93d6fe23745df23c08942`
 
 각 파일에서 복구/오류 대화상자, `sample_labeled` 레이어의 geometry 위치,
 `한글 도로`·`한글 건물` 표시, 도로 라벨 30° 회전, 높이 2.5, `Korean` 문자

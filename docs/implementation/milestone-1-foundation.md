@@ -18,7 +18,7 @@
 - 다중 layer 입력을 위한 `drivers.LayerCollectionReader` 경계와 GDAL 구현
 - PROJ 기반 EPSG:4326·5179·5186 좌표 회귀 테스트와 XY 축 순서 보정
 - `ProjectService.SaveLayer` 저장 어댑터 경계와 writer clone 보장 테스트
-- DXF AC1015 UTF-8·CP949 프로파일의 헤더·바이트 인코딩 회귀 테스트
+- DXF UTF-8(AC1021)·CP949(AC1015) 프로파일의 헤더·바이트 인코딩 회귀 테스트
 - 포맷 독립 `core.Label` 모델과 DXF TEXT의 위치·회전·높이·스타일 출력
 - PostGIS JSONB 기반 스키마 생성·레이어 읽기·원자적 저장 경로
 - Lua allow-list 샌드박스와 context 기반 실행 취소 테스트

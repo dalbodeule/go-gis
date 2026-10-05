@@ -185,7 +185,7 @@ func (s *ProjectService) LayerProperties(name string) (core.Layer, bool) {
 				Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
 				SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
 				CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
-				Style: layer.Style, Labels: layer.Labels,
+				Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 			}, true
 		}
 	}
@@ -201,7 +201,7 @@ func (s *ProjectService) ProjectLayerProperties() []core.Layer {
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
 			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
 			CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
-			Style: layer.Style, Labels: layer.Labels,
+			Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return result

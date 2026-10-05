@@ -77,8 +77,18 @@ Placement modes are:
   (finite numeric degrees counter-clockwise from map east; a null/empty value
   is treated as 0). The renderer converts map angles to screen angles using
   the current extent and canvas aspect ratio.
-- **Free angle**: uses the selected rotation field when set; otherwise line
-  labels follow the local line angle, while other geometries remain unrotated.
+- **Free angle**: follows the longest geometry segment. Polygon labels keep an
+  interior anchor while taking the angle from that segment. A stale rotation
+  field does not override this mode; attribute-driven rotation is available in
+  **Center + rotation**.
+
+Point labels can be positioned in any of eight compass directions and given a
+physical offset in millimeters from the point. The offset is applied to both
+display placement and screen-space collision detection. Overlapping labels are
+omitted in the map view with larger spacing at wider scales; DXF export keeps
+eligible labels instead of applying the screen decluttering. DXF point labels
+use the same compass direction and text justification, with the configured
+offset scaled proportionally to the exported text height in drawing units.
 
 The **Open Lua editor and examples…** dialog shows the active layer's field
 names and provides separate editors for three conditions: feature display,
@@ -106,11 +116,20 @@ The label Lua context exposes only base, table, string, and math libraries; it
 does not expose filesystem or process libraries. Scripts are size-limited and
 observe cancellation.
 
-Use **Export active layer to DXF** in the top toolbar, choose a text encoding,
+Use **Export project layers to DXF** in the top toolbar, choose a text encoding,
 then select an output path. The initial choice follows the interface language:
 CP949 for Korean, Shift-JIS for Japanese, and UTF-8 otherwise. All three are
-available in every language. The export applies that layer's Lua display filter and label
-settings. Viewport-only sources are reopened for export with limits of 1,000,000
+available in every language. The export includes every project layer in one DXF,
+uses each layer's display name as its CAD layer name, and places labels on the same CAD layer.
+Before choosing the output file, you can exclude layers, change their CAD layer names,
+or export only geometry or only labels for each selected layer. By default, both are
+included. Points become DXF POINT objects with a visible circle-and-cross marker;
+lines and polygon boundaries become LWPOLYLINE. Polygons with fill opacity above zero
+also become solid HATCH entities, drawn below their outlines. Label text uses the
+profile's Korean or Japanese system font where applicable. Z coordinates and fill
+opacity levels are not preserved; any enabled fill exports as solid.
+It applies each layer's Lua display filter and label settings. Viewport-only sources
+are reopened one layer at a time with per-layer limits of 1,000,000
 features and 768 MiB of decoded geometry/attribute payload. If a limit is
 exceeded, export reports an error instead of writing a partial file.
 The source dataset is not modified. ARES Commander visual and Korean-font

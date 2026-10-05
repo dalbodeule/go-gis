@@ -20,6 +20,150 @@ import (
 	"golang.org/x/text/encoding/korean"
 )
 
+func TestExportProjectWritesEachLayerAndPreservesDestinationOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.dxf")
+	specs := []LayerSpec{{Name: "연속지적도"}, {Name: "지적도근점"}, {Name: "건물"}}
+	layers := []core.Layer{
+		{Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 1 1)"}}}},
+		{Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (2 2)"}}}},
+		{Features: []core.Feature{{ID: 3, Geometry: core.WKTGeometry{WKT: "POLYGON ((3 3, 4 3, 4 4, 3 3))"}}}},
+	}
+	count := 0
+	load := func(index int) (core.Layer, error) { count++; return layers[index], nil }
+	if err := (Exporter{}).ExportProject(context.Background(), path, specs, load, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("loaded %d layers, want 3", count)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"연속지적도", "지적도근점", "건물"} {
+		if !strings.Contains(string(data), "\n2\n"+name+"\n") || !strings.Contains(string(data), "\n8\n"+name+"\n") {
+			t.Errorf("missing CAD layer %q", name)
+		}
+	}
+	failure := func(index int) (core.Layer, error) {
+		if index == 2 {
+			return core.Layer{}, fmt.Errorf("source unavailable")
+		}
+		return layers[index], nil
+	}
+	if err := (Exporter{}).ExportProject(context.Background(), path, specs, failure, "ares-utf8"); err == nil {
+		t.Fatal("expected loader failure")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, after) {
+		t.Fatal("failed export replaced the previous complete DXF")
+	}
+	if err := (Exporter{}).ExportProject(context.Background(), path, []LayerSpec{{Name: "same"}, {Name: "SAME"}}, load, "ares-utf8"); err == nil {
+		t.Fatal("expected duplicate CAD layer name error")
+	}
+}
+
+func TestExportProjectWritesOpeningViewCenteredOnNonPointLayers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project-view.dxf")
+	specs := []LayerSpec{
+		{Name: "parcels", GeometryType: "MULTIPOLYGON", Bounds: [4]float64{10, 20, 30, 40}, HasBounds: true},
+		{Name: "survey-points", GeometryType: "POINT", Bounds: [4]float64{-500000, -500000, 500000, 500000}, HasBounds: true},
+	}
+	layers := []core.Layer{{}, {}}
+	if err := (Exporter{}).ExportProject(context.Background(), path, specs,
+		func(index int) (core.Layer, error) { return layers[index], nil }, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\n9\n$VIEWCTR\n10\n20\n20\n30\n9\n$VIEWSIZE\n40\n23\n"
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("opening view does not use non-point layer bounds; wanted header sequence %q", want)
+	}
+	for _, want := range []string{"\n2\nVPORT\n", "\n2\n*ACTIVE\n", "\n12\n20\n22\n30\n", "\n45\n23\n"} {
+		if !bytes.Contains(data, []byte(want)) {
+			t.Errorf("opening viewport is missing %q", want)
+		}
+	}
+}
+
+func TestExporterWritesSolidTriangleFillWhenTriangulatorIsAvailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "filled-building.dxf")
+	layer := core.Layer{Name: "building", Style: core.LayerStyle{FillOpacity: 1}, Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 2 0, 0 2, 0 0))"},
+	}}}
+	exporter := Exporter{Triangulate: func(_ context.Context, geometry core.Geometry) ([][3][2]float64, error) {
+		if geometry.GeometryType() != "POLYGON" {
+			t.Fatalf("triangulator received %s", geometry.GeometryType())
+		}
+		return [][3][2]float64{{{0, 0}, {2, 0}, {0, 2}}}, nil
+	}}
+	if err := exporter.Export(context.Background(), path, layer, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("\nHATCH\n")) || bytes.Count(data, []byte("\nSOLID\n")) != 1 ||
+		!bytes.Contains(data, []byte("\n100\nAcDbTrace\n")) ||
+		!bytes.Contains(data, []byte("\n13\n0\n23\n2\n33\n0\n")) ||
+		!bytes.Contains(data, []byte("\nLWPOLYLINE\n")) {
+		t.Fatal("triangle fill did not preserve a valid SOLID and polygon outline")
+	}
+}
+
+func TestExportSingleLayerDerivesOpeningViewFromGeometry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "single-layer-view.dxf")
+	layer := core.Layer{Name: "parcels", Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((100 200, 120 200, 120 240, 100 200))"},
+	}}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\n9\n$VIEWCTR\n10\n110\n20\n220\n9\n$VIEWSIZE\n40\n46\n"
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("single-layer export has no geometry-derived opening view; wanted %q", want)
+	}
+}
+
+func TestInitialViewFallsBackToPointBoundsAndSkipsInvalidBounds(t *testing.T) {
+	specs := []LayerSpec{
+		{Name: "bad", GeometryType: "POLYGON", Bounds: [4]float64{math.NaN(), 0, 1, 1}, HasBounds: true},
+		{Name: "points", GeometryType: "MULTIPOINT", Bounds: [4]float64{5, 7, 5, 7}, HasBounds: true},
+	}
+	x, y, size, ok := initialView(specs)
+	if !ok || x != 5 || y != 7 || size != 1 {
+		t.Fatalf("point-only fallback view = (%v, %v, %v, %t), want (5, 7, 1, true)", x, y, size, ok)
+	}
+	if _, _, _, ok := initialView([]LayerSpec{{Name: "empty"}}); ok {
+		t.Fatal("empty project unexpectedly has an initial view")
+	}
+}
+
+func TestExportProjectRejectsInvalidCADLayerNames(t *testing.T) {
+	for _, name := range []string{"bad/name", "bad,name", "bad:name", " trailing ", strings.Repeat("a", 256)} {
+		path := filepath.Join(t.TempDir(), "invalid.dxf")
+		err := (Exporter{}).ExportProject(context.Background(), path, []LayerSpec{{Name: name}},
+			func(int) (core.Layer, error) { return core.Layer{}, nil }, "ares-utf8")
+		if err == nil {
+			t.Errorf("accepted invalid CAD layer name %q", name)
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Errorf("invalid name wrote %q: %v", path, statErr)
+		}
+	}
+}
+
 func BenchmarkWriteCodeLine100K(b *testing.B) {
 	var output bytes.Buffer
 	writer := bufio.NewWriter(&output)
@@ -385,10 +529,262 @@ func TestExporterWritesHeaderGeometryAndKoreanLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(contents)
-	for _, expected := range []string{"$ACADVER", "AC1015", "$DWGCODEPAGE", "UTF-8", "POINT", "한글 도로", "ENDSEC", "EOF"} {
+	for _, expected := range []string{"$ACADVER", "AC1021", "$DWGCODEPAGE", "UTF-8", "POINT", "한글 도로", "ENDSEC", "EOF"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("DXF does not contain %q", expected)
 		}
+	}
+}
+
+func TestExporterWritesSelfContainedR2000Records(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cad-structure.dxf")
+	layer := core.Layer{Name: "parcels", Style: core.LayerStyle{FillOpacity: 1}, Features: []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 2 0, 2 2, 0 0), (0.5 0.5, 0.5 1, 1 1, 0.5 0.5))"},
+			Label: &core.Label{X: 1, Y: 1, Text: "한글", Height: 2.5, Rotation: 30, Style: "Korean"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (3 4)"}},
+	}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-cp949"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimSuffix(contents, []byte("\n")), []byte("\n"))
+	if len(lines)%2 != 0 {
+		t.Fatal("DXF has an unpaired group code")
+	}
+	type pair struct{ code, value string }
+	pairs := make([]pair, 0, len(lines)/2)
+	for index := 0; index < len(lines); index += 2 {
+		pairs = append(pairs, pair{string(lines[index]), string(lines[index+1])})
+	}
+	codePageFound := false
+	for index, item := range pairs {
+		if item == (pair{"9", "$DWGCODEPAGE"}) {
+			codePageFound = true
+			if index+1 >= len(pairs) {
+				t.Fatal("$DWGCODEPAGE has no value")
+			}
+			if pairs[index+1] != (pair{"3", "ANSI_949"}) {
+				t.Fatalf("$DWGCODEPAGE must use DXF group 3, got %v", pairs[index+1])
+			}
+		}
+	}
+	if !codePageFound {
+		t.Fatal("missing $DWGCODEPAGE header")
+	}
+	for _, header := range []pair{{"9", "$PDMODE"}, {"70", "35"}, {"9", "$PDSIZE"}, {"40", "-3"}} {
+		if !bytes.Contains(contents, []byte("\n"+header.code+"\n"+header.value+"\n")) {
+			t.Errorf("DXF point visibility header missing %v", header)
+		}
+	}
+	var records [][]pair
+	for _, item := range pairs {
+		if item.code == "0" {
+			records = append(records, []pair{item})
+		} else if len(records) > 0 {
+			records[len(records)-1] = append(records[len(records)-1], item)
+		}
+	}
+	field := func(record []pair, code, value string) bool {
+		for _, item := range record {
+			if item.code == code && item.value == value {
+				return true
+			}
+		}
+		return false
+	}
+	wantEntities := map[string]string{"LWPOLYLINE": "AcDbPolyline", "HATCH": "AcDbHatch", "TEXT": "AcDbText", "POINT": "AcDbPoint"}
+	seenEntities := map[string]bool{}
+	seenHandles := map[string]bool{}
+	seenLayers := map[string]bool{}
+	seenStyles := map[string]bool{}
+	modelSpace := false
+	for _, record := range records {
+		kind := record[0].value
+		for _, item := range record {
+			if item.code == "5" {
+				if seenHandles[item.value] {
+					t.Fatalf("duplicate DXF handle %q", item.value)
+				}
+				seenHandles[item.value] = true
+			}
+		}
+		if kind == "LAYER" {
+			for _, item := range record {
+				if item.code == "2" {
+					seenLayers[item.value] = true
+				}
+			}
+		}
+		if kind == "STYLE" {
+			for _, item := range record {
+				if item.code == "2" {
+					seenStyles[item.value] = true
+				}
+			}
+			if field(record, "2", "Standard") && !field(record, "3", "malgun.ttf") {
+				t.Error("Korean profiles must use the Windows Korean TrueType font")
+			}
+		}
+		if kind == "BLOCK_RECORD" && field(record, "2", "*Model_Space") && field(record, "5", "1F") {
+			modelSpace = true
+		}
+		if subclass, ok := wantEntities[kind]; ok {
+			seenEntities[kind] = true
+			for _, required := range []pair{{"330", "1F"}, {"100", "AcDbEntity"}, {"100", subclass}} {
+				if !field(record, required.code, required.value) {
+					t.Fatalf("%s is missing %v", kind, required)
+				}
+			}
+			if !field(record, "8", "parcels") && !field(record, "8", "LABEL") {
+				t.Fatalf("%s references an unexpected layer", kind)
+			}
+			if kind == "HATCH" {
+				if !field(record, "2", "SOLID") || !field(record, "70", "1") || !field(record, "91", "2") {
+					t.Fatal("HATCH must be a solid fill with outer and inner boundary paths")
+				}
+				paths, unassociated := 0, 0
+				for _, item := range record {
+					if item.code == "92" {
+						paths++
+						if paths == 1 && item.value != "3" {
+							t.Errorf("outer HATCH boundary flag = %q, want 3 (external polyline)", item.value)
+						}
+						if paths == 2 && item.value != "2" {
+							t.Errorf("inner HATCH boundary flag = %q, want 2 (polyline)", item.value)
+						}
+					}
+					if item == (pair{"97", "0"}) {
+						unassociated++
+					}
+				}
+				if paths != 2 || unassociated != 2 {
+					t.Fatalf("HATCH boundary path counts = %d/%d, want 2/2", paths, unassociated)
+				}
+			}
+			if kind == "TEXT" {
+				sections := 0
+				textIndex, rotationIndex, styleIndex, finalSubclassIndex := -1, -1, -1, -1
+				for index, item := range record {
+					if item == (pair{"100", "AcDbText"}) {
+						sections++
+						finalSubclassIndex = index
+					}
+					if item.code == "1" {
+						textIndex = index
+					}
+					if item.code == "50" {
+						rotationIndex = index
+					}
+					if item.code == "7" {
+						styleIndex = index
+					}
+				}
+				if sections != 2 {
+					t.Fatalf("TEXT must contain both AcDbText subclass sections, got %d", sections)
+				}
+				if textIndex < 0 || rotationIndex <= textIndex || styleIndex <= rotationIndex || finalSubclassIndex <= styleIndex {
+					t.Fatalf("TEXT group sequence differs from DXF schema: text=%d rotation=%d style=%d final subclass=%d", textIndex, rotationIndex, styleIndex, finalSubclassIndex)
+				}
+			}
+		}
+	}
+	for name := range wantEntities {
+		if !seenEntities[name] {
+			t.Errorf("missing %s entity", name)
+		}
+	}
+	for _, name := range []string{"0", "parcels", "LABEL"} {
+		if !seenLayers[name] {
+			t.Errorf("missing LAYER %q definition", name)
+		}
+	}
+	for _, name := range []string{"Standard", "Korean"} {
+		if !seenStyles[name] {
+			t.Errorf("missing STYLE %q definition", name)
+		}
+	}
+	if !modelSpace {
+		t.Error("missing model-space BLOCK_RECORD handle 1F")
+	}
+}
+
+func TestExporterWritesSeparateHatchesForMultipolygonComponents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multipolygon-hatch.dxf")
+	layer := core.Layer{Name: "buildings", Style: core.LayerStyle{FillOpacity: 1}, Features: []core.Feature{{
+		ID:       1,
+		Geometry: core.WKTGeometry{WKT: "MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0), (1 1, 1 2, 2 1, 1 1)), ((10 10, 14 10, 14 14, 10 10), (11 11, 11 12, 12 11, 11 11)))"},
+	}}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Count(contents, []byte("\nHATCH\n")); got != 2 {
+		t.Fatalf("HATCH entity count = %d, want one per polygon component (2)", got)
+	}
+	if got := bytes.Count(contents, []byte("\n92\n3\n")); got != 2 {
+		t.Fatalf("external polyline boundary count = %d, want 2", got)
+	}
+	if got := bytes.Count(contents, []byte("\n92\n2\n")); got != 2 {
+		t.Fatalf("inner polyline boundary count = %d, want 2", got)
+	}
+}
+
+func TestExporterRejectsNonFiniteGeometry(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "invalid.dxf")
+	if err := os.WriteFile(path, []byte("existing drawing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wkb := make([]byte, 9+2*16)
+	wkb[0] = 1
+	binary.LittleEndian.PutUint32(wkb[1:5], 2)
+	binary.LittleEndian.PutUint32(wkb[5:9], 2)
+	binary.LittleEndian.PutUint64(wkb[9+16:9+24], math.Float64bits(1))
+	binary.LittleEndian.PutUint64(wkb[9+24:9+32], math.Float64bits(math.NaN()))
+	layer := core.Layer{Name: "invalid", Features: []core.Feature{{
+		ID: 1, Geometry: core.WKBGeometry{WKB: wkb},
+	}}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-cp949"); err == nil {
+		t.Fatal("non-finite geometry should not produce an apparently valid DXF")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "existing drawing" {
+		t.Fatalf("failed export replaced previous drawing: contents=%q err=%v", contents, err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(directory, ".gogis-dxf-*.tmp"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("failed export left temporary files: %v, %v", leftovers, err)
+	}
+}
+
+func TestExporterReplacesExistingDrawingAfterSuccessfulWrite(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "existing.dxf")
+	if err := os.WriteFile(path, []byte("old drawing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	layer := core.Layer{Name: "points", Features: []core.Feature{{
+		ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"},
+	}}}
+	if err := (Exporter{}).Export(context.Background(), path, layer, "ares-cp949"); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(contents, []byte("\nEOF\n")) || bytes.Contains(contents, []byte("old drawing")) {
+		t.Fatal("successful export did not replace the old file with a complete DXF")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(directory, ".gogis-dxf-*.tmp"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("successful export left temporary files: %v, %v", leftovers, err)
 	}
 }
 
@@ -562,6 +958,86 @@ func TestExporterWritesLabelPlacementRotationHeightAndStyle(t *testing.T) {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("placed label output does not contain %q", expected)
 		}
+	}
+}
+
+func TestExporterWritesEightCompassPointLabelOffsetsAndAlignment(t *testing.T) {
+	for _, test := range []struct {
+		placement            string
+		dx, dy               float64
+		horizontal, vertical int
+	}{
+		{"N", 0, 3, 1, 1}, {"NE", 3 / math.Sqrt2, 3 / math.Sqrt2, 0, 1},
+		{"E", 3, 0, 0, 2}, {"SE", 3 / math.Sqrt2, -3 / math.Sqrt2, 0, 3},
+		{"S", 0, -3, 1, 3}, {"SW", -3 / math.Sqrt2, -3 / math.Sqrt2, 2, 3},
+		{"W", -3, 0, 2, 2}, {"NW", -3 / math.Sqrt2, 3 / math.Sqrt2, 2, 1},
+	} {
+		t.Run(test.placement, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "point-label.dxf")
+			layer := core.Layer{
+				Name:   "controls",
+				Labels: core.LabelSettings{PointPlacement: test.placement, PointOffsetMM: 3, HeightMM: 2.5},
+				Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (10 20)"},
+					Label: &core.Label{Text: "CP-1", X: 10, Y: 20, AnchorSet: true, Height: 2.5}}},
+			}
+			alignment, aligned := pointTextAlignment(*layer.Features[0].Label, layer.Features[0].Geometry, LayerSpec{
+				PointLabelPlacement: test.placement, PointLabelOffsetMM: 3, LabelHeightMM: 2.5,
+			})
+			if !aligned {
+				t.Fatalf("point label alignment was not computed for placement %s", test.placement)
+			}
+			if math.Abs(alignment.x-(10+test.dx)) > 1e-9 || math.Abs(alignment.y-(20+test.dy)) > 1e-9 {
+				t.Fatalf("computed alignment = %+v, want (%g,%g)", alignment, 10+test.dx, 20+test.dy)
+			}
+			spec := LayerSpec{Name: "controls", PointLabelPlacement: test.placement, PointLabelOffsetMM: 3, LabelHeightMM: 2.5}
+			if err := (Exporter{}).ExportProject(context.Background(), path, []LayerSpec{spec}, func(int) (core.Layer, error) {
+				return layer, nil
+			}, "ares-utf8"); err != nil {
+				t.Fatal(err)
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pairs := bytes.Split(bytes.TrimSuffix(content, []byte("\n")), []byte("\n"))
+			fields := make(map[string]string)
+			inText := false
+			lastTextSubclass, verticalGroup := -1, -1
+			for index := 0; index+1 < len(pairs); index += 2 {
+				code := string(pairs[index])
+				if code == "0" {
+					if inText {
+						break
+					}
+					inText = string(pairs[index+1]) == "TEXT"
+					continue
+				}
+				if !inText {
+					continue
+				}
+				if code == "100" && string(pairs[index+1]) == "AcDbText" {
+					lastTextSubclass = index
+				}
+				if code == "10" || code == "20" || code == "11" || code == "21" || code == "72" || code == "73" {
+					fields[code] = string(pairs[index+1])
+				}
+				if code == "73" {
+					verticalGroup = index
+				}
+			}
+			for code, want := range map[string]float64{
+				"10": 10, "20": 20, "11": 10 + test.dx, "21": 20 + test.dy,
+				"72": float64(test.horizontal), "73": float64(test.vertical),
+			} {
+				got, parseErr := strconv.ParseFloat(fields[code], 64)
+				if parseErr != nil || math.Abs(got-want) > 1e-9 {
+					t.Errorf("DXF TEXT group %s = %q, want %g (error %v); fields=%v", code, fields[code], want, parseErr, fields)
+				}
+			}
+			if verticalGroup <= lastTextSubclass {
+				t.Errorf("DXF TEXT vertical alignment group must follow the second AcDbText subclass marker: marker=%d group73=%d", lastTextSubclass, verticalGroup)
+			}
+		})
 	}
 }
 

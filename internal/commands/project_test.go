@@ -236,6 +236,23 @@ func TestLayerNamesAvoidsProjectSnapshot(t *testing.T) {
 	}
 }
 
+func TestLayerPropertySnapshotsKeepDisplayRule(t *testing.T) {
+	service, err := NewProjectServiceWithLayers("demo", core.CRS{}, []core.Layer{{
+		Name: "parcels", DisplayRule: `return feature.show == true`,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, ok := service.LayerProperties("parcels")
+	if !ok || one.DisplayRule == "" {
+		t.Fatalf("single layer settings lost display rule: %+v", one)
+	}
+	all := service.ProjectLayerProperties()
+	if len(all) != 1 || all[0].DisplayRule != one.DisplayRule {
+		t.Fatalf("project layer settings lost display rule: %+v", all)
+	}
+}
+
 func TestLayerReturnsDetachedNamedLayer(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
 	if err := service.BeginEdit(); err != nil {

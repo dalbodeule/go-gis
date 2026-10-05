@@ -608,6 +608,41 @@ TestCase {
         appWindow.language = "en";
     }
 
+    function test_dxfLayerExportPlanCanExcludeAndRenameLayers() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var dialog = findChild(appWindow, "dxfEncodingDialog");
+        var options = findChild(appWindow, "dxfLayerOptionsModel");
+        var fileDialog = findChild(appWindow, "dxfExportDialog");
+        verify(canvas && layerModel && dialog && options && fileDialog);
+        var originalPayload = canvas.layerTreePayload;
+        try {
+            canvas.layerTreePayload = JSON.stringify([
+                {name: "parcels", displayName: "0-연속지적도", geometryType: "Polygon", visible: true},
+                {name: "points", displayName: "0-지적도근점", geometryType: "Point", visible: true},
+                {name: "buildings", displayName: "0-건물", geometryType: "Polygon", visible: true}
+            ]);
+            tryCompare(layerModel, "count", 3);
+            options.clear();
+            dialog.open();
+            tryCompare(options, "count", 3);
+            options.setProperty(1, "included", false);
+            options.setProperty(2, "cadName", "Buildings CAD");
+            options.setProperty(2, "labelsEnabled", false);
+            dialog.accept();
+            var plan = JSON.parse(fileDialog.selectedOptions);
+            compare(plan.length, 3);
+            compare(plan[0].cadName, "0-연속지적도");
+            compare(plan[1].include, false);
+            compare(plan[2].cadName, "Buildings CAD");
+            compare(plan[2].labels, false);
+            fileDialog.close();
+        } finally {
+            dialog.close();
+            canvas.layerTreePayload = originalPayload;
+        }
+    }
+
     function test_projectCRSPickerShowsCommonNearbyAndSearchableCatalog() {
         var dialog = findChild(appWindow, "projectCRSDialog");
         var field = findChild(appWindow, "projectCRSField");
@@ -881,6 +916,8 @@ TestCase {
         var displayRuleEditor = findChild(appWindow, "featureDisplayRuleEditor");
         var labelPlacement = findChild(appWindow, "labelPlacementField");
         var labelRotation = findChild(appWindow, "labelRotationField");
+        var pointPlacement = findChild(appWindow, "pointLabelPlacementField");
+        var pointOffset = findChild(appWindow, "pointLabelOffsetField");
         var labelHeight = findChild(appWindow, "labelHeightField");
         var labelMinScale = findChild(appWindow, "labelMinScaleField");
         var labelMaxScale = findChild(appWindow, "labelMaxScaleField");
@@ -918,6 +955,8 @@ TestCase {
         verify(displayRuleEditor !== null);
         verify(labelPlacement !== null);
         verify(labelRotation !== null);
+        verify(pointPlacement !== null);
+        verify(pointOffset !== null);
         verify(labelHeight !== null);
         verify(labelMinScale !== null);
         verify(labelMaxScale !== null);
@@ -946,6 +985,8 @@ TestCase {
                     luaScript: "return feature.label",
                     placement: "center-rotated",
                     rotationField: "angle",
+                    pointPlacement: "SW",
+                    pointOffsetMm: 2,
                     heightMm: 2,
                     minScale: 500,
                     maxScale: 25000
@@ -1002,6 +1043,8 @@ TestCase {
         compare(labelLua.text, "return feature.label");
         compare(labelPlacement.currentIndex, 3);
         compare(labelRotation.text, "angle");
+        compare(pointPlacement.currentIndex, 5);
+        compare(pointOffset.text, "2");
         compare(labelHeight.text, "2");
         compare(labelMinScale.text, "500");
         compare(labelMaxScale.text, "25000");
@@ -1064,7 +1107,9 @@ TestCase {
         compare(request.labels.luaScript, "return feature.name");
         compare(request.displayRule, "return feature.visible == true");
         compare(request.labels.placement, "free-angle");
-        compare(request.labels.rotationField, "angle");
+        compare(request.labels.rotationField, "");
+        compare(request.labels.pointPlacement, "SW");
+        compare(request.labels.pointOffsetMm, 2);
         compare(request.labels.heightMm, 3);
         compare(request.labels.minScale, 1000);
         compare(request.labels.maxScale, 50000);
@@ -1175,6 +1220,33 @@ TestCase {
         dialog.submitLayer();
         var free = JSON.parse(canvas.layerSettingsPayload);
         compare(free.labels.placement, "free-angle");
+        compare(free.labels.rotationField, "");
+        dialog.close();
+    }
+
+    function test_englishPlacementAndDXFChoicesContainNoKoreanLabels() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "layerSettingsDialog");
+        var labelPlacement = findChild(appWindow, "labelPlacementField");
+        var pointPlacement = findChild(appWindow, "pointLabelPlacementField");
+        var dxfEncoding = findChild(appWindow, "dxfEncodingChoice");
+        appWindow.language = "en";
+        canvas.layerTreePayload = JSON.stringify([{name: "controls", visible: true, geometryType: "POINT",
+            labels: {enabled: true, expression: "${name}", placement: "free-angle"}}]);
+        tryVerify(function() { return findChild(appWindow, "layerModel").get(0).name === "controls"; });
+        viewport.openLayerPropertiesForCategory("controls", "labels");
+        tryCompare(dialog, "visible", true);
+        compare(labelPlacement.model[0], "East–west horizontal");
+        compare(labelPlacement.model[2], "Free angle (longest segment)");
+        compare(pointPlacement.model[0], "Top");
+        var korean = /[가-힣]/;
+        for (var index = 0; index < labelPlacement.model.length; ++index)
+            verify(!korean.test(String(labelPlacement.model[index])), "English label orientation contains Korean text");
+        for (var pointIndex = 0; pointIndex < pointPlacement.model.length; ++pointIndex)
+            verify(!korean.test(String(pointPlacement.model[pointIndex])), "English point placement contains Korean text");
+        for (var encodingIndex = 0; encodingIndex < dxfEncoding.model.length; ++encodingIndex)
+            verify(!korean.test(String(dxfEncoding.model[encodingIndex].label)), "English DXF encoding choice contains Korean text");
         dialog.close();
     }
 }

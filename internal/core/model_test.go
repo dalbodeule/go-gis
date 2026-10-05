@@ -13,6 +13,27 @@ func TestDefaultLayerStylePrioritizesReadablePolygonBoundaries(t *testing.T) {
 	}
 }
 
+func TestLabelSettingsValidatePointPlacementAndOffset(t *testing.T) {
+	settings := DefaultLabelSettings()
+	if settings.PointPlacement != "NE" || settings.PointOffsetMM != 1.5 {
+		t.Fatalf("default point label layout = %+v, want NE with a 1.5 mm offset", settings)
+	}
+	settings.PointPlacement = "SW"
+	settings.PointOffsetMM = 4
+	if err := settings.Validate(); err != nil {
+		t.Fatalf("valid point label layout rejected: %v", err)
+	}
+	settings.PointPlacement = "middle"
+	if err := settings.Validate(); err == nil {
+		t.Fatal("unsupported point label direction was accepted")
+	}
+	settings.PointPlacement = "N"
+	settings.PointOffsetMM = -1
+	if err := settings.Validate(); err == nil {
+		t.Fatal("negative point label offset was accepted")
+	}
+}
+
 func TestLayerCloneDetachesLabels(t *testing.T) {
 	layer := Layer{
 		Name: "labels",

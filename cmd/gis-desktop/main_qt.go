@@ -461,14 +461,14 @@ func declutterViewportLabelsAtScale(labels []render.LayerLabel, view native.View
 		return labels
 	}
 	const cellSize = 48.0
-	padding := 3.0
+	padding := 6.0
 	switch {
 	case denominator >= 100000:
-		padding = 24
+		padding = 28
 	case denominator >= 25000:
-		padding = 16
+		padding = 20
 	case denominator >= 5000:
-		padding = 8
+		padding = 12
 	}
 	type box struct{ left, top, right, bottom float64 }
 	occupied := make(map[[2]int][]box)
@@ -476,8 +476,8 @@ func declutterViewportLabelsAtScale(labels []render.LayerLabel, view native.View
 	centerX := 0.5 - view.PanX/(view.Width*view.Zoom)
 	centerY := 0.5 + view.PanY/(view.Height*view.Zoom)
 	for _, label := range labels {
-		x := view.ViewportWidth/2 + (label.X-centerX)*view.Width*view.Zoom
-		y := view.ViewportHeight/2 - (label.Y-centerY)*view.Height*view.Zoom
+		x := view.ViewportWidth/2 + (label.X-centerX)*view.Width*view.Zoom + label.OffsetXMM*96/25.4
+		y := view.ViewportHeight/2 - (label.Y-centerY)*view.Height*view.Zoom + label.OffsetYMM*96/25.4
 		if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
 			continue
 		}
@@ -1889,7 +1889,12 @@ func startViewportSync(runtime *demoRuntime) {
 			saveGeneration := native.SaveGeneration()
 			if saveGeneration != lastSaveGeneration {
 				lastSaveGeneration = saveGeneration
-				runtime.saveDataset(native.CurrentSavePath(), native.CurrentSaveProfile())
+				options, err := native.CurrentSaveOptions()
+				if err != nil {
+					native.SetRenderStatus("Save failed: " + err.Error())
+				} else {
+					runtime.saveDatasetWithOptions(native.CurrentSavePath(), native.CurrentSaveProfile(), options)
+				}
 			}
 			loadGeneration := native.LoadGeneration()
 			if loadGeneration != lastLoadGeneration {

@@ -37,6 +37,10 @@ func (r *demoRuntime) saveDataset(destination, _ string) {
 	native.SetRenderStatus("Save failed: build desktop with native GDAL support")
 }
 
+func (r *demoRuntime) saveDatasetWithOptions(destination, profile, _ string) {
+	r.saveDataset(destination, profile)
+}
+
 func (r *demoRuntime) reloadLayerWithSettings(_ layerSettingsRequest, _ bool, _, _ string) error {
 	return fmt.Errorf("relinking layer sources requires the native GDAL build")
 }

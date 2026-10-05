@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -2256,7 +2257,7 @@ func TestReadOnlyMaterializedLayerRebuildsLabelsAfterSettingsChange(t *testing.T
 	}
 }
 
-func TestDesktopDXFExportConnectsActiveLayerToExporter(t *testing.T) {
+func TestDesktopDXFExportConnectsProjectLayerToExporter(t *testing.T) {
 	layer := core.Layer{
 		Name: "roads", DisplayName: "Roads", Visible: true, Style: core.DefaultLayerStyle(),
 		Labels:   core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center", HeightMM: 2.5},
@@ -2267,7 +2268,7 @@ func TestDesktopDXFExportConnectsActiveLayerToExporter(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "roads.dxf")
-	if err := runtime.exportActiveLayerDXF(path, "ares-utf8"); err != nil {
+	if err := runtime.exportProjectLayersDXF(path, "ares-utf8"); err != nil {
 		t.Fatalf("export active layer: %v", err)
 	}
 	data, err := os.ReadFile(path)
@@ -2280,6 +2281,550 @@ func TestDesktopDXFExportConnectsActiveLayerToExporter(t *testing.T) {
 			t.Errorf("desktop DXF output missing %q", expected)
 		}
 	}
+}
+
+func TestDesktopDXFExportIncludesEveryProjectLayerByDisplayName(t *testing.T) {
+	layers := []core.Layer{
+		{Name: "parcels_source", DisplayName: "0-연속지적도", Visible: true, Style: core.DefaultLayerStyle(),
+			Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 1 0, 1 1, 0 0))"}}}},
+		{Name: "control_source", DisplayName: "0-지적도근점", Visible: true, Style: core.DefaultLayerStyle(),
+			Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (2 2)"}}}},
+		{Name: "building_source", DisplayName: "0-건물", Visible: true, Style: core.DefaultLayerStyle(),
+			Labels:   core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center", HeightMM: 2.5},
+			Features: []core.Feature{{ID: 3, Geometry: core.WKTGeometry{WKT: "POLYGON ((3 3, 4 3, 4 4, 3 3))"}, Properties: map[string]any{"name": "건물A"}}}},
+	}
+	runtime, err := buildDataRuntime(context.Background(), layers, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "project.dxf")
+	if err := runtime.exportProjectLayersDXF(path, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	for _, name := range []string{"0-연속지적도", "0-지적도근점", "0-건물"} {
+		if !strings.Contains(content, "\n0\nLAYER\n") || !strings.Contains(content, "\n2\n"+name+"\n") || !strings.Contains(content, "\n8\n"+name+"\n") {
+			t.Errorf("CAD layer %q missing from layer table or entities", name)
+		}
+	}
+	for _, sourceName := range []string{"parcels_source", "control_source", "building_source"} {
+		if strings.Contains(content, "\n8\n"+sourceName+"\n") {
+			t.Errorf("internal source name %q leaked into CAD entities", sourceName)
+		}
+	}
+	if !strings.Contains(content, "\n0\nPOINT\n") || !strings.Contains(content, "\n0\nLWPOLYLINE\n") || !strings.Contains(content, "\n1\n건물A\n") {
+		t.Fatal("project geometry or label missing from DXF")
+	}
+	if strings.Contains(content, "\n2\nLABEL\n") {
+		t.Fatal("unexpected shared LABEL layer")
+	}
+	textStart := strings.Index(content, "\n0\nTEXT\n")
+	if textStart < 0 || !strings.Contains(content[textStart:], "\n8\n0-건물\n") {
+		t.Fatal("building TEXT was not assigned to its project CAD layer")
+	}
+	roundTrip, err := (gdal.Reader{}).Open(context.Background(), path, "")
+	if err != nil {
+		t.Fatalf("GDAL could not reopen multi-layer DXF: %v", err)
+	}
+	if len(roundTrip.Features) < 4 {
+		t.Fatalf("GDAL reopened %d entities, want three geometries and one label", len(roundTrip.Features))
+	}
+}
+
+func TestDesktopDXFExportOptionsSelectAndInterpretLayers(t *testing.T) {
+	layers := []core.Layer{
+		{Name: "parcels", DisplayName: "Parcels", Visible: true, Style: core.DefaultLayerStyle(),
+			Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 1 0, 1 1, 0 0))"}}}},
+		{Name: "points", DisplayName: "Points", Visible: true, Style: core.DefaultLayerStyle(),
+			Labels:   core.LabelSettings{Enabled: true, Expression: "${name}", Placement: "center", HeightMM: 2.5},
+			Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (2 2)"}, Properties: map[string]any{"name": "P-1"}}}},
+		{Name: "buildings", DisplayName: "Buildings", Visible: true, Style: core.DefaultLayerStyle(),
+			Features: []core.Feature{{ID: 3, Geometry: core.WKTGeometry{WKT: "POLYGON ((3 3, 4 3, 4 4, 3 3))"}}}},
+	}
+	runtime, err := buildDataRuntime(context.Background(), layers, "", "", "", "", "", false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := `[{"name":"parcels","cadName":"Land CAD","include":true,"geometry":true,"labels":false},` +
+		`{"name":"points","cadName":"Survey CAD","include":true,"geometry":false,"labels":true},` +
+		`{"name":"buildings","cadName":"Buildings CAD","include":false,"geometry":true,"labels":true}]`
+	path := filepath.Join(t.TempDir(), "selected.dxf")
+	if err := runtime.exportProjectLayersDXFWithOptions(path, "ares-utf8", options); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "\n2\nLand CAD\n") || !strings.Contains(content, "\n2\nSurvey CAD\n") ||
+		strings.Contains(content, "\n2\nBuildings CAD\n") || strings.Contains(content, "\n0\nPOINT\n") ||
+		!strings.Contains(content, "\n1\nP-1\n") || !strings.Contains(content, "\n0\nLWPOLYLINE\n") {
+		t.Fatalf("selected CAD layer/geometry/label output is incorrect")
+	}
+	if err := runtime.exportProjectLayersDXFWithOptions(path, "ares-utf8", `[{"name":"parcels","include":true}]`); err == nil {
+		t.Fatal("stale partial DXF option plan was accepted")
+	}
+}
+
+func TestDesktopReadOnlyDXFExportIncludesEverySource(t *testing.T) {
+	directory := t.TempDir()
+	paths := []string{filepath.Join(directory, "points.shp"), filepath.Join(directory, "buildings.shp")}
+	layers := []core.Layer{
+		{Name: "points", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (200000 400000)"}}}},
+		{Name: "buildings", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: []core.Feature{{ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((200001 400001, 200002 400001, 200002 400002, 200001 400001))"}}}},
+	}
+	for index := range paths {
+		if err := (gdal.Writer{}).Write(context.Background(), paths[index], layers[index]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: paths[0]}, {Path: paths[1]}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	names := runtime.service.LayerNames()
+	if len(names) != 2 {
+		t.Fatalf("source layers = %v", names)
+	}
+	if err := runtime.service.RenameLayer(names[0], "0-지적도근점"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.service.RenameLayer(names[1], "0-건물"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "project.dxf")
+	if err := runtime.exportProjectLayersDXF(path, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	for _, name := range []string{"0-지적도근점", "0-건물"} {
+		if !strings.Contains(content, "\n8\n"+name+"\n") {
+			t.Errorf("missing source CAD layer %q", name)
+		}
+	}
+	if !strings.Contains(content, "\n0\nPOINT\n") || !strings.Contains(content, "\n0\nLWPOLYLINE\n") {
+		t.Fatal("read-only source geometry missing from project DXF")
+	}
+}
+
+// Set GOGIS_TEST_DXF_WORKSPACE to a local three-layer workspace to exercise
+// the full read-only export without checking private GIS data into the repo.
+func TestDesktopDXFIntegrationWorkspace(t *testing.T) {
+	path := os.Getenv("GOGIS_TEST_DXF_WORKSPACE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DXF_WORKSPACE to a local workspace")
+	}
+	runtime, err := loadWorkspaceRuntime(context.Background(), path, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	destination := os.Getenv("GOGIS_TEST_DXF_OUTPUT_PATH")
+	if destination == "" {
+		destination = filepath.Join(t.TempDir(), "all-layers.dxf")
+	}
+	if err := runtime.exportProjectLayersDXF(destination, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	counts := make(map[string]int)
+	entityTypes := make(map[string]map[string]int)
+	entityBytes := make(map[string]int64)
+	polylineVertices := make(map[string]int64)
+	complexPolylines := make(map[string]int)
+	declaredLayers := make(map[string]bool)
+	seenHandles := make(map[string]bool)
+	var kind, handle, owner, layerName, subclass string
+	var vertices, xValues, yValues int
+	var textX, textY float64
+	var textHasX, textHasY bool
+	var hatchDeclaredPaths, hatchPaths, hatchExternalPaths int
+	var hatchExpectedVertices, hatchXValues, hatchYValues int
+	var solidXMask, solidYMask uint8
+	var sectionName, headerVariable string
+	var viewCenterX, viewCenterY, viewSize float64
+	var viewCenterXSet, viewCenterYSet, viewSizeSet bool
+	var activeViewport, viewportXSet, viewportYSet, viewportHeightSet bool
+	var viewportX, viewportY, viewportHeight float64
+	var recordBytes int64
+	checkRecord := func() {
+		if kind != "POINT" && kind != "LINE" && kind != "LWPOLYLINE" && kind != "HATCH" && kind != "SOLID" && kind != "TEXT" {
+			return
+		}
+		if handle == "" || owner != "1F" || layerName == "" || subclass == "" {
+			t.Fatalf("incomplete %s record: handle=%q owner=%q layer=%q subclass=%q", kind, handle, owner, layerName, subclass)
+		}
+		if kind == "LWPOLYLINE" && (vertices <= 0 || vertices != xValues || vertices != yValues) {
+			t.Fatalf("invalid %s vertex count: declared=%d x=%d y=%d", kind, vertices, xValues, yValues)
+		}
+		if kind == "LWPOLYLINE" {
+			polylineVertices[layerName] += int64(vertices)
+			if vertices > 500 {
+				complexPolylines[layerName]++
+			}
+		}
+		if kind == "TEXT" && layerName == "0-지적도근점" {
+			if !textHasX || !textHasY {
+				t.Fatal("survey-point TEXT label has no explicit insertion coordinate")
+			}
+			if math.Abs(textX) < 1e-9 && math.Abs(textY) < 1e-9 {
+				t.Fatalf("survey-point TEXT label unexpectedly uses the origin (%g, %g)", textX, textY)
+			}
+		}
+		if kind == "HATCH" {
+			if hatchDeclaredPaths == 0 || hatchPaths != hatchDeclaredPaths {
+				t.Fatalf("HATCH declares %d paths but contains %d", hatchDeclaredPaths, hatchPaths)
+			}
+			if hatchXValues != hatchExpectedVertices || hatchYValues != hatchExpectedVertices {
+				t.Fatalf("final HATCH path declares %d vertices but has %d X/%d Y coordinates", hatchExpectedVertices, hatchXValues, hatchYValues)
+			}
+			if hatchExternalPaths != 1 {
+				t.Fatalf("HATCH contains %d external paths, want exactly one", hatchExternalPaths)
+			}
+		}
+		if kind == "SOLID" && (solidXMask != 15 || solidYMask != 15 || subclass != "AcDbTrace") {
+			t.Fatalf("SOLID corners/subclass are incomplete: X=%b Y=%b subclass=%q", solidXMask, solidYMask, subclass)
+		}
+		counts[layerName]++
+		if entityTypes[layerName] == nil {
+			entityTypes[layerName] = make(map[string]int)
+		}
+		entityTypes[layerName][kind]++
+	}
+	for scanner.Scan() {
+		code := strings.TrimSpace(scanner.Text())
+		if !scanner.Scan() {
+			t.Fatal("truncated DXF group pair")
+		}
+		value := strings.TrimSpace(scanner.Text())
+		recordBytes += int64(len(code) + len(value) + 2)
+		if code == "0" {
+			checkRecord()
+			if (kind == "POINT" || kind == "LINE" || kind == "LWPOLYLINE" || kind == "HATCH" || kind == "SOLID" || kind == "TEXT") && layerName != "" {
+				entityBytes[layerName+"/"+kind] += recordBytes - int64(len(code)+len(value)+2)
+			}
+			recordBytes = int64(len(code) + len(value) + 2)
+			kind, handle, owner, layerName, subclass = value, "", "", "", ""
+			vertices, xValues, yValues = 0, 0, 0
+			textX, textY, textHasX, textHasY = 0, 0, false, false
+			hatchDeclaredPaths, hatchPaths, hatchExternalPaths = 0, 0, 0
+			hatchExpectedVertices, hatchXValues, hatchYValues = 0, 0, 0
+			solidXMask, solidYMask = 0, 0
+			continue
+		}
+		switch code {
+		case "2":
+			if kind == "SECTION" {
+				sectionName = value
+			}
+			if kind == "LAYER" {
+				declaredLayers[value] = true
+			}
+			if kind == "VPORT" && value == "*ACTIVE" {
+				activeViewport = true
+			}
+		case "9":
+			if sectionName == "HEADER" {
+				headerVariable = value
+			}
+		case "5":
+			if seenHandles[value] {
+				t.Fatalf("duplicate DXF handle %q", value)
+			}
+			seenHandles[value] = true
+			handle = value
+		case "330":
+			owner = value
+		case "8":
+			layerName = value
+		case "100":
+			if strings.HasPrefix(value, "AcDb") && value != "AcDbEntity" {
+				subclass = value
+			}
+		case "90":
+			if kind == "LWPOLYLINE" {
+				vertices, err = strconv.Atoi(value)
+				if err != nil {
+					t.Fatalf("invalid DXF polyline vertex count %q: %v", value, err)
+				}
+			}
+		case "91":
+			if kind == "HATCH" {
+				hatchDeclaredPaths, err = strconv.Atoi(value)
+				if err != nil || hatchDeclaredPaths < 1 {
+					t.Fatalf("invalid HATCH boundary path count %q: %v", value, err)
+				}
+			}
+		case "92":
+			if kind == "HATCH" {
+				if hatchPaths > 0 && (hatchXValues != hatchExpectedVertices || hatchYValues != hatchExpectedVertices) {
+					t.Fatalf("HATCH path %d declares %d vertices but has %d X/%d Y coordinates", hatchPaths, hatchExpectedVertices, hatchXValues, hatchYValues)
+				}
+				hatchPaths++
+				hatchExpectedVertices, hatchXValues, hatchYValues = 0, 0, 0
+				if hatchPaths == 1 {
+					if value != "3" {
+						t.Fatalf("HATCH outer path flag = %q, want 3", value)
+					}
+					hatchExternalPaths++
+				} else if value != "2" {
+					t.Fatalf("HATCH inner path flag = %q, want 2", value)
+				}
+			}
+		case "93":
+			if kind == "HATCH" {
+				hatchExpectedVertices, err = strconv.Atoi(value)
+				if err != nil || hatchExpectedVertices < 3 {
+					t.Fatalf("invalid HATCH boundary vertex count %q: %v", value, err)
+				}
+			}
+		case "10":
+			if sectionName == "HEADER" && headerVariable == "$VIEWCTR" {
+				viewCenterX, err = strconv.ParseFloat(value, 64)
+				if err != nil {
+					t.Fatalf("invalid $VIEWCTR X %q: %v", value, err)
+				}
+				viewCenterXSet = true
+			} else if kind == "LWPOLYLINE" {
+				xValues++
+			} else if kind == "HATCH" {
+				hatchXValues++
+			} else if kind == "SOLID" {
+				solidXMask |= 1
+			} else if kind == "TEXT" {
+				textX, err = strconv.ParseFloat(value, 64)
+				if err != nil || math.IsNaN(textX) || math.IsInf(textX, 0) {
+					t.Fatalf("invalid TEXT insertion X %q: %v", value, err)
+				}
+				textHasX = true
+			}
+		case "20":
+			if sectionName == "HEADER" && headerVariable == "$VIEWCTR" {
+				viewCenterY, err = strconv.ParseFloat(value, 64)
+				if err != nil {
+					t.Fatalf("invalid $VIEWCTR Y %q: %v", value, err)
+				}
+				viewCenterYSet = true
+			} else if kind == "LWPOLYLINE" {
+				yValues++
+			} else if kind == "HATCH" {
+				hatchYValues++
+			} else if kind == "SOLID" {
+				solidYMask |= 1
+			} else if kind == "TEXT" {
+				textY, err = strconv.ParseFloat(value, 64)
+				if err != nil || math.IsNaN(textY) || math.IsInf(textY, 0) {
+					t.Fatalf("invalid TEXT insertion Y %q: %v", value, err)
+				}
+				textHasY = true
+			}
+		case "40":
+			if sectionName == "HEADER" && headerVariable == "$VIEWSIZE" {
+				viewSize, err = strconv.ParseFloat(value, 64)
+				if err != nil {
+					t.Fatalf("invalid $VIEWSIZE %q: %v", value, err)
+				}
+				viewSizeSet = true
+			}
+		case "11", "12", "13":
+			if kind == "SOLID" {
+				solidXMask |= 1 << (code[1] - '0')
+			} else if kind == "VPORT" && code == "12" {
+				viewportX, err = strconv.ParseFloat(value, 64)
+				viewportXSet = err == nil
+			}
+		case "21", "22", "23":
+			if kind == "SOLID" {
+				solidYMask |= 1 << (code[1] - '0')
+			} else if kind == "VPORT" && code == "22" {
+				viewportY, err = strconv.ParseFloat(value, 64)
+				viewportYSet = err == nil
+			}
+		case "45":
+			if kind == "VPORT" {
+				viewportHeight, err = strconv.ParseFloat(value, 64)
+				viewportHeightSet = err == nil
+			}
+		}
+	}
+	checkRecord()
+	if layerName != "" {
+		entityBytes[layerName+"/"+kind] += recordBytes
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !viewCenterXSet || !viewCenterYSet || !viewSizeSet || viewSize <= 0 {
+		t.Fatalf("DXF has no valid opening view: center=(%g, %g) size=%g", viewCenterX, viewCenterY, viewSize)
+	}
+	if !activeViewport || !viewportXSet || !viewportYSet || !viewportHeightSet ||
+		math.Abs(viewportX-viewCenterX) > 1e-6 || math.Abs(viewportY-viewCenterY) > 1e-6 || math.Abs(viewportHeight-viewSize) > 1e-6 {
+		t.Fatalf("DXF active viewport disagrees with opening view: active=%t center=(%g,%g) height=%g", activeViewport, viewportX, viewportY, viewportHeight)
+	}
+	if validMapExtent(runtime.mapFitExtent) {
+		wantX := runtime.mapFitExtent[0] + (runtime.mapFitExtent[2]-runtime.mapFitExtent[0])/2
+		wantY := runtime.mapFitExtent[1] + (runtime.mapFitExtent[3]-runtime.mapFitExtent[1])/2
+		if math.Abs(viewCenterX-wantX) > 1e-6 || math.Abs(viewCenterY-wantY) > 1e-6 {
+			t.Fatalf("DXF opening view center=(%g, %g), want project geometry center=(%g, %g)", viewCenterX, viewCenterY, wantX, wantY)
+		}
+	}
+	for name := range counts {
+		if !declaredLayers[name] {
+			t.Errorf("DXF entity layer %q has no LAYER table record", name)
+		}
+	}
+	godal.RegisterAll()
+	// GDAL's DXF driver may not recognize $DWGCODEPAGE="UTF-8" and can fall
+	// back to ANSI_1252. Override its reader encoding without altering the
+	// AC1021 UTF-8 bytes that CAD applications expect.
+	parsed, err := godal.Open(destination, godal.VectorOnly(), godal.ConfigOption("DXF_ENCODING=UTF-8"))
+	if err != nil {
+		t.Fatalf("GDAL cannot open real project DXF: %v", err)
+	}
+	defer parsed.Close()
+	parsedLayers := parsed.Layers()
+	if len(parsedLayers) != 1 {
+		t.Fatalf("GDAL DXF entity layers = %d, want 1", len(parsedLayers))
+	}
+	parsedCounts := make(map[string]int)
+	for {
+		feature := parsedLayers[0].NextFeature()
+		if feature == nil {
+			break
+		}
+		if field, exists := feature.Fields()["Layer"]; exists {
+			parsedCounts[field.String()]++
+		}
+		feature.Close()
+	}
+	for _, layer := range runtime.service.ProjectLayerProperties() {
+		name := layer.DisplayName
+		if name == "" {
+			name = layer.Name
+		}
+		if counts[name] == 0 {
+			t.Errorf("DXF CAD layer %q has no entities; counts=%v", name, counts)
+		}
+		if parsedCounts[name] != counts[name] {
+			t.Errorf("GDAL parsed %d entities on %q, DXF contains %d", parsedCounts[name], name, counts[name])
+		}
+		if layer.Labels.Enabled && entityTypes[name]["TEXT"] == 0 {
+			t.Errorf("label-enabled layer %q contains no TEXT entities", name)
+		}
+		if strings.Contains(layer.DisplayName, "지적도근점") && entityTypes[name]["POINT"] == 0 {
+			t.Errorf("survey-point layer %q contains no POINT entities", name)
+		}
+		if strings.Contains(layer.DisplayName, "지적도근점") && entityTypes[name]["POINT"] != entityTypes[name]["TEXT"] {
+			t.Errorf("survey-point layer %q has %d point symbols but %d labels", name, entityTypes[name]["POINT"], entityTypes[name]["TEXT"])
+		}
+		if strings.Contains(layer.DisplayName, "건물") && layer.Style.FillOpacity > 0 && (entityTypes[name]["SOLID"] == 0 || entityTypes[name]["HATCH"] != 0) {
+			t.Errorf("filled building layer %q should contain SOLID triangles and no HATCH: %v", name, entityTypes[name])
+		}
+	}
+	t.Logf("DXF/GDAL entities by CAD layer: %v / %v", counts, parsedCounts)
+	t.Logf("DXF entity types by CAD layer: %v", entityTypes)
+	t.Logf("DXF entity payload bytes by layer/type: %v", entityBytes)
+	t.Logf("DXF polyline vertices by layer: %v; polylines >500 vertices: %v", polylineVertices, complexPolylines)
+	cp949Destination := filepath.Join(t.TempDir(), "all-layers-cp949.dxf")
+	if err := runtime.exportProjectLayersDXF(cp949Destination, "ares-cp949"); err != nil {
+		t.Fatalf("CP949 export of actual project: %v", err)
+	}
+	cp949Dataset, err := godal.Open(cp949Destination, godal.VectorOnly())
+	if err != nil {
+		t.Fatalf("GDAL cannot open CP949 project DXF: %v", err)
+	}
+	defer cp949Dataset.Close()
+	cp949Layers := cp949Dataset.Layers()
+	if len(cp949Layers) != 1 {
+		t.Fatalf("GDAL CP949 DXF entity layers = %d, want 1", len(cp949Layers))
+	}
+	cp949Counts := make(map[string]int)
+	for {
+		feature := cp949Layers[0].NextFeature()
+		if feature == nil {
+			break
+		}
+		if field, exists := feature.Fields()["Layer"]; exists {
+			cp949Counts[field.String()]++
+		}
+		feature.Close()
+	}
+	for name, count := range counts {
+		if cp949Counts[name] != count {
+			t.Errorf("GDAL CP949 parsed %d entities on %q, UTF-8 output contains %d", cp949Counts[name], name, count)
+		}
+	}
+	t.Logf("GDAL CP949 entities by CAD layer: %v", cp949Counts)
+
+	// Exercise the exact settings-dialog payload against the real three-source
+	// workspace as well: every configured CAD name must replace the display
+	// name without dropping geometry from either of the other layers.
+	plan := make([]map[string]any, 0, len(runtime.service.ProjectLayerProperties()))
+	renamedCounts := make(map[string]int)
+	for _, property := range runtime.service.ProjectLayerProperties() {
+		oldName := property.DisplayName
+		if oldName == "" {
+			oldName = property.Name
+		}
+		cadName := "CAD-" + oldName
+		plan = append(plan, map[string]any{
+			"name": property.Name, "cadName": cadName, "include": true,
+			"geometry": true, "labels": true,
+		})
+		renamedCounts[cadName] = counts[oldName]
+	}
+	optionsJSON, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamedDestination := filepath.Join(t.TempDir(), "renamed-all-layers.dxf")
+	if err := runtime.exportProjectLayersDXFWithOptions(renamedDestination, "ares-utf8", string(optionsJSON)); err != nil {
+		t.Fatalf("DXF export with settings-dialog layer plan: %v", err)
+	}
+	renamedDataset, err := godal.Open(renamedDestination, godal.VectorOnly(), godal.ConfigOption("DXF_ENCODING=UTF-8"))
+	if err != nil {
+		t.Fatalf("GDAL cannot open renamed project DXF: %v", err)
+	}
+	defer renamedDataset.Close()
+	renamedLayers := renamedDataset.Layers()
+	if len(renamedLayers) != 1 {
+		t.Fatalf("GDAL renamed DXF entity layers = %d, want 1", len(renamedLayers))
+	}
+	actualRenamedCounts := make(map[string]int)
+	for {
+		feature := renamedLayers[0].NextFeature()
+		if feature == nil {
+			break
+		}
+		if field, exists := feature.Fields()["Layer"]; exists {
+			actualRenamedCounts[field.String()]++
+		}
+		feature.Close()
+	}
+	if len(actualRenamedCounts) != len(renamedCounts) {
+		t.Fatalf("renamed DXF layers = %v, want %v", actualRenamedCounts, renamedCounts)
+	}
+	for name, want := range renamedCounts {
+		if got := actualRenamedCounts[name]; got != want {
+			t.Errorf("renamed DXF layer %q has %d entities, want %d", name, got, want)
+		}
+	}
+	t.Logf("GDAL renamed CAD layers: %v", actualRenamedCounts)
 }
 
 func TestDesktopDXFExportKeepsAllOverlappingLabels(t *testing.T) {
@@ -2300,7 +2845,7 @@ func TestDesktopDXFExportKeepsAllOverlappingLabels(t *testing.T) {
 		t.Fatalf("display labels = %+v, want one after collision removal", visible)
 	}
 	path := filepath.Join(t.TempDir(), "all-labels.dxf")
-	if err := runtime.exportActiveLayerDXF(path, "ares-utf8"); err != nil {
+	if err := runtime.exportProjectLayersDXF(path, "ares-utf8"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -2982,7 +3527,7 @@ func TestConfiguredLabelOrientationOptions(t *testing.T) {
 	} {
 		t.Run(test.placement, func(t *testing.T) {
 			layers := []core.Layer{{
-				Name: "road", Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: test.placement, HeightMM: 2.5},
+				Name: "road", Labels: core.LabelSettings{Enabled: true, Expression: "${name}", Placement: test.placement, RotationField: "angle", HeightMM: 2.5},
 				Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "LINESTRING (0 0, 10 0, 10 20)"}, Properties: map[string]any{"name": "main"}}},
 			}}
 			if err := prepareLayerLabels(context.Background(), layers); err != nil {
@@ -3003,6 +3548,27 @@ func TestConfiguredLabelOrientationOptions(t *testing.T) {
 				t.Fatalf("render labels = %+v, want rotation %g", source.Labels, test.angle)
 			}
 		})
+	}
+}
+
+func TestPointFeatureLabelUsesFeatureCoordinates(t *testing.T) {
+	layers := []core.Layer{{
+		Name:   "survey-control-points",
+		Labels: core.LabelSettings{Enabled: true, Expression: "${DOGEUN_POI}", Placement: "center", HeightMM: 2.5},
+		Features: []core.Feature{{
+			ID: 17, Geometry: core.WKTGeometry{WKT: "POINT (225359.85 440025.25)"},
+			Properties: map[string]any{"DOGEUN_POI": "도근점-17"},
+		}},
+	}}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
+		t.Fatal(err)
+	}
+	label := layers[0].Features[0].Label
+	if label == nil || !label.AnchorSet {
+		t.Fatalf("point label has no explicit geometry anchor: %+v", label)
+	}
+	if math.Abs(label.X-225359.85) > 1e-6 || math.Abs(label.Y-440025.25) > 1e-6 {
+		t.Fatalf("point label anchor = (%v, %v), want feature coordinate", label.X, label.Y)
 	}
 }
 

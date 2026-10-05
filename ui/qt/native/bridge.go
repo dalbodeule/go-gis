@@ -381,3 +381,16 @@ func CurrentSaveProfile() string {
 	C.gogis_save_profile((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }
+
+// CurrentSaveOptions returns the per-layer DXF export plan captured with the save request.
+func CurrentSaveOptions() (string, error) {
+	size := int(C.gogis_save_options(nil, 0))
+	if size < 0 || size > 1<<20 {
+		return "", fmt.Errorf("DXF export options exceed the 1 MiB bridge limit")
+	}
+	buffer := make([]C.char, size+1)
+	if written := int(C.gogis_save_options((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))); written != size {
+		return "", fmt.Errorf("DXF export options changed during capture")
+	}
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0]))), nil
+}

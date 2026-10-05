@@ -30,4 +30,6 @@ go build -tags native -o "$cli" ./cmd/gis-cli
   --output "$output_dir/sample-cp949.dxf" \
   --profile ares-cp949
 
+go run -tags native ./scripts/generate-ares-project-samples.go "$output_dir"
+
 echo "Generated ARES samples in $output_dir"
