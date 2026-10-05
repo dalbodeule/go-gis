@@ -99,8 +99,8 @@ func desktopShapefileIndexThresholdFromSettings(settings *qt.QSettings) int {
 }
 
 // configureBundledGISResources makes PROJ/GDAL data discoverable when the app
-// is launched from a macOS bundle. Explicit caller configuration wins, which
-// still permits developers to select an alternate grid/data directory.
+// is launched from a macOS bundle or Windows portable package. Explicit caller
+// configuration wins, which still permits alternate grid/data directories.
 func configureBundledGISResources() {
 	executable, err := os.Executable()
 	if err != nil {
@@ -113,11 +113,19 @@ func configureBundledGISResources() {
 
 func bundledGISResourceEnvironment(executable string) map[string]string {
 	executable = filepath.Clean(executable)
-	if !strings.Contains(filepath.ToSlash(executable), ".app/Contents/MacOS/") {
+	var resources string
+	switch goruntime.GOOS {
+	case "darwin":
+		if !strings.Contains(filepath.ToSlash(executable), ".app/Contents/MacOS/") {
+			return nil
+		}
+		contents := filepath.Dir(filepath.Dir(executable))
+		resources = filepath.Join(contents, "Resources")
+	case "windows":
+		resources = filepath.Join(filepath.Dir(executable), "resources")
+	default:
 		return nil
 	}
-	contents := filepath.Dir(filepath.Dir(executable))
-	resources := filepath.Join(contents, "Resources")
 	result := make(map[string]string, 3)
 	for key, directory := range map[string]string{
 		"GDAL_DATA":        filepath.Join(resources, "gdal"),

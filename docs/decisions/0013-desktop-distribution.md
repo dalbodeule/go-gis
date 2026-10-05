@@ -2,8 +2,8 @@
 
 ## Status
 
-Proposed release direction, not a completed installer. Packaging and clean-machine
-validation remain future work.
+Accepted for the Windows portable-package pilot. Installer compilation, code
+signing, and clean-machine validation remain release gates.
 
 ## Evidence in this checkout
 
@@ -59,4 +59,25 @@ installer/update format, not a replacement for collecting runtime dependencies.
    For Windows installers, decide signing and update-channel policy before
    publishing. Do not claim the release gate passed from a build alone.
 
-No packaging command in this ADR has been run as a release build yet.
+## Windows package pilot
+
+`scripts/package_windows.ps1` builds on the target architecture, runs
+`windeployqt` over the embedded-QML desktop app, copies the GDAL/PROJ data and
+MSYS2 license texts, resolves the non-Windows DLL dependency closure, and emits
+a directory plus ZIP. `installer/windows/GoGIS.iss` provides a per-architecture
+Inno Setup 6 definition; it is compiled only when the local `ISCC.exe` is
+available and `-BuildInstaller` is requested. The app locates its GIS data in a
+`resources` directory next to `GoGIS.exe`, while explicit environment overrides
+remain supported.
+
+The manual `.github/workflows/package-windows.yml` builds AMD64 on
+`windows-2025` with UCRT64 and ARM64 on `windows-11-arm` with CLANGARM64. Each
+job builds natively, compiles the Inno Setup 6 installer, and uploads an expiring
+Actions artifact; it does not publish a release or sign binaries. This checkout's installed MSYS2 environment is
+UCRT64/AMD64 only, so ARM64 output and its runtime behavior are not verified
+until the ARM64 job runs. Windows ARM64 MSYS2 support is preliminary; treat the
+job as a compatibility gate, not proof of support before it passes.
+
+Official references: [GitHub-hosted runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+[MSYS2 ARM64 support](https://www.msys2.org/docs/arm64/), and
+[Inno Setup architecture identifiers](https://jrsoftware.org/ishelp/topic_archidentifiers.htm).

@@ -1,0 +1,72 @@
+name: Windows desktop packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version label
+        required: true
+        default: 0.1.0-dev
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows ${{ matrix.arch }} package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2025
+            msystem: UCRT64
+            prefix: mingw-w64-ucrt-x86_64
+          - arch: arm64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+            prefix: mingw-w64-clang-aarch64
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up native MSYS2 GIS and Qt toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            ${{ matrix.prefix }}-toolchain
+            ${{ matrix.prefix }}-gdal
+            ${{ matrix.prefix }}-proj
+            ${{ matrix.prefix }}-geos
+            ${{ matrix.prefix }}-pkgconf
+            ${{ matrix.prefix }}-qt6-base
+            ${{ matrix.prefix }}-qt6-declarative
+            ${{ matrix.prefix }}-qt6-tools
+
+      - name: Set up Go for the native runner architecture
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build portable directory and ZIP
+        env:
+          GOGIS_VERSION: ${{ inputs.version }}
+        run: .\scripts\package_windows.ps1 -Arch ${{ matrix.arch }} -Version "$env:GOGIS_VERSION" -MsysRoot C:\msys64 -BuildInstaller
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoGIS-windows-${{ matrix.arch }}
+          path: build/packages/windows/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14

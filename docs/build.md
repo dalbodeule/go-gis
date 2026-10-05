@@ -344,6 +344,48 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build.ps1 clean
 ```
 
+### Windows 포터블 패키지와 설치 프로그램
+
+MSYS2 UCRT64가 `C:\tools\msys64`에 설치된 AMD64 PC에서는 다음과 같이 native
+데스크톱 폴더와 ZIP을 만듭니다. 스크립트가 Go 바이너리를 빌드하고 `windeployqt`로
+Qt/QML 파일을 수집한 뒤, 실행 파일과 Qt/GDAL 플러그인의 DLL 의존성을 MSYS2 prefix에서
+추적해 패키지 폴더로 복사합니다. GDAL·PROJ 데이터, MSYS2 라이선스 파일, 빌드 정보도
+함께 넣습니다. 패키지 실행 시 `resources\gdal`, `resources\proj` 경로를 자동으로
+사용합니다.
+
+```powershell
+$env:PROJ_DATA = "C:\tools\msys64\ucrt64\share\proj"
+$env:GDAL_DATA = "C:\tools\msys64\ucrt64\share\gdal"
+$env:Path = "C:\tools\msys64\ucrt64\bin;C:\tools\msys64\usr\bin;$env:Path"
+.\scripts\package_windows.ps1 -Arch amd64 -Version 0.1.0-dev
+```
+
+산출물은 `build\packages\windows\amd64\` 아래의 폴더와 ZIP입니다. 동일 버전의
+출력물이 있으면 덮어쓰지 않고 중단합니다. Inno Setup 6 `ISCC.exe`가 설치된 경우
+`-BuildInstaller`를 추가해 사용자 범위 설치 프로그램도 생성할 수 있습니다.
+
+```powershell
+.\scripts\package_windows.ps1 -Arch amd64 -Version 0.1.0-dev -BuildInstaller
+```
+
+ARM64는 Windows ARM64 native Go와 MSYS2 `CLANGARM64` 환경에서 빌드합니다. AMD64
+UCRT64 DLL을 ARM64 실행 파일과 섞지 않습니다. 저장소의 수동 GitHub Actions workflow는
+`windows-2025`/UCRT64와 `windows-11-arm`/CLANGARM64를 각각 사용해 포터블 ZIP과
+Inno Setup 설치 파일을 생성합니다. Actions artifact는 14일 보관하며 공개 릴리스나
+코드 서명은 하지 않습니다. Inno Setup 6 `ISCC.exe`가 필요합니다.
+이 로컬 PC에는 UCRT64만 설치되어 있어 ARM64 바이너리와 ZIP은 ARM64 runner에서 별도로
+실행해야 합니다.
+
+```powershell
+.\scripts\package_windows.ps1 -Arch arm64 -Version 0.1.0-dev
+```
+
+이는 package pilot 절차이며 clean Windows VM에서 GIS 데이터 열기, EPSG 변환, 저장,
+DXF 내보내기 및 설치/제거를 통과하기 전에는 완성된 공개 배포로 간주하지 않습니다.
+Windows ARM runner는 GitHub-hosted runner의 ARM64 label을 사용하고, MSYS2 ARM64
+툴체인과 GDAL/PROJ/GEOS/Qt 패키지로 native 빌드합니다. MSYS2 ARM64 지원 및 Windows
+Qt/GIS 런타임 조합은 실제 workflow 결과로 계속 확인해야 합니다.
+
 `native`, `desktop-native`, `all-native`는 아래 native GIS/Qt 의존성과 CGO
 툴체인이 설치된 Windows 환경에서만 실행할 수 있습니다.
 
