@@ -88,6 +88,11 @@ filter/label 경로의 benchmark 및 결과 보존 규약은
 [Lua filter/label 결정 기록](docs/decisions/0005-lua-filter-and-label-pipeline.md)을
 참고합니다.
 
+데스크톱 상단의 설정 버튼에서 앱 표시 언어와 대형 Shapefile 자동 인덱스 기준을
+설정할 수 있습니다. 선택은 사용자 설정에 저장되어 재실행 후에도 유지됩니다.
+자세한 기본값과 초기화 동작은 [앱 설정 문서](docs/application-settings.md)를
+참고하세요.
+
 동일 스키마 레이어 병합은 `commands.MergeLayers`를 사용합니다. CRS·필드
 스키마가 다르거나 feature ID가 중복되면 명확한 오류를 반환하며, 프로젝트에
 결과를 추가할 때는 편집 트랜잭션으로 원자적으로 커밋됩니다.
@@ -126,10 +131,15 @@ go test ./...
 ```
 
 DXF 프로파일은 `ares-utf8`과 `ares-cp949`를 지원합니다. 자동 사전 검증과
-ARES Commander 수동 검증 절차는 [ARES 검증 문서](docs/verification/ares-commander.md)에
-정리되어 있으며, 실제 앱 검증 전에는 두 프로파일 모두 실험적으로 취급합니다.
+ARES Commander 수동 절차 및 사용자 실사용 검증 완료 표시는
+[ARES 검증 문서](docs/verification/ares-commander.md)에 정리되어 있습니다.
+profile별 세부 검증 결과는 전달되지 않아 별도 기록에는 미상으로 남아 있습니다.
 MVP 요구사항별 자동·수동 검증 범위는 [MVP 체크리스트](docs/verification/mvp-checklist.md)에
 정리되어 있습니다.
+
+현재 구현 범위와 우선순위별 다음 목표는 [진행 현황과 다음 목표](docs/next-steps.md)를
+참고하세요. ARES Commander 실사용은 사용자가 완료했다고 확인했으며, Windows/Linux
+앱 빌드와 세 OS 배포 패키지 검증은 아직 남아 있습니다.
 
 공간 연산은 native CLI에서 다음과 같이 실행합니다. `buffer`는 `--distance`를
 사용하고, 이외의 연산은 `--right-input`을 추가로 지정합니다. 출력 확장자는

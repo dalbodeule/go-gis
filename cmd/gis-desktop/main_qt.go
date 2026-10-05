@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	goruntime "runtime"
 	"sort"
 	"strings"
@@ -42,12 +43,15 @@ var mainQML []byte
 var appVersion = "0.1.0-dev"
 
 func main() {
+	configureBundledGISResources()
 	if err := startDesktopOutputCapture(); err != nil {
 		fmt.Fprintf(os.Stderr, "GoGIS: unable to capture process output: %v\n", err)
 	}
-	configureShapefileIndexPolicy(os.Args)
 	language, qtArgs := desktopLanguageArgs(os.Args)
+	qt.QCoreApplication_SetOrganizationName("GoGIS")
+	qt.QCoreApplication_SetApplicationName("GoGIS")
 	qt.NewQApplication(qtArgs)
+	configureShapefileIndexPolicyWithDefaults(os.Args, desktopShapefileIndexThreshold(), "cache")
 	// Keep the event loop responsive while GDAL opens and snapshots a large
 	// dataset. Start from an empty project and replace it after QML is ready.
 	runtime := loadEmptyProject()
@@ -71,6 +75,63 @@ func main() {
 	startDiagnosticLogPublisher()
 	startInitialDataLoad(runtime, os.Args)
 	qt.QApplication_Exec()
+}
+
+func desktopShapefileIndexThreshold() int {
+	settings := qt.NewQSettings7("GoGIS", "GoGIS")
+	defer settings.Delete()
+	return desktopShapefileIndexThresholdFromSettings(settings)
+}
+
+func desktopShapefileIndexThresholdFromSettings(settings *qt.QSettings) int {
+	const defaultThreshold = 10_000
+	key := qt.NewQAnyStringView3("preferences/shapefileIndexThreshold")
+	defer key.Delete()
+	if !settings.Contains(*key) {
+		return defaultThreshold
+	}
+	value := settings.ValueWithKey(*key)
+	threshold := value.ToInt()
+	if threshold < 0 || threshold > 1_000_000 {
+		return defaultThreshold
+	}
+	return threshold
+}
+
+// configureBundledGISResources makes PROJ/GDAL data discoverable when the app
+// is launched from a macOS bundle. Explicit caller configuration wins, which
+// still permits developers to select an alternate grid/data directory.
+func configureBundledGISResources() {
+	executable, err := os.Executable()
+	if err != nil {
+		return
+	}
+	for key, directory := range bundledGISResourceEnvironment(executable) {
+		_ = os.Setenv(key, directory)
+	}
+}
+
+func bundledGISResourceEnvironment(executable string) map[string]string {
+	executable = filepath.Clean(executable)
+	if !strings.Contains(filepath.ToSlash(executable), ".app/Contents/MacOS/") {
+		return nil
+	}
+	contents := filepath.Dir(filepath.Dir(executable))
+	resources := filepath.Join(contents, "Resources")
+	result := make(map[string]string, 3)
+	for key, directory := range map[string]string{
+		"GDAL_DATA":        filepath.Join(resources, "gdal"),
+		"GDAL_DRIVER_PATH": filepath.Join(resources, "gdalplugins"),
+		"PROJ_DATA":        filepath.Join(resources, "proj"),
+	} {
+		if os.Getenv(key) != "" {
+			continue
+		}
+		if info, err := os.Stat(directory); err == nil && info.IsDir() {
+			result[key] = directory
+		}
+	}
+	return result
 }
 
 func startDiagnosticLogPublisher() {
@@ -110,7 +171,7 @@ func startMemoryMonitor() {
 }
 
 func desktopLanguageArgs(args []string) (string, []string) {
-	language := "en"
+	language := "system"
 	qtArgs := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -137,6 +198,8 @@ func desktopLanguageArgs(args []string) (string, []string) {
 			language = strings.ToLower(value)
 		case "jp", "ja":
 			language = "jp"
+		default:
+			language = "system"
 		}
 	}
 	return language, qtArgs

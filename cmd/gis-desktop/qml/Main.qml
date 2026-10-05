@@ -4,6 +4,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs as QuickDialogs
 import Qt.labs.platform as Platform
+import QtCore
 import GoGIS 1.0
 
 ApplicationWindow {
@@ -26,10 +27,32 @@ ApplicationWindow {
         });
     }
     property bool vertexEditMode: false
-    property string language: typeof appLanguage === "undefined" ? "en" : appLanguage
+    property string language: appLanguagePreference === "system" ? systemInterfaceLanguage() : appLanguagePreference
+    readonly property string appLanguagePreference: typeof appLanguage === "undefined" ? "system" : appLanguage
     property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
     property string runtimeText: typeof appRuntime === "undefined" ? "Go runtime" : appRuntime
     property string buildTargetText: typeof appBuildTarget === "undefined" ? "desktop" : appBuildTarget
+    function systemInterfaceLanguage() {
+        var localeLanguage = String(Qt.locale().name).toLowerCase().split(/[-_]/)[0]
+        if (localeLanguage === "ko") return "ko"
+        if (localeLanguage === "ja" || localeLanguage === "jp") return "jp"
+        return "en"
+    }
+    Settings {
+        id: userSettings
+        objectName: "applicationSettingsStore"
+        category: "preferences"
+        property string interfaceLanguage: "system"
+        property int shapefileIndexThreshold: 10000
+    }
+    Binding {
+        target: rootWindow
+        property: "language"
+        value: userSettings.interfaceLanguage === "system"
+            ? rootWindow.systemInterfaceLanguage()
+            : userSettings.interfaceLanguage
+        when: rootWindow.appLanguagePreference === "system"
+    }
     property var translations: ({
         en: ({"Add vector files": "Add vector files", "Open workspace": "Open workspace", "Attributes": "Attributes", "Edit vertices": "Edit vertices", "Finish vertex edit": "Finish vertex edit", "Save GeoPackage": "Save GeoPackage", "Save workspace": "Save workspace", "About GoGIS": "About GoGIS", "Layers": "Layers", "No layers yet": "No layers yet", "Add vector files or open a workspace to begin.": "Add vector files or open a workspace to begin.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "Drag to pan · Scroll to zoom · Click a feature to inspect", "General": "General", "Data source": "Data source", "Symbology": "Symbology", "Labels and expressions": "Labels and expressions", "Layer properties": "Layer properties", "Version": "Version", "Build": "Build", "Runtime": "Runtime", "License": "License", "Close": "Close", "Layer": "Layer", "Layer visible": "Layer visible", "Browse…": "Browse…", "Layer in source": "Layer in source", "Shapefile encoding": "Shapefile encoding", "Point color": "Point color", "Point size (mm)": "Point size (mm)", "Line color": "Line color", "Line width (mm)": "Line width (mm)", "Polygon color": "Polygon color", "Fill opacity (0–1)": "Fill opacity (0–1)", "Show labels": "Show labels", "Label field / template": "Label field / template", "Placement": "Placement", "Point label position": "Point label position", "Point label offset (mm)": "Point label offset (mm)", "Rotation field (optional)": "Rotation field (optional)", "Text height (mm)": "Text height (mm)", "Minimum scale denominator": "Minimum scale denominator", "Maximum scale denominator": "Maximum scale denominator", "Display rule — return true to show this feature's label": "Display rule — return true to show this feature's label", "Label text — return string, number, or nil": "Label text — return string, number, or nil", "Insert label example": "Insert label example", "Insert rule example": "Insert rule example", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.", "Layer settings": "Layer settings", "Source path": "Source path", "Data properties": "Data properties"}),
         ko: ({"Add vector files": "벡터 파일 추가", "Open workspace": "작업공간 열기", "Attributes": "속성 테이블", "Edit vertices": "정점 편집", "Finish vertex edit": "정점 편집 종료", "Save GeoPackage": "GeoPackage 저장", "Save workspace": "작업공간 저장", "About GoGIS": "GoGIS 정보", "Layers": "레이어", "No layers yet": "레이어가 없습니다", "Add vector files or open a workspace to begin.": "벡터 파일을 추가하거나 작업공간을 열어 시작하세요.", "Drag to pan · Scroll to zoom · Click a feature to inspect": "드래그: 이동 · 휠: 확대/축소 · 피처 클릭: 정보 확인", "General": "일반", "Data source": "데이터 원본", "Symbology": "심볼로지", "Labels and expressions": "레이블 및 표현식", "Layer properties": "레이어 속성", "Version": "버전", "Build": "빌드", "Runtime": "실행 환경", "License": "라이선스", "Close": "닫기", "Layer": "레이어", "Layer visible": "레이어 표시", "Browse…": "찾아보기…", "Layer in source": "원본 내부 레이어", "Shapefile encoding": "Shapefile 인코딩", "Point color": "점 색상", "Point size (mm)": "점 크기 (mm)", "Line color": "선 색상", "Line width (mm)": "선 두께 (mm)", "Polygon color": "폴리곤 색상", "Fill opacity (0–1)": "채우기 불투명도 (0–1)", "Show labels": "레이블 표시", "Label field / template": "레이블 필드 / 템플릿", "Placement": "배치", "Point label position": "점 레이블 위치", "Point label offset (mm)": "점에서 레이블 간격 (mm)", "Rotation field (optional)": "회전 필드 (선택)", "Text height (mm)": "글자 높이 (mm)", "Minimum scale denominator": "최소 축척 분모", "Maximum scale denominator": "최대 축척 분모", "Display rule — return true to show this feature's label": "표시 규칙 — 레이블 표시 시 true 반환", "Label text — return string, number, or nil": "레이블 문자열 — 문자열, 숫자 또는 nil 반환", "Insert label example": "레이블 예제 삽입", "Insert rule example": "규칙 예제 삽입", "Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.": "스크립트는 피처마다 실행됩니다. 읽기 전용 `feature` 테이블로 속성에 접근합니다. 공백이 있는 필드는 feature[\"필드 이름\"] 형식을 사용하세요.", "Layer settings": "레이어 설정", "Source path": "원본 경로", "Data properties": "데이터 속성"}),
@@ -440,6 +463,14 @@ ApplicationWindow {
                 objectName: "aboutButton"
                 text: rootWindow.tr("About GoGIS")
                 onClicked: aboutDialog.open()
+            }
+            Button {
+                objectName: "applicationSettingsButton"
+                text: "⚙"
+                Accessible.name: rootWindow.language === "ko" ? "설정" : rootWindow.language === "jp" ? "設定" : "Settings"
+                ToolTip.visible: hovered
+                ToolTip.text: Accessible.name
+                onClicked: applicationSettingsDialog.open()
             }
         }
     }
@@ -1826,6 +1857,75 @@ ApplicationWindow {
                     visible: layerModel.count > 0
                     text: rootWindow.tr("Zoom to full extent")
                     onClicked: mapViewport.zoomToFullExtent()
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: applicationSettingsDialog
+        objectName: "applicationSettingsDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "GoGIS 설정" : rootWindow.language === "jp" ? "GoGIS 設定" : "GoGIS Settings"
+        width: Math.min(480, rootWindow.width - 48)
+        standardButtons: Dialog.Close
+        contentItem: ColumnLayout {
+            spacing: 12
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "앱 기본값" : rootWindow.language === "jp" ? "アプリの基本設定" : "Application defaults"
+                font.bold: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.language === "ko" ? "표시 언어" : rootWindow.language === "jp" ? "表示言語" : "Interface language"
+                }
+                ComboBox {
+                    objectName: "interfaceLanguageCombo"
+                    textRole: "label"
+                    valueRole: "value"
+                    model: [
+                        { label: rootWindow.language === "ko" ? "시스템 기본값" : rootWindow.language === "jp" ? "システム設定" : "System default", value: "system" },
+                        { label: "한국어", value: "ko" },
+                        { label: "English", value: "en" },
+                        { label: "日本語", value: "jp" }
+                    ]
+                    currentIndex: Math.max(0, indexOfValue(userSettings.interfaceLanguage))
+                    onCurrentValueChanged: userSettings.interfaceLanguage = currentValue
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.language === "ko" ? "Shapefile 자동 공간 인덱스 기준" : rootWindow.language === "jp" ? "Shapefile自動空間インデックス基準" : "Automatic Shapefile index threshold"
+                }
+                SpinBox {
+                    objectName: "shapefileIndexThresholdSpinBox"
+                    from: 0
+                    to: 1000000
+                    stepSize: 1000
+                    editable: true
+                    value: userSettings.shapefileIndexThreshold
+                    textFromValue: function(value, locale) { return value === 0 ? (rootWindow.language === "ko" ? "사용 안 함" : rootWindow.language === "jp" ? "無効" : "Off") : Number(value).toLocaleString(locale) }
+                    valueFromText: function(text, locale) { return Number.fromLocaleString(locale, text.replace(/[^0-9]/g, "")) }
+                    onValueModified: userSettings.shapefileIndexThreshold = value
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+                text: rootWindow.language === "ko" ? "언어는 즉시 적용됩니다. Shapefile 인덱스 기준은 다음 실행부터 적용되며, 0은 인덱스 생성을 끕니다. 자동 생성은 원본 대신 임시 캐시를 사용해 원본 파일을 수정하지 않습니다." : rootWindow.language === "jp" ? "言語はすぐに適用されます。Shapefileインデックス基準は次回起動時から適用され、0で無効になります。元ファイルを変更せず一時キャッシュを使用します。" : "Language changes apply immediately. The Shapefile index threshold applies on next launch; 0 disables indexing. Generated indexes use a temporary cache and do not modify source files."
+            }
+            Button {
+                objectName: "resetApplicationSettingsButton"
+                text: rootWindow.language === "ko" ? "기본값으로 초기화" : rootWindow.language === "jp" ? "既定値に戻す" : "Restore defaults"
+                onClicked: {
+                    userSettings.interfaceLanguage = "system";
+                    userSettings.shapefileIndexThreshold = 10000;
                 }
             }
         }

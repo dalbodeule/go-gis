@@ -19,7 +19,17 @@ type shapefileIndexPolicy struct {
 var activeShapefileIndexPolicy shapefileIndexPolicy
 
 func configureShapefileIndexPolicy(args []string) {
-	policy := shapefileIndexPolicy{threshold: 10_000, location: "cache"}
+	configureShapefileIndexPolicyWithDefaults(args, 10_000, "cache")
+}
+
+func configureShapefileIndexPolicyWithDefaults(args []string, threshold int, location string) {
+	policy := shapefileIndexPolicy{threshold: threshold, location: location}
+	if policy.threshold < 0 {
+		policy.threshold = 10_000
+	}
+	if !validShapefileIndexLocation(policy.location) {
+		policy.location = "cache"
+	}
 	if value := strings.TrimSpace(os.Getenv("GOGIS_SHAPEFILE_INDEX_THRESHOLD")); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed >= 0 {
 			policy.threshold = parsed

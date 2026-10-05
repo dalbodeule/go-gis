@@ -1,9 +1,14 @@
 # ARES Commander DXF 검증 절차
 
 이 문서는 GoGIS exporter의 자동 검증과 ARES Commander 2027 실제 앱 검증을
-구분한다. 현재 저장소와 CI에서 확인할 수 있는 것은 DXF 구조, 인코딩 바이트,
-GDAL DXF parser round-trip까지이며, ARES의 화면 표시와 글꼴 대체는 ARES가
-설치된 지원 운영체제에서 수동으로 확인해야 한다.
+구분한다. DXF 구조·인코딩·GDAL round-trip은 자동 확인하고, ARES의 화면 표시와
+글꼴 대체는 ARES 앱에서 별도로 확인한다. 아래 절차는 재검증 시 사용할 수 있다.
+
+2026-10-05: 사용자가 ARES Commander 2027에서 실사용 검증을 완료했다고 확인했다.
+OS, ARES 세부 버전, profile별 결과, 캡처/로그는 전달되지 않아 이 기록은 사용자
+확인에 기반한 완료 표시이며 독립 재현 가능한 검증 리포트는 아니다. 더 이상 이
+실사용 확인을 다음 작업의 차단 조건으로 두지 않는다.
+
 GDAL은 UTF-8 DXF의 `$DWGCODEPAGE` 값만으로는 UTF-8을 인식하지 못해 한글을
 ANSI_1252로 잘못 디코딩할 수 있다. 이 경우 GDAL 전용 읽기 설정
 `DXF_ENCODING=UTF-8`을 주면 실제 3-레이어 작업공간의 레이어명과 엔티티 수가

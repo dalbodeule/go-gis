@@ -9,10 +9,10 @@
 | 공통 CRS 표시, 이동/확대/축소, 선택·편집, 전체 저장/취소 | viewport-clipped Qt Quick canvas, coordinate navigation/status bar, multi-layer GeoPackage writer | `go test -tags native ./drivers/gdal ./internal/commands ./internal/render`; `CGO_CXXFLAGS=-std=c++17 go test -tags 'qt native' ./cmd/gis-desktop ./ui/qt/native`; offscreen QML launch | 코드·빌드 검증 완료; 실제 화면 상호작용은 Windows에서 수동 확인 필요 |
 | PROJ 기반 4326/5179/5186 변환 | visualization-normalized XY geometry/bounds 변환 및 EPSG:5179/5186 known numeric regression | `drivers/proj`, `cmd/gis-cli/*_native_test.go` | 자동 회귀 완료; QGIS 독립 control-point 대조는 사용자 확인 필요 |
 | 필터·병합·GEOS 교차/합집합/차집합/버퍼 | 공용 commands와 CLI/Lua dispatch | `go test -tags native ./...` | 자동 검증 완료 |
-| 한글 레이블 위치·회전·높이·스타일 | `core.Label`, 대표점 계산, DXF TEXT | `drivers/dxf/export_test.go`, label native test | 자동 검증 완료 |
-| DXF를 ARES에서 열어 한글·레이어·좌표 확인 | UTF-8/CP949 한글 TEXT fixture(도로 30° 회전), exporter와 GDAL round-trip | `scripts/generate-ares-samples.sh`, `scripts/verify-ares-precheck.sh` | ARES 실제 앱 검증 필요 |
-| GeoPackage/PostGIS 읽기·쓰기와 트랜잭션 | GDAL writer, PostGIS atomic replacement | `go test -tags native ./drivers/postgis ./...` | 자동 검증 완료 |
-| CLI 재현성과 최소 Lua API | CLI subcommands, Lua layers/property/spatial/export API; 같은 fixture에서 Lua predicate/레이블 composer 결과를 공용 `ProjectService` command 경로와 전체 layer 단위 비교 | `go test ./...`; `TestLuaFilterAndLabelResultsMatchSharedCommandAPI`; native CLI script test | 공용 API/Lua 자동 회귀 완료; 실제 GUI 조작·ARES 확인은 별도 |
+| 한글 레이블 위치·회전·높이·스타일 | 화면 축척/겹침 제한; DXF TEXT 및 점 8방향 정렬·오프셋, 선/폴리곤 자유 각도 | `drivers/dxf/export_test.go`, render/core native tests, ARES 사전검증 | 자동 검증 완료; ARES 실사용은 사용자 확인 완료(세부 기록 미제공) |
+| DXF를 ARES에서 열어 한글·레이어·좌표 확인 | UTF-8/CP949 한글 TEXT fixture, exporter와 GDAL round-trip; 사용자가 ARES Commander 2027 실사용 확인 완료를 보고 | `scripts/generate-ares-samples.sh`, `scripts/verify-ares-precheck.sh`; 세부 OS/profile 결과는 미제공 | 사용자 보고 기준 완료; 상세 환경 증거 미기록 |
+| GeoPackage/PostGIS 읽기·쓰기와 트랜잭션 | GDAL GeoPackage writer/UI save; PostGIS driver read/write와 atomic replacement; live rollback CI | GDAL/PostGIS tests, 2026-10-05 [CI run](https://github.com/dalbodeule/go-gis/actions/runs/37301854222) | 드라이버/rollback 검증 완료; CLI/desktop에서 PostGIS 연결 workflow 미구현 |
+| CLI 재현성과 최소 Lua API | CLI subcommands, Lua layers/property/spatial/export API; 같은 fixture에서 Lua predicate/레이블 composer 결과를 공용 `ProjectService` command 경로와 전체 layer 단위 비교 | `go test ./...`; `TestLuaFilterAndLabelResultsMatchSharedCommandAPI`; native CLI script test | 공용 API/Lua 일부 자동 parity 완료; GUI 공간작업 경로 및 넓은 parity matrix는 미완료; ARES는 사용자 확인 완료 |
 | 레이어 속성·워크스페이스 | 레이어 이름/원본 경로·인코딩/표시, mm 점 크기·선 두께 및 GEOS 삼각분할 기반 폴리곤 채움/투명도 렌더링; `.gogis`에 원본 참조, 설정, 지도 중심/확대율/활성 레이어 저장·복원; 원본 누락 시 재연결 가능한 항목 보존; 제한된 Lua 레이블/규칙 평가 | `qmltestrunner` Apply payload UI test; `drivers/geos`, `internal/render`, `internal/workspace`, `internal/scripting`, desktop native tests | 코드·QML 상호작용 검증 완료; Windows 빌드 및 실제 화면 상호작용 확인 미완료 |
 
 ## 통합 검증
@@ -23,10 +23,13 @@
 ```
 
 `verify.sh`는 일반/native/race 테스트, native 빌드, Qt native 테스트와
-패치 검사를 수행한다. ARES precheck는 두 DXF profile을 생성하고 GDAL로
-재읽지만, ARES Commander의 실제 화면·글꼴 대체·재저장 호환성을 대신하지
-않는다. 해당 항목은 [ARES 수동 절차](ares-commander.md)에 따라 지원 OS에서
-수행하고 버전, profile, SHA-256, 결과와 캡처 경로를 기록해야 한다.
+패치 검사를 수행한다. ARES precheck는 두 DXF profile을 생성하고 GDAL로 재읽지만,
+그 자체로 ARES Commander의 화면·글꼴 대체·재저장 호환성을 증명하지 않는다.
+사용자는 ARES 실사용 검증 완료를 보고했으나 OS/profile별 결과와 캡처는 제공하지
+않았다. 재검증 절차는 [ARES 검증 문서](ares-commander.md)를 참고한다.
+
+현재 구현 요약과 다음 목표의 우선순위는 [`docs/next-steps.md`](../next-steps.md)에
+기록한다. 사용 중 체감한 로딩 개선은 정량 성능 보증과 구분한다.
 
 ## Windows 데스크톱 수동 확인
 

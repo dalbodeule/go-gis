@@ -455,6 +455,37 @@ TestCase {
         dialog.close();
     }
 
+    function test_applicationSettingsExposeLanguageAndRestoreDefaults() {
+        var button = findChild(appWindow, "applicationSettingsButton");
+        var dialog = findChild(appWindow, "applicationSettingsDialog");
+        var language = findChild(appWindow, "interfaceLanguageCombo");
+        var store = findChild(appWindow, "applicationSettingsStore");
+        var indexThreshold = findChild(appWindow, "shapefileIndexThresholdSpinBox");
+        var reset = findChild(appWindow, "resetApplicationSettingsButton");
+        verify(button !== null && dialog !== null && language !== null && store !== null && indexThreshold !== null && reset !== null);
+        var previousPreference = store.interfaceLanguage;
+        var previousThreshold = store.shapefileIndexThreshold;
+        try {
+            mouseClick(button);
+            tryCompare(dialog, "visible", true);
+            compare(language.valueAt(language.currentIndex), previousPreference);
+            compare(indexThreshold.value, 10000);
+            indexThreshold.value = 50000;
+            indexThreshold.valueModified();
+            compare(store.shapefileIndexThreshold, 50000);
+            language.currentIndex = language.indexOfValue("ko");
+            compare(store.interfaceLanguage, "ko");
+            tryCompare(appWindow, "language", "ko");
+            mouseClick(reset);
+            compare(store.interfaceLanguage, "system");
+            compare(store.shapefileIndexThreshold, 10000);
+        } finally {
+            store.interfaceLanguage = previousPreference;
+            store.shapefileIndexThreshold = previousThreshold;
+            dialog.close();
+        }
+    }
+
     function test_luaEditorHighlightsSyntaxAndSuggestsTypedFields() {
         var dialog = findChild(appWindow, "luaEditorDialog");
         var editor = findChild(dialog, "labelLuaField");
@@ -885,6 +916,7 @@ TestCase {
     }
 
     function test_applySubmitsLayerSettings() {
+        appWindow.language = "en";
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var renderStatus = findChild(appWindow, "renderStatusLabel");
         var loadIndicator = findChild(appWindow, "loadBusyIndicator");

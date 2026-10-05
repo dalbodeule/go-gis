@@ -29,6 +29,26 @@
 ./scripts/build.sh clean     # build/ 제거
 ```
 
+### 2026-10-05 검증 범위
+
+| 환경 | 실제 확인한 범위 | 아직 확인하지 않은 범위 |
+| --- | --- | --- |
+| macOS ARM64 로컬 | Go 1.27.1; Qt 6.11.2; GDAL 3.13.3; PROJ 9.9.0; GEOS 3.15.0; `./scripts/build.sh all-native`; Qt/native 데스크톱 및 native 브리지 테스트 통과. 내부 `.app`/`.dmg` 생성, codesign verify 및 DMG CRC verify 통과 | 직접 실행 시 Cocoa plugin은 로드되나 Codex 세션의 pasteboard/XPC 연결 오류 후 SIGABRT; 일반 GUI 세션의 UI·GIS 데이터 검증과 clean-machine 테스트 필요 |
+| macOS GitHub runner | portable checks, native GIS tests/race 및 native CLI build 통과 | Qt desktop build와 app packaging |
+| Linux GitHub runner (Ubuntu) | portable checks, native GIS tests/race 및 native CLI build 통과 | Qt desktop build, AppImage/배포 패키지, 깨끗한 VM 실행 |
+| Windows GitHub runner | portable tests/vet 및 portable CLI `.exe` build 통과 | native GIS/Qt desktop build, DLL 및 GIS/Qt runtime package |
+
+세 OS의 최신 workflow 결과는 [2026-10-05 CI 실행](https://github.com/dalbodeule/go-gis/actions/runs/37301854222)에서 확인할 수 있다. CI 통과는 해당 job에 포함된 테스트/바이너리 범위만 증명한다. 특히 Windows CI의 portable CLI 빌드를 Windows native GIS 앱 빌드로 간주하지 않는다.
+
+요청된 추가 배포 대상은 Windows/Linux의 `amd64`와 `arm64` 네 조합이다. 현재
+CI에는 이 조합의 native GIS/Qt 데스크톱 패키지 job이 없다. `GOOS`/`GOARCH`만
+지정한 CGO 비활성 CLI 교차 빌드는 이 요구를 충족하지 않으므로 배포 지원으로
+표기하지 않는다. 각 조합은 해당 아키텍처 runner에서 Qt·GDAL·PROJ·GEOS를 같은
+ABI로 빌드/설치하고, Qt 및 GIS runtime/data를 포함한 패키지를 만든 뒤 clean
+machine에서 실행 검증해야 한다.
+
+배포 목표 형식은 [ADR 0013](decisions/0013-desktop-distribution.md)에 따라 macOS `.app`/`.dmg`, Windows portable `.zip`(clean-machine 검증 후 installer), Linux 정의된 기준 배포판의 AppImage로 둔다. macOS ARM64 내부 테스트 산출물은 `build/packages/macos-arm64/`에 생성됐고 앱 번들 서명 및 DMG checksum을 검증했다. 직접 앱 실행은 Codex 세션의 AppKit pasteboard/XPC 연결 오류로 중단되어 UI runtime 검증은 미완료다. 패키지에는 Qt QML/plugin, GDAL/PROJ/GEOS 라이브러리와 data, 라이선스 고지가 필요하고 대상 OS에서 만든 뒤 clean-machine 실행을 통과해야 한다. 코드 서명/공증은 내부 검증 패키지와 공개 배포를 구별해 후속 gate로 둔다.
+
 커밋 전 전체 검증은 다음 명령으로 실행합니다. 일반/native 테스트와 race
 검사, `go vet`, native 산출물 빌드, patch whitespace 검사를 순서대로 수행합니다.
 
@@ -46,8 +66,8 @@ Windows PowerShell에서는 같은 portable 검증을 다음처럼 실행할 수
 
 GitHub Actions는 Windows에서 PowerShell portable CLI 빌드와 portable Go 테스트·vet을 수행하고, Linux/macOS
 에서는 GDAL·PROJ·GEOS native 테스트와 native race 테스트를 추가로 수행합니다.
-Qt 데스크톱 패키징은 각 OS의 Qt 배포 방식 차이 때문에 CI native GIS job과
-분리하며, Qt가 설치된 개발 환경에서 `scripts/verify.sh`가 수행합니다.
+Qt desktop 실행 파일은 Qt SDK가 설치된 개발 환경에서 `scripts/verify.sh`가 테스트·빌드할 수 있습니다.
+현재 CI는 Qt desktop build를 포함하지 않으며, 아래 표의 OS별 배포 번들을 생성하지 않습니다.
 
 `desktop` 대상은 Qt 6의 C++17 요구사항을 위해 `CGO_CXXFLAGS`에
 `-std=c++17`을 자동으로 추가합니다. 호출자가 이미 `-std=c++17` 또는
@@ -109,7 +129,7 @@ go build -o bin/gis-cli ./cmd/gis-cli
 
 ## Qt Quick desktop prototype
 
-The Milestone B shell is optional and uses Qt 6 Quick/QML through MIQT. It is
+The Milestone B shell is optional and uses Qt 6.5 or newer Quick/QML through MIQT. It is
 guarded by the `qt` build tag, so the standard CLI and test commands do not
 need Qt. Install Qt 6 development components for Core, Gui, Quick, Qml, and
 QuickControls2, then make sure the Qt `pkg-config` files and a CGO-compatible

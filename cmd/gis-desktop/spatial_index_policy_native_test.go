@@ -91,3 +91,19 @@ func TestConfigureShapefileIndexPolicyDefaultsToCacheAtTenThousandFeatures(t *te
 		t.Fatalf("default SHP index policy = %+v, want %+v", activeShapefileIndexPolicy, want)
 	}
 }
+
+func TestConfigureShapefileIndexPolicyUsesSavedThresholdUnlessOverridden(t *testing.T) {
+	t.Setenv("GOGIS_SHAPEFILE_INDEX_THRESHOLD", "")
+	t.Setenv("GOGIS_SHAPEFILE_INDEX_LOCATION", "")
+	previousPolicy := activeShapefileIndexPolicy
+	t.Cleanup(func() { activeShapefileIndexPolicy = previousPolicy })
+
+	configureShapefileIndexPolicyWithDefaults(nil, 50_000, "cache")
+	if want := (shapefileIndexPolicy{threshold: 50_000, location: "cache"}); activeShapefileIndexPolicy != want {
+		t.Fatalf("saved preference policy = %+v, want %+v", activeShapefileIndexPolicy, want)
+	}
+	configureShapefileIndexPolicyWithDefaults([]string{"app", "--spatial-index-threshold=250000"}, 50_000, "cache")
+	if want := (shapefileIndexPolicy{threshold: 250_000, location: "cache"}); activeShapefileIndexPolicy != want {
+		t.Fatalf("command-line override policy = %+v, want %+v", activeShapefileIndexPolicy, want)
+	}
+}

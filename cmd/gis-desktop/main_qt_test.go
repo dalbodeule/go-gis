@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	qt "github.com/mappu/miqt/qt6"
 	"gogis/internal/commands"
 	"gogis/internal/core"
 	"gogis/internal/render"
@@ -335,11 +336,11 @@ func TestDesktopLanguageArgs(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "default", args: []string{"gis-desktop", "--verbose"}, want: "en"},
+		{name: "default uses system preference", args: []string{"gis-desktop", "--verbose"}, want: "system"},
 		{name: "Korean equals form", args: []string{"gis-desktop", "--lang=ko"}, want: "ko"},
 		{name: "English separate form", args: []string{"gis-desktop", "--lang", "en"}, want: "en"},
 		{name: "Japanese alias", args: []string{"gis-desktop", "--lang=ja"}, want: "jp"},
-		{name: "unknown falls back", args: []string{"gis-desktop", "--lang=fr"}, want: "en"},
+		{name: "unknown falls back to system preference", args: []string{"gis-desktop", "--lang=fr"}, want: "system"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -353,6 +354,32 @@ func TestDesktopLanguageArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDesktopShapefileIndexThresholdReadsPreferencesAndValidates(t *testing.T) {
+	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
+	defer settings.Delete()
+	key := qt.NewQAnyStringView3("preferences/shapefileIndexThreshold")
+	defer key.Delete()
+	value := qt.NewQVariant4(50_000)
+	defer value.Delete()
+	settings.SetValue(*key, value)
+	settings.Sync()
+	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 50_000 {
+		t.Fatalf("saved SHP index threshold = %d, want 50000", got)
+	}
+	settings.Remove(*key)
+	settings.Sync()
+	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 10_000 {
+		t.Fatalf("default SHP index threshold = %d, want 10000", got)
+	}
+	invalidValue := qt.NewQVariant4(-1)
+	defer invalidValue.Delete()
+	settings.SetValue(*key, invalidValue)
+	settings.Sync()
+	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 10_000 {
+		t.Fatalf("invalid SHP index threshold fallback = %d, want 10000", got)
 	}
 }
 
