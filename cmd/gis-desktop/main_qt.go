@@ -30,6 +30,11 @@ import (
 
 type forceReadOnlyOverviewContextKey struct{}
 
+// Large viewport replacements should reveal newly rendered chunks as they
+// arrive instead of leaving a zoomed, stale complete frame on screen until
+// hundreds of chunk requests finish.
+const maxPreservedCompleteFrameChunkKeys = 128
+
 func shouldRetryViewportWithOverview(viewportReadOnly, alreadyForced bool, err string) bool {
 	return viewportReadOnly && !alreadyForced && strings.Contains(err, "viewport render batch exceeds the")
 }
@@ -196,6 +201,17 @@ func desktopLanguageArgs(args []string) (string, []string) {
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
 			}
+			continue
+		} else if arg == "--input" || arg == "--layer" || arg == "--source-crs" ||
+			arg == "--target-crs" || arg == "--save" {
+			// These are GoGIS startup options. Passing them through makes
+			// QApplication parse them as Qt options before the data loader can
+			// read os.Args.
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		} else if arg == "--read-only" || arg == "--editable-large" {
 			continue
 		} else {
 			qtArgs = append(qtArgs, arg)
@@ -1143,6 +1159,13 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	}
 	keys = visibility.FilterChunkKeysInPlace(keys)
 	prioritizeViewportChunks(keys, viewport, planner.ChunkSize)
+	if keepCompleteFrame && len(keys) > maxPreservedCompleteFrameChunkKeys {
+		keepCompleteFrame = false
+		native.RecordDiagnostic("render", fmt.Sprintf(
+			"progressive-replacement chunks=%d previous_complete_frame=true threshold=%d",
+			len(keys), maxPreservedCompleteFrameChunkKeys,
+		))
+	}
 	hiddenKeys := make([]render.ChunkKey, 0)
 	if !chunkPlanExceeded && len(keys) < render.MaxViewportChunkKeys {
 		for layer, visible := range layerVisibility {
@@ -1243,8 +1266,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		current := r.scheduler == scheduler && scheduler.Generation() == requestGeneration
 		preview := r.previewLoading
 		loading := r.loadCancel != nil
-		r.mu.Unlock()
 		if !current || (loading && !preview) {
+			r.mu.Unlock()
 			return
 		}
 		if preview {
@@ -1258,7 +1281,15 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		} else {
 			native.SetRenderStatus(progress.Message())
 		}
+		r.mu.Unlock()
 		lastProgress = now
+	}
+	setStatusIfCurrent := func(status string) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.scheduler == scheduler && scheduler.Generation() == requestGeneration {
+			native.SetRenderStatus(status)
+		}
 	}
 	setProgress(presentation.RenderProgress{Phase: "Loading", Total: len(keys), Cancellable: true}, true)
 	zoomBucket := readOnlyWindowZoomBucket(viewport.Zoom)
@@ -1280,10 +1311,53 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 
 	go func(requestKeys []render.ChunkKey, keyBuffer *render.ChunkKeyBuffer, scheduler *render.Scheduler) {
 		defer scheduler.ReleaseChunkKeyBuffer(keyBuffer)
-		results := scheduler.RequestUnique(requestContext, requestKeys, builder)
+		var activeBuildsMu sync.Mutex
+		activeBuilds := make(map[render.ChunkKey]time.Time)
+		trackedBuilder := func(buildContext context.Context, key render.ChunkKey) (render.Chunk, error) {
+			activeBuildsMu.Lock()
+			activeBuilds[key] = time.Now()
+			activeBuildsMu.Unlock()
+			defer func() {
+				activeBuildsMu.Lock()
+				delete(activeBuilds, key)
+				activeBuildsMu.Unlock()
+			}()
+			return builder(buildContext, key)
+		}
+		requestFinished := make(chan struct{})
+		defer close(requestFinished)
+		results := scheduler.RequestUnique(requestContext, requestKeys, trackedBuilder)
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-requestFinished:
+					return
+				case <-requestContext.Done():
+					return
+				case <-ticker.C:
+					activeBuildsMu.Lock()
+					entries := make([]string, 0, len(activeBuilds))
+					for key, started := range activeBuilds {
+						entries = append(entries, fmt.Sprintf("%s:%d,%d:%dms", key.Layer, key.X, key.Y,
+							time.Since(started).Milliseconds()))
+					}
+					activeBuildsMu.Unlock()
+					if len(entries) > 0 {
+						sort.Strings(entries)
+					}
+					stats := scheduler.Stats()
+					native.RecordDiagnostic("render", fmt.Sprintf(
+						"in-flight generation=%d workers=%d/%d tiles=%v",
+						requestGeneration, stats.ActiveWorkers, scheduler.MaxWorkers(), entries))
+				}
+			}
+		}()
 		completed := 0
 		renderedVertices := 0
 		nonemptyChunks := 0
+		emptyChunkKeys := make([]render.ChunkKey, 0)
 		fillVerticesByLayer := make(map[string]int, len(visibleLayerNames))
 		zeroAlphaFillVertices := 0
 		centerVertices := 0
@@ -1293,6 +1367,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		vertexMaxX, vertexMaxY := float32(math.Inf(-1)), float32(math.Inf(-1))
 		renderErr := ""
 		lastPublish := time.Now()
+		lastDiagnosticProgress := time.Now()
 		// Publishing flattens and copies the complete visible batch. Limit that
 		// repeated work during bulk loads while keeping partial results responsive.
 		const progressivePublishInterval = 50 * time.Millisecond
@@ -1358,6 +1433,14 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		}
 		for result := range results {
 			completed++
+			if completed%25 == 0 || time.Since(lastDiagnosticProgress) >= 5*time.Second {
+				native.RecordDiagnostic("render", fmt.Sprintf(
+					"progress generation=%d chunks=%d/%d last=%s:%d,%d elapsed_ms=%d",
+					requestGeneration, completed, len(requestKeys), result.Key.Layer, result.Key.X, result.Key.Y,
+					time.Since(renderStartedAt).Milliseconds(),
+				))
+				lastDiagnosticProgress = time.Now()
+			}
 			setProgress(presentation.RenderProgress{Phase: "Loading", Completed: completed, Total: len(requestKeys), Cancellable: true}, completed == len(requestKeys))
 			applied, applyErr := batchStore.ApplyImmutableChecked(result)
 			if !applied {
@@ -1370,6 +1453,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			renderedVertices += len(result.Chunk.Vertices)
 			if len(result.Chunk.Vertices) > 0 {
 				nonemptyChunks++
+			} else {
+				emptyChunkKeys = append(emptyChunkKeys, result.Key)
 			}
 			chunkFillVertices := 0
 			for _, vertex := range result.Chunk.Vertices {
@@ -1408,7 +1493,19 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			// replacement is ready, but its new labels must not wait for that frame.
 			publishLabelsIfDue()
 		}
-		publishBatch(requestContext.Err() == nil && renderErr == "" && completed == len(requestKeys))
+		// Publish the current generation's successful chunks when the request
+		// terminates with an error or missing results. Keeping the previous
+		// complete frame in that case makes stale cached tiles look like a
+		// successful render of the new viewport.
+		publishBatch(requestContext.Err() == nil)
+		if requestContext.Err() == nil && (renderErr != "" || completed != len(requestKeys)) {
+			r.mu.Lock()
+			if r.scheduler == scheduler && scheduler.Generation() == requestGeneration {
+				r.hasCompleteFrame = false
+				r.completeFrameLayers = ""
+			}
+			r.mu.Unlock()
+		}
 		if requestContext.Err() != nil {
 			setProgress(presentation.RenderProgress{Phase: "Render cancelled"}, true)
 		} else if renderErr != "" {
@@ -1440,7 +1537,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				stats.CacheHits-renderStatsBefore.CacheHits, stats.ChunksBuilt-renderStatsBefore.ChunksBuilt,
 				renderErr,
 			))
-			native.SetRenderStatus("Render incomplete; zoom in and try again: " + renderErr)
+			setStatusIfCurrent("Render incomplete; zoom in and try again: " + renderErr)
 		} else if completed != len(requestKeys) {
 			// A closed result stream is not proof that every requested chunk was
 			// delivered (for example, cancellation or a scheduler regression can
@@ -1451,9 +1548,12 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				requestGeneration, completed, len(requestKeys), renderedVertices,
 				time.Since(renderStartedAt).Milliseconds(), missing,
 			))
-			native.SetRenderStatus(fmt.Sprintf("Render incomplete; zoom in and try again: %d chunks were not returned", missing))
+			setStatusIfCurrent(fmt.Sprintf("Render incomplete; zoom in and try again: %d chunks were not returned", missing))
 		} else {
 			setProgress(presentation.RenderProgress{Phase: "Ready", Completed: completed, Total: len(requestKeys)}, true)
+			if nonemptyChunks < completed {
+				setStatusIfCurrent(fmt.Sprintf("Render ready: %d/%d chunks contain geometry", nonemptyChunks, completed))
+			}
 			r.mu.Lock()
 			if r.scheduler == scheduler && scheduler.Generation() == requestGeneration {
 				r.hasCompleteFrame = true
@@ -1467,16 +1567,32 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 					occupiedCount++
 				}
 			}
+			sort.Slice(emptyChunkKeys, func(left, right int) bool {
+				if emptyChunkKeys[left].Layer != emptyChunkKeys[right].Layer {
+					return emptyChunkKeys[left].Layer < emptyChunkKeys[right].Layer
+				}
+				if emptyChunkKeys[left].Y != emptyChunkKeys[right].Y {
+					return emptyChunkKeys[left].Y < emptyChunkKeys[right].Y
+				}
+				return emptyChunkKeys[left].X < emptyChunkKeys[right].X
+			})
+			emptySampleCount := min(16, len(emptyChunkKeys))
+			emptySample := make([]string, emptySampleCount)
+			for index, key := range emptyChunkKeys[:emptySampleCount] {
+				emptySample[index] = fmt.Sprintf("%s:%d,%d", key.Layer, key.X, key.Y)
+			}
 			fillSummary, _ := json.Marshal(fillVerticesByLayer)
 			native.RecordDiagnostic("render", fmt.Sprintf(
-				"ready generation=%d chunks=%d nonempty=%d vertices=%d fill_vertices_by_layer=%s zero_alpha_fills=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
-				requestGeneration, completed, nonemptyChunks, renderedVertices, string(fillSummary), zeroAlphaFillVertices,
+				"ready generation=%d chunks=%d nonempty=%d empty=%d empty_sample=%v vertices=%d fill_vertices_by_layer=%s zero_alpha_fills=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
+				requestGeneration, completed, nonemptyChunks, completed-nonemptyChunks, emptySample, renderedVertices, string(fillSummary), zeroAlphaFillVertices,
 				vertexMinX, vertexMinY, vertexMaxX, vertexMaxY, centerVertices, validVertices, occupiedCount,
 				time.Since(renderStartedAt).Milliseconds(),
 				stats.CacheHits-renderStatsBefore.CacheHits, stats.ChunksBuilt-renderStatsBefore.ChunksBuilt,
 			))
 		}
-		r.publishLayerLabels()
+		// Keep the final map-render status visible; label-limit notices must not
+		// replace a ready/incomplete chunk summary in the shared status channel.
+		r.publishLayerLabelsWithStatus(false)
 	}(keys, keyBuffer, scheduler)
 }
 
@@ -2013,10 +2129,10 @@ func startViewportSync(runtime *demoRuntime) {
 				viewportChangedAt = time.Now()
 				pendingViewportRefresh = true
 			}
-			visibilityChanged := layerVisibilityGeneration != lastLayerVisibilityGeneration
-			if visibilityChanged {
+			visibilityChanged := false
+			if layerVisibilityGeneration != lastLayerVisibilityGeneration {
 				lastLayerVisibilityGeneration = layerVisibilityGeneration
-				applyLayerVisibility(runtime, native.CurrentLayerVisibility())
+				visibilityChanged = applyLayerVisibility(runtime, native.CurrentLayerVisibility())
 			}
 			// Reuse the already rendered map while a wheel/drag gesture is
 			// active. Rebuilding each 16 ms cancels expensive GDAL windows
@@ -2275,10 +2391,10 @@ func (r *demoRuntime) refreshCurrentViewport() {
 	})
 }
 
-func applyLayerVisibility(runtime *demoRuntime, payload string) {
+func applyLayerVisibility(runtime *demoRuntime, payload string) bool {
 	var visibility map[string]bool
 	if err := json.Unmarshal([]byte(payload), &visibility); err != nil {
-		return
+		return false
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -2305,4 +2421,5 @@ func applyLayerVisibility(runtime *demoRuntime, payload string) {
 	if visibleSnapshot != nil {
 		runtime.visibleLayers = visibleSnapshot
 	}
+	return visibleSnapshot != nil
 }

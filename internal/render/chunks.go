@@ -62,6 +62,7 @@ type SchedulerStats struct {
 	CacheHits     uint64
 	StaleResults  uint64
 	CanceledCalls uint64
+	ActiveWorkers int
 }
 
 // BatchStore holds the vertex batch currently presented by a renderer. It
@@ -567,6 +568,7 @@ func (s *Scheduler) Stats() SchedulerStats {
 		CacheHits:     s.stats.cacheHits.Load(),
 		StaleResults:  s.stats.staleResults.Load(),
 		CanceledCalls: s.stats.canceledCalls.Load(),
+		ActiveWorkers: len(s.workerSlots),
 	}
 }
 
@@ -821,15 +823,23 @@ func (s *Scheduler) runMissing(ctx context.Context, requestGeneration uint64, ke
 	if workers == 0 {
 		return
 	}
+	// Chunk costs can vary dramatically for vector data: one dense polygon
+	// tile may take much longer than dozens of sparse tiles. Let each worker
+	// claim the next key only after it finishes its current build so a slow tile
+	// does not strand the rest of its former fixed slice while other workers sit
+	// idle.
+	var nextIndex atomic.Uint64
 	var wait sync.WaitGroup
 	wait.Add(workers)
-	for worker := 0; worker < workers; worker++ {
-		start := len(keys) * worker / workers
-		end := len(keys) * (worker + 1) / workers
-		go func(start, end int) {
+	for range workers {
+		go func() {
 			defer wait.Done()
-			for index := start; index < end; index++ {
+			for {
 				if ctx.Err() != nil {
+					return
+				}
+				index := nextIndex.Add(1) - 1
+				if index >= uint64(len(keys)) {
 					return
 				}
 				select {
@@ -841,10 +851,10 @@ func (s *Scheduler) runMissing(ctx context.Context, requestGeneration uint64, ke
 					<-s.workerSlots
 					return
 				}
-				s.buildChunk(ctx, requestGeneration, keys[index], builder, results)
+				s.buildChunk(ctx, requestGeneration, keys[int(index)], builder, results)
 				<-s.workerSlots
 			}
-		}(start, end)
+		}()
 	}
 	wait.Wait()
 }

@@ -1160,6 +1160,34 @@ func (runtime *demoRuntime) readOnlyAttributeFeature(_ context.Context, layerNam
 // Bind window writes to the active runtime. A closure over the temporary
 // loading runtime would render geometry but leave labels and hit data there.
 func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+	startedAt := time.Now()
+	var stageMu sync.Mutex
+	stage, stageStartedAt := "prepare", startedAt
+	setStage := func(next string) {
+		stageMu.Lock()
+		stage, stageStartedAt = next, time.Now()
+		stageMu.Unlock()
+	}
+	stopHeartbeat := make(chan struct{})
+	defer close(stopHeartbeat)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				stageMu.Lock()
+				currentStage, currentStageStartedAt := stage, stageStartedAt
+				stageMu.Unlock()
+				native.RecordDiagnostic("render", fmt.Sprintf(
+					"tile-stage layer=%s chunk=%d,%d stage=%s stage_ms=%d total_ms=%d",
+					key.Layer, key.X, key.Y, currentStage,
+					time.Since(currentStageStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds()))
+			}
+		}
+	}()
 	baseBuilder := runtime.readOnlyBaseBuilder
 	runtime.mu.Lock()
 	binding, isWindowLayer := runtime.readOnlyBindings[key.Layer]
@@ -1190,12 +1218,14 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
 	overview := lodBucket <= 1 || forceOverview
 	if !overview {
+		setStage("wait-detail-slot")
 		releaseDetailSlot, detailErr := readOnlyDetailBuildSemaphore.acquire(ctx)
 		if detailErr != nil {
 			return render.Chunk{}, detailErr
 		}
 		defer releaseDetailSlot()
 	}
+	setStage("wait-window-slot")
 	releaseWindowSlot, err := readOnlyWindowBuildSemaphore.acquire(ctx)
 	if err != nil {
 		return render.Chunk{}, err
@@ -1210,6 +1240,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		return render.Chunk{Key: key}, nil
 	}
 	if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+		setStage("transform-query-bounds")
 		queryBounds, err = (proj.Transformer{}).TransformBounds(ctx,
 			binding.layer.CRS, core.CRS{AuthorityCode: binding.sourceCRS}, queryBounds)
 		if err != nil {
@@ -1233,6 +1264,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// forced dissolved boundary, which no longer has per-parcel anchors.
 	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview)
 	profileStarted := time.Now()
+	setStage("wait-dataset")
 	windowSession := binding.session
 	if binding.windowPool != nil {
 		select {
@@ -1241,6 +1273,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			return render.Chunk{}, ctx.Err()
 		}
 	}
+	setStage("query-window")
 	window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
 		return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
 			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
@@ -1255,12 +1288,15 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	queryFeatures := len(window.Features)
 	var unionElapsed, simplifyElapsed, fillElapsed time.Duration
 	window.DisplayRule = binding.layer.DisplayRule
+	setStage("apply-display-rule")
 	if err := applyFeatureDisplayRule(ctx, &window); err != nil {
 		return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
 	}
 	if overview {
+		setStage("sample-overview")
 		window = sampleReadOnlyOverviewFeatures(window, overviewStride)
 		if polygonOverview && !denseParcelOverview {
+			setStage("dissolve-overview")
 			started := time.Now()
 			operator := geosdriver.NewOperator()
 			window, err = operator.DissolvePolygonBoundariesForDisplay(ctx, window)
@@ -1291,6 +1327,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	window.Name, window.CRS = binding.layer.Name, core.CRS{AuthorityCode: binding.sourceCRS}
 	window.Fields, window.Style, window.Labels = binding.layer.Fields, binding.layer.Style, binding.layer.Labels
 	if !strings.EqualFold(binding.sourceCRS, binding.layer.CRS.AuthorityCode) {
+		setStage("transform-window")
 		window, err = (proj.Transformer{}).Transform(ctx,
 			core.CRS{AuthorityCode: binding.sourceCRS}, binding.layer.CRS, window)
 		if err != nil {
@@ -1324,6 +1361,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		runtime.mu.Unlock()
 	}
 	if includeProperties && binding.layer.Labels.Enabled {
+		setStage("prepare-labels")
 		if err := prepareReadOnlyWindowLabels(ctx, &window, overview, lodBucket); err != nil {
 			return render.Chunk{}, err
 		}
@@ -1345,6 +1383,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 		displayTolerance = tolerance
 		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
+			setStage("simplify-geometry")
 			started := time.Now()
 			displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
 			if err != nil {
@@ -1355,6 +1394,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	var newSources map[string]render.LayerSource
 	var hits []render.HitFeature
+	setStage("build-vertices")
 	if overview {
 		newSources, hits, err = render.NewLayerSourcesWithExtentAndChunkSizeForChunkDeduplicatedOutlines(
 			[]core.Layer{displayWindow}, runtime.mapExtent, chunkSize, key)
@@ -1376,6 +1416,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		labelBytes += bytes
 	}
 	if !outlineOnly {
+		setStage("build-fill")
 		started := time.Now()
 		if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{displayWindow}, newSources, &key); err != nil {
 			return render.Chunk{}, err
@@ -1435,12 +1476,14 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		return render.Chunk{}, err
 	}
 	if denseParcelOverview && !outlineOnly {
+		setStage("build-dense-overview-fill")
 		chunk, err = buildDenseParcelOverviewChunk(ctx, key, displayWindow, newSources[key.Layer],
 			runtime.mapExtent, chunkSize, displayTolerance, chunk)
 		if err != nil {
 			return render.Chunk{}, err
 		}
 	}
+	setStage("complete")
 	if denseParcelOverview && os.Getenv("GOGIS_OVERVIEW_PROFILE") == "1" ||
 		!overview && os.Getenv("GOGIS_DETAIL_PROFILE") == "1" {
 		fmt.Fprintf(os.Stderr, "GoGIS window profile: layer=%s chunk=(%d,%d) features=%d query=%s union=%s simplify=%s fill=%s total=%s vertices=%d\n",

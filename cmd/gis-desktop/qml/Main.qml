@@ -14,7 +14,7 @@ ApplicationWindow {
     height: 900
     minimumWidth: 960
     minimumHeight: 640
-    title: "GoGIS — Milestone B prototype"
+    title: "GoGIS"
     color: "#f4f6f8"
     onVisibilityChanged: {
         var requestedState = rootWindow.visibility;
@@ -140,6 +140,12 @@ ApplicationWindow {
 
     function localizedStatus(raw) {
         var status = String(raw || "");
+        var renderReady = /^Render ready: (\d+)\/(\d+) chunks contain geometry$/.exec(status);
+        if (renderReady) {
+            if (language === "ko") return "타일 렌더링 완료 · " + renderReady[1] + "/" + renderReady[2] + "개 청크에 도형 포함";
+            if (language === "jp") return "タイル描画完了 · " + renderReady[2] + " 件中 " + renderReady[1] + " 件に地物あり";
+            return status;
+        }
         if (status.indexOf("Reprojecting project to ") === 0) {
             var targetCRS = status.substring("Reprojecting project to ".length);
             return language === "ko" ? "프로젝트 좌표계로 변환 중: " + targetCRS : language === "jp" ? "プロジェクト座標系に変換中: " + targetCRS : status;
@@ -207,6 +213,13 @@ ApplicationWindow {
     function statusIsBusy(raw) {
         var status = String(raw || "").toLowerCase();
         return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
+    }
+
+    function renderProgressSnapshot(raw) {
+        var match = /Loading(?: approximate overview)?\s+\(?([0-9]+)\/([0-9]+)/i.exec(String(raw || ""));
+        if (!match || Number(match[2]) <= 0)
+            return {known: false, value: 0};
+        return {known: true, value: Math.max(0, Math.min(100, Number(match[1]) * 100 / Number(match[2])))};
     }
 
     function memorySummary(processBytes, heapBytes, available, kind) {
@@ -443,21 +456,10 @@ ApplicationWindow {
                 onClicked: rootWindow.vertexEditMode = !rootWindow.vertexEditMode
             }
             Button {
-                text: rootWindow.tr("Save GeoPackage")
-                onClicked: saveDialog.open()
-            }
-            Button {
-                objectName: "exportDxfButton"
-                text: rootWindow.tr("Export project layers to DXF")
-                enabled: layerModel.count > 0
-                onClicked: {
-                    dxfLayerOptions.clear();
-                    dxfEncodingDialog.open();
-                }
-            }
-            Button {
-                text: rootWindow.tr("Save workspace")
-                onClicked: workspaceDialog.open()
+                id: projectActionsButtonControl
+                objectName: "projectActionsButton"
+                text: rootWindow.language === "ko" ? "저장·내보내기" : rootWindow.language === "jp" ? "保存・エクスポート" : "Save / Export"
+                onClicked: projectActionsMenu.popup(projectActionsButtonControl, 0, projectActionsButtonControl.height)
             }
             Button {
                 objectName: "aboutButton"
@@ -472,6 +474,31 @@ ApplicationWindow {
                 ToolTip.text: Accessible.name
                 onClicked: applicationSettingsDialog.open()
             }
+        }
+    }
+
+    Menu {
+        id: projectActionsMenu
+        objectName: "projectActionsMenu"
+        MenuItem {
+            objectName: "saveGeoPackageAction"
+            text: rootWindow.tr("Save GeoPackage")
+            enabled: layerModel.count > 0
+            onTriggered: saveDialog.open()
+        }
+        MenuItem {
+            objectName: "exportDxfButton"
+            text: rootWindow.tr("Export project layers to DXF")
+            enabled: layerModel.count > 0
+            onTriggered: {
+                dxfLayerOptions.clear();
+                dxfEncodingDialog.open();
+            }
+        }
+        MenuItem {
+            objectName: "saveWorkspaceAction"
+            text: rootWindow.tr("Save workspace")
+            onTriggered: workspaceDialog.open()
         }
     }
 
@@ -929,13 +956,13 @@ ApplicationWindow {
                         width: ListView.view.width
                         text: (model.sourceError ? "⚠ " : "") + (typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName)
                         checked: layerVisible
-                        onToggled: {
+                        onClicked: {
                             if (index < 0 || index >= layerModel.count || layerModel.get(index).name !== name)
                                 return;
-                            layerModel.setProperty(index, "layerVisible", checked);
-                            mapViewport.syncLayerVisibility();
-                        }
-                        onClicked: {
+                            if (layerModel.get(index).layerVisible !== checked) {
+                                layerModel.setProperty(index, "layerVisible", checked);
+                                mapViewport.syncLayerVisibility();
+                            }
                             if (mapViewport.findLayerIndex(name) >= 0)
                                 mapViewport.selectLayer(name);
                         }
@@ -982,6 +1009,7 @@ ApplicationWindow {
                 property string editorValue: ""
                 property string attributePayloadSeen: ""
                 property string layerTreePayloadSeen: "[]"
+                property string lastSyncedLayerVisibilityPayload: ""
                 property int mapMetadataGenerationSeen: -1
                 property string activeLayer: ""
                 property string pendingWorkspaceActiveLayer: ""
@@ -1161,6 +1189,23 @@ ApplicationWindow {
                     panX = (0.5 - nx) * mapCanvas.width * mapZoom;
                     panY = (ny - 0.5) * mapCanvas.height * mapZoom;
                     pendingInitialLayerFit = false;
+                    viewportGeneration += 1;
+                    return true;
+                }
+
+                function zoomByFactor(factor) {
+                    var oldZoom = mapZoom;
+                    if (!isFinite(oldZoom) || oldZoom <= 0)
+                        return false;
+                    var newZoom = Math.max(0.25, Math.min(maxMapZoom(), oldZoom * factor));
+                    if (Math.abs(newZoom - oldZoom) < 0.000001)
+                        return false;
+                    var ratio = newZoom / oldZoom;
+                    mapZoom = newZoom;
+                    // Keep the current map center fixed while zooming from a button.
+                    panX *= ratio;
+                    panY *= ratio;
+                    cursorValid = false;
                     viewportGeneration += 1;
                     return true;
                 }
@@ -1365,7 +1410,11 @@ ApplicationWindow {
                         var layer = layerModel.get(i);
                         visibility[layer.name] = layer.layerVisible;
                     }
-                    mapCanvas.layerVisibilityPayload = JSON.stringify(visibility);
+                    var payload = JSON.stringify(visibility);
+                    if (payload === lastSyncedLayerVisibilityPayload)
+                        return;
+                    lastSyncedLayerVisibilityPayload = payload;
+                    mapCanvas.layerVisibilityPayload = payload;
                     mapCanvas.layerVisibilityGeneration += 1;
                 }
 
@@ -1848,15 +1897,96 @@ ApplicationWindow {
                     }
                 }
 
-                Button {
-                    objectName: "zoomToFullExtentButton"
+                Rectangle {
+                    id: progressCard
+                    objectName: "mapRenderProgressCard"
+                    anchors.top: parent.top
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.topMargin: 10
+                    width: Math.min(parent.width - 96, 420)
+                    height: showProgress ? 58 : 42
+                    z: 6
+                    property bool showProgress: rootWindow.statusIsBusy(mapViewport.renderStatus)
+                    property string currentStatus: String(mapViewport.renderStatus || "").toLowerCase()
+                    property bool hasRenderProblem: currentStatus.indexOf("incomplete") >= 0 ||
+                                                   currentStatus.indexOf("render error") >= 0 ||
+                                                   currentStatus.indexOf("render stopped") >= 0 ||
+                                                   currentStatus.indexOf("render ready:") === 0
+                    visible: layerModel.count > 0 && (showProgress || hasRenderProblem)
+                    color: currentStatus.indexOf("incomplete") >= 0 || currentStatus.indexOf("render error") >= 0 || currentStatus.indexOf("render stopped") >= 0
+                           ? "#fff7f5" : hasRenderProblem ? "#fffaf0" : "#f8fbfd"
+                    border.color: hasRenderProblem ? rootWindow.statusColor(mapViewport.renderStatus) : "#bfd0dc"
+                    radius: 7
+                    property var progressSnapshot: rootWindow.renderProgressSnapshot(mapViewport.renderStatus)
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 12
+                        anchors.rightMargin: 12
+                        anchors.topMargin: 7
+                        anchors.bottomMargin: 7
+                        spacing: 4
+                        Label {
+                            Layout.fillWidth: true
+                            text: rootWindow.localizedStatus(mapViewport.renderStatus)
+                            color: progressCard.hasRenderProblem ? rootWindow.statusColor(mapViewport.renderStatus) : "#24516d"
+                            elide: Text.ElideRight
+                            font.bold: progressCard.hasRenderProblem
+                            font.pixelSize: 12
+                        }
+                        ProgressBar {
+                            objectName: "mapRenderProgressBar"
+                            Layout.fillWidth: true
+                            implicitHeight: 7
+                            visible: progressCard.showProgress
+                            from: 0
+                            to: 100
+                            value: progressCard.progressSnapshot.value
+                            indeterminate: !progressCard.progressSnapshot.known
+                        }
+                    }
+                }
+
+                Column {
                     anchors.top: parent.top
                     anchors.right: parent.right
                     anchors.margins: 10
                     z: 6
                     visible: layerModel.count > 0
-                    text: rootWindow.tr("Zoom to full extent")
-                    onClicked: mapViewport.zoomToFullExtent()
+                    spacing: 4
+                    Button {
+                        objectName: "zoomInButton"
+                        width: 38
+                        height: 34
+                        enabled: mapViewport.mapZoom < mapViewport.maxMapZoom() - 0.000001
+                        text: "+"
+                        font.pixelSize: 20
+                        Accessible.name: rootWindow.language === "ko" ? "확대" : rootWindow.language === "jp" ? "拡大" : "Zoom in"
+                        ToolTip.visible: hovered
+                        ToolTip.text: Accessible.name
+                        onClicked: mapViewport.zoomByFactor(1.5)
+                    }
+                    Button {
+                        objectName: "zoomOutButton"
+                        width: 38
+                        height: 34
+                        enabled: mapViewport.mapZoom > 0.250001
+                        text: "−"
+                        font.pixelSize: 20
+                        Accessible.name: rootWindow.language === "ko" ? "축소" : rootWindow.language === "jp" ? "縮小" : "Zoom out"
+                        ToolTip.visible: hovered
+                        ToolTip.text: Accessible.name
+                        onClicked: mapViewport.zoomByFactor(1 / 1.5)
+                    }
+                    Button {
+                        objectName: "zoomToFullExtentButton"
+                        width: 38
+                        height: 34
+                        text: "⤢"
+                        Accessible.name: rootWindow.tr("Zoom to full extent")
+                        ToolTip.visible: hovered
+                        ToolTip.text: Accessible.name
+                        onClicked: mapViewport.zoomToFullExtent()
+                    }
                 }
             }
         }
