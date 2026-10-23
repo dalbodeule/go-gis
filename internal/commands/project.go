@@ -27,6 +27,7 @@ type ProjectService struct {
 	draftFeatureCopies  map[int]bool
 	draftPropertyCopies map[int]map[int]bool
 	featureIndex        map[string]map[uint64]int
+	layerIndex          map[string]int
 	indexedProject      *core.Project
 }
 
@@ -349,75 +350,85 @@ func (s *ProjectService) HasFeature(layerName string, featureID uint64) bool {
 
 // FeatureProperty returns one property without cloning the containing feature.
 func (s *ProjectService) FeatureProperty(layerName string, featureID uint64, propertyName string) (any, bool) {
-	for _, layer := range s.project.Layers {
-		if layer.Name != layerName {
-			continue
-		}
-		index, ok := s.featureIndexForLayer(layerName)
-		if !ok {
-			return nil, false
-		}
-		featureIndex, ok := index[featureID]
-		if !ok {
-			return nil, false
-		}
-		value, ok := layer.Features[featureIndex].Properties[propertyName]
-		return value, ok
+	layerIndex, ok := s.layerIndexForName(layerName)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	index, ok := s.featureIndexForLayer(layerName)
+	if !ok {
+		return nil, false
+	}
+	featureIndex, ok := index[featureID]
+	if !ok {
+		return nil, false
+	}
+	value, ok := s.project.Layers[layerIndex].Features[featureIndex].Properties[propertyName]
+	return value, ok
 }
 
 // FeatureGeometry returns a detached geometry snapshot for editor and renderer
 // consumers. The caller may safely retain it across a subsequent edit.
 func (s *ProjectService) FeatureGeometry(layerName string, featureID uint64) (core.Geometry, bool) {
-	for _, layer := range s.project.Layers {
-		if layer.Name != layerName {
-			continue
-		}
-		index, ok := s.featureIndexForLayer(layerName)
-		if !ok {
-			return nil, false
-		}
-		featureIndex, ok := index[featureID]
-		if !ok || featureIndex >= len(layer.Features) {
-			return nil, false
-		}
-		geometry := layer.Features[featureIndex].Geometry
-		if geometry == nil {
-			return nil, false
-		}
-		return geometry.Clone(), true
+	layerIndex, ok := s.layerIndexForName(layerName)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	index, ok := s.featureIndexForLayer(layerName)
+	if !ok {
+		return nil, false
+	}
+	featureIndex, ok := index[featureID]
+	if !ok || featureIndex >= len(s.project.Layers[layerIndex].Features) {
+		return nil, false
+	}
+	geometry := s.project.Layers[layerIndex].Features[featureIndex].Geometry
+	if geometry == nil {
+		return nil, false
+	}
+	return geometry.Clone(), true
 }
 
 func (s *ProjectService) invalidateFeatureIndex() {
 	s.featureIndex = nil
+	s.layerIndex = nil
 	s.indexedProject = nil
 }
 
-func (s *ProjectService) featureIndexForLayer(layerName string) (map[uint64]int, bool) {
+func (s *ProjectService) layerIndexForName(layerName string) (int, bool) {
 	if s.indexedProject != s.project {
-		s.featureIndex = make(map[string]map[uint64]int, len(s.project.Layers))
+		s.layerIndex = make(map[string]int, len(s.project.Layers))
+		for index, layer := range s.project.Layers {
+			if _, exists := s.layerIndex[layer.Name]; !exists {
+				s.layerIndex[layer.Name] = index
+			}
+		}
 		s.indexedProject = s.project
+	}
+	index, ok := s.layerIndex[layerName]
+	return index, ok
+}
+
+func (s *ProjectService) featureIndexForLayer(layerName string) (map[uint64]int, bool) {
+	if s.featureIndex == nil || s.indexedProject != s.project {
+		s.featureIndex = make(map[string]map[uint64]int, len(s.project.Layers))
+		_, _ = s.layerIndexForName(layerName)
 	}
 	if index, ok := s.featureIndex[layerName]; ok {
 		return index, true
 	}
-	for _, layer := range s.project.Layers {
-		if layer.Name != layerName {
-			continue
-		}
-		index := make(map[uint64]int, len(layer.Features))
-		for featureIndex, feature := range layer.Features {
-			if _, exists := index[feature.ID]; !exists {
-				index[feature.ID] = featureIndex
-			}
-		}
-		s.featureIndex[layerName] = index
-		return index, true
+	layerIndex, ok := s.layerIndexForName(layerName)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	layer := s.project.Layers[layerIndex]
+	index := make(map[uint64]int, len(layer.Features))
+	for featureIndex, feature := range layer.Features {
+		if _, exists := index[feature.ID]; !exists {
+			index[feature.ID] = featureIndex
+		}
+	}
+	s.featureIndex[layerName] = index
+	return index, true
 }
 
 // BeginEdit starts an atomic edit transaction.

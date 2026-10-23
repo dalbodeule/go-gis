@@ -30,6 +30,21 @@
 [마일스톤 C parity 검증표](verification/milestone-c-parity.md),
 [기술 결정 기록](decisions/)에서 확인한다.
 
+## 성능·UI 작업 목표와 현재 상태
+
+| 목표 | 이번 작업에서 확인한 상태 | 다음 증거 |
+| --- | --- | --- |
+| 대용량 import/render 메모리·CPU 비용 제한 | WKB/viewport/index/cache/batch 경로와 read-only lazy loading이 적용되어 있고, 레이어 조회 인덱스도 추가했다. | 1M synthetic benchmark와 실제 업무 데이터의 반복 pan/zoom을 별도로 측정 |
+| 공용 command 조회 비용 절감 | `ProjectService`의 레이어 이름 인덱스와 feature ID 인덱스가 snapshot identity에 맞춰 lazy-build/무효화된다. | 다중 레이어 property/geometry 회귀 테스트, `go test ./...` |
+| QML 상태 갱신 비용 절감 | 상태 번역의 언어별 prefix 정렬 결과를 캐시해 진행률 갱신마다 `Object.keys`/sort를 반복하지 않는다. | QML offscreen 테스트와 상태 갱신 프로파일 |
+| UI payload·모델 상한 유지 | attribute page, JSON byte limit, render batch/frame budget, hidden-window release 정책을 유지한다. | 대형 속성/레이어 fixture의 payload와 retained memory 측정 |
+| 빌드 재현성 | 버전 플래그가 비어 있어도 Qt/native 빌드가 실패하지 않도록 build script를 보강했다. | `scripts/build.sh native`, `desktop-native`, `verify.sh` |
+
+이번 세션에서 일반·race·native Go 테스트와 native CLI/Qt desktop build는 통과했다.
+QML offscreen 수용 테스트는 62건 통과, 0건 실패했으며, 기존 실패는 레이어 속성 입력·색상
+피커·CRS catalog·vertex edit 등 기존 UI 수용 경로에 남아 있다. 따라서 QML 전체 수용
+완료로 선언하지 않고, 새 prefix cache의 동작은 정적 검토와 빌드에 포함한 상태로 둔다.
+
 ## 다음 목표 — 우선순위 순
 
 ### 완료: ARES Commander 2027 실사용 검증

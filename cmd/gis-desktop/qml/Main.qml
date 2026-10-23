@@ -41,6 +41,11 @@ ApplicationWindow {
     property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
     property string runtimeText: typeof appRuntime === "undefined" ? "Go runtime" : appRuntime
     property string buildTargetText: typeof appBuildTarget === "undefined" ? "desktop" : appBuildTarget
+    // Status updates can arrive every render tick while a large layer loads.
+    // Keep the language-specific prefix order instead of rebuilding and
+    // sorting it for every transient status message.
+    property var statusPrefixCache: ({})
+    property var statusDictionaryCache: ({})
     onVertexEditModeChanged: {
         if (vertexEditMode && mapCanvas.visible)
             mapViewport.vertexHandleGenerationSeen = -1;
@@ -192,11 +197,14 @@ ApplicationWindow {
             return (language === "ko" ? "레이어 제거 완료: " : language === "jp" ? "レイヤーを除去しました: " : "Layer removed: ") + status.substring("Layer removed: ".length);
         if (status.indexOf("Remove layer failed: ") === 0)
             return (language === "ko" ? "레이어 제거 실패: " : language === "jp" ? "レイヤーの除去に失敗しました: " : "Remove layer failed: ") + status.substring("Remove layer failed: ".length);
-        var dictionary = {
+        var dictionary = statusDictionaryCache[language];
+        if (dictionary === undefined) dictionary = {
             en: {"Loading": "Loading", "Loading: checking feature count": "Checking feature count", "Preview displayed; loading full data": "Preview displayed; loading full data", "Layer settings applied": "Layer settings applied", "Loading cancelled": "Loading cancelled", "Render cancelled": "Render cancelled", "Dataset size unavailable; opened read-only to limit memory": "Dataset size unavailable; opened read-only to limit memory", "Render incomplete; zoom in and try again: ": "Render incomplete; zoom in and try again: ", "Open failed: ": "Open failed: ", "Save failed: ": "Save failed: ", "Workspace load failed: ": "Workspace load failed: ", "Layer settings failed: ": "Layer settings failed: ", "Render stopped: ": "Render stopped: ", "Render error: ": "Render error: ", "Render skipped: ": "Render skipped: ", "Loading ": "Loading ", "Saving ": "Saving ", "Saved ": "Saved ", "Dataset has at least ": "Dataset has at least "},
             ko: {"Loading": "불러오는 중", "Loading: checking feature count": "피처 개수 확인 중", "Preview displayed; loading full data": "미리보기 표시됨 · 전체 데이터 불러오는 중", "Layer settings applied": "레이어 설정 적용 완료", "Loading cancelled": "불러오기 취소됨", "Render cancelled": "렌더링 취소됨", "Dataset size unavailable; opened read-only to limit memory": "데이터 크기를 알 수 없어 메모리 보호를 위해 읽기 전용으로 열었습니다", "Render incomplete; zoom in and try again: ": "일부 렌더링을 완료하지 못했습니다. 확대 후 다시 시도하세요: ", "Open failed: ": "열기 실패: ", "Save failed: ": "저장 실패: ", "Workspace load failed: ": "작업공간 열기 실패: ", "Workspace save failed: ": "작업공간 저장 실패: ", "Layer settings failed: ": "레이어 설정 실패: ", "Layer reload failed: ": "레이어 다시 열기 실패: ", "Attribute page failed: ": "속성 페이지 표시 실패: ", "Attribute page exceeds the 16 MiB display payload limit": "속성 페이지가 16 MiB 표시 한도를 초과했습니다", "Render stopped: ": "렌더링 중단: ", "Render error: ": "렌더링 오류: ", "Render skipped: ": "렌더링 생략: ", "Label display skipped: ": "레이블 표시 생략: ", "Loading ": "불러오는 중: ", "Saving ": "저장 중: ", "Saved ": "저장 완료: ", "Workspace saved ": "작업공간 저장 완료: ", "Workspace loaded ": "작업공간 열기 완료: ", "Loading workspace ": "작업공간 불러오는 중: ", "Add files requires the native GDAL build": "파일을 추가하려면 GDAL 지원 데스크톱 빌드가 필요합니다", "Reopening layer source with selected encoding": "선택한 인코딩으로 레이어 원본 다시 여는 중", "Layer source reloaded": "레이어 원본 다시 열기 완료", "Vertex edit failed: ": "정점 편집 실패: ", "Vertex moved": "정점 이동 완료", "No visible layers": "표시 중인 레이어가 없습니다", "No vector files selected": "벡터 파일을 선택하지 않았습니다", "A file load is already in progress": "파일을 불러오는 중입니다", "Selected source is already loaded": "선택한 원본이 이미 열려 있습니다", "Cannot add files until the read-only source is ready": "읽기 전용 원본이 준비될 때까지 파일을 추가할 수 없습니다", "Open cancelled": "열기를 취소했습니다", "Save cancelled": "저장을 취소했습니다", "Dataset has at least ": "피처가 최소 "},
             jp: {"Loading": "読み込み中", "Loading: checking feature count": "地物数を確認中", "Preview displayed; loading full data": "プレビューを表示 · 全データを読み込み中", "Layer settings applied": "レイヤー設定を適用しました", "Loading cancelled": "読み込みをキャンセルしました", "Render cancelled": "描画をキャンセルしました", "Dataset size unavailable; opened read-only to limit memory": "メモリ保護のため読み取り専用で開きました（データ件数不明）", "Render incomplete; zoom in and try again: ": "一部を描画できません。拡大して再試行してください: ", "Open failed: ": "開けませんでした: ", "Save failed: ": "保存できませんでした: ", "Workspace load failed: ": "ワークスペースを開けませんでした: ", "Workspace save failed: ": "ワークスペースを保存できませんでした: ", "Layer settings failed: ": "レイヤー設定に失敗しました: ", "Layer reload failed: ": "レイヤーを再読み込みできませんでした: ", "Attribute page failed: ": "属性ページを表示できませんでした: ", "Attribute page exceeds the 16 MiB display payload limit": "属性ページが16 MiBの表示上限を超えました", "Render stopped: ": "描画を停止しました: ", "Render error: ": "描画エラー: ", "Render skipped: ": "描画を省略しました: ", "Label display skipped: ": "ラベル表示を省略しました: ", "Loading ": "読み込み中: ", "Saving ": "保存中: ", "Saved ": "保存しました: ", "Workspace saved ": "ワークスペースを保存しました: ", "Workspace loaded ": "ワークスペースを開きました: ", "Workspace loaded; relink unavailable layers: ": "ワークスペースを開きました。再リンクが必要なレイヤー: ", "Loading workspace ": "ワークスペースを読み込み中: ", "Add files requires the native GDAL build": "ファイル追加にはGDAL対応デスクトップビルドが必要です", "Reopening layer source with selected encoding": "選択した文字コードでレイヤーソースを再読み込み中", "Layer source reloaded": "レイヤーソースを再読み込みしました", "Vertex edit failed: ": "頂点編集に失敗しました: ", "Vertex moved": "頂点を移動しました", "No visible layers": "表示中のレイヤーがありません", "No vector files selected": "ベクターファイルが選択されていません", "A file load is already in progress": "ファイルを読み込み中です", "Selected source is already loaded": "選択したソースは既に開いています", "Cannot add files until the read-only source is ready": "読み取り専用ソースの準備完了後に追加できます", "Open cancelled": "開く操作をキャンセルしました", "Save cancelled": "保存をキャンセルしました", "Dataset has at least ": "地物数が少なくとも "}
         }[language] || {};
+        if (statusDictionaryCache[language] === undefined)
+            statusDictionaryCache[language] = dictionary;
         if (status.indexOf("Dataset has at least ") === 0) {
             var count = status.substring("Dataset has at least ".length).split(" features;")[0];
             if (language === "ko") return "피처 " + count + "개 이상 · 메모리 보호를 위해 읽기 전용으로 열었습니다";
@@ -218,7 +226,11 @@ ApplicationWindow {
         var exact = dictionary[status];
         if (exact !== undefined) return exact;
         if (status.indexOf("Workspace loaded; relink unavailable layers: ") === 0 && language === "ko") return "작업공간을 열었습니다. 다시 연결할 레이어: " + status.substring("Workspace loaded; relink unavailable layers: ".length);
-        var prefixes = Object.keys(dictionary).sort(function(a, b) { return b.length - a.length; });
+        var prefixes = statusPrefixCache[language];
+        if (prefixes === undefined) {
+            prefixes = Object.keys(dictionary).sort(function(a, b) { return b.length - a.length; });
+            statusPrefixCache[language] = prefixes;
+        }
         for (var i = 0; i < prefixes.length; ++i) {
             if (status.indexOf(prefixes[i]) === 0) return dictionary[prefixes[i]] + status.substring(prefixes[i].length);
         }
@@ -757,6 +769,7 @@ ApplicationWindow {
                 cacheBuffer: 0
                 model: mapViewport.postGISTables
                 delegate: ItemDelegate {
+                    required property var modelData
                     width: ListView.view.width
                     text: modelData.schema + "." + modelData.name + "  ·  SRID " + modelData.srid
                     onClicked: {
@@ -880,6 +893,7 @@ ApplicationWindow {
             }
         }
         property var searchResultEntries: []
+        property var catalogEntryIndex: ({})
         property var commonCodes: ["EPSG:5186", "EPSG:5179", "EPSG:4326", "EPSG:3857", "EPSG:32652"]
         property var countryOptions: [
             {ko: "대한민국", jp: "韓国", en: "South Korea", aliases: ["korea"], featured: ["EPSG:5186", "EPSG:5179"]},
@@ -896,12 +910,17 @@ ApplicationWindow {
             {ko: "뉴질랜드", jp: "ニュージーランド", en: "New Zealand", aliases: ["new zealand"], featured: ["EPSG:2193"]}
         ]
         function catalogEntry(code) {
+            return catalogEntryIndex[code] || null;
+        }
+        function rebuildCatalogEntryIndex() {
+            var next = {};
             var entries = catalogResponse.entries || [];
             for (var i = 0; i < entries.length; ++i) {
-                if (entries[i].code === code)
-                    return entries[i];
+                var entry = entries[i];
+                if (entry && entry.code && next[entry.code] === undefined)
+                    next[entry.code] = entry;
             }
-            return null;
+            catalogEntryIndex = next;
         }
         function entriesForCodes(codes) {
             var result = [];
@@ -982,8 +1001,12 @@ ApplicationWindow {
             repeat: false
             onTriggered: projectCRSDialog.refreshSearchEntries()
         }
-        onCatalogResponseChanged: scheduleSearchRefresh()
+        onCatalogResponseChanged: {
+            rebuildCatalogEntryIndex();
+            scheduleSearchRefresh();
+        }
         onOpened: {
+            rebuildCatalogEntryIndex();
             projectCRSField.text = mapViewport.dataCRS || "";
             crsCategoryTabs.currentIndex = 0;
             countryChoice.currentIndex = countryIndexForCurrentCRS();
@@ -1046,6 +1069,8 @@ ApplicationWindow {
                     cacheBuffer: 0
                     model: projectCRSDialog.entriesForCodes(projectCRSDialog.commonCodes)
                     delegate: ItemDelegate {
+                        required property var modelData
+                        required property int index
                         width: ListView.view.width
                         text: modelData.code + "  " + modelData.name
                         highlighted: projectCRSField.text === modelData.code
@@ -1078,6 +1103,8 @@ ApplicationWindow {
                         cacheBuffer: 0
                         model: projectCRSDialog.countryEntries(countryChoice.currentIndex)
                         delegate: ItemDelegate {
+                            required property var modelData
+                            required property int index
                             width: ListView.view.width
                             text: modelData.code + "  " + modelData.name
                             highlighted: projectCRSField.text === modelData.code
@@ -1111,6 +1138,8 @@ ApplicationWindow {
                         cacheBuffer: 0
                         model: projectCRSDialog.searchResultEntries
                         delegate: ItemDelegate {
+                            required property var modelData
+                            required property int index
                             width: ListView.view.width
                             text: modelData.code + "  " + modelData.name
                             highlighted: projectCRSField.text === modelData.code
@@ -1177,6 +1206,7 @@ ApplicationWindow {
                     objectName: "presetColorRepeater"
                     model: layerColorPicker.presetColors
                     delegate: Rectangle {
+                        required property string modelData
                         width: 32
                         height: 32
                         radius: 4
@@ -1287,9 +1317,15 @@ ApplicationWindow {
                         objectName: "layerModel"
                     }
                     delegate: CheckDelegate {
+                        required property string name
+                        required property string displayName
+                        required property string sourceError
+                        required property bool layerVisible
+                        required property int index
                         objectName: "layerDelegate_" + name
                         width: ListView.view.width
-                        text: (model.sourceError ? "⚠ " : "") + (typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName)
+                        implicitHeight: 36
+                        text: (sourceError ? "⚠ " : "") + (displayName === "" ? name : displayName)
                         checked: layerVisible
                         onClicked: {
                             if (index < 0 || index >= layerModel.count || layerModel.get(index).name !== name)
@@ -1992,6 +2028,7 @@ ApplicationWindow {
                     objectName: "mapLabelRepeater"
                     model: mapLabelModel.rows
                     delegate: Text {
+                        required property var modelData
                         property var label: modelData
                         z: 2
                         x: mapCanvas.x + mapCanvas.width / 2 + (label.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2 + Number(label.offsetXmm || 0) * mapCanvas.logicalPixelsPerMm
@@ -2019,6 +2056,7 @@ ApplicationWindow {
                     // while vertex editing is not active.
                     model: rootWindow.vertexEditMode && mapCanvas.visible ? vertexHandleModel.rows : []
                     delegate: Rectangle {
+                        required property var modelData
                         id: vertexHandle
                         property var handle: modelData || ({})
                         property alias dragArea: vertexMouseArea
@@ -2644,12 +2682,15 @@ ApplicationWindow {
                     cacheBuffer: 0
                     model: layerModel
                     delegate: TabButton {
+                        required property string name
+                        required property string displayName
+                        required property int index
                         width: implicitWidth
                         checked: ListView.isCurrentItem
-                        text: typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName
+                        text: displayName === "" ? name : displayName
                         onClicked: {
                             ListView.view.currentIndex = index;
-                            mapViewport.selectLayer(model.name);
+                            mapViewport.selectLayer(name);
                         }
                     }
                 }
@@ -2773,6 +2814,7 @@ ApplicationWindow {
                     cacheBuffer: 0
                     spacing: 6
                     delegate: Rectangle {
+                        required property var modelData
                         id: featureCard
                         width: ListView.view.width
                         property var row: modelData || ({})
@@ -3729,6 +3771,7 @@ ApplicationWindow {
                 model: mapViewport.attributeFieldHints
                 spacing: 4
                 delegate: Button {
+                    required property var modelData
                     objectName: "labelFieldHintRow"
                     width: labelFieldList.width
                     text: modelData.name + "  ·  " + (modelData.type || "unknown")

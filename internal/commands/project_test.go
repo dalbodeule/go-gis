@@ -342,6 +342,26 @@ func TestFeatureIndexBuildsOnlyRequestedLayer(t *testing.T) {
 	}
 }
 
+func TestLayerIndexServesPropertyAndGeometryAcrossLayers(t *testing.T) {
+	service, err := NewProjectServiceWithLayers("demo", core.CRS{}, []core.Layer{
+		{Name: "roads", Features: []core.Feature{{ID: 1, Properties: map[string]any{"name": "road"}}}},
+		{Name: "buildings", Features: []core.Feature{{ID: 7, Geometry: core.WKTGeometry{WKT: "POINT (1 2)"}, Properties: map[string]any{"name": "building"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := service.FeatureProperty("buildings", 7, "name"); !ok || value != "building" {
+		t.Fatalf("property = %#v, ok=%v", value, ok)
+	}
+	geometry, ok := service.FeatureGeometry("buildings", 7)
+	if !ok || geometry.GeometryType() != "POINT" {
+		t.Fatalf("geometry = %#v, ok=%v", geometry, ok)
+	}
+	if got := service.layerIndex["buildings"]; got != 1 {
+		t.Fatalf("buildings layer index = %d, want 1", got)
+	}
+}
+
 type recordingLayerWriter struct {
 	destination string
 	layer       core.Layer

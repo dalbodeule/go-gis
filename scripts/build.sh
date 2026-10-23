@@ -95,11 +95,17 @@ build_desktop() {
 		*" -std=c++17 "*|*" -std=gnu++17 "*) ;;
 		*) cgo_cxxflags="${cgo_cxxflags} -std=c++17" ;;
 	esac
-	CGO_CXXFLAGS="${cgo_cxxflags# }" \
-		GOCACHE="${GOCACHE_DIR}" \
-		go build "${app_ldflags[@]}" -tags qt \
-			-o "${BUILD_DIR}/gogis-desktop" \
-			"${ROOT_DIR}/cmd/gis-desktop"
+		if ((${#app_ldflags[@]})); then
+			CGO_CXXFLAGS="${cgo_cxxflags# }" GOCACHE="${GOCACHE_DIR}" \
+				go build "${app_ldflags[@]}" -tags qt \
+				-o "${BUILD_DIR}/gogis-desktop" \
+				"${ROOT_DIR}/cmd/gis-desktop"
+		else
+			CGO_CXXFLAGS="${cgo_cxxflags# }" GOCACHE="${GOCACHE_DIR}" \
+				go build -tags qt \
+				-o "${BUILD_DIR}/gogis-desktop" \
+				"${ROOT_DIR}/cmd/gis-desktop"
+		fi
 }
 
 build_desktop_native() {
@@ -113,11 +119,17 @@ build_desktop_native() {
 		*" -std=c++17 "*|*" -std=gnu++17 "*) ;;
 		*) cgo_cxxflags="${cgo_cxxflags} -std=c++17" ;;
 	esac
-	CGO_CXXFLAGS="${cgo_cxxflags# }" \
-		GOCACHE="${GOCACHE_DIR}" \
-		go build "${app_ldflags[@]}" -tags "qt native" \
-			-o "${BUILD_DIR}/gogis-desktop-native" \
-			"${ROOT_DIR}/cmd/gis-desktop"
+		if ((${#app_ldflags[@]})); then
+			CGO_CXXFLAGS="${cgo_cxxflags# }" GOCACHE="${GOCACHE_DIR}" \
+				go build "${app_ldflags[@]}" -tags "qt native" \
+				-o "${BUILD_DIR}/gogis-desktop-native" \
+				"${ROOT_DIR}/cmd/gis-desktop"
+		else
+			CGO_CXXFLAGS="${cgo_cxxflags# }" GOCACHE="${GOCACHE_DIR}" \
+				go build -tags "qt native" \
+				-o "${BUILD_DIR}/gogis-desktop-native" \
+				"${ROOT_DIR}/cmd/gis-desktop"
+		fi
 }
 
 target="${1:-cli}"
