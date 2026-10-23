@@ -42,6 +42,14 @@ type Store struct {
 	Table string
 }
 
+// TableInfo is the QGIS-style catalog entry exposed by ListTables.
+type TableInfo struct {
+	Schema         string
+	Name           string
+	GeometryColumn string
+	SRID           int
+}
+
 var _ drivers.TransactionalStore = (*Store)(nil)
 
 // Open opens a pgx-backed database/sql connection.
@@ -58,6 +66,49 @@ func Open(ctx context.Context, dsn, table string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{DB: db, Table: table}, nil
+}
+
+// ListTables returns user tables visible to the connection. It reads
+// PostgreSQL metadata so the result can drive a table picker like QGIS.
+func ListTables(ctx context.Context, dsn, schema string) ([]TableInfo, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, fmt.Errorf("PostGIS database is not configured")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	const query = `SELECT t.table_schema, t.table_name,
+    COALESCE(g.f_geometry_column, ''), COALESCE(g.srid, 0)
+FROM information_schema.tables t
+LEFT JOIN geometry_columns g
+  ON g.f_table_schema = t.table_schema AND g.f_table_name = t.table_name
+WHERE t.table_type = 'BASE TABLE'
+  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND g.f_geometry_column IS NOT NULL
+  AND ($1 = '' OR t.table_schema = $1)
+ORDER BY t.table_schema, t.table_name`
+	rows, err := db.QueryContext(ctx, query, strings.TrimSpace(schema))
+	if err != nil {
+		return nil, fmt.Errorf("list PostGIS tables: %w", err)
+	}
+	defer rows.Close()
+	var result []TableInfo
+	for rows.Next() {
+		var table TableInfo
+		if err := rows.Scan(&table.Schema, &table.Name, &table.GeometryColumn, &table.SRID); err != nil {
+			return nil, fmt.Errorf("scan PostGIS table: %w", err)
+		}
+		result = append(result, table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate PostGIS tables: %w", err)
+	}
+	return result, nil
 }
 
 // Close closes the database connection.
@@ -187,6 +238,39 @@ func (s *Store) SaveLayer(ctx context.Context, layer core.Layer) error {
 	return tx.Commit(ctx)
 }
 
+// AppendFeature adds one feature to the configured table in its own
+// transaction. The geometry CRS is supplied explicitly because a feature does
+// not carry CRS metadata in the core model.
+func (s *Store) AppendFeature(ctx context.Context, crs core.CRS, feature core.Feature) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := tx.EnsureSchema(ctx); err != nil {
+		return err
+	}
+	if err := tx.InsertFeature(ctx, crs, feature); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// DeleteFeature removes one feature by its stable numeric ID in an atomic
+// transaction. A missing ID is reported as an error so the caller cannot
+// silently claim that a record was removed when it was not present.
+func (s *Store) DeleteFeature(ctx context.Context, id uint64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := tx.DeleteFeature(ctx, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // Transaction is an all-or-nothing PostGIS writer.
 type Transaction struct {
 	tx    *sql.Tx
@@ -224,17 +308,52 @@ func (t *Transaction) WriteLayer(ctx context.Context, layer core.Layer) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		geometry, err := core.ToWKT(feature.Geometry)
-		if err != nil {
-			return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+		if err := t.insertFeatureWithSRID(ctx, query, srid, feature); err != nil {
+			return err
 		}
-		properties, err := json.Marshal(feature.Properties)
-		if err != nil {
-			return fmt.Errorf("feature %d properties: %w", feature.ID, err)
-		}
-		if _, err := t.tx.ExecContext(ctx, query, feature.ID, geometry.WKT, srid, properties); err != nil {
-			return fmt.Errorf("insert feature %d: %w", feature.ID, err)
-		}
+	}
+	return nil
+}
+
+// InsertFeature inserts one feature into the active transaction.
+func (t *Transaction) InsertFeature(ctx context.Context, crs core.CRS, feature core.Feature) error {
+	srid, err := srid(crs.AuthorityCode)
+	if err != nil {
+		return err
+	}
+	return t.insertFeatureWithSRID(ctx, insertLayerQuery(t.table), srid, feature)
+}
+
+func (t *Transaction) insertFeatureWithSRID(ctx context.Context, query string, srid int, feature core.Feature) error {
+	geometry, err := core.ToWKT(feature.Geometry)
+	if err != nil {
+		return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+	}
+	properties, err := json.Marshal(feature.Properties)
+	if err != nil {
+		return fmt.Errorf("feature %d properties: %w", feature.ID, err)
+	}
+	if _, err := t.tx.ExecContext(ctx, query, feature.ID, geometry.WKT, srid, properties); err != nil {
+		return fmt.Errorf("insert feature %d: %w", feature.ID, err)
+	}
+	return nil
+}
+
+// DeleteFeature deletes one feature from the active transaction.
+func (t *Transaction) DeleteFeature(ctx context.Context, id uint64) error {
+	if id > uint64(^uint64(0)>>1) {
+		return fmt.Errorf("feature ID %d exceeds PostgreSQL BIGINT", id)
+	}
+	result, err := t.tx.ExecContext(ctx, deleteFeatureQuery(t.table), int64(id))
+	if err != nil {
+		return fmt.Errorf("delete feature %d: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect delete feature %d: %w", id, err)
+	}
+	if count != 1 {
+		return fmt.Errorf("feature %d not found", id)
 	}
 	return nil
 }
@@ -275,6 +394,10 @@ func schemaQuery(table string) string {
 
 func insertLayerQuery(table string) string {
 	return fmt.Sprintf("INSERT INTO %s (id, geom, properties) VALUES ($1, ST_GeomFromText($2, $3), $4::jsonb)", quoteIdentifier(table))
+}
+
+func deleteFeatureQuery(table string) string {
+	return fmt.Sprintf("DELETE FROM %s WHERE id = $1", quoteIdentifier(table))
 }
 
 func readLayerQuery(table string) string {

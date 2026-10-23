@@ -106,6 +106,20 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 	if err := store.SaveLayer(ctx, initial); err != nil {
 		t.Fatalf("save initial snapshot: %v", err)
 	}
+	tables, err := ListTables(ctx, dsn, "public")
+	if err != nil {
+		t.Fatalf("list PostGIS tables: %v", err)
+	}
+	foundTable := false
+	for _, tableInfo := range tables {
+		if tableInfo.Schema == "public" && tableInfo.Name == table {
+			foundTable = true
+			break
+		}
+	}
+	if !foundTable {
+		t.Fatalf("table %q was not returned by catalog listing: %+v", table, tables)
+	}
 
 	// The first replacement insert succeeds, then malformed WKT makes the next
 	// PostGIS insert fail after the previous snapshot has been deleted. The
@@ -129,6 +143,23 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 	if len(got.Features) != 1 || got.Features[0].ID != 1 || got.Features[0].Properties["version"] != "original" {
 		t.Fatalf("failed replacement did not roll back atomically: %+v", got.Features)
 	}
+
+	if err := store.AppendFeature(ctx, initial.CRS, core.Feature{
+		ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (128 38)"}, Properties: map[string]any{"version": "appended"},
+	}); err != nil {
+		t.Fatalf("append feature: %v", err)
+	}
+	got, err = store.ReadLayer(ctx)
+	if err != nil || len(got.Features) != 2 {
+		t.Fatalf("read after append: features=%d err=%v", len(got.Features), err)
+	}
+	if err := store.DeleteFeature(ctx, 2); err != nil {
+		t.Fatalf("delete feature: %v", err)
+	}
+	got, err = store.ReadLayer(ctx)
+	if err != nil || len(got.Features) != 1 || got.Features[0].ID != 1 {
+		t.Fatalf("read after delete: %+v err=%v", got.Features, err)
+	}
 }
 
 func TestQuoteIdentifierQuotesEachPart(t *testing.T) {
@@ -147,6 +178,9 @@ func TestPostGISWriteQueriesQuoteRawIdentifierOnce(t *testing.T) {
 	}
 	if got, want := insertLayerQuery(table), `INSERT INTO "gis"."roads" (id, geom, properties) VALUES ($1, ST_GeomFromText($2, $3), $4::jsonb)`; got != want {
 		t.Fatalf("insert query = %q, want %q", got, want)
+	}
+	if got, want := deleteFeatureQuery(table), `DELETE FROM "gis"."roads" WHERE id = $1`; got != want {
+		t.Fatalf("delete query = %q, want %q", got, want)
 	}
 }
 

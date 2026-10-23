@@ -202,7 +202,7 @@ func desktopLanguageArgs(args []string) (string, []string) {
 				i++
 			}
 			continue
-		} else if arg == "--input" || arg == "--layer" || arg == "--source-crs" ||
+		} else if arg == "--input" || arg == "--layer" || arg == "--postgis-table" || arg == "--source-crs" ||
 			arg == "--target-crs" || arg == "--save" {
 			// These are GoGIS startup options. Passing them through makes
 			// QApplication parse them as Qt options before the data loader can
@@ -298,6 +298,8 @@ type demoRuntime struct {
 	attributeGeneration         uint64
 	attributeDispatchGeneration uint64
 	attributeCancel             context.CancelFunc
+	operationCancel             context.CancelFunc
+	operationGeneration         uint64
 	featureNameCacheLayer       string
 	featureNameCacheID          uint64
 	featureNameCacheValue       string
@@ -1881,7 +1883,14 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 	r.mu.Lock()
 	selected, ok := r.selected, r.hasSelect
 	readOnly := r.readOnly
+	service := r.service
 	r.mu.Unlock()
+	if event.Action == "addFeature" {
+		if err := r.addFeature(event.Value); err != nil {
+			native.SetRenderStatus("Record add failed: " + err.Error())
+		}
+		return
+	}
 	if !ok {
 		return
 	}
@@ -1893,6 +1902,38 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		}
 		r.mu.Unlock()
 		native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), name, "Read-only mode")
+		return
+	}
+	if event.Action == "deleteConfirmed" {
+		if service == nil {
+			native.SetRenderStatus("Record delete failed: project is unavailable")
+			return
+		}
+		if err := service.BeginEdit(); err != nil {
+			native.SetRenderStatus("Record delete failed: " + err.Error())
+			return
+		}
+		if err := service.DeleteFeature(selected.Layer, selected.FeatureID); err != nil {
+			_ = service.Rollback()
+			native.SetRenderStatus("Record delete failed: " + err.Error())
+			return
+		}
+		if err := service.Commit(); err != nil {
+			native.SetRenderStatus("Record delete failed: " + err.Error())
+			return
+		}
+		if err := r.rebuildEditedLayer(selected.Layer); err != nil {
+			native.SetRenderStatus("Record deleted; render refresh failed: " + err.Error())
+			return
+		}
+		if r.persist != nil {
+			if err := r.persist(context.Background(), selected.Layer); err != nil {
+				native.SetRenderStatus("Record deleted in memory; save failed: " + err.Error())
+				return
+			}
+		}
+		native.SetSelection("", "", "", "Record deleted")
+		r.republishAttributesAsync(selected.Layer)
 		return
 	}
 	if event.Action == "moveVertex" {
@@ -1933,6 +1974,51 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 		return
 	}
 	native.SetSelection(selected.Layer, fmt.Sprintf("%s segment #%d", selected.Layer, selected.FeatureID), event.Value, "Property saved in memory")
+}
+
+func (r *demoRuntime) addFeature(value string) error {
+	var request struct {
+		Layer      string         `json:"layer"`
+		ID         uint64         `json:"id"`
+		WKT        string         `json:"wkt"`
+		Properties map[string]any `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(value), &request); err != nil {
+		return fmt.Errorf("invalid record payload: %w", err)
+	}
+	request.Layer = strings.TrimSpace(request.Layer)
+	request.WKT = strings.TrimSpace(request.WKT)
+	if request.Layer == "" || request.WKT == "" {
+		return fmt.Errorf("layer and WKT are required")
+	}
+	r.mu.Lock()
+	service := r.service
+	readOnly := r.readOnly
+	r.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	if err := service.BeginEdit(); err != nil {
+		return err
+	}
+	if err := service.AddFeature(request.Layer, core.Feature{ID: request.ID, Geometry: core.WKTGeometry{WKT: request.WKT}, Properties: request.Properties}); err != nil {
+		_ = service.Rollback()
+		return err
+	}
+	if err := service.Commit(); err != nil {
+		return err
+	}
+	if err := r.rebuildEditedLayer(request.Layer); err != nil {
+		return err
+	}
+	if r.persist != nil {
+		if err := r.persist(context.Background(), request.Layer); err != nil {
+			return fmt.Errorf("save record: %w", err)
+		}
+	}
+	r.republishAttributesAsync(request.Layer)
+	native.SetRenderStatus("Record added")
+	return nil
 }
 
 func (r *demoRuntime) moveSelectedVertex(selected render.HitResult, value string) error {
@@ -2025,6 +2111,7 @@ func (r *demoRuntime) cancelCurrentRender() {
 	r.mu.Lock()
 	renderCancel := r.cancel
 	loadCancel := r.loadCancel
+	operationCancel := r.operationCancel
 	loading := loadCancel != nil
 	if loading {
 		r.loadGeneration++
@@ -2039,10 +2126,15 @@ func (r *demoRuntime) cancelCurrentRender() {
 	if loadCancel != nil {
 		loadCancel()
 	}
+	if operationCancel != nil {
+		operationCancel()
+	}
 	if loading {
 		native.SetRenderStatus("Loading cancelled")
 	} else if renderCancel != nil {
 		native.SetRenderStatus("Render cancelled")
+	} else if operationCancel != nil {
+		native.SetRenderStatus("Spatial operation cancelled")
 	}
 }
 
@@ -2069,10 +2161,18 @@ func startViewportSync(runtime *demoRuntime) {
 	lastAttributePageGeneration := native.AttributePageGeneration()
 	lastLoadGeneration := native.LoadGeneration()
 	lastSaveGeneration := native.SaveGeneration()
+	lastSpatialGeneration := native.SpatialGeneration()
 	go func() {
 		var viewportChangedAt time.Time
 		pendingViewportRefresh := false
 		for range time.NewTicker(16 * time.Millisecond).C {
+			spatialGeneration := native.SpatialGeneration()
+			if spatialGeneration != lastSpatialGeneration {
+				lastSpatialGeneration = spatialGeneration
+				if err := applySpatialRequest(runtime, native.CurrentSpatialRequest()); err != nil {
+					native.SetRenderStatus("Spatial operation failed: " + err.Error())
+				}
+			}
 			saveGeneration := native.SaveGeneration()
 			if saveGeneration != lastSaveGeneration {
 				lastSaveGeneration = saveGeneration
@@ -2208,6 +2308,14 @@ type layerSettingsRequest struct {
 	Style           core.LayerStyle    `json:"style"`
 	Labels          core.LabelSettings `json:"labels"`
 	DisplayRule     string             `json:"displayRule,omitempty"`
+}
+
+type spatialOperationRequest struct {
+	Operation string  `json:"operation"`
+	Left      string  `json:"left"`
+	Right     string  `json:"right"`
+	Result    string  `json:"result"`
+	Distance  float64 `json:"distance"`
 }
 
 func applyLayerSettings(runtime *demoRuntime, payload string) error {

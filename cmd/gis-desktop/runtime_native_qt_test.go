@@ -4752,6 +4752,15 @@ func TestDesktopInputArgsIncludesCRSOverrides(t *testing.T) {
 	}
 }
 
+func TestDesktopInputArgsSupportsPostGISTable(t *testing.T) {
+	input, layer, sourceCRS, targetCRS := desktopInputArgs([]string{
+		"gogis-desktop", "--postgis-table", "public.roads", "--target-crs", "EPSG:5179",
+	})
+	if input != "postgis://public.roads" || layer != "" || sourceCRS != "" || targetCRS != "EPSG:5179" {
+		t.Fatalf("unexpected PostGIS desktop args: %q %q %q %q", input, layer, sourceCRS, targetCRS)
+	}
+}
+
 func TestDesktopReadOnlyFlag(t *testing.T) {
 	if !desktopReadOnly([]string{"gogis-desktop", "--read-only"}) {
 		t.Fatal("read-only flag was not detected")

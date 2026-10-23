@@ -537,6 +537,31 @@ func (s *ProjectService) AddFeature(layerName string, feature core.Feature) erro
 	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
 }
 
+// DeleteFeature removes one feature from an editable layer in the active edit.
+func (s *ProjectService) DeleteFeature(layerName string, featureID uint64) error {
+	if s.draft == nil {
+		return ErrEditNotActive
+	}
+	for layerIndex := range s.draft.Layers {
+		layer := &s.draft.Layers[layerIndex]
+		if layer.Name != layerName {
+			continue
+		}
+		if !layer.Editable {
+			return fmt.Errorf("layer %q is not editable", layerName)
+		}
+		for featureIndex, feature := range layer.Features {
+			if feature.ID != featureID {
+				continue
+			}
+			layer.Features = append(layer.Features[:featureIndex], layer.Features[featureIndex+1:]...)
+			return nil
+		}
+		return fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
+	}
+	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
+}
+
 // SetFeatureProperty changes one property in a layer within the active edit.
 func (s *ProjectService) SetFeatureProperty(layerName string, featureID uint64, field string, value any) error {
 	if s.draft == nil {

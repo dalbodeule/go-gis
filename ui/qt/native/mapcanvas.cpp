@@ -78,6 +78,9 @@ std::atomic<unsigned long long> g_layer_visibility_generation{0};
 std::mutex g_layer_settings_mutex;
 std::string g_layer_settings_payload;
 std::atomic<unsigned long long> g_layer_settings_generation{0};
+std::mutex g_spatial_mutex;
+std::string g_spatial_payload;
+std::atomic<unsigned long long> g_spatial_generation{0};
 std::mutex g_edit_mutex;
 std::string g_edit_action;
 std::string g_edit_value;
@@ -312,6 +315,13 @@ public:
                 std::lock_guard<std::mutex> lock(g_layer_settings_mutex);
                 g_layer_settings_payload = property("layerSettingsPayload").toString().toStdString();
                 g_layer_settings_generation.store(settings_generation, std::memory_order_relaxed);
+            }
+
+            const auto spatial_generation = property("spatialGeneration").toULongLong();
+            if (spatial_generation != g_spatial_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_spatial_mutex);
+                g_spatial_payload = property("spatialPayload").toString().toStdString();
+                g_spatial_generation.store(spatial_generation, std::memory_order_relaxed);
             }
 
             const auto edit_generation = property("editGeneration").toULongLong();
@@ -893,6 +903,20 @@ extern "C" void gogis_layer_settings(char* buffer, int buffer_length) {
     std::lock_guard<std::mutex> lock(g_layer_settings_mutex);
     const auto copy_length = std::min<size_t>(g_layer_settings_payload.size(), static_cast<size_t>(buffer_length - 1));
     std::memcpy(buffer, g_layer_settings_payload.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
+extern "C" unsigned long long gogis_spatial_generation(void) {
+    return g_spatial_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_spatial_request(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_spatial_mutex);
+    const auto copy_length = std::min<size_t>(g_spatial_payload.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_spatial_payload.data(), copy_length);
     buffer[copy_length] = '\0';
 }
 

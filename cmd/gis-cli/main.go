@@ -66,6 +66,21 @@ type scriptOptions struct {
 	outputLayer string
 }
 
+type postGISOptions struct {
+	input   string
+	output  string
+	dsn     string
+	table   string
+	layer   string
+	profile string
+	id      uint64
+	idSet   bool
+	wkt     string
+	crs     string
+	props   string
+	schema  string
+}
+
 type stringListFlag []string
 
 func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
@@ -86,13 +101,18 @@ func main() {
 
 	if *help || flag.NArg() == 0 {
 		fmt.Fprintln(os.Stdout, "gogis CLI")
-		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label|script]")
+		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label|script|postgis-list|postgis-import|postgis-export|postgis-insert|postgis-delete]")
 		fmt.Fprintln(os.Stdout, "       gis-cli convert --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli spatial --operation OP --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli merge --input SOURCE --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli filter --input SOURCE --field FIELD --value VALUE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli label --input SOURCE --field FIELD --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli script --input SOURCE --script FILE.lua [--output RESULT.gpkg] [--output-layer NAME]")
+		fmt.Fprintln(os.Stdout, "       gis-cli postgis-import --input SOURCE --dsn DSN --table schema.table [--layer NAME]")
+		fmt.Fprintln(os.Stdout, "       gis-cli postgis-list --dsn DSN [--schema SCHEMA]")
+		fmt.Fprintln(os.Stdout, "       gis-cli postgis-export --dsn DSN --table schema.table --output FILE [--profile PROFILE]")
+		fmt.Fprintln(os.Stdout, "       gis-cli postgis-insert --dsn DSN --table schema.table --id ID --wkt WKT --crs EPSG:4326 [--properties JSON]")
+		fmt.Fprintln(os.Stdout, "       gis-cli postgis-delete --dsn DSN --table schema.table --id ID")
 		return
 	}
 
@@ -157,10 +177,77 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "postgis-list", "postgis-import", "postgis-export", "postgis-insert", "postgis-delete":
+		options, err := parsePostGISOptions(flag.Arg(0), flag.Args()[1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := runPostGIS(context.Background(), flag.Arg(0), options); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", flag.Arg(0))
 		os.Exit(2)
 	}
+}
+
+func parsePostGISOptions(command string, args []string) (postGISOptions, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	options := postGISOptions{}
+	flags.StringVar(&options.input, "input", "", "local input SHP or GeoPackage path")
+	flags.StringVar(&options.output, "output", "", "local output DXF, GeoPackage, or Shapefile path")
+	flags.StringVar(&options.dsn, "dsn", "", "PostgreSQL connection string")
+	flags.StringVar(&options.table, "table", "", "PostGIS table, optionally schema-qualified")
+	flags.StringVar(&options.layer, "layer", "", "input layer name")
+	flags.StringVar(&options.profile, "profile", "ares-utf8", "DXF profile: ares-utf8 or ares-cp949")
+	flags.Uint64Var(&options.id, "id", 0, "feature ID")
+	flags.StringVar(&options.wkt, "wkt", "", "feature geometry as WKT")
+	flags.StringVar(&options.crs, "crs", "", "feature CRS, for example EPSG:4326")
+	flags.StringVar(&options.props, "properties", "{}", "feature properties as JSON object")
+	flags.StringVar(&options.schema, "schema", "", "optional PostgreSQL schema filter")
+	if err := flags.Parse(args); err != nil {
+		return postGISOptions{}, err
+	}
+	for _, arg := range args {
+		if arg == "--id" || strings.HasPrefix(arg, "--id=") {
+			options.idSet = true
+			break
+		}
+	}
+	if options.dsn == "" || options.table == "" {
+		if command != "postgis-list" || options.dsn == "" {
+			return postGISOptions{}, fmt.Errorf("%s requires --dsn and --table", command)
+		}
+	}
+	switch command {
+	case "postgis-list":
+		// The DSN is the only required value for a catalog request.
+	case "postgis-import":
+		if options.input == "" {
+			return postGISOptions{}, fmt.Errorf("postgis-import requires --input")
+		}
+	case "postgis-export":
+		if options.output == "" {
+			return postGISOptions{}, fmt.Errorf("postgis-export requires --output")
+		}
+	case "postgis-insert":
+		if options.wkt == "" || options.crs == "" || !options.idSet {
+			return postGISOptions{}, fmt.Errorf("postgis-insert requires --id, --wkt, and --crs")
+		}
+	case "postgis-delete":
+		if !options.idSet {
+			return postGISOptions{}, fmt.Errorf("postgis-delete requires --id")
+		}
+	default:
+		return postGISOptions{}, fmt.Errorf("unsupported PostGIS command %q", command)
+	}
+	if flags.NArg() != 0 {
+		return postGISOptions{}, fmt.Errorf("unexpected %s arguments: %v", command, flags.Args())
+	}
+	return options, nil
 }
 
 func parseScriptOptions(args []string) (scriptOptions, error) {

@@ -496,6 +496,12 @@ ApplicationWindow {
             }
         }
         MenuItem {
+            objectName: "spatialOperationAction"
+            text: rootWindow.language === "ko" ? "공간 연산…" : rootWindow.language === "jp" ? "空間演算…" : "Spatial operation…"
+            enabled: layerModel.count > 0
+            onTriggered: spatialOperationDialog.open()
+        }
+        MenuItem {
             objectName: "saveWorkspaceAction"
             text: rootWindow.tr("Save workspace")
             onTriggered: workspaceDialog.open()
@@ -540,6 +546,145 @@ ApplicationWindow {
                 removeLayerDialog.targetLayerName = layerContextMenu.targetLayerName;
                 removeLayerDialog.open();
             }
+        }
+    }
+
+    Dialog {
+        id: spatialOperationDialog
+        objectName: "spatialOperationDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "공간 연산" : rootWindow.language === "jp" ? "空間演算" : "Spatial operation"
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        width: Math.min(520, rootWindow.width - 48)
+        property string selectedOperation: spatialOperationChoice.currentValue
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label { text: rootWindow.language === "ko" ? "연산" : rootWindow.language === "jp" ? "演算" : "Operation" }
+            ComboBox {
+                id: spatialOperationChoice
+                objectName: "spatialOperationChoice"
+                Layout.fillWidth: true
+                model: ["intersect", "union", "difference", "buffer"]
+                onCurrentValueChanged: spatialRightLabel.visible = currentValue !== "buffer"
+            }
+            Label { text: rootWindow.language === "ko" ? "왼쪽 레이어" : rootWindow.language === "jp" ? "左レイヤー" : "Left layer" }
+            ComboBox {
+                id: spatialLeftChoice
+                objectName: "spatialLeftChoice"
+                Layout.fillWidth: true
+                model: layerModel
+                textRole: "displayName"
+            }
+            Label {
+                id: spatialRightLabel
+                text: rootWindow.language === "ko" ? "오른쪽 레이어" : rootWindow.language === "jp" ? "右レイヤー" : "Right layer"
+                visible: spatialOperationChoice.currentValue !== "buffer"
+            }
+            ComboBox {
+                id: spatialRightChoice
+                objectName: "spatialRightChoice"
+                Layout.fillWidth: true
+                model: layerModel
+                textRole: "displayName"
+                visible: spatialOperationChoice.currentValue !== "buffer"
+            }
+            Label {
+                text: rootWindow.language === "ko" ? "결과 레이어 이름" : rootWindow.language === "jp" ? "結果レイヤー名" : "Result layer name"
+            }
+            TextField {
+                id: spatialResultName
+                objectName: "spatialResultName"
+                Layout.fillWidth: true
+                placeholderText: "result"
+            }
+            Label {
+                text: rootWindow.language === "ko" ? "버퍼 거리" : rootWindow.language === "jp" ? "バッファ距離" : "Buffer distance"
+                visible: spatialOperationChoice.currentValue === "buffer"
+            }
+            TextField {
+                id: spatialDistance
+                objectName: "spatialDistance"
+                Layout.fillWidth: true
+                visible: spatialOperationChoice.currentValue === "buffer"
+                text: "10"
+                validator: DoubleValidator {}
+            }
+        }
+        onOpened: {
+            spatialOperationChoice.currentIndex = 0;
+            spatialLeftChoice.currentIndex = 0;
+            spatialRightChoice.currentIndex = layerModel.count > 1 ? 1 : 0;
+            spatialResultName.text = "result";
+            spatialDistance.text = "10";
+        }
+        onAccepted: {
+            if (layerModel.count === 0 || spatialLeftChoice.currentIndex < 0)
+                return;
+            var left = layerModel.get(spatialLeftChoice.currentIndex).name;
+            var right = spatialRightChoice.currentIndex >= 0 && layerModel.count > 0 ? layerModel.get(spatialRightChoice.currentIndex).name : "";
+            var result = spatialResultName.text.trim();
+            if (result.length === 0) {
+                mapCanvas.renderStatus = rootWindow.language === "ko" ? "결과 레이어 이름이 필요합니다" : "Result layer name is required";
+                return;
+            }
+            mapCanvas.spatialPayload = JSON.stringify({operation: spatialOperationChoice.currentValue, left: left, right: right, result: result, distance: Number(spatialDistance.text)});
+            mapCanvas.spatialGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: deleteRecordDialog
+        objectName: "deleteRecordDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "레코드 삭제 확인" : rootWindow.language === "jp" ? "レコード削除の確認" : "Confirm record deletion"
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        contentItem: Label {
+            text: rootWindow.language === "ko" ? "선택한 레코드를 삭제하고 PostGIS/원본에 저장할까요?" : rootWindow.language === "jp" ? "選択したレコードを削除してPostGIS/ソースに保存しますか？" : "Delete the selected record and save the change to PostGIS/source?"
+            wrapMode: Text.WordWrap
+        }
+        onAccepted: {
+            mapCanvas.editAction = "deleteConfirmed";
+            mapCanvas.editValue = "";
+            mapCanvas.editGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: addRecordDialog
+        objectName: "addRecordDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "레코드 추가" : rootWindow.language === "jp" ? "レコード追加" : "Add record"
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        width: Math.min(560, rootWindow.width - 48)
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label { text: "ID" }
+            TextField { id: addRecordID; objectName: "addRecordID"; Layout.fillWidth: true; text: "1"; validator: IntValidator {} }
+            Label { text: "WKT" }
+            TextField { id: addRecordWKT; objectName: "addRecordWKT"; Layout.fillWidth: true; placeholderText: "POINT (127 37)" }
+            Label { text: "Properties JSON" }
+            TextArea { id: addRecordProperties; objectName: "addRecordProperties"; Layout.fillWidth: true; text: "{}"; wrapMode: TextEdit.NoWrap }
+        }
+        onOpened: {
+            addRecordID.text = "1";
+            addRecordWKT.text = "";
+            addRecordProperties.text = "{}";
+        }
+        onAccepted: {
+            if (addRecordWKT.text.trim().length === 0) {
+                mapCanvas.renderStatus = rootWindow.language === "ko" ? "WKT가 필요합니다" : rootWindow.language === "jp" ? "WKTが必要です" : "WKT is required";
+                return;
+            }
+            var properties;
+            try {
+                properties = JSON.parse(addRecordProperties.text);
+            } catch (error) {
+                mapCanvas.renderStatus = rootWindow.language === "ko" ? "Properties JSON 형식이 잘못되었습니다" : rootWindow.language === "jp" ? "Properties JSONの形式が不正です" : "Properties JSON is invalid";
+                return;
+            }
+            mapCanvas.editAction = "addFeature";
+            mapCanvas.editValue = JSON.stringify({layer: mapViewport.activeLayer, id: Number(addRecordID.text), wkt: addRecordWKT.text, properties: properties});
+            mapCanvas.editGeneration += 1;
         }
     }
 
@@ -1454,6 +1599,8 @@ ApplicationWindow {
                     property string layerTreePayload: "[]"
                     property string layerSettingsPayload: ""
                     property int layerSettingsGeneration: 0
+                    property string spatialPayload: ""
+                    property int spatialGeneration: 0
                     property string layerLabelPayload: "[]"
                     property int layerLabelGeneration: 0
                     property string vertexHandlePayload: "[]"
@@ -2156,6 +2303,18 @@ ApplicationWindow {
                             mapViewport.editorValue = mapCanvas.selectionValue;
                         }
                     }
+                    Button {
+                        objectName: "deleteSelectedRecordButton"
+                        text: rootWindow.language === "ko" ? "레코드 삭제…" : rootWindow.language === "jp" ? "レコード削除…" : "Delete record…"
+                        onClicked: deleteRecordDialog.open()
+                    }
+                }
+                Button {
+                    objectName: "addRecordButton"
+                    Layout.fillWidth: true
+                    text: rootWindow.language === "ko" ? "레코드 추가…" : rootWindow.language === "jp" ? "レコード追加…" : "Add record…"
+                    enabled: mapViewport.activeLayer !== ""
+                    onClicked: addRecordDialog.open()
                 }
                 GridLayout {
                     columns: 2

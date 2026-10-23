@@ -556,6 +556,40 @@ func TestRuntimeSpatialUsesSharedCommandAndAddsResultLayer(t *testing.T) {
 	}
 }
 
+func TestLuaSpatialResultMatchesSharedCommandAPI(t *testing.T) {
+	newService := func() *commands.ProjectService {
+		service := commands.NewProjectService("spatial-parity", core.CRS{AuthorityCode: "EPSG:4326"})
+		if err := service.BeginEdit(); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"left", "right"} {
+			if err := service.AddLayer(core.Layer{Name: name, CRS: core.CRS{AuthorityCode: "EPSG:4326"}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := service.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		return service
+	}
+
+	commandService := newService()
+	operator := scriptingSpatialOperator{}
+	if err := commandService.ApplySpatialOperation(context.Background(), operator, "intersect", "left", "right", "intersection", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	luaService := newService()
+	runtime := NewRuntime(luaService, nil, operator)
+	defer runtime.Close()
+	if err := runtime.Run(context.Background(), `gogis.spatial("intersect", "left", "right", "intersection")`); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := luaService.Project().Layers, commandService.Project().Layers; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Lua spatial project differs from shared command API\nLua:     %#v\nCommand: %#v", got, want)
+	}
+}
+
 func TestRuntimeFilterUsesSharedCommandAndAddsResultLayer(t *testing.T) {
 	service := commands.NewProjectService("demo", core.CRS{})
 	if err := service.BeginEdit(); err != nil {

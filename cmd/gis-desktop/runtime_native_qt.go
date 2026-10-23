@@ -304,6 +304,16 @@ func loadDataRuntimeModeContextWithEncoding(ctx context.Context, input, layerNam
 }
 
 func loadDataRuntimeModeContextWithEncodingAndSession(ctx context.Context, input, layerName, sourceCRS, targetCRS, savePath, encoding string, readOnly bool, onPreview func(*demoRuntime), initialSession *gdal.AttributeSession) (_ *demoRuntime, resultErr error) {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "postgis://") {
+		if initialSession != nil {
+			_ = initialSession.Close()
+		}
+		table := strings.TrimPrefix(strings.TrimSpace(input), "postgis://")
+		if table == "" {
+			return nil, fmt.Errorf("PostGIS table is missing")
+		}
+		return loadPostGISRuntime(ctx, table, targetCRS, readOnly)
+	}
 	defer func() {
 		if initialSession != nil {
 			_ = initialSession.Close()
@@ -4419,6 +4429,11 @@ func desktopInputArgs(args []string) (string, string, string, string) {
 		case "--input":
 			if index+1 < len(args) {
 				input = args[index+1]
+				index++
+			}
+		case "--postgis-table":
+			if index+1 < len(args) {
+				input = "postgis://" + args[index+1]
 				index++
 			}
 		case "--layer":

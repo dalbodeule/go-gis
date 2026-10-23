@@ -1,0 +1,20 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    platform: linux/amd64
+    environment:
+      POSTGRES_DB: gogis
+      POSTGRES_USER: gogis
+      POSTGRES_PASSWORD: gogis
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gogis -d gogis"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - gogis-postgis-data:/var/lib/postgresql/data
+
+volumes:
+  gogis-postgis-data:

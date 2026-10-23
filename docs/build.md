@@ -162,6 +162,22 @@ interaction checklist.
   --save build/sample-edited.gpkg
 ```
 
+PostGIS 테이블은 `GOGIS_POSTGIS_DSN`으로 연결 정보를 주고 `--postgis-table`로
+QGIS의 테이블 식별자와 같은 `schema.table` 이름을 지정합니다. 연결 문자열은
+워크스페이스에 저장하지 않습니다.
+
+```sh
+GOGIS_POSTGIS_DSN='postgres://gogis:gogis@localhost:55432/gogis?sslmode=disable' \
+  ./build/gogis-desktop-native --postgis-table public.roads
+```
+
+CLI에서 현재 연결의 공간 테이블 목록은 다음처럼 확인할 수 있습니다.
+
+```sh
+GOGIS_POSTGIS_DSN='postgres://gogis:gogis@localhost:55432/gogis?sslmode=disable' \
+  ./build/gogis-cli postgis-list --schema public
+```
+
 데스크톱에서 100,000개 이상의 feature를 가진 데이터 또는 개수를 확인할 수 없는
 데이터를 열면 메모리 사용을 줄이기 위해 자동으로 읽기 전용으로 전환합니다.
 geometry-only 초기 로딩과 원본 GDAL attribute page 조회를 사용하며, 상태 표시줄에

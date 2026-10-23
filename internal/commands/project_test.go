@@ -522,3 +522,26 @@ func TestProjectAddFeatureIsTransactional(t *testing.T) {
 		t.Fatalf("feature ID = %d", got)
 	}
 }
+
+func TestProjectDeleteFeatureIsTransactional(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{
+		Name: "roads", Editable: true,
+		Features: []core.Feature{{ID: 1}, {ID: 2}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeleteFeature("roads", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	layer, ok := service.Layer("roads")
+	if !ok || len(layer.Features) != 1 || layer.Features[0].ID != 2 {
+		t.Fatalf("unexpected features after delete: %+v", layer.Features)
+	}
+}

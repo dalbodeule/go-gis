@@ -27,6 +27,7 @@
 관련 동작은 [레이어 속성/레이블 안내](layer-properties.md),
 [ARES DXF 검증 절차](verification/ares-commander.md),
 [MVP 체크리스트](verification/mvp-checklist.md),
+[마일스톤 C parity 검증표](verification/milestone-c-parity.md),
 [기술 결정 기록](decisions/)에서 확인한다.
 
 ## 다음 목표 — 우선순위 순
@@ -83,15 +84,18 @@ Brief의 Milestone C를 저장소 코드와 대조한 결과, “데이터 처�
 
 | Milestone C 항목 | 현재 구현/증거 | 실제 잔여 범위 |
 | --- | --- | --- |
-| 병합 및 GEOS 공간 연산 | 공용 `ProjectService`/command, CLI merge/spatial, Lua spatial API; 단위/native 테스트 | 데스크톱 UI에 입력 레이어/연산/결과 레이어/취소·오류 흐름이 없음. GUI에서도 같은 공용 command를 사용할지 구현·검증 필요. |
-| 레이블 설정/생성 | 데스크톱 레이어별 표현식·Lua·스타일 설정, CLI label, Lua label/filter, DXF TEXT; 일부 Lua와 공용 command 결과 parity 테스트 | 대표 입력에서 GUI 설정 결과와 CLI/Lua 결과의 실제 산출물 동등성(geometry/속성/레이블)을 자동 비교하는 수용 테스트가 없음. |
+| 병합 및 GEOS 공간 연산 | 공용 `ProjectService`/command, CLI merge/spatial, Lua spatial API; 데스크톱 공간 연산 대화상자와 취소·오류 상태; 단위/native 테스트 | 실제 GUI 세션에서 결과 레이어와 취소 동작을 수동 확인하고, 동일 fixture의 모델 결과 parity 수용 테스트를 확장. |
+| 레이블 설정/생성 | 데스크톱 레이어별 표현식·Lua·스타일 설정, CLI label, Lua label/filter, DXF TEXT; Lua·공용 command 결과 parity 테스트 | 대표 입력에서 GUI 설정 결과와 CLI/Lua 결과의 실제 산출물 모델 동등성 수용 테스트를 확장. |
 | DXF/GeoPackage 출력 | DXF exporter와 GUI/CLI/Lua 연결; GDAL GeoPackage writer 및 GUI 저장 경로, native 테스트 | 일반 파일 왕복 시나리오를 CLI와 GUI에서 동일 fixture로 확인하고 데이터/CRS/레이블 보존을 명시적으로 검증. ARES 사용 확인은 완료로 처리. |
-| PostGIS I/O 및 롤백 | `drivers/postgis`의 read/store 및 원자적 replacement; 2026-10-05 CI live PostGIS 롤백 테스트 성공 | PostGIS를 여는/저장하는 사용 경로가 CLI·데스크톱에 연결되어 있지 않음. 연결 설정, 선택한 schema/table, 읽기/쓰기 및 실패 rollback을 실제 workflow로 제공하고 통합 테스트해야 함. |
-| CLI 배치 및 Lua 예제 | CLI convert/filter/merge/spatial/label/script, sandboxed Lua API, 예제 및 테스트 | 명령/API 문서를 공통 옵션·오류·취소 규약에 맞춰 정리하고, 구현된 같은 작업의 parity matrix를 보강. Lua 전체를 CLI와 동일 기능으로 확장하는 것은 brief가 요구하는 범위를 먼저 판정한 뒤 결정. |
+| PostGIS I/O 및 롤백 | `drivers/postgis`의 read/store, QGIS식 공간 테이블 목록, `gis-cli postgis-import`/`postgis-export`/`postgis-insert`/`postgis-delete`, 데스크톱 `--postgis-table` 로드 및 레코드 편집 저장, 원자적 replacement와 live rollback 테스트 | GUI의 연결/테이블 카탈로그 선택 대화상자와 실제 workflow 수용 테스트가 남음. 현재 DSN은 `GOGIS_POSTGIS_DSN` 환경 변수로 주입한다. 대형 PostGIS용 bounded/viewport reader도 후속 범위다. |
+| CLI 배치 및 Lua 예제 | CLI convert/filter/merge/spatial/label/script, sandboxed Lua API, 예제 및 테스트; parity 검증표 추가 | 실제 GUI·CLI·Lua 산출물을 동일 fixture로 모델 비교하는 수용 테스트와 명령/API 문서 보강. Lua 전체를 CLI와 동일 기능으로 확장하는 것은 brief가 요구하는 범위를 먼저 판정한 뒤 결정. |
 
-이 표에서 가장 큰 기능 공백은 **PostGIS의 애플리케이션 연결**과 **GUI에서 병합/공간
-연산을 실행하는 경로**다. parity 검증은 이 기능 경로를 실제로 제공한 후 같은 소형
-fixture를 이용해 범위를 좁혀 수행한다. “Milestone C 완료”는 각 행의 기능 경로가
+이 표에서 가장 큰 기능 공백은 **데스크톱 PostGIS 테이블 카탈로그 선택 대화상자와
+실제 수용 테스트** 및 **GUI에서 병합/공간 연산을 실행하는 경로의 수용 검증**이다.
+현재 데스크톱은 `GOGIS_POSTGIS_DSN`과 `--postgis-table`로 직접 연결하고 레코드 추가·삭제
+저장까지 수행한다. CLI PostGIS 경로는 ADR 0016으로 연결했지만, parity 검증은 GUI
+기능 경로까지 제공한 후 같은 소형 fixture를 이용해 범위를 좁혀 수행한다.
+“Milestone C 완료”는 각 행의 기능 경로가
 사용 가능하고 테스트/수용 기준이 통과했을 때만 선언한다.
 
 ### 3. 실제 지도에서 렌더링·레이블 품질 회귀 확인

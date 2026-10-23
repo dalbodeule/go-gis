@@ -915,6 +915,91 @@ TestCase {
         verify(Math.abs(edit.x - 0.5) > 0.001 || Math.abs(edit.y - 0.5) > 0.001);
     }
 
+    function test_recordAddAndDeleteActionsRequireTheExpectedDialogFlow() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var layerModel = findChild(appWindow, "layerModel");
+        var addButton = findChild(appWindow, "addRecordButton");
+        var addDialog = findChild(appWindow, "addRecordDialog");
+        var addID = findChild(appWindow, "addRecordID");
+        var addWKT = findChild(appWindow, "addRecordWKT");
+        var addProperties = findChild(appWindow, "addRecordProperties");
+        var deleteButton = findChild(appWindow, "deleteSelectedRecordButton");
+        var deleteDialog = findChild(appWindow, "deleteRecordDialog");
+        verify(canvas && viewport && layerModel && addButton && addDialog && addID && addWKT && addProperties && deleteButton && deleteDialog);
+
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        tryCompare(layerModel, "count", 1);
+        tryCompare(viewport, "activeLayer", "roads");
+        addButton.click();
+        tryCompare(addDialog, "visible", true);
+        addID.text = "42";
+        addWKT.text = "POINT (127 37)";
+        addProperties.text = '{"name":"added"}';
+        addDialog.accept();
+        compare(canvas.editAction, "addFeature");
+        var addPayload = JSON.parse(canvas.editValue);
+        compare(addPayload.layer, "roads");
+        compare(addPayload.id, 42);
+        compare(addPayload.wkt, "POINT (127 37)");
+        compare(addPayload.properties.name, "added");
+
+        canvas.selectionLayer = "roads";
+        canvas.selectionFeature = "7";
+        canvas.selectionStatus = "Selected";
+        tryCompare(viewport, "selectedFeature", "7");
+        deleteButton.click();
+        tryCompare(deleteDialog, "visible", true);
+        deleteDialog.reject();
+        compare(canvas.editAction, "addFeature");
+        deleteButton.click();
+        deleteDialog.accept();
+        compare(canvas.editAction, "deleteConfirmed");
+    }
+
+    function test_spatialOperationDialogSubmitsSharedRequestPayload() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var dialog = findChild(appWindow, "spatialOperationDialog");
+        var operation = findChild(appWindow, "spatialOperationChoice");
+        var left = findChild(appWindow, "spatialLeftChoice");
+        var right = findChild(appWindow, "spatialRightChoice");
+        var result = findChild(appWindow, "spatialResultName");
+        var distance = findChild(appWindow, "spatialDistance");
+        verify(canvas && layerModel && dialog && operation && left && right && result && distance);
+
+        canvas.layerTreePayload = JSON.stringify([
+            {name: "roads", displayName: "Roads", visible: true},
+            {name: "parcels", displayName: "Parcels", visible: true}
+        ]);
+        tryCompare(layerModel, "count", 2);
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        operation.currentIndex = operation.indexOfValue("intersect");
+        left.currentIndex = 0;
+        right.currentIndex = 1;
+        result.text = "road_parcel_intersection";
+        dialog.accept();
+        var payload = JSON.parse(canvas.spatialPayload);
+        compare(payload.operation, "intersect");
+        compare(payload.left, "roads");
+        compare(payload.right, "parcels");
+        compare(payload.result, "road_parcel_intersection");
+
+        dialog.open();
+        operation.currentIndex = operation.indexOfValue("buffer");
+        tryCompare(findChild(appWindow, "spatialRightChoice"), "visible", false);
+        distance.text = "25";
+        result.text = "buffered_roads";
+        dialog.accept();
+        payload = JSON.parse(canvas.spatialPayload);
+        compare(payload.operation, "buffer");
+        compare(payload.left, "roads");
+        compare(payload.right, "parcels");
+        compare(payload.distance, 25);
+        compare(payload.result, "buffered_roads");
+    }
+
     function test_applySubmitsLayerSettings() {
         appWindow.language = "en";
         var canvas = findChild(appWindow, "goGisMapCanvas");

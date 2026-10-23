@@ -104,3 +104,43 @@ func TestParseScriptOptionsRequiresOutputLayerForShapefile(t *testing.T) {
 		t.Fatalf("Shapefile output with --output-layer was rejected: %v", err)
 	}
 }
+
+func TestParsePostGISImportOptions(t *testing.T) {
+	options, err := parsePostGISOptions("postgis-import", []string{
+		"--input", "roads.gpkg", "--dsn", "postgres://gis", "--table", "public.roads", "--layer", "roads",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.input != "roads.gpkg" || options.dsn != "postgres://gis" || options.table != "public.roads" || options.layer != "roads" {
+		t.Fatalf("unexpected PostGIS options: %#v", options)
+	}
+}
+
+func TestParsePostGISExportRequiresOutput(t *testing.T) {
+	if _, err := parsePostGISOptions("postgis-export", []string{"--dsn", "postgres://gis", "--table", "public.roads"}); err == nil {
+		t.Fatal("expected missing output error")
+	}
+}
+
+func TestParsePostGISInsertAndDeleteOptions(t *testing.T) {
+	insert, err := parsePostGISOptions("postgis-insert", []string{
+		"--dsn", "postgres://gis", "--table", "public.roads", "--id", "7",
+		"--wkt", "POINT (127 37)", "--crs", "EPSG:4326", "--properties", `{"name":"new"}`,
+	})
+	if err != nil || insert.id != 7 || insert.crs != "EPSG:4326" {
+		t.Fatalf("unexpected insert options: %#v, err=%v", insert, err)
+	}
+	if _, err := parsePostGISOptions("postgis-delete", []string{"--dsn", "postgres://gis", "--table", "public.roads", "--id", "7"}); err != nil {
+		t.Fatalf("valid delete options rejected: %v", err)
+	}
+}
+
+func TestParsePostGISListOnlyRequiresDSN(t *testing.T) {
+	if _, err := parsePostGISOptions("postgis-list", []string{"--dsn", "postgres://gis", "--schema", "public"}); err != nil {
+		t.Fatalf("valid list options rejected: %v", err)
+	}
+	if _, err := parsePostGISOptions("postgis-list", nil); err == nil {
+		t.Fatal("missing DSN was accepted")
+	}
+}

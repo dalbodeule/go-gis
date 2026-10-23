@@ -162,6 +162,18 @@ func CurrentLayerSettings() string {
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }
 
+// SpatialGeneration returns the latest QML spatial-operation request.
+func SpatialGeneration() uint64 {
+	return uint64(C.gogis_spatial_generation())
+}
+
+// CurrentSpatialRequest returns the JSON spatial-operation request captured by Qt.
+func CurrentSpatialRequest() string {
+	buffer := make([]C.char, 1<<20)
+	C.gogis_spatial_request((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}
+
 // EditGeneration returns the latest QML edit event generation.
 func EditGeneration() uint64 {
 	return uint64(C.gogis_edit_generation())
