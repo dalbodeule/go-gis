@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -27,6 +28,7 @@ var diagnosticLog = struct {
 	entries []diagnosticLogEntry
 	bytes   int
 }{entries: make([]diagnosticLogEntry, 0, diagnosticLogEntryLimit)}
+var diagnosticLogGeneration uint64
 
 // RecordDiagnostic adds a process or application message to the bounded,
 // in-memory desktop log. Messages are never written to disk by this collector.
@@ -59,6 +61,13 @@ func RecordDiagnostic(stream, message string) {
 		copy(diagnosticLog.entries, diagnosticLog.entries[1:])
 		diagnosticLog.entries = diagnosticLog.entries[:len(diagnosticLog.entries)-1]
 	}
+	atomic.AddUint64(&diagnosticLogGeneration, 1)
+}
+
+// DiagnosticLogGeneration changes only when the bounded log contents change.
+// Publishers can use it to avoid repeatedly encoding an unchanged snapshot.
+func DiagnosticLogGeneration() uint64 {
+	return atomic.LoadUint64(&diagnosticLogGeneration)
 }
 
 // DiagnosticLogJSON returns a snapshot suitable for the QML log viewer.

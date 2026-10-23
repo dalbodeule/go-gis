@@ -106,6 +106,23 @@ func CanvasVisible() bool {
 	return C.gogis_canvas_visible() != 0
 }
 
+// CanvasVisibilityGeneration changes when the canvas or its window becomes
+// visible/hidden, allowing the Go runtime to release and restore render data.
+func CanvasVisibilityGeneration() uint64 {
+	return uint64(C.gogis_canvas_visibility_generation())
+}
+
+// AttributePayloadVisible reports whether the QML attribute dialog is open.
+// The desktop runtime uses it to release cached attribute pages while closed.
+func AttributePayloadVisible() bool {
+	return C.gogis_attribute_payload_visible() != 0
+}
+
+// PostGISCatalogVisible reports whether the table catalog dialog is open.
+func PostGISCatalogVisible() bool {
+	return C.gogis_postgis_catalog_visible() != 0
+}
+
 // ClickGeneration returns the latest click event observed by the Qt bridge.
 func ClickGeneration() uint64 {
 	return uint64(C.gogis_click_generation())
@@ -135,6 +152,11 @@ func SetSelection(layer, feature, value, status string) {
 	defer C.free(unsafe.Pointer(cValue))
 	defer C.free(unsafe.Pointer(cStatus))
 	C.gogis_set_selection(cLayer, cFeature, cValue, cStatus)
+}
+
+// SelectionGeneration returns the generation of the last distinct selection state.
+func SelectionGeneration() uint64 {
+	return uint64(C.gogis_selection_generation())
 }
 
 // LayerVisibilityGeneration returns the latest QML layer-state generation.
@@ -206,6 +228,11 @@ func SetAttributePayload(payload string) {
 	C.gogis_set_attribute_payload(cPayload)
 }
 
+// AttributeGeneration returns the generation of the last distinct attribute payload.
+func AttributeGeneration() uint64 {
+	return uint64(C.gogis_attribute_generation())
+}
+
 // AttributePageGeneration returns the latest QML attribute page request.
 func AttributePageGeneration() uint64 {
 	return uint64(C.gogis_attribute_page_generation())
@@ -223,11 +250,21 @@ func SetLayerTreePayload(payload string) {
 	C.gogis_set_layer_tree_payload(cPayload)
 }
 
+// LayerTreeGeneration returns the generation of the last distinct layer tree payload.
+func LayerTreeGeneration() uint64 {
+	return uint64(C.gogis_layer_tree_generation())
+}
+
 // SetLayerLabelPayload publishes normalized vector labels for the viewport.
 func SetLayerLabelPayload(payload string) {
 	cPayload := C.CString(payload)
 	defer C.free(unsafe.Pointer(cPayload))
 	C.gogis_set_layer_label_payload(cPayload)
+}
+
+// LayerLabelGeneration returns the generation of the last distinct label payload.
+func LayerLabelGeneration() uint64 {
+	return uint64(C.gogis_layer_label_generation())
 }
 
 // SetVertexHandlePayload publishes normalized editable vertices for the
@@ -236,6 +273,35 @@ func SetVertexHandlePayload(payload string) {
 	cPayload := C.CString(payload)
 	defer C.free(unsafe.Pointer(cPayload))
 	C.gogis_set_vertex_handle_payload(cPayload)
+}
+
+// VertexHandleGeneration returns the generation of the last distinct handle payload.
+func VertexHandleGeneration() uint64 {
+	return uint64(C.gogis_vertex_handle_generation())
+}
+
+// PostGISCatalogGeneration returns the latest QML catalog refresh request.
+func PostGISCatalogGeneration() uint64 {
+	return uint64(C.gogis_postgis_catalog_generation())
+}
+
+// CurrentPostGISCatalogSchema returns the optional schema filter requested by QML.
+func CurrentPostGISCatalogSchema() string {
+	buffer := make([]C.char, 256)
+	C.gogis_postgis_catalog_schema((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}
+
+// SetPostGISCatalogPayload publishes a bounded QGIS-style table catalog.
+func SetPostGISCatalogPayload(payload string) {
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	C.gogis_set_postgis_catalog_payload(cPayload)
+}
+
+// PostGISCatalogPayloadGeneration returns the generation of the last distinct catalog payload.
+func PostGISCatalogPayloadGeneration() uint64 {
+	return uint64(C.gogis_postgis_catalog_payload_generation())
 }
 
 // ActiveLayerGeneration returns the latest QML layer selection generation.
@@ -261,6 +327,11 @@ func SetRenderStatus(status string) {
 	cStatus := C.CString(status)
 	defer C.free(unsafe.Pointer(cStatus))
 	C.gogis_set_render_status(cStatus)
+}
+
+// RenderStatusGeneration returns the generation of the last distinct status.
+func RenderStatusGeneration() uint64 {
+	return uint64(C.gogis_render_status_generation())
 }
 
 // SetDiagnosticLogPayload publishes the current bounded process log to QML.

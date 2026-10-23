@@ -31,12 +31,21 @@ import (
 )
 
 type readOnlyLayerBinding struct {
-	session      *gdal.AttributeSession
-	windowPool   chan *gdal.AttributeSession
+	session      readOnlyWindowSource
+	windowPool   chan readOnlyWindowSource
 	sourceName   string
 	layer        core.Layer
 	sourceCRS    string
 	featureCount int
+}
+
+// readOnlyWindowSource is the bounded source contract shared by GDAL files
+// and PostGIS. Keeping this adapter below the runtime prevents the viewport
+// scheduler from depending on a particular storage driver.
+type readOnlyWindowSource interface {
+	OpenWindowWithLimits(context.Context, string, [4]float64, bool, int, int64) (core.Layer, error)
+	OpenAttributePage(context.Context, string, int, int) (core.Layer, int, error)
+	OpenFeature(context.Context, string, uint64) (core.Feature, error)
 }
 
 func prepareAutomaticShapefileIndex(ctx context.Context, source vectorSourceSpec, layerName string,
@@ -974,7 +983,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		// overview workers can query concurrently. Keep the
 		// original session for attribute pages and fall back to it if any clone
 		// cannot be opened. Every clone is closed with the runtime.
-		var windowPool chan *gdal.AttributeSession
+		var windowPool chan readOnlyWindowSource
 		if goruntime.GOOS == "windows" && indexFeatureCount >= 100_000 && strings.EqualFold(filepath.Ext(queryPath), ".shp") &&
 			gdal.HasShapefileSpatialIndex(queryPath) {
 			windowReaders := min(4, readOnlyOverviewWorkerLimit())
@@ -994,7 +1003,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				}
 				native.RecordDiagnostic("render", fmt.Sprintf("parallel SHP readers unavailable for %s: %v", source.Path, cloneErr))
 			} else {
-				windowPool = make(chan *gdal.AttributeSession, windowReaders)
+				windowPool = make(chan readOnlyWindowSource, windowReaders)
 				for _, clone := range clones {
 					windowPool <- clone
 					sessions = append(sessions, clone)
@@ -1106,7 +1115,11 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
 	runtime.windowPayloadBytes = make(map[render.ChunkKey]int64)
 	runtime.windowVisibleKeys = make(map[render.ChunkKey]struct{})
-	runtime.windowFeatureNames = make(map[uint64]string)
+	// Feature names are only needed when the viewport assigns transient IDs.
+	// Sources that preserve IDs resolve attributes through their own reader.
+	if !runtime.preserveReadOnlyFeatureIDs {
+		runtime.windowFeatureNames = make(map[uint64]string)
+	}
 	runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
 	runtime.readOnlyBindings = bindings
 	runtime.unavailableSources = unavailable
@@ -1227,7 +1240,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
 	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
 	overview := lodBucket <= 1 || forceOverview
-	if !overview {
+	if !overview && !runtime.preserveReadOnlyFeatureIDs {
 		setStage("wait-detail-slot")
 		releaseDetailSlot, detailErr := readOnlyDetailBuildSemaphore.acquire(ctx)
 		if detailErr != nil {
@@ -1346,8 +1359,10 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	if len(window.Features) == 0 {
 		runtime.mu.Lock()
-		runtime.removeWindowChunkLocked(key)
-		runtime.rebuildWindowFeaturesLocked()
+		if _, visible := runtime.windowVisibleKeys[key]; visible {
+			runtime.removeWindowChunkLocked(key)
+			runtime.rebuildWindowFeaturesLocked()
+		}
 		runtime.mu.Unlock()
 		return render.Chunk{Key: key}, nil
 	}
@@ -1356,8 +1371,9 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		return render.Chunk{}, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
 	}
 	window = window.WithDefaultPresentation()
-	featureNames := make(map[uint64]string, len(window.Features))
+	var featureNames map[uint64]string
 	if !overview {
+		featureNames = make(map[uint64]string, len(window.Features))
 		runtime.mu.Lock()
 		for index := range window.Features {
 			runtime.nextWindowFeatureID++
@@ -1440,8 +1456,9 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 	}
 	if _, visible := runtime.windowVisibleKeys[key]; visible {
+		_, replacing := runtime.windowPayloadBytes[key]
 		runtime.removeWindowChunkLocked(key)
-		if !overview {
+		if !overview && !runtime.preserveReadOnlyFeatureIDs {
 			if !readOnlyVisibleFeaturesFit(runtime.windowVisibleFeatureCount, len(window.Features)) {
 				runtime.mu.Unlock()
 				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
@@ -1478,7 +1495,15 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		if len(newSources[key.Layer].Labels) > 0 {
 			runtime.windowLabels[key] = newSources[key.Layer].Labels
 		}
-		runtime.rebuildWindowFeaturesLocked()
+		if replacing || len(newSources[key.Layer].Labels) > 0 {
+			runtime.rebuildWindowFeaturesLocked()
+		} else if !overview && len(hits) > 0 {
+			// A new geometry-only chunk can extend the current snapshot without
+			// copying every previously visible chunk again. Rebuild remains the
+			// safe path when replacing a chunk or adding labels that need deduping.
+			runtime.features = append(runtime.features, hits...)
+			runtime.hitIndexReady = false
+		}
 	}
 	runtime.mu.Unlock()
 	chunk, err := newSources[key.Layer].Builder(ctx, key)
@@ -2356,6 +2381,7 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 	}
 	r.sourcesMu.RUnlock()
 	r.mapLabels = labels
+	r.labelRevision++
 	selected := r.selected
 	r.mu.Unlock()
 	r.publishLayerLabels()
@@ -4284,6 +4310,8 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	r.layerFeatureCounts = next.layerFeatureCounts
 	r.layerStyleMu = next.layerStyleMu
 	r.mapLabels = next.mapLabels
+	r.labelRevision = next.labelRevision
+	r.hasPublishedLabelState = false
 	r.builder = next.builder
 	r.readOnlyBaseBuilder = next.readOnlyBaseBuilder
 	r.features = next.features

@@ -56,6 +56,8 @@ constexpr size_t kMaxSceneGraphVertices = 36 * 1024 * 1024;
 // by some scene-graph batching paths. Each batch ends on a triangle boundary.
 constexpr size_t kSceneGraphBatchVertices = 60'000;
 constexpr size_t kRetainedVertexCapacityFloor = 64 * 1024;
+constexpr int kVisibleBridgeIntervalMs = 33;
+constexpr int kHiddenBridgeIntervalMs = 250;
 int g_vertices_stage = 0;
 std::atomic<unsigned long long> g_vertices_generation{0};
 std::atomic<long long> g_perf_load_started_ns{0};
@@ -69,6 +71,7 @@ std::atomic<double> g_viewport_width{1};
 std::atomic<double> g_viewport_height{1};
 std::atomic<double> g_logical_pixels_per_mm{96.0 / 25.4};
 std::atomic<bool> g_visible{true};
+std::atomic<unsigned long long> g_visibility_generation{0};
 std::atomic<unsigned long long> g_click_generation{0};
 std::atomic<double> g_click_x{0};
 std::atomic<double> g_click_y{0};
@@ -88,6 +91,7 @@ std::atomic<unsigned long long> g_edit_generation{0};
 std::mutex g_attribute_mutex;
 std::string g_attribute_payload;
 std::atomic<unsigned long long> g_attribute_generation{0};
+std::atomic<bool> g_attribute_payload_visible{false};
 std::atomic<unsigned long long> g_attribute_page_generation{0};
 std::atomic<int> g_attribute_page{0};
 std::mutex g_layer_tree_mutex;
@@ -99,6 +103,13 @@ std::atomic<unsigned long long> g_layer_label_generation{0};
 std::mutex g_vertex_handle_mutex;
 std::string g_vertex_handle_payload = "[]";
 std::atomic<unsigned long long> g_vertex_handle_generation{0};
+std::mutex g_postgis_catalog_mutex;
+std::string g_postgis_catalog_schema;
+std::atomic<unsigned long long> g_postgis_catalog_generation{0};
+std::mutex g_postgis_catalog_payload_mutex;
+std::string g_postgis_catalog_payload = "[]";
+std::atomic<unsigned long long> g_postgis_catalog_payload_generation{0};
+std::atomic<bool> g_postgis_catalog_visible{false};
 std::mutex g_active_layer_mutex;
 std::string g_active_layer;
 std::atomic<unsigned long long> g_active_layer_generation{0};
@@ -136,16 +147,23 @@ std::mutex g_canvas_mutex;
 QQuickItem* g_canvas = nullptr;
 
 void set_render_status_safely(const char* status) noexcept {
+    bool changed = false;
     try {
         {
             std::lock_guard<std::mutex> lock(g_render_status_mutex);
-            g_render_status = status != nullptr ? status : "";
+            const char* next = status != nullptr ? status : "";
+            if (g_render_status.compare(next) != 0) {
+                g_render_status = next;
+                changed = true;
+            }
         }
-        g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+        if (changed) {
+            g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+        }
     } catch (...) {
         // Reporting a rendering allocation failure must not terminate the UI.
     }
-    if (status != nullptr) {
+    if (status != nullptr && changed) {
 #ifdef _WIN32
         const HANDLE output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if (output_handle != nullptr && output_handle != INVALID_HANDLE_VALUE) {
@@ -251,7 +269,15 @@ void update_viewport_snapshot(const QQuickItem* item) {
     const auto* viewport = item->parentItem();
     g_viewport_width.store(viewport != nullptr ? viewport->width() : item->width(), std::memory_order_relaxed);
     g_viewport_height.store(viewport != nullptr ? viewport->height() : item->height(), std::memory_order_relaxed);
-    g_visible.store(item->isVisible(), std::memory_order_relaxed);
+}
+
+void update_canvas_visibility(const QQuickItem* item) {
+    const auto window_active = item->property("windowActive");
+    const bool visible = item->isVisible() && (!window_active.isValid() || window_active.toBool());
+    const bool previous = g_visible.exchange(visible, std::memory_order_relaxed);
+    if (previous != visible) {
+        g_visibility_generation.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 } // namespace
@@ -267,12 +293,25 @@ public:
         material_.setFlag(QSGMaterial::NoBatching);
         setFlag(ItemHasContents, true);
         update_viewport_snapshot(this);
+        update_canvas_visibility(this);
 
         // QML adds clickX/clickY/clickGeneration to the registered item. Read
         // those dynamic properties on the GUI thread so Go never touches a
         // QObject from its render polling goroutine.
-        click_timer_.setInterval(16);
+        // Generation-based bridge state does not require a 60 Hz poll. Keep
+        // the native/QML bridge at 30 Hz to reduce GUI-thread wake-ups while
+        // retaining sub-frame-feeling input latency for map interactions.
+        click_timer_.setInterval(kVisibleBridgeIntervalMs);
         QObject::connect(&click_timer_, &QTimer::timeout, this, [this]() {
+            update_canvas_visibility(this);
+            const int bridge_interval = g_visible.load(std::memory_order_relaxed)
+                                            ? kVisibleBridgeIntervalMs
+                                            : kHiddenBridgeIntervalMs;
+            if (click_timer_.interval() != bridge_interval) {
+                // Keep load/save/file-picker generations observable while the
+                // window is hidden, but avoid a 30 Hz idle property sweep.
+                click_timer_.setInterval(bridge_interval);
+            }
             const auto view_generation = property("viewGeneration").toULongLong();
             if (view_generation != view_generation_) {
                 update_viewport_snapshot(this);
@@ -293,6 +332,49 @@ public:
             const double logical_pixels_per_mm = property("logicalPixelsPerMm").toDouble();
             if (std::isfinite(logical_pixels_per_mm) && logical_pixels_per_mm > 0.0) {
                 g_logical_pixels_per_mm.store(logical_pixels_per_mm, std::memory_order_relaxed);
+            }
+
+            // Attribute pages can be large JSON strings. When the QML dialog
+            // is closed, release the native bridge copy even if an in-flight
+            // request publishes a late result after the close event.
+            const QVariant attribute_payload_visible = property("attributePayloadVisible");
+            if (attribute_payload_visible.isValid()) {
+                const bool visible = attribute_payload_visible.toBool();
+                g_attribute_payload_visible.store(visible, std::memory_order_relaxed);
+            }
+            if (attribute_payload_visible.isValid() && !attribute_payload_visible.toBool()) {
+                bool cleared = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_attribute_mutex);
+                    if (g_attribute_payload != "[]") {
+                        g_attribute_payload = "[]";
+                        cleared = true;
+                    }
+                }
+                if (cleared) {
+                    g_attribute_generation.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // The PostGIS catalog is also dialog-only. Drop its bounded JSON
+            // copy while closed so a large schema list does not survive the
+            // picker lifetime.
+            const QVariant postgis_catalog_visible = property("postGISCatalogVisible");
+            if (postgis_catalog_visible.isValid()) {
+                g_postgis_catalog_visible.store(postgis_catalog_visible.toBool(), std::memory_order_relaxed);
+            }
+            if (postgis_catalog_visible.isValid() && !postgis_catalog_visible.toBool()) {
+                bool cleared = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_postgis_catalog_payload_mutex);
+                    if (g_postgis_catalog_payload != "[]") {
+                        g_postgis_catalog_payload = "[]";
+                        cleared = true;
+                    }
+                }
+                if (cleared) {
+                    g_postgis_catalog_payload_generation.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
             const QVariant generation = property("clickGeneration");
@@ -332,6 +414,13 @@ public:
                 g_edit_generation.store(edit_generation, std::memory_order_relaxed);
             }
 
+            const auto postgis_catalog_generation = property("postGISCatalogGeneration").toULongLong();
+            if (postgis_catalog_generation != g_postgis_catalog_generation.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(g_postgis_catalog_mutex);
+                g_postgis_catalog_schema = property("postGISCatalogSchema").toString().toStdString();
+                g_postgis_catalog_generation.store(postgis_catalog_generation, std::memory_order_relaxed);
+            }
+
             const auto selection_generation = g_selection_generation.load(std::memory_order_relaxed);
             if (selection_generation != selection_generation_) {
                 std::lock_guard<std::mutex> lock(g_selection_mutex);
@@ -346,7 +435,19 @@ public:
             if (attribute_generation != attribute_generation_) {
                 std::lock_guard<std::mutex> lock(g_attribute_mutex);
                 setProperty("attributePayload", QString::fromStdString(g_attribute_payload));
+                setProperty("attributePayloadGeneration",
+                            QVariant::fromValue<qulonglong>(attribute_generation));
                 attribute_generation_ = attribute_generation;
+            }
+
+            const auto postgis_catalog_payload_generation =
+                g_postgis_catalog_payload_generation.load(std::memory_order_relaxed);
+            if (postgis_catalog_payload_generation != postgis_catalog_payload_generation_) {
+                std::lock_guard<std::mutex> lock(g_postgis_catalog_payload_mutex);
+                setProperty("postGISCatalogPayload", QString::fromStdString(g_postgis_catalog_payload));
+                setProperty("postGISCatalogPayloadGeneration",
+                            QVariant::fromValue<qulonglong>(postgis_catalog_payload_generation));
+                postgis_catalog_payload_generation_ = postgis_catalog_payload_generation;
             }
 
             const auto attribute_page_generation = property("attributePageGeneration").toULongLong();
@@ -359,6 +460,8 @@ public:
             if (layer_tree_generation != layer_tree_generation_) {
                 std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
                 setProperty("layerTreePayload", QString::fromStdString(g_layer_tree_payload));
+                setProperty("layerTreePayloadGeneration",
+                            QVariant::fromValue<qulonglong>(layer_tree_generation));
                 layer_tree_generation_ = layer_tree_generation;
             }
 
@@ -651,15 +754,47 @@ protected:
             }
         }
         if (geometry_changed) {
-            while (auto* child = node->firstChild()) {
-                node->removeChildNode(child);
-                delete child;
-            }
             bool batched = true;
+            bool reused_batches = false;
             size_t batch_count = 0;
             try {
                 const auto* source = geometry_.vertexDataAsColoredPoint2D();
-                for (size_t start = 0; start < rendered_vertex_count_;) {
+                const size_t expected_batches = rendered_vertex_count_ == 0
+                                                    ? 0
+                                                    : (rendered_vertex_count_ + kSceneGraphBatchVertices - 1) /
+                                                          kSceneGraphBatchVertices;
+                if (node->childCount() == static_cast<int>(expected_batches)) {
+                    reused_batches = true;
+                    size_t start = 0;
+                    for (size_t batch_index = 0; batch_index < expected_batches; ++batch_index) {
+                        const size_t count = std::min(kSceneGraphBatchVertices, rendered_vertex_count_ - start);
+                        auto* batch_node = static_cast<QSGGeometryNode*>(node->childAtIndex(
+                            static_cast<int>(batch_index)));
+                        auto* batch_geometry = batch_node != nullptr ? batch_node->geometry() : nullptr;
+                        if (batch_geometry == nullptr || batch_geometry->vertexCount() != static_cast<int>(count)) {
+                            reused_batches = false;
+                            break;
+                        }
+                        auto* destination = batch_geometry->vertexDataAsColoredPoint2D();
+                        if (destination == nullptr && count > 0) {
+                            reused_batches = false;
+                            break;
+                        }
+                        if (count > 0) {
+                            std::memcpy(destination, source + start,
+                                        count * sizeof(QSGGeometry::ColoredPoint2D));
+                        }
+                        batch_node->markDirty(QSGNode::DirtyGeometry);
+                        start += count;
+                    }
+                }
+                if (!reused_batches) {
+                    while (auto* child = node->firstChild()) {
+                        node->removeChildNode(child);
+                        delete child;
+                    }
+                }
+                for (size_t start = 0; !reused_batches && start < rendered_vertex_count_;) {
                     const size_t count = std::min(kSceneGraphBatchVertices, rendered_vertex_count_ - start);
                     auto batch_node = std::make_unique<QSGGeometryNode>();
                     auto batch_geometry = std::make_unique<QSGGeometry>(
@@ -728,6 +863,7 @@ private:
     unsigned long long view_generation_ = 0;
     unsigned long long selection_generation_ = 0;
     unsigned long long attribute_generation_ = 0;
+    unsigned long long postgis_catalog_payload_generation_ = 0;
     unsigned long long layer_tree_generation_ = 0;
     unsigned long long layer_label_generation_ = 0;
     unsigned long long vertex_handle_generation_ = 0;
@@ -853,6 +989,10 @@ extern "C" int gogis_canvas_visible(void) {
     return g_visible.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
+extern "C" unsigned long long gogis_canvas_visibility_generation(void) {
+    return g_visibility_generation.load(std::memory_order_relaxed);
+}
+
 extern "C" unsigned long long gogis_click_generation(void) {
     return g_click_generation.load(std::memory_order_relaxed);
 }
@@ -868,14 +1008,29 @@ extern "C" void gogis_canvas_click(double* x, double* y) {
 
 extern "C" void gogis_set_selection(const char* layer, const char* feature,
                                       const char* value, const char* status) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_selection_mutex);
-        g_selection_layer = layer != nullptr ? layer : "";
-        g_selection_feature = feature != nullptr ? feature : "";
-        g_selection_value = value != nullptr ? value : "";
-        g_selection_status = status != nullptr ? status : "";
+        const char* next_layer = layer != nullptr ? layer : "";
+        const char* next_feature = feature != nullptr ? feature : "";
+        const char* next_value = value != nullptr ? value : "";
+        const char* next_status = status != nullptr ? status : "";
+        if (g_selection_layer != next_layer || g_selection_feature != next_feature ||
+            g_selection_value != next_value || g_selection_status != next_status) {
+            g_selection_layer = next_layer;
+            g_selection_feature = next_feature;
+            g_selection_value = next_value;
+            g_selection_status = next_status;
+            changed = true;
+        }
     }
-    g_selection_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_selection_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_selection_generation(void) {
+    return g_selection_generation.load(std::memory_order_relaxed);
 }
 
 extern "C" unsigned long long gogis_layer_visibility_generation(void) {
@@ -939,11 +1094,26 @@ extern "C" void gogis_edit_event(char* action, int action_length,
 }
 
 extern "C" void gogis_set_attribute_payload(const char* payload) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_attribute_mutex);
-        g_attribute_payload = payload != nullptr ? payload : "[]";
+        const char* next = payload != nullptr ? payload : "[]";
+        if (g_attribute_payload.compare(next) != 0) {
+            g_attribute_payload = next;
+            changed = true;
+        }
     }
-    g_attribute_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_attribute_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_attribute_generation(void) {
+    return g_attribute_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" int gogis_attribute_payload_visible(void) {
+    return g_attribute_payload_visible.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 extern "C" unsigned long long gogis_attribute_page_generation(void) {
@@ -955,27 +1125,97 @@ extern "C" int gogis_attribute_page(void) {
 }
 
 extern "C" void gogis_set_layer_tree_payload(const char* payload) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_layer_tree_mutex);
-        g_layer_tree_payload = payload != nullptr ? payload : "[]";
+        const char* next = payload != nullptr ? payload : "[]";
+        if (g_layer_tree_payload.compare(next) != 0) {
+            g_layer_tree_payload = next;
+            changed = true;
+        }
     }
-    g_layer_tree_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_layer_tree_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_layer_tree_generation(void) {
+    return g_layer_tree_generation.load(std::memory_order_relaxed);
 }
 
 extern "C" void gogis_set_layer_label_payload(const char* payload) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_layer_label_mutex);
-        g_layer_label_payload = payload != nullptr ? payload : "[]";
+        const char* next = payload != nullptr ? payload : "[]";
+        if (g_layer_label_payload.compare(next) != 0) {
+            g_layer_label_payload = next;
+            changed = true;
+        }
     }
-    g_layer_label_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_layer_label_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_layer_label_generation(void) {
+    return g_layer_label_generation.load(std::memory_order_relaxed);
 }
 
 extern "C" void gogis_set_vertex_handle_payload(const char* payload) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_vertex_handle_mutex);
-        g_vertex_handle_payload = payload != nullptr ? payload : "[]";
+        const char* next = payload != nullptr ? payload : "[]";
+        if (g_vertex_handle_payload.compare(next) != 0) {
+            g_vertex_handle_payload = next;
+            changed = true;
+        }
     }
-    g_vertex_handle_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_vertex_handle_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_vertex_handle_generation(void) {
+    return g_vertex_handle_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" unsigned long long gogis_postgis_catalog_generation(void) {
+    return g_postgis_catalog_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_postgis_catalog_schema(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_postgis_catalog_mutex);
+    const auto copy_length = std::min<size_t>(g_postgis_catalog_schema.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_postgis_catalog_schema.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
+extern "C" void gogis_set_postgis_catalog_payload(const char* payload) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_postgis_catalog_payload_mutex);
+        const char* next = payload != nullptr ? payload : "[]";
+        if (g_postgis_catalog_payload.compare(next) != 0) {
+            g_postgis_catalog_payload = next;
+            changed = true;
+        }
+    }
+    if (changed) {
+        g_postgis_catalog_payload_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_postgis_catalog_payload_generation(void) {
+    return g_postgis_catalog_payload_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" int gogis_postgis_catalog_visible(void) {
+    return g_postgis_catalog_visible.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 extern "C" unsigned long long gogis_active_layer_generation(void) {
@@ -993,11 +1233,22 @@ extern "C" void gogis_active_layer(char* buffer, int buffer_length) {
 }
 
 extern "C" void gogis_set_render_status(const char* status) {
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_render_status_mutex);
-        g_render_status = status != nullptr ? status : "";
+        const char* next = status != nullptr ? status : "";
+        if (g_render_status.compare(next) != 0) {
+            g_render_status = next;
+            changed = true;
+        }
     }
-    g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        g_render_status_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" unsigned long long gogis_render_status_generation(void) {
+    return g_render_status_generation.load(std::memory_order_relaxed);
 }
 
 extern "C" void gogis_set_diagnostic_log_payload(const char* payload) {
@@ -1025,9 +1276,18 @@ extern "C" unsigned long long gogis_retained_vertex_bytes(void) {
 }
 
 extern "C" void gogis_set_map_metadata(const char* payload) {
-    std::lock_guard<std::mutex> lock(g_map_metadata_mutex);
-    g_map_metadata_payload = payload == nullptr ? "{}" : payload;
-    g_map_metadata_generation.fetch_add(1, std::memory_order_relaxed);
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_map_metadata_mutex);
+        const char* next = payload == nullptr ? "{}" : payload;
+        if (g_map_metadata_payload.compare(next) != 0) {
+            g_map_metadata_payload = next;
+            changed = true;
+        }
+    }
+    if (changed) {
+        g_map_metadata_generation.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 extern "C" unsigned long long gogis_map_metadata_generation(void) {

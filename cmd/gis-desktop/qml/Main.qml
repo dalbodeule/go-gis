@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
@@ -16,8 +17,16 @@ ApplicationWindow {
     minimumHeight: 640
     title: "GoGIS"
     color: "#f4f6f8"
+    function syncTransientWindowModels() {
+        if (rootWindow.visible && rootWindow.visibility !== Window.Minimized)
+            mapViewport.restoreTransientWindowModels();
+        else
+            mapViewport.releaseTransientWindowModels();
+    }
+    onVisibleChanged: syncTransientWindowModels()
     onVisibilityChanged: {
         var requestedState = rootWindow.visibility;
+        syncTransientWindowModels();
         Qt.callLater(function() {
             console.info("GoGIS window-state=" + requestedState +
                          " current=" + rootWindow.visibility +
@@ -32,6 +41,12 @@ ApplicationWindow {
     property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
     property string runtimeText: typeof appRuntime === "undefined" ? "Go runtime" : appRuntime
     property string buildTargetText: typeof appBuildTarget === "undefined" ? "desktop" : appBuildTarget
+    onVertexEditModeChanged: {
+        if (vertexEditMode && mapCanvas.visible)
+            mapViewport.vertexHandleGenerationSeen = -1;
+        else
+            mapViewport.vertexHandleModel.rows = [];
+    }
     function systemInterfaceLanguage() {
         var localeLanguage = String(Qt.locale().name).toLowerCase().split(/[-_]/)[0]
         if (localeLanguage === "ko") return "ko"
@@ -121,6 +136,12 @@ ApplicationWindow {
         jp: ({"Zoom to full extent": "全体表示", "Remove layer…": "レイヤーを除去…", "Remove layer from project": "プロジェクトからレイヤーを除去", "Remove '%1' from this project? The source file will not be deleted.": "このプロジェクトから'%1'を除去しますか？元のファイルは削除しません。", "Transparent": "透明", "Opaque": "不透明", "Set point symbols, boundary lines, and polygon fill. Colors use #RRGGBB; sizes are in millimeters on screen.": "点・境界線・ポリゴンの塗りを設定します。色は#RRGGBB、サイズは画面上のmmです。", "Outline only (no polygon fill)": "輪郭線のみ表示（塗りなし）", "Fill opacity: 0 = transparent, 1 = opaque. Boundary lines remain visible. This setting affects polygons only.": "塗りの不透明度: 0は透明、1は不透明です。境界線は表示されたままです。ポリゴンのみに適用されます。", "Available fields…": "使用可能なフィールド…", "Choose a field or type a template, for example ${NAME} (${CODE}).": "フィールドを選ぶか、${NAME} (${CODE})のように入力してください。", "Fields for this layer": "このレイヤーのフィールド", "Click a field to insert ${FIELD} at the cursor. A single field name also works.": "フィールドを選ぶとカーソル位置に${FIELD}を挿入します。フィールド名だけでも使えます。", "Field list is loading or unavailable for this layer.": "フィールド一覧を読み込み中、またはこのレイヤーでは利用できません。"})
     })
 
+    property var attributeTranslations: ({
+        en: ({"Layer": "Layer", "Feature": "Feature", "Editable": "Editable", "Yes": "Yes", "Read-only": "Read-only", "Page": "Page"}),
+        ko: ({"Layer": "레이어", "Feature": "피처", "Editable": "편집 가능", "Yes": "예", "Read-only": "읽기 전용", "Page": "페이지"}),
+        jp: ({"Layer": "レイヤー", "Feature": "地物", "Editable": "編集可能", "Yes": "はい", "Read-only": "読み取り専用", "Page": "ページ"})
+    })
+
     function tr(key) {
         var override = translationOverrides[language] || translationOverrides.en;
         if (override[key] !== undefined)
@@ -131,6 +152,9 @@ ApplicationWindow {
         var diagnosticDictionary = diagnosticTranslations[language] || diagnosticTranslations.en;
         if (diagnosticDictionary[key] !== undefined)
             return diagnosticDictionary[key];
+        var attributeDictionary = attributeTranslations[language] || attributeTranslations.en;
+        if (attributeDictionary[key] !== undefined)
+            return attributeDictionary[key];
         var viewDictionary = viewTranslations[language] || viewTranslations.en;
         if (viewDictionary[key] !== undefined)
             return viewDictionary[key];
@@ -205,14 +229,23 @@ ApplicationWindow {
         var status = String(raw || "").toLowerCase();
         if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
         if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
-        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
         if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0 || status.indexOf("project crs set") >= 0) return "#2e7d32";
         return "#65717d";
     }
 
     function statusIsBusy(raw) {
         var status = String(raw || "").toLowerCase();
-        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
+        // Terminal messages can contain the same operation word as their
+        // running state (for example "spatial operation cancelled").
+        if (status.indexOf("cancel") >= 0 || status.indexOf("failed") >= 0 ||
+            status.indexOf("error") >= 0 || status.indexOf("stopped") >= 0 ||
+            status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 ||
+            status.indexOf("added") >= 0 || status.indexOf("deleted") >= 0 ||
+            status.indexOf("removed") >= 0 || status.indexOf("exported") >= 0 ||
+            status.indexOf("ready") >= 0)
+            return false;
+        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
     }
 
     function renderProgressSnapshot(raw) {
@@ -238,6 +271,11 @@ ApplicationWindow {
         property alias cursorPosition: sourceArea.cursorPosition
         property string highlightedHTML: ""
         property string highlightedLineNumbers: "1"
+        // Rich-text highlighting keeps both the editor source and a rendered
+        // HTML copy alive. Fall back to the native TextArea for unusually
+        // large scripts so typing remains responsive and bounded.
+        readonly property int maxHighlightSourceLength: 128 * 1024
+        readonly property bool syntaxHighlightingEnabled: sourceArea.text.length <= maxHighlightSourceLength
         readonly property var keywordLookup: ({"and": true, "break": true, "do": true, "else": true, "elseif": true, "end": true, "false": true, "for": true, "function": true, "if": true, "in": true, "local": true, "nil": true, "not": true, "or": true, "repeat": true, "return": true, "then": true, "true": true, "until": true, "while": true})
         readonly property var apiLookup: ({"feature": true, "gogis": true, "math": true, "string": true, "table": true, "ipairs": true, "pairs": true, "tonumber": true, "tostring": true, "type": true})
         implicitHeight: 144
@@ -252,6 +290,11 @@ ApplicationWindow {
             interval: 75
             repeat: false
             onTriggered: {
+                if (!luaCodeEditor.syntaxHighlightingEnabled) {
+                    luaCodeEditor.highlightedHTML = "";
+                    luaCodeEditor.highlightedLineNumbers = "";
+                    return;
+                }
                 luaCodeEditor.highlightedHTML = luaCodeEditor.highlightLua(sourceArea.text);
                 luaCodeEditor.highlightedLineNumbers = luaCodeEditor.lineNumberText(sourceArea.text);
             }
@@ -389,9 +432,11 @@ ApplicationWindow {
             textFormat: Text.RichText
             font: sourceArea.font
             color: "#263238"
+            visible: luaCodeEditor.syntaxHighlightingEnabled
         }
         TextArea {
             id: sourceArea
+            objectName: "luaSourceArea"
             anchors.fill: parent
             leftPadding: 52
             rightPadding: 8
@@ -400,7 +445,7 @@ ApplicationWindow {
             wrapMode: TextEdit.NoWrap
             selectByMouse: true
             font.family: Qt.platform.os === "osx" ? "Menlo" : Qt.platform.os === "windows" ? "Consolas" : "DejaVu Sans Mono"
-            color: "transparent"
+            color: luaCodeEditor.syntaxHighlightingEnabled ? "transparent" : "#263238"
             selectedTextColor: "transparent"
             selectionColor: "#557aa6d6"
             background: null
@@ -435,6 +480,11 @@ ApplicationWindow {
                 onClicked: fileDialog.open()
             }
             Button {
+                objectName: "openPostGISTablesButton"
+                text: rootWindow.language === "ko" ? "PostGIS 테이블" : rootWindow.language === "jp" ? "PostGISテーブル" : "PostGIS tables"
+                onClicked: postGISTableDialog.open()
+            }
+            Button {
                 text: rootWindow.tr("Open workspace")
                 onClicked: workspaceOpenDialog.open()
             }
@@ -452,7 +502,7 @@ ApplicationWindow {
             Button {
                 objectName: "toggleVertexEditButton"
                 text: rootWindow.vertexEditMode ? "Finish vertex edit" : "Edit vertices"
-                enabled: layerModel.count > 0 && vertexHandleModel.count > 0
+                enabled: layerModel.count > 0 && mapCanvas.visible
                 onClicked: rootWindow.vertexEditMode = !rootWindow.vertexEditMode
             }
             Button {
@@ -491,7 +541,6 @@ ApplicationWindow {
             text: rootWindow.tr("Export project layers to DXF")
             enabled: layerModel.count > 0
             onTriggered: {
-                dxfLayerOptions.clear();
                 dxfEncodingDialog.open();
             }
         }
@@ -633,6 +682,93 @@ ApplicationWindow {
     }
 
     Dialog {
+        id: postGISTableDialog
+        objectName: "postGISTableDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "PostGIS 테이블 목록" : rootWindow.language === "jp" ? "PostGISテーブル一覧" : "PostGIS table catalog"
+        width: Math.min(620, rootWindow.width - 48)
+        height: Math.min(560, rootWindow.height - 80)
+        standardButtons: Dialog.Close
+        property string errorText: ""
+        property bool catalogTruncated: false
+        onOpened: {
+            errorText = "";
+            catalogTruncated = false;
+            mapCanvas.postGISCatalogVisible = true;
+            // Keep catalog rows lazy: the native payload remains the source
+            // of truth while the QML ListView exists only when open.
+            mapViewport.postGISCatalogPayloadSeen = -1;
+            mapCanvas.postGISCatalogSchema = postGISSchemaField.text.trim();
+            mapCanvas.postGISCatalogGeneration += 1;
+        }
+        onClosed: {
+            mapCanvas.postGISCatalogVisible = false;
+            mapCanvas.postGISCatalogPayload = "[]";
+            mapViewport.postGISTables = [];
+            errorText = "";
+            catalogTruncated = false;
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: rootWindow.language === "ko" ? "스키마" : rootWindow.language === "jp" ? "スキーマ" : "Schema" }
+                TextField {
+                    id: postGISSchemaField
+                    objectName: "postGISSchemaField"
+                    Layout.fillWidth: true
+                    placeholderText: "public"
+                }
+                Button {
+                    objectName: "refreshPostGISTablesButton"
+                    text: rootWindow.language === "ko" ? "새로고침" : rootWindow.language === "jp" ? "更新" : "Refresh"
+                    onClicked: {
+                        mapCanvas.postGISCatalogSchema = postGISSchemaField.text.trim();
+                        mapCanvas.postGISCatalogGeneration += 1;
+                    }
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: postGISTableDialog.errorText !== ""
+                text: postGISTableDialog.errorText
+                color: "#b42318"
+                wrapMode: Text.WordWrap
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: postGISTableDialog.catalogTruncated
+                text: rootWindow.language === "ko" ? "테이블이 많아 처음 2,048개만 표시됩니다. 스키마를 좁혀 다시 조회하세요." : rootWindow.language === "jp" ? "テーブル数が多いため最初の2,048件だけ表示しています。スキーマを絞って再検索してください。" : "There are more tables; only the first 2,048 are shown. Narrow the schema and refresh."
+                color: "#8a4b08"
+                wrapMode: Text.WordWrap
+            }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "공간 테이블을 선택하면 레이어로 불러옵니다. 레코드 추가·삭제는 속성 테이블에서 수행합니다." : rootWindow.language === "jp" ? "空間テーブルを選択するとレイヤーとして読み込みます。レコードの追加・削除は属性テーブルで行います。" : "Select a spatial table to load it as a layer. Add or delete records from the attribute table."
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+            }
+            ListView {
+                objectName: "postGISTableList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                reuseItems: true
+                cacheBuffer: 0
+                model: mapViewport.postGISTables
+                delegate: ItemDelegate {
+                    width: ListView.view.width
+                    text: modelData.schema + "." + modelData.name + "  ·  SRID " + modelData.srid
+                    onClicked: {
+                        mapViewport.requestLoad("postgis://" + modelData.schema + "." + modelData.name);
+                        postGISTableDialog.close();
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
         id: deleteRecordDialog
         objectName: "deleteRecordDialog"
         modal: true
@@ -654,7 +790,6 @@ ApplicationWindow {
         objectName: "addRecordDialog"
         modal: true
         title: rootWindow.language === "ko" ? "레코드 추가" : rootWindow.language === "jp" ? "レコード追加" : "Add record"
-        standardButtons: Dialog.Ok | Dialog.Cancel
         width: Math.min(560, rootWindow.width - 48)
         contentItem: ColumnLayout {
             spacing: 8
@@ -670,7 +805,13 @@ ApplicationWindow {
             addRecordWKT.text = "";
             addRecordProperties.text = "{}";
         }
-        onAccepted: {
+        function submitRecord() {
+            var recordIDText = addRecordID.text.trim();
+            var recordID = Number(recordIDText);
+            if (recordIDText.length === 0 || !isFinite(recordID)) {
+                mapCanvas.renderStatus = rootWindow.language === "ko" ? "ID가 필요합니다" : rootWindow.language === "jp" ? "IDが必要です" : "Feature ID is required";
+                return;
+            }
             if (addRecordWKT.text.trim().length === 0) {
                 mapCanvas.renderStatus = rootWindow.language === "ko" ? "WKT가 필요합니다" : rootWindow.language === "jp" ? "WKTが必要です" : "WKT is required";
                 return;
@@ -683,8 +824,22 @@ ApplicationWindow {
                 return;
             }
             mapCanvas.editAction = "addFeature";
-            mapCanvas.editValue = JSON.stringify({layer: mapViewport.activeLayer, id: Number(addRecordID.text), wkt: addRecordWKT.text, properties: properties});
+            mapCanvas.editValue = JSON.stringify({layer: mapViewport.activeLayer, id: recordID, wkt: addRecordWKT.text, properties: properties});
             mapCanvas.editGeneration += 1;
+            addRecordDialog.accept();
+        }
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button {
+                objectName: "addRecordCancelButton"
+                text: rootWindow.tr("Cancel")
+                onClicked: addRecordDialog.reject()
+            }
+            Button {
+                objectName: "addRecordAcceptButton"
+                text: rootWindow.language === "ko" ? "추가" : rootWindow.language === "jp" ? "追加" : "Add"
+                onClicked: addRecordDialog.submitRecord()
+            }
         }
     }
 
@@ -724,6 +879,7 @@ ApplicationWindow {
                 return {available: false, error: String(error), entries: []};
             }
         }
+        property var searchResultEntries: []
         property var commonCodes: ["EPSG:5186", "EPSG:5179", "EPSG:4326", "EPSG:3857", "EPSG:32652"]
         property var countryOptions: [
             {ko: "대한민국", jp: "韓国", en: "South Korea", aliases: ["korea"], featured: ["EPSG:5186", "EPSG:5179"]},
@@ -797,24 +953,46 @@ ApplicationWindow {
             }
             return result;
         }
-        function searchEntries(query) {
+        function refreshSearchEntries() {
             if (!catalogResponse.available)
-                return [];
-            var needle = query.trim().toLowerCase();
+                return searchResultEntries = [];
+            var needle = crsSearchField.text.trim().toLowerCase();
             var entries = catalogResponse.entries || [];
-            if (needle === "")
-                return entries;
-            return entries.filter(function(entry) {
-                return entry.code.toLowerCase().indexOf(needle) >= 0 ||
-                       entry.name.toLowerCase().indexOf(needle) >= 0 ||
-                       (entry.area || "").toLowerCase().indexOf(needle) >= 0;
-            });
+            if (needle === "") {
+                searchResultEntries = entries;
+                return;
+            }
+            var result = [];
+            for (var i = 0; i < entries.length; ++i) {
+                var entry = entries[i];
+                if (entry.code.toLowerCase().indexOf(needle) >= 0 ||
+                    entry.name.toLowerCase().indexOf(needle) >= 0 ||
+                    (entry.area || "").toLowerCase().indexOf(needle) >= 0)
+                    result.push(entry);
+            }
+            searchResultEntries = result;
         }
+        function scheduleSearchRefresh() {
+            crsSearchTimer.restart();
+        }
+        Timer {
+            id: crsSearchTimer
+            objectName: "crsSearchTimer"
+            interval: 120
+            repeat: false
+            onTriggered: projectCRSDialog.refreshSearchEntries()
+        }
+        onCatalogResponseChanged: scheduleSearchRefresh()
         onOpened: {
             projectCRSField.text = mapViewport.dataCRS || "";
             crsCategoryTabs.currentIndex = 0;
             countryChoice.currentIndex = countryIndexForCurrentCRS();
             crsSearchField.text = "";
+            scheduleSearchRefresh();
+        }
+        onClosed: {
+            crsSearchTimer.stop();
+            searchResultEntries = [];
         }
         contentItem: ColumnLayout {
             spacing: 8
@@ -864,6 +1042,8 @@ ApplicationWindow {
                 ListView {
                     objectName: "commonCRSList"
                     clip: true
+                    reuseItems: true
+                    cacheBuffer: 0
                     model: projectCRSDialog.entriesForCodes(projectCRSDialog.commonCodes)
                     delegate: ItemDelegate {
                         width: ListView.view.width
@@ -894,6 +1074,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
+                        reuseItems: true
+                        cacheBuffer: 0
                         model: projectCRSDialog.countryEntries(countryChoice.currentIndex)
                         delegate: ItemDelegate {
                             width: ListView.view.width
@@ -925,7 +1107,9 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
-                        model: projectCRSDialog.searchEntries(crsSearchField.text)
+                        reuseItems: true
+                        cacheBuffer: 0
+                        model: projectCRSDialog.searchResultEntries
                         delegate: ItemDelegate {
                             width: ListView.view.width
                             text: modelData.code + "  " + modelData.name
@@ -935,6 +1119,10 @@ ApplicationWindow {
                             onClicked: projectCRSField.text = modelData.code
                         }
                         ScrollBar.vertical: ScrollBar {}
+                    }
+                    Connections {
+                        target: crsSearchField
+                        function onTextChanged() { projectCRSDialog.scheduleSearchRefresh(); }
                     }
                     Label {
                         text: rootWindow.language === "ko" ? allCRSList.count + "개 좌표계" : rootWindow.language === "jp" ? allCRSList.count + "件" : allCRSList.count + " CRSs"
@@ -1092,6 +1280,8 @@ ApplicationWindow {
                     objectName: "layerList"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+                    reuseItems: true
+                    cacheBuffer: 0
                     model: ListModel {
                         id: layerModel
                         objectName: "layerModel"
@@ -1152,8 +1342,8 @@ ApplicationWindow {
                 property string selectedFeature: ""
                 property string selectedStatus: "No feature selected"
                 property string editorValue: ""
-                property string attributePayloadSeen: ""
-                property string layerTreePayloadSeen: "[]"
+                property int attributePayloadGenerationSeen: -1
+                property int layerTreePayloadGenerationSeen: -1
                 property string lastSyncedLayerVisibilityPayload: ""
                 property int mapMetadataGenerationSeen: -1
                 property string activeLayer: ""
@@ -1172,9 +1362,13 @@ ApplicationWindow {
                 property int attributePage: 0
                 property int attributePageSize: 0
                 property int attributeTotal: 0
+                readonly property int maxAttributeRows: 128
+                readonly property int maxAttributeColumns: 256
                 property int layerLabelGenerationSeen: -1
                 property int vertexHandleGenerationSeen: -1
                 property string renderStatus: "Ready"
+                property var postGISTables: []
+                property string postGISCatalogPayloadSeen: ""
 
                 // mapCanvas covers the data extent while the clipped viewport
                 // may show only part of it. Preserve enough zoom range for a
@@ -1214,16 +1408,139 @@ ApplicationWindow {
                     return spanX * metersPerMapUnitX(bounds, crs) / (spanY * (String(crs).toUpperCase() === "EPSG:4326" ? 111319.49 : 1));
                 }
 
-                ListModel {
+                QtObject {
                     id: attributeModel
+                    objectName: "attributeModel"
+                    property var rows: []
+                    readonly property int count: rows.length
                 }
-                ListModel {
+                QtObject {
                     id: mapLabelModel
                     objectName: "mapLabelModel"
+                    property var rows: []
+                    readonly property int count: rows.length
+                    function get(index) {
+                        return rows[index];
+                    }
                 }
-                ListModel {
+                QtObject {
                     id: vertexHandleModel
                     objectName: "vertexHandleModel"
+                    property var rows: []
+                    readonly property int count: rows.length
+                }
+
+                // Release transient delegate data while the window is not
+                // usable. The active poll repopulates it after restoration.
+                function releaseTransientWindowModels() {
+                    attributeModel.rows = [];
+                    mapLabelModel.rows = [];
+                    vertexHandleModel.rows = [];
+                }
+
+                function restoreTransientWindowModels() {
+                    attributePayloadGenerationSeen = -1;
+                    layerLabelGenerationSeen = -1;
+                    vertexHandleGenerationSeen = -1;
+                }
+
+                function parseJSONOr(value, fallback) {
+                    try {
+                        return JSON.parse(value);
+                    } catch (error) {
+                        return fallback;
+                    }
+                }
+
+                function parseJSONArray(value) {
+                    var parsed = parseJSONOr(value, []);
+                    return Array.isArray(parsed) ? parsed : [];
+                }
+
+                function parseJSONObject(value) {
+                    var parsed = parseJSONOr(value, ({}));
+                    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : ({});
+                }
+
+                function layerTreeRow(layer) {
+                    return {
+                        name: layer.name,
+                        displayName: layer.displayName || layer.name,
+                        sourcePath: layer.sourcePath || "",
+                        sourceLayerName: layer.sourceLayerName || "",
+                        sourceEncoding: layer.sourceEncoding || "",
+                        sourceCrs: layer.sourceCrs || "",
+                        sourceError: layer.sourceError || "",
+                        crs: layer.crs || "",
+                        geometryType: layer.geometryType || "",
+                        boundsJson: JSON.stringify(layer.bounds || []),
+                        layerVisible: layer.visible !== false,
+                        editable: layer.editable === true,
+                        style: layer.style || ({}),
+                        labels: layer.labels || ({
+                            enabled: false,
+                            expression: "",
+                            placement: "center",
+                            heightMm: 2.5
+                        })
+                    };
+                }
+
+                function sameLayerObjectFields(left, right, fields) {
+                    left = left || ({});
+                    right = right || ({});
+                    for (var fieldIndex = 0; fieldIndex < fields.length; ++fieldIndex) {
+                        var field = fields[fieldIndex];
+                        if (left[field] !== right[field])
+                            return false;
+                    }
+                    return true;
+                }
+
+                function sameLayerStyle(left, right) {
+                    return sameLayerObjectFields(left, right, [
+                        "pointColor", "lineColor", "polygonColor", "pointSizeMm",
+                        "lineWidthMm", "fillOpacity"
+                    ]);
+                }
+
+                function sameLayerLabels(left, right) {
+                    return sameLayerObjectFields(left, right, [
+                        "enabled", "expression", "luaScript", "placement", "rotationField",
+                        "pointPlacement", "pointOffsetMm", "heightMm", "minScale", "maxScale", "rule"
+                    ]);
+                }
+
+                // Preserve existing ListView delegates when a layer's metadata
+                // changes. Clearing and appending the whole model causes every
+                // layer row to be destroyed/recreated, which is expensive and
+                // visibly resets hover/scroll state on large projects.
+                function replaceLayerModel(layers) {
+                    var roleNames = ["name", "displayName", "sourcePath", "sourceLayerName",
+                                     "sourceEncoding", "sourceCrs", "sourceError", "crs",
+                                     "geometryType", "boundsJson", "layerVisible", "editable",
+                                     "style", "labels"];
+                    var sharedCount = Math.min(layerModel.count, layers.length);
+                    for (var index = 0; index < sharedCount; ++index) {
+                        var next = layerTreeRow(layers[index]);
+                        var current = layerModel.get(index);
+                        for (var roleIndex = 0; roleIndex < roleNames.length; ++roleIndex) {
+                            var role = roleNames[roleIndex];
+                            var changed;
+                            if (role === "style")
+                                changed = !sameLayerStyle(current[role], next[role]);
+                            else if (role === "labels")
+                                changed = !sameLayerLabels(current[role], next[role]);
+                            else
+                                changed = current[role] !== next[role];
+                            if (changed)
+                                layerModel.setProperty(index, role, next[role]);
+                        }
+                    }
+                    while (layerModel.count > layers.length)
+                        layerModel.remove(layerModel.count - 1);
+                    for (var appendIndex = sharedCount; appendIndex < layers.length; ++appendIndex)
+                        layerModel.append(layerTreeRow(layers[appendIndex]));
                 }
 
                 function anyLayerVisible() {
@@ -1234,12 +1551,24 @@ ApplicationWindow {
                     return false;
                 }
 
+                function activeLayerEditable() {
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        var layer = layerModel.get(i);
+                        if (layer.name === activeLayer)
+                            return layer.editable === true;
+                    }
+                    return false;
+                }
+
                 function selectLayer(name) {
-                    if (activeLayer !== name)
+                    var layerChanged = activeLayer !== name || mapCanvas.activeLayer !== name;
+                    if (layerChanged)
                         attributeFieldHints = [];
                     activeLayer = name;
-                    mapCanvas.activeLayer = name;
-                    mapCanvas.activeLayerGeneration += 1;
+                    if (mapCanvas.activeLayer !== name) {
+                        mapCanvas.activeLayer = name;
+                        mapCanvas.activeLayerGeneration += 1;
+                    }
                     for (var i = 0; i < layerModel.count; ++i) {
                         if (layerModel.get(i).name === name) {
                             attributeLayerTabs.currentIndex = i;
@@ -1566,6 +1895,9 @@ ApplicationWindow {
                 MapCanvas {
                     id: mapCanvas
                     objectName: "goGisMapCanvas"
+                    // The native bridge uses this state to release scene data
+                    // while the window is minimized, then repaints on restore.
+                    property bool windowActive: rootWindow.visible && rootWindow.visibility !== Window.Minimized
                     property real mapAspectRatio: {
                         return mapViewport.mapMeterAspectRatio(mapViewport.dataBounds, mapViewport.dataCRS);
                     }
@@ -1594,9 +1926,14 @@ ApplicationWindow {
                     property string editValue: ""
                     property int editGeneration: 0
                     property string attributePayload: "[]"
+                    property bool attributePayloadVisible: false
+                    property int attributePayloadGeneration: 0
+                    onAttributePayloadChanged: attributePayloadGeneration += 1
                     property int attributePage: 0
                     property int attributePageGeneration: 0
                     property string layerTreePayload: "[]"
+                    property int layerTreePayloadGeneration: 0
+                    onLayerTreePayloadChanged: layerTreePayloadGeneration += 1
                     property string layerSettingsPayload: ""
                     property int layerSettingsGeneration: 0
                     property string spatialPayload: ""
@@ -1623,8 +1960,12 @@ ApplicationWindow {
                     property string loadRequestJournal: "[]"
                     property int loadGeneration: 0
                     property int loadCapturedGeneration: 0
+                    property string postGISCatalogSchema: ""
+                    property int postGISCatalogGeneration: 0
+                    property string postGISCatalogPayload: "[]"
+                    property int postGISCatalogPayloadGeneration: 0
                     onLoadCapturedGenerationChanged: {
-                        var requests = JSON.parse(loadRequestJournal);
+                        var requests = mapViewport.parseJSONArray(loadRequestJournal);
                         loadRequestJournal = JSON.stringify(requests.filter(function(request) {
                             return request.generation > loadCapturedGeneration;
                         }));
@@ -1636,58 +1977,65 @@ ApplicationWindow {
                     scale: mapViewport.mapZoom
                     transformOrigin: Item.Center
                     visible: mapViewport.anyLayerVisible()
+                    onVisibleChanged: {
+                        if (!visible) {
+                            mapLabelModel.rows = [];
+                            vertexHandleModel.rows = [];
+                        } else {
+                            mapViewport.layerLabelGenerationSeen = -1;
+                            mapViewport.vertexHandleGenerationSeen = -1;
+                        }
+                    }
                 }
 
                 Repeater {
                     objectName: "mapLabelRepeater"
-                    model: mapLabelModel
+                    model: mapLabelModel.rows
                     delegate: Text {
+                        property var label: modelData
                         z: 2
-                        x: mapCanvas.x + mapCanvas.width / 2 + (model.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2 + Number(model.offsetXmm || 0) * mapCanvas.logicalPixelsPerMm
-                        y: mapCanvas.y + mapCanvas.height / 2 - (model.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2 + Number(model.offsetYmm || 0) * mapCanvas.logicalPixelsPerMm
-                        rotation: mapViewport.screenRotation(model.rotation)
-                        text: model.text
+                        x: mapCanvas.x + mapCanvas.width / 2 + (label.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2 + Number(label.offsetXmm || 0) * mapCanvas.logicalPixelsPerMm
+                        y: mapCanvas.y + mapCanvas.height / 2 - (label.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2 + Number(label.offsetYmm || 0) * mapCanvas.logicalPixelsPerMm
+                        rotation: mapViewport.screenRotation(label.rotation)
+                        text: label.text
                         textFormat: Text.PlainText
-                        font.pixelSize: Math.max(1, Math.round(model.heightMm * mapCanvas.logicalPixelsPerMm))
+                        font.pixelSize: Math.max(1, Math.round(label.heightMm * mapCanvas.logicalPixelsPerMm))
                         color: "#17212b"
                         style: Text.Outline
                         styleColor: "#ffffff"
-                        visible: {
-                            var shown = false;
-                            for (var i = 0; i < layerModel.count; ++i) {
-                                var row = layerModel.get(i);
-                                if (row.name === model.layer) {
-                                    shown = row.layerVisible;
-                                    break;
-                                }
-                            }
-                            var denominator = mapViewport.currentScaleDenominator();
-                            return shown && (model.minScale <= 0 || denominator >= model.minScale) && (model.maxScale <= 0 || denominator <= model.maxScale);
-                        }
+                        // Go filters labels by layer visibility, viewport, scale,
+                        // decluttering, and density before publishing this model.
+                        // Repeating a full layer scan for every label here made
+                        // visibility updates O(labels * layers) on the GUI thread.
+                        visible: true
                     }
                 }
 
                 Repeater {
                     objectName: "vertexHandleRepeater"
                     z: 15
-                    model: vertexHandleModel
+                    // Keep the bounded handle data available for the edit
+                    // action, but do not allocate interactive QML delegates
+                    // while vertex editing is not active.
+                    model: rootWindow.vertexEditMode && mapCanvas.visible ? vertexHandleModel.rows : []
                     delegate: Rectangle {
                         id: vertexHandle
+                        property var handle: modelData || ({})
                         property alias dragArea: vertexMouseArea
-                        objectName: "vertexHandle_" + model.vertexIndex
+                        objectName: "vertexHandle_" + handle.vertexIndex
                         z: 20
                         width: 12
                         height: 12
                         radius: 6
-                        x: mapCanvas.x + mapCanvas.width / 2 + (model.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2
-                        y: mapCanvas.y + mapCanvas.height / 2 - (model.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2
+                        x: mapCanvas.x + mapCanvas.width / 2 + (handle.x - 0.5) * mapCanvas.width * mapCanvas.scale - width / 2
+                        y: mapCanvas.y + mapCanvas.height / 2 - (handle.y - 0.5) * mapCanvas.height * mapCanvas.scale - height / 2
                         color: "#fff"
                         border.color: "#145da0"
                         border.width: 2
                         visible: rootWindow.vertexEditMode
                         MouseArea {
                             id: vertexMouseArea
-                            objectName: "vertexDragArea_" + model.vertexIndex
+                            objectName: "vertexDragArea_" + vertexHandle.handle.vertexIndex
                             anchors.fill: parent
                             enabled: rootWindow.vertexEditMode
                             cursorShape: Qt.SizeAllCursor
@@ -1714,7 +2062,7 @@ ApplicationWindow {
                                 var ny = 0.5 - (vertexHandle.y + vertexHandle.height / 2 - mapCanvas.y - mapCanvas.height / 2) / (mapCanvas.height * mapCanvas.scale);
                                 var bounds = mapViewport.dataBounds;
                                 mapCanvas.editAction = "moveVertex";
-                                mapCanvas.editValue = JSON.stringify({vertexIndex: model.vertexIndex, x: bounds[0] + nx * (bounds[2] - bounds[0]), y: bounds[1] + ny * (bounds[3] - bounds[1])});
+                                mapCanvas.editValue = JSON.stringify({vertexIndex: vertexHandle.handle.vertexIndex, x: bounds[0] + nx * (bounds[2] - bounds[0]), y: bounds[1] + ny * (bounds[3] - bounds[1])});
                                 mapCanvas.editGeneration += 1;
                             }
                             onReleased: submitVertexEdit()
@@ -1767,7 +2115,7 @@ ApplicationWindow {
                             paths.push(path);
                     }
                     var generation = mapCanvas.loadGeneration + 1;
-                    var pending = JSON.parse(mapCanvas.loadRequestJournal);
+                    var pending = mapViewport.parseJSONArray(mapCanvas.loadRequestJournal);
                     pending.push({generation: generation, paths: paths});
                     mapCanvas.loadRequestJournal = JSON.stringify(pending);
                     mapCanvas.loadPath = JSON.stringify(paths);
@@ -1838,54 +2186,69 @@ ApplicationWindow {
                 }
 
                 Timer {
-                    interval: 16
+                    objectName: "mapStateSyncTimer"
+                    // Keep rendering and vertex-edit updates at 30 Hz, but
+                    // avoid waking the QML/JSON bridge at that rate when the
+                    // map is completely idle. Dialogs use generation-gated
+                    // payloads and remain responsive at the idle cadence.
+                    interval: rootWindow.statusIsBusy(mapCanvas.renderStatus) || rootWindow.vertexEditMode ? 33 : 125
                     repeat: true
-                    running: true
+                    running: rootWindow.visible && rootWindow.visibility !== Window.Minimized
                     onTriggered: {
                         if (mapViewport.selectedFeature !== mapCanvas.selectionFeature) {
                             mapViewport.editorValue = mapCanvas.selectionValue;
                         }
-                        if (mapCanvas.attributePayload !== mapViewport.attributePayloadSeen) {
-                            mapViewport.attributePayloadSeen = mapCanvas.attributePayload;
-                            attributeModel.clear();
-                            var table = JSON.parse(mapCanvas.attributePayload);
-                            mapViewport.attributeColumns = table.columns || [];
-                            mapViewport.attributeFieldHints = table.fields || mapViewport.attributeColumns.map(function(name) { return {name: name, type: "unknown"}; });
-                            mapViewport.attributePage = table.page || 0;
-                            mapViewport.attributePageSize = table.pageSize || 0;
-                            mapViewport.attributeTotal = table.total || 0;
-                            var rows = table.rows || [];
-                            for (var i = 0; i < rows.length; ++i) {
-                                attributeModel.append(rows[i]);
+                        if (mapCanvas.attributePayloadGeneration !== mapViewport.attributePayloadGenerationSeen) {
+                            mapViewport.attributePayloadGenerationSeen = mapCanvas.attributePayloadGeneration;
+                            if (attributeDialog.visible) {
+                                var table = mapViewport.parseJSONObject(mapCanvas.attributePayload);
+                                var columns = Array.isArray(table.columns) ? table.columns.slice(0, mapViewport.maxAttributeColumns) : [];
+                                mapViewport.attributeColumns = columns;
+                                var fields = Array.isArray(table.fields) ? table.fields.slice(0, mapViewport.maxAttributeColumns) : columns.map(function(name) { return {name: name, type: "unknown"}; });
+                                mapViewport.attributeFieldHints = fields;
+                                var pageNumber = Number(table.page);
+                                var pageSize = Number(table.pageSize);
+                                var totalRecords = Number(table.total);
+                                mapViewport.attributePage = isFinite(pageNumber) && pageNumber >= 0 ? Math.floor(pageNumber) : 0;
+                                mapViewport.attributePageSize = isFinite(pageSize) && pageSize > 0 ? Math.min(mapViewport.maxAttributeRows, Math.floor(pageSize)) : 0;
+                                mapViewport.attributeTotal = isFinite(totalRecords) && totalRecords >= 0 ? Math.floor(totalRecords) : 0;
+                                var rows = Array.isArray(table.rows) ? table.rows.slice(0, mapViewport.maxAttributeRows) : [];
+                                // Replace one bounded page at once instead of
+                                // emitting one ListModel change per record.
+                                attributeModel.rows = rows;
+                            } else {
+                                attributeModel.rows = [];
                             }
                         }
-                        if (mapCanvas.layerTreePayload !== mapViewport.layerTreePayloadSeen) {
-                            mapViewport.layerTreePayloadSeen = mapCanvas.layerTreePayload;
-                            var layers = JSON.parse(mapCanvas.layerTreePayload);
-                            var previousActiveLayer = mapViewport.activeLayer;
-                            layerModel.clear();
-                            for (var layerIndex = 0; layerIndex < layers.length; ++layerIndex) {
-                                layerModel.append({
-                                    name: layers[layerIndex].name,
-                                    displayName: layers[layerIndex].displayName || layers[layerIndex].name,
-                                    sourcePath: layers[layerIndex].sourcePath || "",
-                                    sourceLayerName: layers[layerIndex].sourceLayerName || "",
-                                    sourceEncoding: layers[layerIndex].sourceEncoding || "",
-                                    sourceCrs: layers[layerIndex].sourceCrs || "",
-                                    sourceError: layers[layerIndex].sourceError || "",
-                                    crs: layers[layerIndex].crs || "",
-                                    geometryType: layers[layerIndex].geometryType || "",
-                                    boundsJson: JSON.stringify(layers[layerIndex].bounds || []),
-                                    layerVisible: layers[layerIndex].visible !== false,
-                                    style: layers[layerIndex].style || ({}),
-                                    labels: layers[layerIndex].labels || ({
-                                            enabled: false,
-                                            expression: "",
-                                            placement: "center",
-                                            heightMm: 2.5
-                                        })
-                                });
+                        if (mapCanvas.postGISCatalogPayloadGeneration !== mapViewport.postGISCatalogPayloadSeen) {
+                            mapViewport.postGISCatalogPayloadSeen = mapCanvas.postGISCatalogPayloadGeneration;
+                            if (postGISTableDialog.visible) {
+                                var catalog = mapViewport.parseJSONObject(mapCanvas.postGISCatalogPayload || "{}");
+                                if (!Array.isArray(catalog.tables))
+                                    catalog.tables = [];
+                                mapViewport.postGISTables = catalog.tables || [];
+                                postGISTableDialog.errorText = catalog.error || "";
+                                postGISTableDialog.catalogTruncated = catalog.truncated === true;
+                            } else {
+                                mapViewport.postGISTables = [];
+                                postGISTableDialog.errorText = "";
                             }
+                        }
+                        if (mapCanvas.layerTreePayloadGeneration !== mapViewport.layerTreePayloadGenerationSeen) {
+                            mapViewport.layerTreePayloadGenerationSeen = mapCanvas.layerTreePayloadGeneration;
+                            var layers = [];
+                            try {
+                                layers = JSON.parse(mapCanvas.layerTreePayload || "[]");
+                                if (!Array.isArray(layers))
+                                    layers = [];
+                            } catch (error) {
+                                // Keep the synchronizer alive when a native or
+                                // driver error produces a truncated payload.
+                                // The next generation can repopulate the tree.
+                                layers = [];
+                            }
+                            var previousActiveLayer = mapViewport.activeLayer;
+                            mapViewport.replaceLayerModel(layers);
                             if (layers.length > 0) {
                                 var selectedName = layers[0].name;
                                 for (var selectedIndex = 0; selectedIndex < layers.length; ++selectedIndex) {
@@ -1919,21 +2282,23 @@ ApplicationWindow {
                         }
                         if (mapCanvas.layerLabelGeneration !== mapViewport.layerLabelGenerationSeen) {
                             mapViewport.layerLabelGenerationSeen = mapCanvas.layerLabelGeneration;
-                            mapLabelModel.clear();
-                            var labels = JSON.parse(mapCanvas.layerLabelPayload || "[]");
-                            if (!Array.isArray(labels))
-                                labels = [];
-                            for (var labelIndex = 0; labelIndex < labels.length; ++labelIndex)
-                                mapLabelModel.append(labels[labelIndex]);
+                            if (mapCanvas.visible) {
+                                var labels = mapViewport.parseJSONArray(mapCanvas.layerLabelPayload || "[]");
+                                // Replace the array once so a large label payload does
+                                // not emit one ListModel change per row on the GUI thread.
+                                mapLabelModel.rows = labels;
+                            } else {
+                                mapLabelModel.rows = [];
+                            }
                         }
                         if (mapCanvas.vertexHandleGeneration !== mapViewport.vertexHandleGenerationSeen) {
                             mapViewport.vertexHandleGenerationSeen = mapCanvas.vertexHandleGeneration;
-                            vertexHandleModel.clear();
-                            var handles = JSON.parse(mapCanvas.vertexHandlePayload || "[]");
-                            if (!Array.isArray(handles))
-                                handles = [];
-                            for (var handleIndex = 0; handleIndex < handles.length; ++handleIndex)
-                                vertexHandleModel.append(handles[handleIndex]);
+                            if (rootWindow.vertexEditMode && mapCanvas.visible) {
+                                var handles = mapViewport.parseJSONArray(mapCanvas.vertexHandlePayload || "[]");
+                                vertexHandleModel.rows = handles;
+                            } else {
+                                vertexHandleModel.rows = [];
+                            }
                         }
                         if (mapCanvas.mapMetadataPayload !== "" && mapCanvas.mapMetadataGeneration !== mapViewport.mapMetadataGenerationSeen) {
                             mapViewport.mapMetadataGenerationSeen = mapCanvas.mapMetadataGeneration;
@@ -1948,7 +2313,7 @@ ApplicationWindow {
                             var preserveExistingView = mapViewport.hasMapMetadata;
                             var metadata = ({});
                             try {
-                                metadata = JSON.parse(mapCanvas.mapMetadataPayload);
+                                metadata = mapViewport.parseJSONObject(mapCanvas.mapMetadataPayload);
                                 if (metadata.bounds && metadata.bounds.length === 4) {
                                     mapViewport.dataBounds = metadata.bounds;
                                     mapViewport.fitBounds = metadata.fitBounds && metadata.fitBounds.length === 4 ? metadata.fitBounds : metadata.bounds;
@@ -2244,23 +2609,47 @@ ApplicationWindow {
         width: Math.min(780, rootWindow.width - 48)
         height: Math.min(680, rootWindow.height - 80)
         standardButtons: Dialog.Close
+        onOpened: {
+            // Attribute rows are only needed while this dialog is visible.
+            // Invalidate the gate so the active payload is restored lazily.
+            mapCanvas.attributePayloadVisible = true;
+            // The native bridge releases the previous JSON while the dialog
+            // is closed. Request the active layer's first page again on reopen.
+            mapCanvas.attributePage = 0;
+            mapCanvas.attributePageGeneration += 1;
+            mapViewport.attributePayloadGenerationSeen = -1;
+        }
+        onClosed: {
+            mapCanvas.attributePayloadVisible = false;
+            mapCanvas.attributePayload = "[]";
+            attributeModel.rows = [];
+            mapViewport.attributeColumns = [];
+            mapViewport.attributePage = 0;
+            mapViewport.attributePageSize = 0;
+            mapViewport.attributeTotal = 0;
+            // Prevent the idle synchronizer from immediately rebuilding rows
+            // while the dialog is closed; a later open invalidates this gate.
+            mapViewport.attributePayloadGenerationSeen = mapCanvas.attributePayloadGeneration;
+        }
         contentItem: ColumnLayout {
             spacing: 8
-                Flickable {
+                ListView {
+                    id: attributeLayerTabs
+                    objectName: "attributeLayerTabs"
                     Layout.fillWidth: true
-                    Layout.preferredHeight: attributeLayerTabs.implicitHeight
-                    contentWidth: attributeLayerTabs.implicitWidth
+                    Layout.preferredHeight: 40
                     clip: true
-                    boundsBehavior: Flickable.StopAtBounds
-                    TabBar {
-                        id: attributeLayerTabs
+                    orientation: ListView.Horizontal
+                    reuseItems: true
+                    cacheBuffer: 0
+                    model: layerModel
+                    delegate: TabButton {
                         width: implicitWidth
-                        Repeater {
-                            model: layerModel
-                            TabButton {
-                                text: typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName
-                                onClicked: mapViewport.selectLayer(model.name)
-                            }
+                        checked: ListView.isCurrentItem
+                        text: typeof model.displayName === "undefined" || model.displayName === "" ? model.name : model.displayName
+                        onClicked: {
+                            ListView.view.currentIndex = index;
+                            mapViewport.selectLayer(model.name);
                         }
                     }
                 }
@@ -2275,10 +2664,19 @@ ApplicationWindow {
                     visible: mapViewport.selectedFeature !== ""
                     color: mapViewport.selectedFeature ? "#2e7d32" : "#65717d"
                 }
+                Label {
+                    objectName: "attributeReadOnlyNotice"
+                    Layout.fillWidth: true
+                    visible: !mapViewport.activeLayerEditable() && mapViewport.activeLayer !== ""
+                    text: rootWindow.language === "ko" ? "대용량 레이어는 화면 영역만 읽는 읽기 전용 모드입니다. 레코드 편집은 작은 테이블에서 사용할 수 있습니다." : rootWindow.language === "jp" ? "大容量レイヤーは表示範囲だけを読む読み取り専用モードです。レコード編集は小さいテーブルで利用できます。" : "Large layers use bounded read-only viewport mode. Record editing is available for smaller tables."
+                    color: "#8a4b08"
+                    wrapMode: Text.WordWrap
+                }
                 TextField {
                     id: propertyEditor
                     Layout.fillWidth: true
                     visible: mapViewport.selectedFeature !== ""
+                    readOnly: !mapViewport.activeLayerEditable()
                     placeholderText: rootWindow.tr("Feature name")
                     text: mapViewport.editorValue
                     onTextChanged: if (activeFocus)
@@ -2288,6 +2686,7 @@ ApplicationWindow {
                     visible: mapViewport.selectedFeature !== ""
                     Button {
                         text: rootWindow.tr("Save")
+                        enabled: mapViewport.activeLayerEditable()
                         onClicked: {
                             mapCanvas.editAction = "commit";
                             mapCanvas.editValue = mapViewport.editorValue;
@@ -2296,6 +2695,7 @@ ApplicationWindow {
                     }
                     Button {
                         text: rootWindow.tr("Cancel")
+                        enabled: mapViewport.activeLayerEditable()
                         onClicked: {
                             mapCanvas.editAction = "rollback";
                             mapCanvas.editValue = "";
@@ -2306,6 +2706,7 @@ ApplicationWindow {
                     Button {
                         objectName: "deleteSelectedRecordButton"
                         text: rootWindow.language === "ko" ? "레코드 삭제…" : rootWindow.language === "jp" ? "レコード削除…" : "Delete record…"
+                        enabled: mapViewport.activeLayerEditable()
                         onClicked: deleteRecordDialog.open()
                     }
                 }
@@ -2313,33 +2714,33 @@ ApplicationWindow {
                     objectName: "addRecordButton"
                     Layout.fillWidth: true
                     text: rootWindow.language === "ko" ? "레코드 추가…" : rootWindow.language === "jp" ? "レコード追加…" : "Add record…"
-                    enabled: mapViewport.activeLayer !== ""
+                    enabled: mapViewport.activeLayer !== "" && mapViewport.activeLayerEditable()
                     onClicked: addRecordDialog.open()
                 }
                 GridLayout {
                     columns: 2
                     visible: mapViewport.selectedFeature !== ""
                     Label {
-                        text: "Layer"
+                        text: rootWindow.tr("Layer")
                         font.bold: true
                     }
                     Label {
                         text: mapViewport.selectedLayer
                     }
                     Label {
-                        text: "Feature"
+                        text: rootWindow.tr("Feature")
                         font.bold: true
                     }
                     Label {
                         text: mapViewport.selectedFeature
                     }
                     Label {
-                        text: "Editable"
+                        text: rootWindow.tr("Editable")
                         font.bold: true
                     }
                     Label {
-                        text: "Yes"
-                        color: "#2e7d32"
+                        text: mapViewport.activeLayerEditable() ? rootWindow.tr("Yes") : rootWindow.tr("Read-only")
+                        color: mapViewport.activeLayerEditable() ? "#2e7d32" : "#65717d"
                     }
                 }
                 RowLayout {
@@ -2351,7 +2752,7 @@ ApplicationWindow {
                         onClicked: mapViewport.requestAttributePage(mapViewport.attributePage - 1)
                     }
                     Label {
-                        text: "Page " + (mapViewport.attributePage + 1) + " / " + Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
+                        text: rootWindow.tr("Page") + " " + (mapViewport.attributePage + 1) + " / " + Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
                     }
@@ -2362,17 +2763,21 @@ ApplicationWindow {
                     }
                 }
                 ListView {
+                    objectName: "attributeRowsView"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     visible: layerModel.count > 0 && mapViewport.attributeTotal > 0
-                    model: attributeModel
+                    model: attributeModel.rows
                     clip: true
+                    reuseItems: true
+                    cacheBuffer: 0
                     spacing: 6
                     delegate: Rectangle {
                         id: featureCard
                         width: ListView.view.width
-                        property var rowValues: model.values || ({})
-                        property var rowFeatureID: model.featureId
+                        property var row: modelData || ({})
+                        property var rowValues: row.values || ({})
+                        property var rowFeatureID: row.featureId
                         implicitHeight: cardLayout.implicitHeight + 16
                         color: "#ffffff"
                         border.color: "#d9e0e6"
@@ -2536,8 +2941,9 @@ ApplicationWindow {
                     onClicked: coordinateNavigationDialog.open()
                 }
                 Button {
+                    objectName: "cancelWorkButton"
                     text: rootWindow.tr("Cancel loading/render")
-                    enabled: mapViewport.renderStatus.toLowerCase().indexOf("loading") >= 0
+                    enabled: rootWindow.statusIsBusy(mapViewport.renderStatus)
                     visible: enabled
                     onClicked: mapCanvas.cancelGeneration += 1
                 }
@@ -3318,6 +3724,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
+                reuseItems: true
+                cacheBuffer: 0
                 model: mapViewport.attributeFieldHints
                 spacing: 4
                 delegate: Button {
@@ -3500,6 +3908,8 @@ ApplicationWindow {
                     wrapMode: TextEdit.NoWrap
                     textFormat: TextEdit.PlainText
                     text: {
+                        if (!diagnosticLogDialog.visible)
+                            return "";
                         try {
                             var entries = JSON.parse(mapCanvas.diagnosticLogPayload || "[]");
                             return entries.map(function(entry) {
@@ -3569,17 +3979,20 @@ ApplicationWindow {
         ListModel { id: dxfLayerOptions; objectName: "dxfLayerOptionsModel" }
         onOpened: {
             dxfEncodingChoice.currentIndex = 0;
-            if (dxfLayerOptions.count === 0) {
-                for (var i = 0; i < layerModel.count; ++i) {
-                    var layer = layerModel.get(i);
-                    dxfLayerOptions.append({name: layer.name,
-                        cadName: layer.displayName || layer.name,
-                        included: true, geometryEnabled: true, labelsEnabled: true,
-                        geometryType: layer.geometryType || ""});
-                }
+            // Rebuild from the current layer tree on every open. Keeping the
+            // first snapshot caused removed layers and old export settings to
+            // survive subsequent layer edits.
+            dxfLayerOptions.clear();
+            for (var i = 0; i < layerModel.count; ++i) {
+                var layer = layerModel.get(i);
+                dxfLayerOptions.append({name: layer.name,
+                    cadName: layer.displayName || layer.name,
+                    included: true, geometryEnabled: true, labelsEnabled: true,
+                    geometryType: layer.geometryType || ""});
             }
             validationMessage = "";
         }
+        onClosed: dxfLayerOptions.clear()
         onAccepted: {
             var plan = [];
             var seen = {};
@@ -3651,52 +4064,51 @@ ApplicationWindow {
                 text: rootWindow.language === "ko" ? "2D 도형: 점→POINT(원형 십자 표시), 선·폴리곤 경계→LWPOLYLINE. 채우기가 설정된 폴리곤은 SOLID 삼각형으로 채웁니다. Z 좌표는 제외하며 레이블은 같은 CAD 레이어의 TEXT입니다." : rootWindow.language === "jp" ? "2D図形: 点→POINT（円と十字の記号）、線・ポリゴン境界→LWPOLYLINE。塗り設定のあるポリゴンはSOLID三角形で塗ります。Z座標は除外し、ラベルは同じCADレイヤーのTEXTです。" : "2D geometry: points → POINT with a circle-and-cross marker; lines and polygon outlines → LWPOLYLINE. Filled polygons use SOLID triangles. Z coordinates are omitted; labels become TEXT on the same CAD layer."
                 wrapMode: Text.WordWrap
             }
-            ScrollView {
+            ListView {
+                id: dxfLayerOptionsView
+                objectName: "dxfLayerOptionsView"
                 Layout.fillWidth: true
                 Layout.preferredHeight: Math.min(340, Math.max(100, dxfLayerOptions.count * 115))
                 clip: true
-                ColumnLayout {
-                    width: parent.width
-                    Repeater {
-                        model: dxfLayerOptions
-                        delegate: ColumnLayout {
+                reuseItems: true
+                cacheBuffer: 0
+                model: dxfLayerOptions
+                delegate: ColumnLayout {
+                    width: dxfLayerOptionsView.width
+                    CheckBox {
+                        text: model.cadName + " (" + model.geometryType + ")"
+                        checked: model.included
+                        onToggled: dxfLayerOptions.setProperty(index, "included", checked)
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        leftPadding: 20
+                        color: "#526578"
+                        text: rootWindow.language === "ko"
+                            ? "도형 해석: " + (/point/i.test(model.geometryType) ? "점 → POINT" : /polygon/i.test(model.geometryType) ? "폴리곤 경계 → LWPOLYLINE" : /line/i.test(model.geometryType) ? "선 → LWPOLYLINE" : "원본 형상에 따라 POINT/LWPOLYLINE")
+                            : "Geometry mapping: " + (/point/i.test(model.geometryType) ? "points → POINT" : /polygon/i.test(model.geometryType) ? "polygon outlines → LWPOLYLINE" : /line/i.test(model.geometryType) ? "lines → LWPOLYLINE" : "POINT/LWPOLYLINE by source shape")
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        enabled: model.included
+                        Label { text: rootWindow.language === "ko" ? "CAD 이름" : "CAD name" }
+                        TextField {
                             Layout.fillWidth: true
-                            CheckBox {
-                                text: model.cadName + " (" + model.geometryType + ")"
-                                checked: model.included
-                                onToggled: dxfLayerOptions.setProperty(index, "included", checked)
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                leftPadding: 20
-                                color: "#526578"
-                                text: rootWindow.language === "ko"
-                                    ? "도형 해석: " + (/point/i.test(model.geometryType) ? "점 → POINT" : /polygon/i.test(model.geometryType) ? "폴리곤 경계 → LWPOLYLINE" : /line/i.test(model.geometryType) ? "선 → LWPOLYLINE" : "원본 형상에 따라 POINT/LWPOLYLINE")
-                                    : "Geometry mapping: " + (/point/i.test(model.geometryType) ? "points → POINT" : /polygon/i.test(model.geometryType) ? "polygon outlines → LWPOLYLINE" : /line/i.test(model.geometryType) ? "lines → LWPOLYLINE" : "POINT/LWPOLYLINE by source shape")
-                            }
-                            RowLayout {
-                                Layout.fillWidth: true
-                                enabled: model.included
-                                Label { text: rootWindow.language === "ko" ? "CAD 이름" : "CAD name" }
-                                TextField {
-                                    Layout.fillWidth: true
-                                    text: model.cadName
-                                    onTextChanged: dxfLayerOptions.setProperty(index, "cadName", text)
-                                }
-                            }
-                            RowLayout {
-                                enabled: model.included
-                                CheckBox {
-                                    text: rootWindow.language === "ko" ? "도형" : "Geometry"
-                                    checked: model.geometryEnabled
-                                    onToggled: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
-                                }
-                                CheckBox {
-                                    text: rootWindow.language === "ko" ? "레이블" : "Labels"
-                                    checked: model.labelsEnabled
-                                    onToggled: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
-                                }
-                            }
+                            text: model.cadName
+                            onTextChanged: dxfLayerOptions.setProperty(index, "cadName", text)
+                        }
+                    }
+                    RowLayout {
+                        enabled: model.included
+                        CheckBox {
+                            text: rootWindow.language === "ko" ? "도형" : "Geometry"
+                            checked: model.geometryEnabled
+                            onToggled: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
+                        }
+                        CheckBox {
+                            text: rootWindow.language === "ko" ? "레이블" : "Labels"
+                            checked: model.labelsEnabled
+                            onToggled: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
                         }
                     }
                 }

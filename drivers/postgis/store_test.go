@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -46,6 +47,15 @@ func TestNormIterMakesProgressOnMalformedUTF8(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("normalizer did not finish malformed UTF-8 input within 2 seconds")
+	}
+}
+
+func TestListTablesLimitedRejectsInvalidLimitBeforeOpeningDatabase(t *testing.T) {
+	for _, limit := range []int{0, -1} {
+		tables, truncated, err := ListTablesLimited(context.Background(), "", "public", limit)
+		if err == nil || tables != nil || truncated {
+			t.Fatalf("limit %d: tables=%v truncated=%t err=%v", limit, tables, truncated, err)
+		}
 	}
 }
 
@@ -119,6 +129,17 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 	}
 	if !foundTable {
 		t.Fatalf("table %q was not returned by catalog listing: %+v", table, tables)
+	}
+	info, err := store.Describe(ctx)
+	if err != nil {
+		t.Fatalf("describe PostGIS table: %v", err)
+	}
+	if info.FeatureCount != 1 || info.CRS.AuthorityCode != "EPSG:4326" || !(info.Bounds[0] < 127 && info.Bounds[2] > 127) {
+		t.Fatalf("unexpected PostGIS layer info: %+v", info)
+	}
+	window, err := store.ReadWindow(ctx, [4]float64{126, 36, 128, 38}, true, 16, 1<<20)
+	if err != nil || len(window.Features) != 1 || window.Features[0].ID != 1 {
+		t.Fatalf("read PostGIS window: features=%d err=%v", len(window.Features), err)
 	}
 
 	// The first replacement insert succeeds, then malformed WKT makes the next
@@ -227,6 +248,52 @@ func TestPostGISQueriesUseQuotedTableAndStableOrdering(t *testing.T) {
 	}
 	if got := clearLayerQuery(`gis.roads`); got != `DELETE FROM "gis"."roads"` {
 		t.Fatalf("clear query = %s", got)
+	}
+}
+
+func TestPostGISWindowQueryIsBoundedAndUsesNativeSRID(t *testing.T) {
+	withProperties := readWindowQuery(`gis.roads`, true)
+	for _, expected := range []string{
+		`"gis"."roads"`,
+		`ST_Intersects`,
+		`ST_MakeEnvelope($1, $2, $3, $4)`,
+		`ST_SetSRID`,
+		`ST_SRID(geom)`,
+		`ORDER BY id LIMIT $5`,
+		`octet_length(properties::text) <= 8388608`,
+	} {
+		if !strings.Contains(withProperties, expected) {
+			t.Fatalf("window query %q does not contain %q", withProperties, expected)
+		}
+	}
+	withoutProperties := readWindowQuery(`gis.roads`, false)
+	if strings.Contains(withoutProperties, "properties::text) <=") {
+		t.Fatalf("geometry-only window query still requests full properties: %s", withoutProperties)
+	}
+}
+
+func TestValidatePostGISBounds(t *testing.T) {
+	if err := validatePostGISBounds([4]float64{0, 0, 10, 10}); err != nil {
+		t.Fatalf("valid bounds rejected: %v", err)
+	}
+	for _, bounds := range [][4]float64{
+		{10, 0, 0, 10}, {0, 10, 10, 0}, {0, 0, 0, 10},
+		{0, 0, math.Inf(1), 10}, {0, 0, math.NaN(), 10},
+	} {
+		if err := validatePostGISBounds(bounds); err == nil {
+			t.Fatalf("invalid bounds accepted: %v", bounds)
+		}
+	}
+}
+
+func TestExpandDegenerateBoundsKeepsPointTablesRenderable(t *testing.T) {
+	got := expandDegenerateBounds([4]float64{127, 37, 127, 37})
+	if !(got[0] < 127 && got[1] < 37 && got[2] > 127 && got[3] > 37) {
+		t.Fatalf("point bounds were not expanded: %v", got)
+	}
+	line := expandDegenerateBounds([4]float64{10, 20, 10, 30})
+	if !(line[0] < 10 && line[2] > 10 && line[1] == 20 && line[3] == 30) {
+		t.Fatalf("vertical line bounds changed unexpectedly: %v", line)
 	}
 }
 

@@ -39,6 +39,8 @@ void gogis_canvas_viewport(double* pan_x, double* pan_y, double* zoom,
 
 // Returns whether the registered MapCanvas is currently visible in QML.
 int gogis_canvas_visible(void);
+// Returns the generation raised when the canvas/window becomes visible or hidden.
+unsigned long long gogis_canvas_visibility_generation(void);
 
 // Returns the latest QML click generation observed on the GUI thread.
 unsigned long long gogis_click_generation(void);
@@ -49,6 +51,7 @@ void gogis_canvas_click(double* x, double* y);
 // Publishes selection state for the QML properties on MapCanvas.
 void gogis_set_selection(const char* layer, const char* feature,
                          const char* value, const char* status);
+unsigned long long gogis_selection_generation(void);
 
 // Reads the latest JSON layer visibility payload observed on the GUI thread.
 unsigned long long gogis_layer_visibility_generation(void);
@@ -64,6 +67,8 @@ void gogis_edit_event(char* action, int action_length, char* value, int value_le
 
 // Publishes a JSON attribute-row payload for the QML table.
 void gogis_set_attribute_payload(const char* payload);
+unsigned long long gogis_attribute_generation(void);
+int gogis_attribute_payload_visible(void);
 
 // Reads the latest QML attribute-table page request.
 unsigned long long gogis_attribute_page_generation(void);
@@ -71,8 +76,19 @@ int gogis_attribute_page(void);
 
 // Publishes a JSON layer-tree payload for the QML layer model.
 void gogis_set_layer_tree_payload(const char* payload);
+unsigned long long gogis_layer_tree_generation(void);
 void gogis_set_layer_label_payload(const char* payload);
+unsigned long long gogis_layer_label_generation(void);
 void gogis_set_vertex_handle_payload(const char* payload);
+unsigned long long gogis_vertex_handle_generation(void);
+
+// Reads a QML request to refresh the PostGIS table catalog and publishes the
+// bounded catalog result back to QML.
+unsigned long long gogis_postgis_catalog_generation(void);
+void gogis_postgis_catalog_schema(char* buffer, int buffer_length);
+void gogis_set_postgis_catalog_payload(const char* payload);
+unsigned long long gogis_postgis_catalog_payload_generation(void);
+int gogis_postgis_catalog_visible(void);
 
 // Reads the latest QML-selected layer name.
 unsigned long long gogis_active_layer_generation(void);
@@ -80,6 +96,7 @@ void gogis_active_layer(char* buffer, int buffer_length);
 
 // Publishes the current Go-side render request status to QML.
 void gogis_set_render_status(const char* status);
+unsigned long long gogis_render_status_generation(void);
 void gogis_set_diagnostic_log_payload(const char* payload);
 void gogis_set_memory_status(unsigned long long process_bytes,
                              unsigned long long go_heap_bytes,

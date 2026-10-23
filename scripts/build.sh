@@ -84,6 +84,10 @@ build_native() {
 
 build_desktop() {
 	ensure_build_dir
+	local app_ldflags=()
+	if [[ -n "${GOGIS_VERSION:-}" ]]; then
+		app_ldflags=(-ldflags "-X main.appVersion=${GOGIS_VERSION}")
+	fi
 	# Qt 6 requires C++17. Preserve a caller-provided flag and append the
 	# requirement when it is absent.
 	local cgo_cxxflags="${CGO_CXXFLAGS:-}"
@@ -93,13 +97,17 @@ build_desktop() {
 	esac
 	CGO_CXXFLAGS="${cgo_cxxflags# }" \
 		GOCACHE="${GOCACHE_DIR}" \
-		go build -tags qt \
+		go build "${app_ldflags[@]}" -tags qt \
 			-o "${BUILD_DIR}/gogis-desktop" \
 			"${ROOT_DIR}/cmd/gis-desktop"
 }
 
 build_desktop_native() {
 	ensure_build_dir
+	local app_ldflags=()
+	if [[ -n "${GOGIS_VERSION:-}" ]]; then
+		app_ldflags=(-ldflags "-X main.appVersion=${GOGIS_VERSION}")
+	fi
 	local cgo_cxxflags="${CGO_CXXFLAGS:-}"
 	case " ${cgo_cxxflags} " in
 		*" -std=c++17 "*|*" -std=gnu++17 "*) ;;
@@ -107,7 +115,7 @@ build_desktop_native() {
 	esac
 	CGO_CXXFLAGS="${cgo_cxxflags# }" \
 		GOCACHE="${GOCACHE_DIR}" \
-		go build -tags "qt native" \
+		go build "${app_ldflags[@]}" -tags "qt native" \
 			-o "${BUILD_DIR}/gogis-desktop-native" \
 			"${ROOT_DIR}/cmd/gis-desktop"
 }

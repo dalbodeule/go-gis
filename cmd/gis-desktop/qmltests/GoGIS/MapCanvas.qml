@@ -16,6 +16,8 @@ Item {
     property string editValue: ""
     property int editGeneration: 0
     property string attributePayload: "[]"
+    property bool attributePayloadVisible: false
+    property bool postGISCatalogVisible: false
     property int attributePage: 0
     property int attributePageGeneration: 0
     property string layerTreePayload: "[]"

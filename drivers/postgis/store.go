@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -50,6 +51,15 @@ type TableInfo struct {
 	SRID           int
 }
 
+// LayerInfo contains the lightweight metadata needed to create a viewport
+// runtime without materializing the table's features.
+type LayerInfo struct {
+	Bounds       [4]float64
+	FeatureCount int
+	GeometryType string
+	CRS          core.CRS
+}
+
 var _ drivers.TransactionalStore = (*Store)(nil)
 
 // Open opens a pgx-backed database/sql connection.
@@ -68,9 +78,31 @@ func Open(ctx context.Context, dsn, table string) (*Store, error) {
 	return &Store{DB: db, Table: table}, nil
 }
 
-// ListTables returns user tables visible to the connection. It reads
+// ListTables returns all user tables visible to the connection. It reads
 // PostgreSQL metadata so the result can drive a table picker like QGIS.
 func ListTables(ctx context.Context, dsn, schema string) ([]TableInfo, error) {
+	return listTables(ctx, dsn, schema, -1)
+}
+
+// ListTablesLimited returns at most limit user tables and reports whether more
+// matching tables exist. The limit is applied in PostgreSQL so a GUI catalog
+// does not materialize an unbounded metadata list in the driver.
+func ListTablesLimited(ctx context.Context, dsn, schema string, limit int) ([]TableInfo, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("invalid PostGIS table catalog limit %d", limit)
+	}
+	tables, err := listTables(ctx, dsn, schema, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(tables) > limit
+	if truncated {
+		tables = tables[:limit]
+	}
+	return tables, truncated, nil
+}
+
+func listTables(ctx context.Context, dsn, schema string, limit int) ([]TableInfo, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, fmt.Errorf("PostGIS database is not configured")
 	}
@@ -92,7 +124,13 @@ WHERE t.table_type = 'BASE TABLE'
   AND g.f_geometry_column IS NOT NULL
   AND ($1 = '' OR t.table_schema = $1)
 ORDER BY t.table_schema, t.table_name`
-	rows, err := db.QueryContext(ctx, query, strings.TrimSpace(schema))
+	queryText := query
+	args := []any{strings.TrimSpace(schema)}
+	if limit >= 0 {
+		queryText += "\nLIMIT $2"
+		args = append(args, limit)
+	}
+	rows, err := db.QueryContext(ctx, queryText, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list PostGIS tables: %w", err)
 	}
@@ -149,12 +187,169 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 		return core.Layer{}, fmt.Errorf("read PostGIS layer %q: %w", s.Table, err)
 	}
 	defer rows.Close()
+	return readPostGISRows(rows, s.Table)
+}
 
-	layer := core.Layer{Name: tableName(s.Table), Editable: true}
+// ReadWindow reads only features intersecting a source-CRS bounding box.
+// Geometry and properties remain subject to the same decoded safety limits as
+// ReadLayer, while maxFeatures/maxBytes bound one viewport payload. The
+// geometry envelope inherits each row's SRID so callers can use the table's
+// native coordinates without guessing an axis order or CRS.
+func (s *Store) ReadWindow(ctx context.Context, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	if s == nil || s.DB == nil {
+		return core.Layer{}, fmt.Errorf("PostGIS database is not configured")
+	}
+	if !validTableIdentifier(s.Table) {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS table identifier %q", s.Table)
+	}
+	if err := validatePostGISBounds(bounds); err != nil {
+		return core.Layer{}, err
+	}
+	if maxFeatures <= 0 || maxFeatures > maxPostGISReadFeatures {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS window feature limit %d", maxFeatures)
+	}
+	if maxBytes <= 0 || maxBytes > maxPostGISReadBytes {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS window byte limit %d", maxBytes)
+	}
+	rows, err := s.DB.QueryContext(ctx, readWindowQuery(s.Table, includeProperties),
+		bounds[0], bounds[1], bounds[2], bounds[3], maxFeatures+1)
+	if err != nil {
+		return core.Layer{}, fmt.Errorf("read PostGIS window %q: %w", s.Table, err)
+	}
+	defer rows.Close()
+	layer, err := readPostGISRows(rows, s.Table)
+	if err != nil {
+		return core.Layer{}, err
+	}
+	if len(layer.Features) > maxFeatures {
+		return core.Layer{}, fmt.Errorf("PostGIS window %q exceeds the %d-feature limit; zoom in", s.Table, maxFeatures)
+	}
+	var payloadBytes int64
+	for _, feature := range layer.Features {
+		geometry, geometryErr := core.ToWKT(feature.Geometry)
+		if geometryErr != nil {
+			return core.Layer{}, fmt.Errorf("estimate PostGIS window feature %d: %w", feature.ID, geometryErr)
+		}
+		properties, propertiesErr := json.Marshal(feature.Properties)
+		if propertiesErr != nil {
+			return core.Layer{}, fmt.Errorf("estimate PostGIS window feature %d: %w", feature.ID, propertiesErr)
+		}
+		payloadBytes += int64(len(geometry.WKT) + len(properties) + 128)
+		if payloadBytes > maxBytes {
+			return core.Layer{}, fmt.Errorf("PostGIS window %q exceeds the %d MiB byte limit; zoom in", s.Table, maxBytes>>20)
+		}
+	}
+	return layer, nil
+}
+
+// OpenWindowWithLimits implements the desktop read-only window source
+// contract. sourceName is accepted for parity with GDAL sessions; Store is
+// already bound to its table.
+func (s *Store) OpenWindowWithLimits(ctx context.Context, sourceName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	if sourceName != "" && sourceName != s.Table {
+		return core.Layer{}, fmt.Errorf("PostGIS source %q does not match table %q", sourceName, s.Table)
+	}
+	return s.ReadWindow(ctx, bounds, includeProperties, maxFeatures, maxBytes)
+}
+
+// OpenAttributePage returns one bounded attribute page without loading the
+// table's geometry into the runtime.
+func (s *Store) OpenAttributePage(ctx context.Context, sourceName string, offset, limit int) (core.Layer, int, error) {
+	if sourceName != "" && sourceName != s.Table {
+		return core.Layer{}, 0, fmt.Errorf("PostGIS source %q does not match table %q", sourceName, s.Table)
+	}
+	if offset < 0 || limit <= 0 || limit > 1_000 {
+		return core.Layer{}, 0, fmt.Errorf("invalid PostGIS attribute page: offset=%d limit=%d", offset, limit)
+	}
+	var total int
+	if err := s.DB.QueryRowContext(ctx, countLayerQuery(s.Table)).Scan(&total); err != nil {
+		return core.Layer{}, 0, fmt.Errorf("count PostGIS layer %q: %w", s.Table, err)
+	}
+	rows, err := s.DB.QueryContext(ctx, attributePageQuery(s.Table), limit, offset)
+	if err != nil {
+		return core.Layer{}, 0, fmt.Errorf("read PostGIS attribute page %q: %w", s.Table, err)
+	}
+	defer rows.Close()
+	layer, err := readPostGISRows(rows, s.Table)
+	if err != nil {
+		return core.Layer{}, 0, err
+	}
+	return layer, total, nil
+}
+
+// OpenFeature reads one feature by its stable database ID.
+func (s *Store) OpenFeature(ctx context.Context, sourceName string, id uint64) (core.Feature, error) {
+	if sourceName != "" && sourceName != s.Table {
+		return core.Feature{}, fmt.Errorf("PostGIS source %q does not match table %q", sourceName, s.Table)
+	}
+	if id > uint64(^uint64(0)>>1) {
+		return core.Feature{}, fmt.Errorf("feature ID %d exceeds PostgreSQL BIGINT", id)
+	}
+	rows, err := s.DB.QueryContext(ctx, featureQuery(s.Table), int64(id))
+	if err != nil {
+		return core.Feature{}, fmt.Errorf("read PostGIS feature %d: %w", id, err)
+	}
+	defer rows.Close()
+	layer, err := readPostGISRows(rows, s.Table)
+	if err != nil {
+		return core.Feature{}, err
+	}
+	if len(layer.Features) != 1 {
+		return core.Feature{}, fmt.Errorf("feature %d not found in PostGIS table %q", id, s.Table)
+	}
+	return layer.Features[0], nil
+}
+
+// Describe returns table extent and row metadata without decoding feature
+// geometries. The exact extent query is intentionally kept at the driver
+// boundary so the runtime never needs to infer CRS or axis order.
+func (s *Store) Describe(ctx context.Context) (LayerInfo, error) {
+	if s == nil || s.DB == nil {
+		return LayerInfo{}, fmt.Errorf("PostGIS database is not configured")
+	}
+	var info LayerInfo
+	var count int
+	var srid int
+	var minX, minY, maxX, maxY sql.NullFloat64
+	if err := s.DB.QueryRowContext(ctx, describeLayerQuery(s.Table)).Scan(
+		&count, &srid, &minX, &minY, &maxX, &maxY); err != nil {
+		return LayerInfo{}, fmt.Errorf("describe PostGIS layer %q: %w", s.Table, err)
+	}
+	if count == 0 || !minX.Valid || !minY.Valid || !maxX.Valid || !maxY.Valid || minX.Float64 > maxX.Float64 || minY.Float64 > maxY.Float64 {
+		return LayerInfo{}, fmt.Errorf("PostGIS table %q has no usable geometry extent", s.Table)
+	}
+	geometryType := ""
+	if err := s.DB.QueryRowContext(ctx, geometryTypeQuery(s.Table)).Scan(&geometryType); err != nil {
+		return LayerInfo{}, fmt.Errorf("read PostGIS geometry type %q: %w", s.Table, err)
+	}
+	info.FeatureCount = count
+	info.GeometryType = geometryType
+	info.CRS = core.CRS{AuthorityCode: "EPSG:" + strconv.Itoa(srid)}
+	info.Bounds = expandDegenerateBounds([4]float64{minX.Float64, minY.Float64, maxX.Float64, maxY.Float64})
+	return info, nil
+}
+
+func expandDegenerateBounds(bounds [4]float64) [4]float64 {
+	if bounds[0] == bounds[2] {
+		padding := math.Max(1e-6, math.Abs(bounds[0])*1e-9)
+		bounds[0] -= padding
+		bounds[2] += padding
+	}
+	if bounds[1] == bounds[3] {
+		padding := math.Max(1e-6, math.Abs(bounds[1])*1e-9)
+		bounds[1] -= padding
+		bounds[3] += padding
+	}
+	return bounds
+}
+
+func readPostGISRows(rows *sql.Rows, table string) (core.Layer, error) {
+
+	layer := core.Layer{Name: tableName(table), Editable: true}
 	var totalPayloadBytes int64
 	for rows.Next() {
 		if len(layer.Features) >= maxPostGISReadFeatures {
-			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d-feature in-memory read limit; use a bounded query or viewport reader", s.Table, maxPostGISReadFeatures)
+			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d-feature in-memory read limit; use a bounded query or viewport reader", table, maxPostGISReadFeatures)
 		}
 		var id int64
 		var wkt sql.NullString
@@ -199,7 +394,7 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 			return core.Layer{}, fmt.Errorf("feature %d exceeds the %d MiB decoded PostGIS feature limit", id, maxPostGISFeatureBytes>>20)
 		}
 		if featurePayloadBytes > maxPostGISReadBytes-totalPayloadBytes {
-			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d MiB in-memory read limit", s.Table, maxPostGISReadBytes>>20)
+			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d MiB in-memory read limit", table, maxPostGISReadBytes>>20)
 		}
 		totalPayloadBytes += featurePayloadBytes
 		layer.Features = append(layer.Features, core.Feature{
@@ -216,6 +411,18 @@ func (s *Store) ReadLayer(ctx context.Context) (core.Layer, error) {
 	}
 	layer.Fields = inferFields(layer.Features)
 	return layer, nil
+}
+
+func validatePostGISBounds(bounds [4]float64) error {
+	for _, value := range bounds {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return fmt.Errorf("PostGIS window bounds must be finite")
+		}
+	}
+	if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
+		return fmt.Errorf("PostGIS window bounds must have positive area")
+	}
+	return nil
 }
 
 // SaveLayer creates the minimal table schema and atomically replaces the
@@ -409,6 +616,49 @@ func readLayerQuery(table string) string {
 FROM %s ORDER BY id LIMIT %d`,
 		maxPostGISGeometryPoints, maxPostGISGeometryStorageBytes, maxPostGISPropertiesBytes,
 		quoteIdentifier(table), maxPostGISReadFeatures+1)
+}
+
+func readWindowQuery(table string, includeProperties bool) string {
+	properties := "'{}'::text"
+	if includeProperties {
+		properties = fmt.Sprintf("CASE WHEN octet_length(properties::text) <= %d THEN properties::text END", maxPostGISPropertiesBytes)
+	}
+	return fmt.Sprintf(`SELECT id,
+    CASE WHEN ST_NPoints(geom) <= %d AND pg_column_size(geom) <= %d THEN ST_AsText(geom) END,
+    ST_SRID(geom), %s,
+    ST_NPoints(geom), pg_column_size(geom), octet_length(properties::text)
+FROM %s
+WHERE ST_Intersects(geom, ST_SetSRID(ST_MakeEnvelope($1, $2, $3, $4), ST_SRID(geom)))
+ORDER BY id LIMIT $5`, maxPostGISGeometryPoints, maxPostGISGeometryStorageBytes,
+		properties, quoteIdentifier(table))
+}
+
+func countLayerQuery(table string) string {
+	return fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteIdentifier(table))
+}
+
+func attributePageQuery(table string) string {
+	return fmt.Sprintf(`SELECT id,
+    CASE WHEN ST_NPoints(geom) <= %d AND pg_column_size(geom) <= %d THEN ST_AsText(geom) END,
+    ST_SRID(geom), CASE WHEN octet_length(properties::text) <= %d THEN properties::text END,
+    ST_NPoints(geom), pg_column_size(geom), octet_length(properties::text)
+FROM %s ORDER BY id LIMIT $1 OFFSET $2`, maxPostGISGeometryPoints, maxPostGISGeometryStorageBytes,
+		maxPostGISPropertiesBytes, quoteIdentifier(table))
+}
+
+func featureQuery(table string) string {
+	return attributePageQuery(table)[:strings.Index(attributePageQuery(table), " ORDER BY id")] + " WHERE id = $1"
+}
+
+func describeLayerQuery(table string) string {
+	return fmt.Sprintf(`SELECT COUNT(*), COALESCE(MAX(ST_SRID(geom)), 0),
+	    ST_XMin(ST_Extent(geom)::box3d), ST_YMin(ST_Extent(geom)::box3d),
+	    ST_XMax(ST_Extent(geom)::box3d), ST_YMax(ST_Extent(geom)::box3d)
+FROM %s WHERE geom IS NOT NULL`, quoteIdentifier(table))
+}
+
+func geometryTypeQuery(table string) string {
+	return fmt.Sprintf("SELECT COALESCE(ST_GeometryType(geom), '') FROM %s WHERE geom IS NOT NULL LIMIT 1", quoteIdentifier(table))
 }
 
 func validTableIdentifier(table string) bool {

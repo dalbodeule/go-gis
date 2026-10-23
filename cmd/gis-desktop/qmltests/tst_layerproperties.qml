@@ -41,6 +41,164 @@ TestCase {
         compare(viewport.localPathFromUrl("/data/My Roads.shp"), "/data/My Roads.shp");
     }
 
+    function test_mapStateSyncUsesAdaptivePollingRate() {
+        var syncTimer = findChild(appWindow, "mapStateSyncTimer");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        verify(syncTimer !== null);
+        verify(canvas !== null);
+        // The test harness may start with a native loading status. Assert the
+        // idle branch explicitly, then restore the active branch below.
+        canvas.renderStatus = "Ready";
+        compare(syncTimer.interval, 125);
+        compare(syncTimer.repeat, true);
+        compare(syncTimer.running, true);
+        compare(canvas.windowActive, true);
+        try {
+            canvas.renderStatus = "Rendering";
+            compare(syncTimer.interval, 33);
+            canvas.renderStatus = "Spatial operation cancelled";
+            compare(syncTimer.interval, 125);
+            canvas.renderStatus = "Showing 200 labels in the current view; zoom in for more";
+            compare(syncTimer.interval, 125);
+        } finally {
+            canvas.renderStatus = "Ready";
+        }
+        compare(syncTimer.interval, 125);
+    }
+
+    function test_layerTreeStyleAndLabelComparisonAvoidsSerialization() {
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(viewport !== null);
+        verify(viewport.sameLayerStyle({pointColor: "#123456", fillOpacity: 0.4},
+                                       {pointColor: "#123456", fillOpacity: 0.4}));
+        verify(!viewport.sameLayerStyle({pointColor: "#123456"},
+                                        {pointColor: "#654321"}));
+        verify(viewport.sameLayerLabels({enabled: true, expression: "${name}"},
+                                        {enabled: true, expression: "${name}"}));
+        verify(!viewport.sameLayerLabels({enabled: true, expression: "${name}"},
+                                         {enabled: true, expression: "${id}"}));
+    }
+
+    function test_selectingSameLayerDoesNotRefetchAttributes() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        verify(viewport !== null && canvas !== null);
+        canvas.activeLayer = "roads";
+        viewport.activeLayer = "roads";
+        var generation = canvas.activeLayerGeneration;
+        viewport.selectLayer("roads");
+        compare(canvas.activeLayerGeneration, generation);
+        viewport.selectLayer("buildings");
+        compare(canvas.activeLayerGeneration, generation + 1);
+    }
+
+    function test_canvasWindowActiveCanGateNativeResourceRetention() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        verify(canvas !== null);
+        var previous = canvas.windowActive;
+        try {
+            canvas.windowActive = false;
+            compare(canvas.windowActive, false);
+        } finally {
+            canvas.windowActive = previous;
+        }
+        compare(canvas.windowActive, previous);
+    }
+
+    function test_hiddenWindowReleasesTransientQmlModels() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var attributes = findChild(appWindow, "attributeModel");
+        var labels = findChild(appWindow, "mapLabelModel");
+        var handles = findChild(appWindow, "vertexHandleModel");
+        verify(viewport !== null && attributes !== null && labels !== null && handles !== null);
+        attributes.rows = [{featureId: 1}];
+        labels.rows = [{text: "label"}];
+        handles.rows = [{vertexIndex: 0}];
+        viewport.attributePayloadGenerationSeen = 7;
+        viewport.layerLabelGenerationSeen = 7;
+        viewport.vertexHandleGenerationSeen = 8;
+
+        viewport.releaseTransientWindowModels();
+        compare(attributes.count, 0);
+        compare(labels.count, 0);
+        compare(handles.count, 0);
+
+        viewport.restoreTransientWindowModels();
+        compare(viewport.attributePayloadGenerationSeen, -1);
+        compare(viewport.layerLabelGenerationSeen, -1);
+        compare(viewport.vertexHandleGenerationSeen, -1);
+    }
+
+    function test_windowVisibilityContractIncludesExplicitHide() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var attributes = findChild(appWindow, "attributeModel");
+        verify(viewport !== null);
+        verify(attributes !== null);
+        attributes.rows = [{featureId: 1}];
+        viewport.attributePayloadGenerationSeen = 7;
+        var previousVisible = appWindow.visible;
+        try {
+            appWindow.visible = false;
+            compare(attributes.count, 0);
+            appWindow.visible = true;
+            compare(viewport.attributePayloadGenerationSeen, -1);
+        } finally {
+            appWindow.visible = previousVisible;
+        }
+    }
+
+    function test_attributeRowsReuseDelegates() {
+        var rowsView = findChild(appWindow, "attributeRowsView");
+        verify(rowsView !== null);
+        compare(rowsView.reuseItems, true);
+        compare(rowsView.cacheBuffer, 0);
+    }
+
+    function test_attributeLayerTabsReuseDelegates() {
+        var tabs = findChild(appWindow, "attributeLayerTabs");
+        verify(tabs !== null);
+        compare(tabs.orientation, ListView.Horizontal);
+        compare(tabs.reuseItems, true);
+        compare(tabs.cacheBuffer, 0);
+    }
+
+    function test_layerListReusesDelegates() {
+        var layersView = findChild(appWindow, "layerList");
+        verify(layersView !== null);
+        compare(layersView.reuseItems, true);
+        compare(layersView.cacheBuffer, 0);
+    }
+
+    function test_dialogListsReuseDelegates() {
+        var common = findChild(appWindow, "commonCRSList");
+        var nearby = findChild(appWindow, "nearbyCRSList");
+        var all = findChild(appWindow, "allCRSList");
+        var fields = findChild(appWindow, "labelFieldList");
+        verify(common && nearby && all && fields);
+        compare(common.reuseItems, true);
+        compare(common.cacheBuffer, 0);
+        compare(nearby.reuseItems, true);
+        compare(nearby.cacheBuffer, 0);
+        compare(all.reuseItems, true);
+        compare(all.cacheBuffer, 0);
+        compare(fields.reuseItems, true);
+        compare(fields.cacheBuffer, 0);
+    }
+
+    function test_cancelActionCoversSpatialWork() {
+        var viewport = findChild(appWindow, "mapViewport");
+        var cancel = findChild(appWindow, "cancelWorkButton");
+        verify(viewport !== null && cancel !== null);
+        var previous = viewport.renderStatus;
+        try {
+            viewport.renderStatus = "Running intersect";
+            tryCompare(cancel, "visible", true);
+            compare(cancel.enabled, true);
+        } finally {
+            viewport.renderStatus = previous;
+        }
+    }
+
     function test_fullScreenKeepsWorkspacePanelsVisible() {
         var viewport = findChild(appWindow, "mapViewport");
         var layers = findChild(appWindow, "layerList");
@@ -280,6 +438,7 @@ TestCase {
         appWindow.language = "ko";
         compare(dialog.title, "애플리케이션 로그");
         dialog.close();
+        tryCompare(logText, "text", "");
         appWindow.language = "en";
     }
 
@@ -287,7 +446,7 @@ TestCase {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var layerModel = findChild(appWindow, "layerModel");
         var layerList = findChild(appWindow, "layerList");
-        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true, editable: true}]);
         tryCompare(layerModel, "count", 1);
         tryVerify(function() { return layerModel.get(0).name === "roads"; });
         tryVerify(function() {
@@ -306,6 +465,81 @@ TestCase {
         mouseClick(delegate, delegate.width / 2, delegate.height / 2);
         tryCompare(canvas, "layerVisibilityGeneration", generation + 1);
         compare(JSON.parse(canvas.layerVisibilityPayload).roads, true);
+    }
+
+    function test_layerMetadataUpdatePreservesExistingDelegate() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerList = findChild(appWindow, "layerList");
+        var layerModel = findChild(appWindow, "layerModel");
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", displayName: "Roads", visible: true}]);
+        tryVerify(function() { return layerModel.count === 1 && layerList.itemAtIndex(0) !== null; });
+        var delegate = layerList.itemAtIndex(0);
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", displayName: "Road network", visible: true}]);
+        tryVerify(function() { return layerModel.get(0).displayName === "Road network"; });
+        verify(layerList.itemAtIndex(0) === delegate, "unchanged layer should retain its delegate");
+    }
+
+    function test_malformedLayerTreePayloadDoesNotBreakSynchronizer() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        verify(canvas !== null && layerModel !== null);
+        canvas.layerTreePayload = "{truncated";
+        tryCompare(layerModel, "count", 0);
+        canvas.layerTreePayload = JSON.stringify([{name: "recovered", visible: true}]);
+        tryVerify(function() { return layerModel.count === 1 && layerModel.get(0).name === "recovered"; });
+    }
+
+    function test_malformedAsyncPayloadsDoNotBreakTransientModels() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var attributes = findChild(appWindow, "attributeModel");
+        var attributeDialog = findChild(appWindow, "attributeDialog");
+        var labels = findChild(appWindow, "mapLabelModel");
+        var handles = findChild(appWindow, "vertexHandleModel");
+        verify(canvas !== null && viewport !== null && attributes !== null && attributeDialog !== null && labels !== null && handles !== null);
+        attributeDialog.open();
+        tryCompare(attributeDialog, "visible", true);
+        canvas.layerTreePayload = JSON.stringify([{name: "vertex-layer", visible: true}]);
+        tryCompare(canvas, "visible", true);
+        appWindow.vertexEditMode = true;
+        canvas.attributePayload = "{truncated";
+        canvas.layerLabelPayload = "{truncated";
+        canvas.layerLabelGeneration += 1;
+        canvas.vertexHandlePayload = "{truncated";
+        canvas.vertexHandleGeneration += 1;
+        tryVerify(function() { return attributes.count === 0 && labels.count === 0 && handles.count === 0; });
+
+        canvas.attributePayload = JSON.stringify({columns: ["name"], rows: [{featureId: 1, values: {name: "ok"}}], page: 0, pageSize: 1, total: 1});
+        canvas.layerLabelPayload = JSON.stringify([{text: "ok", x: 0.5, y: 0.5}]);
+        canvas.layerLabelGeneration += 1;
+        canvas.vertexHandlePayload = JSON.stringify([{vertexIndex: 0, x: 0.5, y: 0.5}]);
+        canvas.vertexHandleGeneration += 1;
+        tryVerify(function() { return attributes.count === 1 && labels.count === 1 && handles.count === 1; });
+        appWindow.vertexEditMode = false;
+        attributeDialog.close();
+    }
+
+    function test_attributePayloadIsBoundedAtQmlBoundary() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var attributes = findChild(appWindow, "attributeModel");
+        var attributeDialog = findChild(appWindow, "attributeDialog");
+        verify(canvas !== null && viewport !== null && attributes !== null && attributeDialog !== null);
+        attributeDialog.open();
+        tryCompare(attributeDialog, "visible", true);
+        var rows = [];
+        for (var rowIndex = 0; rowIndex < 140; ++rowIndex)
+            rows.push({featureId: rowIndex + 1, values: {name: "row-" + rowIndex}});
+        var columns = [];
+        for (var columnIndex = 0; columnIndex < 270; ++columnIndex)
+            columns.push("field-" + columnIndex);
+        canvas.attributePayload = JSON.stringify({columns: columns, rows: rows, page: "invalid", pageSize: 9999, total: -4});
+        tryVerify(function() { return attributes.count === 128; });
+        compare(viewport.attributeColumns.length, 256);
+        compare(viewport.attributePage, 0);
+        compare(viewport.attributePageSize, 128);
+        compare(viewport.attributeTotal, 0);
+        attributeDialog.close();
     }
 
     function test_zoomToLayerExtentFitsPolygonWithoutChangingProjectBounds() {
@@ -520,6 +754,12 @@ TestCase {
         tryVerify(function() { return editor.highlightedHTML.length > longScript.length && editor.highlightedHTML.indexOf("local") >= 0; });
         verify(editor.highlightedHTML.length > longScript.length, "large scripts should still be highlighted");
         compare(editor.highlightedLineNumbers.split("\n").length, 5001);
+        var oversizedScript = "local n = 1\n".repeat(12000);
+        editor.text = oversizedScript;
+        tryVerify(function() { return !editor.syntaxHighlightingEnabled && editor.highlightedHTML === ""; });
+        var sourceArea = findChild(editor, "luaSourceArea");
+        verify(sourceArea !== null);
+        compare(sourceArea.color, "#263238");
         viewport.attributeFieldHints = [{name: "road class", type: "text"}];
         compare(viewport.luaFieldAccess("road class"), 'feature["road class"]');
         dialog.close();
@@ -612,6 +852,83 @@ TestCase {
         tryCompare(handles, "count", 0);
     }
 
+    function test_labelPayloadReplacesArrayModelInOneUpdate() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var labels = findChild(appWindow, "mapLabelModel");
+        verify(canvas !== null && labels !== null);
+        canvas.layerLabelPayload = JSON.stringify([
+            {x: 0.25, y: 0.25, text: "A", heightMm: 2.5},
+            {x: 0.75, y: 0.75, text: "B", heightMm: 2.5}
+        ]);
+        canvas.layerLabelGeneration += 1;
+        tryCompare(labels, "count", 2);
+        compare(labels.get(0).text, "A");
+        compare(labels.get(1).text, "B");
+        canvas.layerLabelPayload = "[]";
+        canvas.layerLabelGeneration += 1;
+        tryCompare(labels, "count", 0);
+    }
+
+    function test_attributePageReplacesArrayModelInOneUpdate() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var attributes = findChild(appWindow, "attributeModel");
+        var attributeDialog = findChild(appWindow, "attributeDialog");
+        verify(canvas !== null && attributes !== null && attributeDialog !== null);
+        attributeDialog.open();
+        tryCompare(attributeDialog, "visible", true);
+        canvas.attributePayload = JSON.stringify({
+            columns: ["NAME"],
+            rows: [
+                {featureId: 11, values: {NAME: "one"}},
+                {featureId: 12, values: {NAME: "two"}}
+            ],
+            page: 0,
+            pageSize: 128,
+            total: 2
+        });
+        tryCompare(attributes, "count", 2);
+        canvas.attributePayload = JSON.stringify({columns: [], rows: [], page: 0, pageSize: 128, total: 0});
+        tryCompare(attributes, "count", 0);
+        attributeDialog.close();
+    }
+
+    function test_attributeDialogReleasesRowsUntilReopened() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "attributeDialog");
+        var attributes = findChild(appWindow, "attributeModel");
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(canvas !== null && dialog !== null && attributes !== null && viewport !== null);
+        canvas.attributePayload = JSON.stringify({
+            columns: ["NAME"],
+            rows: [{featureId: 21, values: {NAME: "one"}}],
+            page: 0,
+            pageSize: 128,
+            total: 1
+        });
+        tryCompare(attributes, "count", 0);
+        dialog.open();
+        tryCompare(attributes, "count", 1);
+        dialog.close();
+        compare(attributes.count, 0);
+        compare(viewport.attributeColumns.length, 0);
+        compare(viewport.attributePageSize, 0);
+        compare(viewport.attributeTotal, 0);
+        var reopenPageGeneration = canvas.attributePageGeneration;
+        dialog.open();
+        compare(canvas.attributePageGeneration, reopenPageGeneration + 1);
+        // The real desktop runtime answers the reopen request asynchronously;
+        // the QML fixture supplies that response explicitly.
+        canvas.attributePayload = JSON.stringify({
+            columns: ["NAME"],
+            rows: [{featureId: 21, values: {NAME: "one"}}],
+            page: 0,
+            pageSize: 128,
+            total: 1
+        });
+        tryCompare(attributes, "count", 1);
+        dialog.close();
+    }
+
     function test_projectCRSChangeAndDXFEncodingDialogs() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var projectDialog = findChild(appWindow, "projectCRSDialog");
@@ -644,8 +961,11 @@ TestCase {
         var layerModel = findChild(appWindow, "layerModel");
         var dialog = findChild(appWindow, "dxfEncodingDialog");
         var options = findChild(appWindow, "dxfLayerOptionsModel");
+        var optionsView = findChild(appWindow, "dxfLayerOptionsView");
         var fileDialog = findChild(appWindow, "dxfExportDialog");
-        verify(canvas && layerModel && dialog && options && fileDialog);
+        verify(canvas && layerModel && dialog && options && optionsView && fileDialog);
+        compare(optionsView.reuseItems, true);
+        compare(optionsView.cacheBuffer, 0);
         var originalPayload = canvas.layerTreePayload;
         try {
             canvas.layerTreePayload = JSON.stringify([
@@ -654,7 +974,6 @@ TestCase {
                 {name: "buildings", displayName: "0-건물", geometryType: "Polygon", visible: true}
             ]);
             tryCompare(layerModel, "count", 3);
-            options.clear();
             dialog.open();
             tryCompare(options, "count", 3);
             options.setProperty(1, "included", false);
@@ -667,7 +986,16 @@ TestCase {
             compare(plan[1].include, false);
             compare(plan[2].cadName, "Buildings CAD");
             compare(plan[2].labels, false);
+            compare(options.count, 0);
             fileDialog.close();
+            canvas.layerTreePayload = JSON.stringify([
+                {name: "roads", displayName: "Roads", geometryType: "LineString", visible: true}
+            ]);
+            tryCompare(layerModel, "count", 1);
+            dialog.open();
+            tryCompare(options, "count", 1);
+            dialog.close();
+            compare(options.count, 0);
         } finally {
             dialog.close();
             canvas.layerTreePayload = originalPayload;
@@ -683,10 +1011,11 @@ TestCase {
         var country = findChild(appWindow, "countryCRSChoice");
         var all = findChild(appWindow, "allCRSList");
         var search = findChild(appWindow, "crsSearchField");
+        var searchTimer = findChild(dialog, "crsSearchTimer");
         var details = findChild(appWindow, "selectedCRSDetails");
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var viewport = findChild(appWindow, "mapViewport");
-        verify(dialog && field && tabs && common && nearby && country && all && search && details);
+        verify(dialog && field && tabs && common && nearby && country && all && search && searchTimer && details);
         var previousCatalog = dialog.catalogResponse;
         var previousCRS = viewport.dataCRS;
         try {
@@ -720,12 +1049,14 @@ TestCase {
             compare(nearby.model[0].code, "EPSG:32643");
             tabs.currentIndex = 2;
             search.text = "east belt";
+            compare(searchTimer.interval, 120);
             tryCompare(all, "count", 1);
             tryVerify(function() { return all.itemAtIndex(0) !== null; });
             mouseClick(all.itemAtIndex(0));
             compare(field.text, "EPSG:5187");
             verify(details.text.indexOf("East Belt") >= 0);
             dialog.accept();
+            compare(all.count, 0);
             compare(JSON.parse(canvas.layerSettingsPayload).projectCrs, "EPSG:5187");
         } finally {
             dialog.close();
@@ -888,14 +1219,16 @@ TestCase {
         var toggle = findChild(appWindow, "toggleVertexEditButton");
         canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
         tryCompare(layerModel, "count", 1);
+        tryCompare(canvas, "visible", true);
         canvas.vertexHandlePayload = JSON.stringify([{x: 0.5, y: 0.5, vertexIndex: 3}]);
         canvas.vertexHandleGeneration += 1;
         var repeater = findChild(appWindow, "vertexHandleRepeater");
         verify(repeater !== null);
-        tryCompare(repeater, "count", 1);
-        verify(toggle.enabled);
+        tryCompare(repeater, "count", 0);
+        tryCompare(toggle, "enabled", true);
         toggle.click();
         tryCompare(appWindow, "vertexEditMode", true);
+        tryCompare(repeater, "count", 1);
         var handle = repeater.itemAt(0);
         verify(handle !== null);
         var dragArea = handle.dragArea;
@@ -924,19 +1257,27 @@ TestCase {
         var addID = findChild(appWindow, "addRecordID");
         var addWKT = findChild(appWindow, "addRecordWKT");
         var addProperties = findChild(appWindow, "addRecordProperties");
+        var addAccept = findChild(appWindow, "addRecordAcceptButton");
         var deleteButton = findChild(appWindow, "deleteSelectedRecordButton");
         var deleteDialog = findChild(appWindow, "deleteRecordDialog");
-        verify(canvas && viewport && layerModel && addButton && addDialog && addID && addWKT && addProperties && deleteButton && deleteDialog);
+        verify(canvas && viewport && layerModel && addButton && addDialog && addID && addWKT && addProperties && addAccept && deleteButton && deleteDialog);
 
-        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true}]);
+        canvas.layerTreePayload = JSON.stringify([{name: "roads", visible: true, editable: true}]);
         tryCompare(layerModel, "count", 1);
         tryCompare(viewport, "activeLayer", "roads");
         addButton.click();
         tryCompare(addDialog, "visible", true);
+        addID.text = "";
+        addAccept.click();
+        tryCompare(addDialog, "visible", true);
+        compare(canvas.renderStatus, "Feature ID is required");
         addID.text = "42";
+        addAccept.click();
+        tryCompare(addDialog, "visible", true);
+        compare(canvas.renderStatus, "WKT is required");
         addWKT.text = "POINT (127 37)";
         addProperties.text = '{"name":"added"}';
-        addDialog.accept();
+        addAccept.click();
         compare(canvas.editAction, "addFeature");
         var addPayload = JSON.parse(canvas.editValue);
         compare(addPayload.layer, "roads");
@@ -1365,5 +1706,67 @@ TestCase {
         for (var encodingIndex = 0; encodingIndex < dxfEncoding.model.length; ++encodingIndex)
             verify(!korean.test(String(dxfEncoding.model[encodingIndex].label)), "English DXF encoding choice contains Korean text");
         dialog.close();
+    }
+
+    function test_postGISTableCatalogUsesReusableListAndLoadsSelectedTable() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "postGISTableDialog");
+        var list = findChild(appWindow, "postGISTableList");
+        var button = findChild(appWindow, "openPostGISTablesButton");
+        verify(canvas !== null && viewport !== null && dialog !== null && list !== null && button !== null);
+        compare(list.reuseItems, true);
+        compare(list.cacheBuffer, 0);
+        canvas.postGISCatalogPayload = JSON.stringify({tables: [
+            {schema: "public", name: "roads", srid: 5179, geometryColumn: "geom"}
+        ]});
+        canvas.postGISCatalogPayloadGeneration += 1;
+        mouseClick(button);
+        tryCompare(dialog, "visible", true);
+        tryVerify(function() { return list.count === 1; });
+        mouseClick(list.itemAtIndex(0));
+        tryCompare(dialog, "visible", false);
+        compare(list.count, 0);
+        // The desktop native bridge releases the catalog payload while the
+        // dialog is closed; the fixture supplies the next catalog response.
+        canvas.postGISCatalogPayload = JSON.stringify({tables: [
+            {schema: "public", name: "roads", srid: 5179, geometryColumn: "geom"}
+        ]});
+        mouseClick(button);
+        tryCompare(dialog, "visible", true);
+        tryVerify(function() { return list.count === 1; });
+        dialog.close();
+        compare(JSON.parse(canvas.loadPath)[0], "postgis://public.roads");
+    }
+
+    function test_largeReadOnlyLayerExplainsDisabledRecordEditing() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "attributeDialog");
+        var notice = findChild(appWindow, "attributeReadOnlyNotice");
+        var addButton = findChild(appWindow, "addRecordButton");
+        verify(canvas !== null && viewport !== null && dialog !== null && notice !== null && addButton !== null);
+        canvas.layerTreePayload = JSON.stringify([{name: "large", visible: true, editable: false}]);
+        tryCompare(viewport, "activeLayer", "large");
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        compare(notice.visible, true);
+        compare(addButton.enabled, false);
+        dialog.close();
+    }
+
+    function test_attributeStatusLabelsFollowInterfaceLanguage() {
+        var previousLanguage = appWindow.language;
+        try {
+            appWindow.language = "ko";
+            compare(appWindow.tr("Editable"), "편집 가능");
+            compare(appWindow.tr("Read-only"), "읽기 전용");
+            compare(appWindow.tr("Page"), "페이지");
+            appWindow.language = "jp";
+            compare(appWindow.tr("Feature"), "地物");
+            compare(appWindow.tr("Yes"), "はい");
+        } finally {
+            appWindow.language = previousLanguage;
+        }
     }
 }

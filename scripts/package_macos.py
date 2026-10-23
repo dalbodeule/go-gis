@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import argparse
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -182,15 +183,26 @@ def bundle_non_system_libraries(app: Path, executable: Path) -> int:
             except ValueError:
                 pass
 
-            library_name = Path(dependency).name
-            destination = frameworks / library_name
-            previous = bundled.get(library_name)
-            if previous is not None and previous != resolved and not filecmp.cmp(
-                previous, resolved, shallow=False
-            ):
-                digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:10]
-                destination = frameworks / f"{destination.stem}-{digest}{destination.suffix}"
-                previous = bundled.get(destination.name)
+            # Homebrew/Qt dependencies can use different install-name
+            # spellings for byte-identical libraries (for example ICU's
+            # versioned name and its hashed alias). Reuse the first bundled
+            # image by content before creating a suffix-based destination.
+            destination = None
+            for bundled_name, bundled_source in bundled.items():
+                if bundled_source == resolved or filecmp.cmp(bundled_source, resolved, shallow=False):
+                    destination = frameworks / bundled_name
+                    break
+            previous = None
+            if destination is None:
+                library_name = Path(dependency).name
+                destination = frameworks / library_name
+                previous = bundled.get(library_name)
+                if previous is not None and previous != resolved and not filecmp.cmp(
+                    previous, resolved, shallow=False
+                ):
+                    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:10]
+                    destination = frameworks / f"{destination.stem}-{digest}{destination.suffix}"
+                    previous = bundled.get(destination.name)
             if previous is None:
                 if destination.exists() and not os.path.samefile(destination, resolved):
                     if not filecmp.cmp(resolved, destination, shallow=False):
@@ -217,7 +229,7 @@ def bundle_non_system_libraries(app: Path, executable: Path) -> int:
     return len(bundled)
 
 
-def create_app(stage: Path) -> Path:
+def create_app(stage: Path, version: str) -> Path:
     app = stage / "GoGIS.app"
     contents = app / "Contents"
     macos = contents / "MacOS"
@@ -237,8 +249,8 @@ def create_app(stage: Path) -> Path:
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "GoGIS",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
         "LSApplicationCategoryType": "public.app-category.utilities",
         "NSHighResolutionCapable": True,
         "NSPrincipalClass": "NSApplication",
@@ -293,22 +305,27 @@ def create_app(stage: Path) -> Path:
 
 
 def main() -> None:
-    if os.uname().machine != "arm64":
-        raise SystemExit("this packaging pilot currently targets macOS ARM64 only")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", default=os.environ.get("GOGIS_VERSION", "0.1.0-dev"))
+    args = parser.parse_args()
+    machine = os.uname().machine
+    if machine not in {"arm64", "x86_64"}:
+        raise SystemExit(f"unsupported macOS architecture: {machine}")
     if shutil.which("brew") is None or shutil.which("macdeployqt") is None:
         raise SystemExit("Homebrew and macdeployqt are required")
 
+    os.environ["GOGIS_VERSION"] = args.version
     run([str(ROOT / "scripts" / "build.sh"), "desktop-native"])
-    package_root = BUILD / "packages" / "macos-arm64"
+    package_root = BUILD / "packages" / f"macos-{machine}"
     package_root.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    stem = f"GoGIS-0.1.0-dev-macos-arm64-{stamp}"
+    stem = f"GoGIS-{args.version}-macos-{machine}-{stamp}"
     app_output = package_root / f"{stem}.app"
     dmg_output = package_root / f"{stem}.dmg"
 
     with tempfile.TemporaryDirectory(prefix="gogis-macos-package-", dir=BUILD) as temporary:
         stage = Path(temporary)
-        app = create_app(stage)
+        app = create_app(stage, args.version)
         shutil.copytree(app, app_output, symlinks=True)
         run([
             "hdiutil", "create", "-quiet", "-format", "UDZO",

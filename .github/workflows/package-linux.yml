@@ -1,0 +1,65 @@
+name: Linux desktop packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version label
+        required: true
+        default: 0.1.0-dev
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Linux ${{ matrix.arch }} packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install native GIS and Qt toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev libproj-dev libgeos-dev \
+            qt6-base-dev qt6-declarative-dev qt6-tools-dev pkg-config \
+            dpkg-dev tar
+
+      - name: Install linuxdeploy and Qt plugin
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/linuxdeploy" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          curl -fsSL -o "$HOME/.local/bin/linuxdeploy-plugin-qt" \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
+          chmod +x "$HOME/.local/bin/linuxdeploy" "$HOME/.local/bin/linuxdeploy-plugin-qt"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build Linux packages
+        env:
+          GOGIS_VERSION: ${{ inputs.version }}
+        run: ./scripts/package_linux.sh --version "$GOGIS_VERSION" --arch ${{ matrix.arch }} --appimage
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoGIS-linux-${{ matrix.arch }}
+          path: build/packages/linux/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14

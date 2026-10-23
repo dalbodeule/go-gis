@@ -19,6 +19,7 @@ import (
 
 	qt "github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/qml"
+	"gogis/drivers/postgis"
 	"gogis/internal/commands"
 	"gogis/internal/core"
 	"gogis/internal/presentation"
@@ -129,7 +130,8 @@ func bundledGISResourceEnvironment(executable string) map[string]string {
 	case "windows":
 		resources = filepath.Join(filepath.Dir(executable), "resources")
 	default:
-		return nil
+		// Linux portable/AppDir packages keep resources beside the executable.
+		resources = filepath.Join(filepath.Dir(executable), "resources")
 	}
 	result := make(map[string]string, 3)
 	for key, directory := range map[string]string{
@@ -149,38 +151,71 @@ func bundledGISResourceEnvironment(executable string) map[string]string {
 
 func startDiagnosticLogPublisher() {
 	go func() {
-		lastPayload := ""
+		lastGeneration := ^uint64(0)
 		publish := func() {
-			payload := native.DiagnosticLogJSON()
-			if payload != lastPayload {
-				native.SetDiagnosticLogPayload(payload)
-				lastPayload = payload
+			generation := native.DiagnosticLogGeneration()
+			if generation == lastGeneration {
+				return
 			}
+			payload := native.DiagnosticLogJSON()
+			native.SetDiagnosticLogPayload(payload)
+			lastGeneration = generation
 		}
 		publish()
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
-		for range ticker.C {
+		timer := time.NewTimer(diagnosticLogPublishInterval(native.CanvasVisible()))
+		defer timer.Stop()
+		for {
+			<-timer.C
 			publish()
+			timer.Reset(diagnosticLogPublishInterval(native.CanvasVisible()))
 		}
 	}()
 }
 
+func diagnosticLogPublishInterval(visible bool) time.Duration {
+	if visible {
+		return 250 * time.Millisecond
+	}
+	return time.Second
+}
+
 func startMemoryMonitor() {
 	go func() {
+		var lastProcessBytes, lastHeapBytes uint64
+		var lastProcessKind string
+		var lastAvailable bool
+		haveSample := false
 		sample := func() {
 			var memory goruntime.MemStats
 			goruntime.ReadMemStats(&memory)
 			processBytes, processKind, processAvailable := processMemoryBytes()
+			if haveSample && processBytes == lastProcessBytes && memory.HeapAlloc == lastHeapBytes &&
+				processKind == lastProcessKind && processAvailable == lastAvailable {
+				return
+			}
 			native.SetMemoryStatus(processBytes, memory.HeapAlloc, processKind, processAvailable)
+			lastProcessBytes = processBytes
+			lastHeapBytes = memory.HeapAlloc
+			lastProcessKind = processKind
+			lastAvailable = processAvailable
+			haveSample = true
 		}
 		sample()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+		timer := time.NewTimer(memoryMonitorInterval(native.CanvasVisible()))
+		defer timer.Stop()
+		for {
+			<-timer.C
 			sample()
+			timer.Reset(memoryMonitorInterval(native.CanvasVisible()))
 		}
 	}()
+}
+
+func memoryMonitorInterval(visible bool) time.Duration {
+	if visible {
+		return time.Second
+	}
+	return 5 * time.Second
 }
 
 func desktopLanguageArgs(args []string) (string, []string) {
@@ -244,7 +279,15 @@ type demoRuntime struct {
 	layerBounds                 map[string][4]float64
 	layerFeatureCounts          map[string]int
 	layerStyleMu                *sync.RWMutex
+	layerTreePayloadMu          sync.Mutex
+	lastLayerTreePayload        string
+	hasLastLayerTreePayload     bool
 	mapLabels                   []render.LayerLabel
+	labelRevision               uint64
+	lastPublishedLabelRevision  uint64
+	lastPublishedLabelViewport  native.Viewport
+	lastPublishedLabelStatus    bool
+	hasPublishedLabelState      bool
 	builder                     render.ChunkBuilder
 	readOnlyBaseBuilder         render.ChunkBuilder
 	mu                          sync.Mutex
@@ -280,6 +323,7 @@ type demoRuntime struct {
 	readOnlyBaseFeatures        []render.HitFeature
 	readOnlyBaseLabels          []render.LayerLabel
 	readOnlyDisplayCRS          string
+	preserveReadOnlyFeatureIDs  bool
 	unavailableSources          map[string]unavailableSource
 	mapExtent                   [4]float64
 	mapFitExtent                [4]float64
@@ -289,6 +333,9 @@ type demoRuntime struct {
 	attributePageReader         func(context.Context, string, int, int) (core.Layer, int, error)
 	attributeFeatureReader      func(context.Context, string, uint64) (core.Feature, error)
 	closeAttributeSource        func()
+	postGISCatalogMu            sync.Mutex
+	postGISCatalogCancel        context.CancelFunc
+	postGISCatalogRequest       uint64
 	attributeLayer              string
 	attributePage               int
 	attributeReady              bool
@@ -422,10 +469,12 @@ type layerTreePayloadRow struct {
 	DisplayRule     string             `json:"displayRule,omitempty"`
 	GeometryType    string             `json:"geometryType,omitempty"`
 	Bounds          *[4]float64        `json:"bounds,omitempty"`
+	Editable        bool               `json:"editable"`
 }
 
 func (r *demoRuntime) publishLayerTree() {
 	if r.service == nil {
+		r.invalidateLayerTreePayloadCache()
 		native.SetLayerTreePayload("[]")
 		return
 	}
@@ -448,7 +497,7 @@ func (r *demoRuntime) publishLayerTree() {
 			Name: name, DisplayName: displayName, SourcePath: layer.SourcePath,
 			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
 			CRS: layer.CRS.AuthorityCode, Visible: visible, SourceError: r.unavailableSources[name].Reason, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
-			GeometryType: r.layerGeometryTypes[name],
+			GeometryType: r.layerGeometryTypes[name], Editable: layer.Editable,
 		}
 		if bounds, exists := r.layerBounds[name]; exists {
 			boundsCopy := bounds
@@ -457,10 +506,27 @@ func (r *demoRuntime) publishLayerTree() {
 	}
 	payload, err := json.Marshal(rows)
 	if err != nil {
+		r.invalidateLayerTreePayloadCache()
 		native.SetLayerTreePayload("[]")
 		return
 	}
-	native.SetLayerTreePayload(string(payload))
+	payloadString := string(payload)
+	r.layerTreePayloadMu.Lock()
+	if r.hasLastLayerTreePayload && r.lastLayerTreePayload == payloadString {
+		r.layerTreePayloadMu.Unlock()
+		return
+	}
+	r.lastLayerTreePayload = payloadString
+	r.hasLastLayerTreePayload = true
+	native.SetLayerTreePayload(payloadString)
+	r.layerTreePayloadMu.Unlock()
+}
+
+func (r *demoRuntime) invalidateLayerTreePayloadCache() {
+	r.layerTreePayloadMu.Lock()
+	r.lastLayerTreePayload = ""
+	r.hasLastLayerTreePayload = false
+	r.layerTreePayloadMu.Unlock()
 }
 
 func (r *demoRuntime) publishLayerLabels() {
@@ -468,29 +534,36 @@ func (r *demoRuntime) publishLayerLabels() {
 }
 
 func (r *demoRuntime) publishLayerLabelsWithStatus(showLimitStatus bool) {
-	r.mu.Lock()
-	labels := append([]render.LayerLabel(nil), r.mapLabels...)
-	sourceCount := len(labels)
-	visibility := make(map[string]bool, len(r.visibleLayers))
-	for layer, visible := range r.visibleLayers {
-		visibility[layer] = visible
-	}
-	extent, crs := r.mapExtent, r.mapCRS
-	r.mu.Unlock()
 	viewport := native.CurrentViewport()
+	r.mu.Lock()
+	if r.hasPublishedLabelState && r.labelRevision == r.lastPublishedLabelRevision &&
+		r.lastPublishedLabelViewport == viewport && (!showLimitStatus || r.lastPublishedLabelStatus) {
+		r.mu.Unlock()
+		return
+	}
+	r.lastPublishedLabelRevision = r.labelRevision
+	r.lastPublishedLabelViewport = viewport
+	r.lastPublishedLabelStatus = r.lastPublishedLabelStatus || showLimitStatus
+	r.hasPublishedLabelState = true
+	sourceCount := len(r.mapLabels)
+	extent, crs := r.mapExtent, r.mapCRS
 	denominator := labelScaleDenominator(viewport, extent, crs)
-	visibleLabels := labels[:0]
-	for _, label := range labels {
-		if visible, exists := visibility[label.Layer]; exists && !visible {
+	labels := make([]render.LayerLabel, 0, min(sourceCount, maxLayerLabelCount))
+	for _, label := range r.mapLabels {
+		if visible, exists := r.visibleLayers[label.Layer]; exists && !visible {
+			continue
+		}
+		if !layerLabelWithinViewport(label, viewport) {
 			continue
 		}
 		if denominator > 0 && ((label.MinScale > 0 && denominator < label.MinScale) ||
 			(label.MaxScale > 0 && denominator > label.MaxScale)) {
 			continue
 		}
-		visibleLabels = append(visibleLabels, label)
+		labels = append(labels, label)
 	}
-	labels, safetyOmitted := viewportLayerLabels(visibleLabels, viewport, maxLayerLabelCount)
+	r.mu.Unlock()
+	labels, safetyOmitted := viewportLayerLabels(labels, viewport, maxLayerLabelCount)
 	beforeDeclutter := len(labels)
 	labels = declutterViewportLabelsAtScale(labels, viewport, denominator)
 	limit := viewportLabelLimit(denominator)
@@ -508,6 +581,19 @@ func (r *demoRuntime) publishLayerLabelsWithStatus(showLimitStatus bool) {
 	if showLimitStatus && safetyOmitted+scaleOmitted > 0 {
 		native.SetRenderStatus(fmt.Sprintf("Showing %d labels in the current view; zoom in for more", len(labels)))
 	}
+}
+
+func layerLabelWithinViewport(label render.LayerLabel, viewport native.Viewport) bool {
+	if viewport.Width <= 0 || viewport.Height <= 0 || viewport.Zoom <= 0 ||
+		viewport.ViewportWidth <= 0 || viewport.ViewportHeight <= 0 {
+		return true
+	}
+	centerX := 0.5 - viewport.PanX/(viewport.Width*viewport.Zoom)
+	centerY := 0.5 + viewport.PanY/(viewport.Height*viewport.Zoom)
+	halfWidth := 0.55 * viewport.ViewportWidth / (viewport.Width * viewport.Zoom)
+	halfHeight := 0.55 * viewport.ViewportHeight / (viewport.Height * viewport.Zoom)
+	return label.X >= centerX-halfWidth && label.X <= centerX+halfWidth &&
+		label.Y >= centerY-halfHeight && label.Y <= centerY+halfHeight
 }
 
 func labelScaleDenominator(view native.Viewport, extent [4]float64, crs string) float64 {
@@ -730,7 +816,10 @@ func (r *demoRuntime) publishAttributes(layerName string) {
 	r.publishAttributesPage(layerName, 0)
 }
 
-const attributePageSize = 200
+// Keep attribute pages small enough that one Qt bridge transfer and one QML
+// model update remain responsive even with wide/long text fields. Users can
+// page through the complete table without retaining all rows in the GUI.
+const attributePageSize = 128
 
 func attributePageOffset(page int) (int, bool) {
 	if page < 0 || page > int(^uint(0)>>1)/attributePageSize {
@@ -869,14 +958,18 @@ func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int
 		r.attributeReady = true
 		return
 	}
-	native.SetAttributePayload(string(payload))
-	r.cacheAttributePayload(key, string(payload))
+	payloadString := string(payload)
+	native.SetAttributePayload(payloadString)
+	r.cacheAttributePayload(key, payloadString)
 	r.attributeLayer = layerName
 	r.attributePage = page
 	r.attributeReady = true
 }
 
 func (r *demoRuntime) republishAttributesAsync(layerName string) {
+	if !native.AttributePayloadVisible() {
+		return
+	}
 	r.mu.Lock()
 	r.attributeReady = false
 	r.attributeCache = nil
@@ -914,6 +1007,17 @@ func (r *demoRuntime) cacheAttributePayload(key attributePageKey, payload string
 		r.attributeCacheBytes -= int64(len(oldestPayload))
 		r.attributeCacheOrder = r.attributeCacheOrder[1:]
 	}
+}
+
+// releaseAttributePayloadCache drops page payloads while the attribute dialog
+// is closed. The next dialog open requests page zero again, so retaining the
+// cache only adds memory pressure without improving the current UX.
+func (r *demoRuntime) releaseAttributePayloadCache() {
+	r.mu.Lock()
+	r.attributeCache = nil
+	r.attributeCacheOrder = nil
+	r.attributeCacheBytes = 0
+	r.mu.Unlock()
 }
 
 // estimateAttributePayloadJSONBytes conservatively bounds the encoded JSON
@@ -1117,9 +1221,12 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	for _, layerName := range visibleLayerNames {
 		maxVisibleLayerFeatureCount = max(maxVisibleLayerFeatureCount, r.layerFeatureCounts[layerName])
 	}
-	layerVisibility := make(map[string]bool, len(r.visibleLayers))
+	var hiddenLayerNames []string
+	layerCount := len(r.visibleLayers)
 	for layer, visible := range r.visibleLayers {
-		layerVisibility[layer] = visible
+		if !visible {
+			hiddenLayerNames = append(hiddenLayerNames, layer)
+		}
 	}
 	renderStage := 0
 	if r.dataMode {
@@ -1170,10 +1277,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	}
 	hiddenKeys := make([]render.ChunkKey, 0)
 	if !chunkPlanExceeded && len(keys) < render.MaxViewportChunkKeys {
-		for layer, visible := range layerVisibility {
-			if visible {
-				continue
-			}
+		for _, layer := range hiddenLayerNames {
 			var withinLimit bool
 			hiddenKeys, withinLimit = planner.VisibleKeysIntoLimit(hiddenKeys, viewport, layer,
 				render.MaxViewportChunkKeys-len(keys))
@@ -1226,7 +1330,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		}
 		if chunkPlanExceeded {
 			native.SetRenderStatus("Render stopped: viewport exceeds the chunk-key safety limit")
-		} else if len(layerVisibility) > 0 {
+		} else if layerCount > 0 {
 			native.SetRenderStatus("No visible layers")
 		}
 		batchStore.Clear()
@@ -1625,6 +1729,18 @@ func prioritizeViewportChunks(keys []render.ChunkKey, viewport render.Viewport, 
 // retainVisibleWindowChunksLocked drops cached feature geometry and metadata
 // once its chunk leaves the viewport. The caller must hold r.mu.
 func (r *demoRuntime) retainVisibleWindowChunksLocked(keys []render.ChunkKey) {
+	if len(r.windowVisibleKeys) == len(keys) {
+		unchanged := true
+		for _, key := range keys {
+			if _, exists := r.windowVisibleKeys[key]; !exists {
+				unchanged = false
+				break
+			}
+		}
+		if unchanged {
+			return
+		}
+	}
 	r.windowVisibleKeys = make(map[render.ChunkKey]struct{}, len(keys))
 	for _, key := range keys {
 		r.windowVisibleKeys[key] = struct{}{}
@@ -1637,6 +1753,39 @@ func (r *demoRuntime) retainVisibleWindowChunksLocked(keys []render.ChunkKey) {
 	r.rebuildWindowFeaturesLocked()
 }
 
+// releaseHiddenRenderResources drops viewport-derived geometry while keeping
+// the project, layer metadata, and source sessions available for restoration.
+// A visibility transition will request the current viewport again.
+func (r *demoRuntime) releaseHiddenRenderResources() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	scheduler := r.scheduler
+	batchStore := r.batchStore
+	cancel := r.cancel
+	r.cancel = nil
+	if r.viewportReadOnly {
+		r.retainVisibleWindowChunksLocked(nil)
+	}
+	r.hasCompleteFrame = false
+	r.completeFrameLayers = ""
+	if scheduler != nil {
+		scheduler.AdvanceGeneration()
+	}
+	if batchStore != nil {
+		batchStore.Clear()
+	}
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if scheduler != nil {
+		scheduler.RetainOnly(nil)
+	}
+	native.SetVertices(nil)
+}
+
 // rebuildWindowFeaturesLocked keeps hit-test and label data bounded to the
 // same viewport chunks as rendered geometry. The caller must hold r.mu.
 func (r *demoRuntime) rebuildWindowFeaturesLocked() {
@@ -1647,10 +1796,13 @@ func (r *demoRuntime) rebuildWindowFeaturesLocked() {
 		text  string
 		x, y  float64
 	}
-	seenLabels := make(map[labelKey]struct{})
+	var seenLabels map[labelKey]struct{}
 	for key := range r.windowVisibleKeys {
 		features = append(features, r.windowHits[key]...)
 		for _, label := range r.windowLabels[key] {
+			if seenLabels == nil {
+				seenLabels = make(map[labelKey]struct{})
+			}
 			key := labelKey{layer: label.Layer, text: label.Text, x: label.X, y: label.Y}
 			if _, seen := seenLabels[key]; seen {
 				continue
@@ -1661,6 +1813,7 @@ func (r *demoRuntime) rebuildWindowFeaturesLocked() {
 	}
 	r.features = features
 	r.mapLabels = labels
+	r.labelRevision++
 	r.hitIndex = render.HitIndex{}
 	r.hitIndexReady = false
 }
@@ -1773,7 +1926,9 @@ func (r *demoRuntime) selectAt(click native.CanvasClick, viewport native.Viewpor
 	}
 	r.mu.Unlock()
 	r.publishVertexHandles(result, features, readOnly)
-	r.publishAttributesPageAsync(result.Layer, 0)
+	if native.AttributePayloadVisible() {
+		r.publishAttributesPageAsync(result.Layer, 0)
+	}
 	if readOnly {
 		if lookupContext != nil {
 			go r.finishReadOnlySelectionName(lookupContext, generation, service, reader, result, label)
@@ -2162,16 +2317,50 @@ func startViewportSync(runtime *demoRuntime) {
 	lastLoadGeneration := native.LoadGeneration()
 	lastSaveGeneration := native.SaveGeneration()
 	lastSpatialGeneration := native.SpatialGeneration()
+	lastCanvasVisibilityGeneration := native.CanvasVisibilityGeneration()
+	lastPostGISCatalogGeneration := native.PostGISCatalogGeneration()
+	lastPostGISCatalogVisible := native.PostGISCatalogVisible()
 	go func() {
 		var viewportChangedAt time.Time
 		pendingViewportRefresh := false
-		for range time.NewTicker(16 * time.Millisecond).C {
+		// QML payloads are generation-based and viewport redraws are already
+		// debounced below. A 30 Hz bridge poll keeps visible interaction
+		// responsive; hidden windows use the slower cadence used by the native
+		// bridge because only generation-based file/load state needs polling.
+		syncTimer := time.NewTimer(viewportSyncInterval(true))
+		defer syncTimer.Stop()
+		for {
+			<-syncTimer.C
+			if !native.AttributePayloadVisible() {
+				runtime.releaseAttributePayloadCache()
+			}
+			canvasVisibilityGeneration := native.CanvasVisibilityGeneration()
+			if canvasVisibilityGeneration != lastCanvasVisibilityGeneration {
+				lastCanvasVisibilityGeneration = canvasVisibilityGeneration
+				if native.CanvasVisible() {
+					runtime.refreshCurrentViewport()
+				} else {
+					// Release viewport-derived native, scheduler, and window payload
+					// resources while hidden; file-picker requests remain on the bridge.
+					runtime.releaseHiddenRenderResources()
+				}
+			}
 			spatialGeneration := native.SpatialGeneration()
 			if spatialGeneration != lastSpatialGeneration {
 				lastSpatialGeneration = spatialGeneration
 				if err := applySpatialRequest(runtime, native.CurrentSpatialRequest()); err != nil {
 					native.SetRenderStatus("Spatial operation failed: " + err.Error())
 				}
+			}
+			postGISCatalogGeneration := native.PostGISCatalogGeneration()
+			postGISCatalogVisible := native.PostGISCatalogVisible()
+			if lastPostGISCatalogVisible && !postGISCatalogVisible {
+				runtime.cancelPostGISCatalogRequest()
+			}
+			lastPostGISCatalogVisible = postGISCatalogVisible
+			if postGISCatalogGeneration != lastPostGISCatalogGeneration {
+				lastPostGISCatalogGeneration = postGISCatalogGeneration
+				runtime.publishPostGISTableCatalogAsync(native.CurrentPostGISCatalogSchema(), postGISCatalogGeneration)
 			}
 			saveGeneration := native.SaveGeneration()
 			if saveGeneration != lastSaveGeneration {
@@ -2234,10 +2423,16 @@ func startViewportSync(runtime *demoRuntime) {
 				lastLayerVisibilityGeneration = layerVisibilityGeneration
 				visibilityChanged = applyLayerVisibility(runtime, native.CurrentLayerVisibility())
 			}
+			canvasVisible := native.CanvasVisible()
 			// Reuse the already rendered map while a wheel/drag gesture is
 			// active. Rebuilding each 16 ms cancels expensive GDAL windows
 			// before parcel tiles can ever finish.
-			if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
+			if !canvasVisible {
+				// A visibility-generation transition will refresh the current
+				// viewport once after restoration. Do not let a pre-hide debounce
+				// or layer toggle start a background render here.
+				pendingViewportRefresh = false
+			} else if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
 				pendingViewportRefresh = false
 				runtime.advanceRenderGeneration()
 				width, height := viewport.Width, viewport.Height
@@ -2280,19 +2475,98 @@ func startViewportSync(runtime *demoRuntime) {
 			activeLayerGeneration := native.ActiveLayerGeneration()
 			if activeLayerGeneration != lastActiveLayerGeneration {
 				lastActiveLayerGeneration = activeLayerGeneration
-				if layer := native.CurrentActiveLayer(); layer != "" {
-					runtime.publishAttributesPageAsync(layer, 0)
+				if native.AttributePayloadVisible() {
+					if layer := native.CurrentActiveLayer(); layer != "" {
+						runtime.publishAttributesPageAsync(layer, 0)
+					}
 				}
 			}
 			attributePageGeneration := native.AttributePageGeneration()
 			if attributePageGeneration != lastAttributePageGeneration {
 				lastAttributePageGeneration = attributePageGeneration
-				if layer := native.CurrentActiveLayer(); layer != "" {
-					runtime.publishAttributesPageAsync(layer, native.CurrentAttributePage())
+				if native.AttributePayloadVisible() {
+					if layer := native.CurrentActiveLayer(); layer != "" {
+						runtime.publishAttributesPageAsync(layer, native.CurrentAttributePage())
+					}
 				}
 			}
+			// Attribute pages are a dialog-only resource. Selection and layer
+			// changes still update their generations while the dialog is closed,
+			// but do not start I/O that will be discarded immediately.
+			syncTimer.Reset(viewportSyncInterval(native.CanvasVisible()))
 		}
 	}()
+}
+
+func viewportSyncInterval(visible bool) time.Duration {
+	if visible {
+		return 33 * time.Millisecond
+	}
+	return 250 * time.Millisecond
+}
+
+func (r *demoRuntime) publishPostGISTableCatalog(schema string) {
+	native.SetPostGISCatalogPayload(r.postGISTableCatalogPayload(context.Background(), schema))
+}
+
+func (r *demoRuntime) publishPostGISTableCatalogAsync(schema string, generation uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	r.postGISCatalogMu.Lock()
+	if r.postGISCatalogCancel != nil {
+		r.postGISCatalogCancel()
+	}
+	r.postGISCatalogCancel = cancel
+	r.postGISCatalogRequest++
+	request := r.postGISCatalogRequest
+	r.postGISCatalogMu.Unlock()
+	go func() {
+		defer cancel()
+		payload := r.postGISTableCatalogPayload(ctx, schema)
+		if ctx.Err() != nil {
+			return
+		}
+		r.postGISCatalogMu.Lock()
+		current := request == r.postGISCatalogRequest
+		r.postGISCatalogMu.Unlock()
+		if !current || native.PostGISCatalogGeneration() != generation {
+			return
+		}
+		native.SetPostGISCatalogPayload(payload)
+	}()
+}
+
+func (r *demoRuntime) cancelPostGISCatalogRequest() {
+	r.postGISCatalogMu.Lock()
+	if r.postGISCatalogCancel != nil {
+		r.postGISCatalogCancel()
+		r.postGISCatalogRequest++
+	}
+	r.postGISCatalogMu.Unlock()
+}
+
+func (r *demoRuntime) postGISTableCatalogPayload(ctx context.Context, schema string) string {
+	dsn := strings.TrimSpace(os.Getenv("GOGIS_POSTGIS_DSN"))
+	if dsn == "" {
+		return `{"error":"GOGIS_POSTGIS_DSN is not configured","tables":[]}`
+	}
+	const maxCatalogTables = 2048
+	tables, truncated, err := postgis.ListTablesLimited(ctx, dsn, schema, maxCatalogTables)
+	if err != nil {
+		payload, _ := json.Marshal(struct {
+			Error     string              `json:"error"`
+			Tables    []postgis.TableInfo `json:"tables"`
+			Truncated bool                `json:"truncated"`
+		}{Error: err.Error(), Tables: []postgis.TableInfo{}, Truncated: false})
+		return string(payload)
+	}
+	payload, err := json.Marshal(struct {
+		Tables    []postgis.TableInfo `json:"tables"`
+		Truncated bool                `json:"truncated"`
+	}{Tables: tables, Truncated: truncated})
+	if err != nil {
+		return `{"error":"failed to encode PostGIS table catalog","tables":[]}`
+	}
+	return string(payload)
 }
 
 type layerSettingsRequest struct {

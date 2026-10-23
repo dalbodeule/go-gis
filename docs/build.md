@@ -499,6 +499,40 @@ go vet ./...
 - Linux: 배포판 패키지 의존성으로 설치하거나 호환되는 `.so`와 data directory를 패키징
 - Windows: 호환되는 `.dll`과 GDAL/PROJ data를 함께 배포
 
+### OS별 데스크톱 패키지 스크립트
+
+데스크톱 native 빌드는 대상 OS에서 실행해야 합니다. 세 스크립트 모두
+개발 머신의 절대 경로를 최종 실행 파일에 남기지 않는 것을 목표로 하지만,
+공개 배포 전에는 반드시 clean-machine 검증과 라이선스 고지를 수행합니다.
+
+```sh
+# macOS: Homebrew의 Qt/GDAL/PROJ/GEOS와 macdeployqt 필요
+python3 scripts/package_macos.py --version 0.1.0-dev
+
+# Linux: Qt/GDAL/PROJ/GEOS, pkg-config, dpkg-deb 필요
+./scripts/package_linux.sh --version 0.1.0-dev --arch amd64
+# linuxdeploy + linuxdeploy-plugin-qt가 있으면 AppImage도 추가
+./scripts/package_linux.sh --version 0.1.0-dev --arch amd64 --appimage
+```
+
+Linux 스크립트는 `build/packages/linux/<arch>/`에 portable 디렉터리,
+`tar.gz`, `.deb`를 생성합니다. `.deb`는 Debian/Ubuntu 계열의 설치 형식이며
+배포판별 Qt/GDAL ABI 차이를 없애는 보증이 아니므로, 실제 지원 Ubuntu/Debian
+버전에서 설치·실행해야 합니다. `linuxdeploy` 없이 만들어진 결과는 Qt
+공유 라이브러리 수집 전의 개발용 AppDir로 취급합니다.
+
+Windows portable ZIP 및 선택적 Inno Setup 설치 파일은 PowerShell 스크립트로
+생성합니다.
+
+```powershell
+.\scripts\package_windows.ps1 -Arch amd64 -Version 0.1.0-dev
+.\scripts\package_windows.ps1 -Arch amd64 -Version 0.1.0-dev -BuildInstaller
+```
+
+상세한 Linux 선택과 release gate는 [Linux 배포 결정](decisions/0019-linux-packaging.md),
+공통 배포 방향은 [데스크톱 배포 결정](decisions/0013-desktop-distribution.md)을
+참조합니다.
+
 ### 단일 실행 파일 배포 점검
 
 현재 빌드 스크립트는 배포 패키지가 아니라 실행 파일만 `build/`에 만든다.

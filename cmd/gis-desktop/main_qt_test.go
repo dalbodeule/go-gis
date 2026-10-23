@@ -20,6 +20,33 @@ import (
 	"gogis/ui/qt/native"
 )
 
+func TestViewportSyncIntervalMatchesCanvasVisibility(t *testing.T) {
+	if got := viewportSyncInterval(true); got != 33*time.Millisecond {
+		t.Fatalf("visible viewport sync interval = %s, want 33ms", got)
+	}
+	if got := viewportSyncInterval(false); got != 250*time.Millisecond {
+		t.Fatalf("hidden viewport sync interval = %s, want 250ms", got)
+	}
+}
+
+func TestMemoryMonitorIntervalMatchesCanvasVisibility(t *testing.T) {
+	if got := memoryMonitorInterval(true); got != time.Second {
+		t.Fatalf("visible memory monitor interval = %s, want 1s", got)
+	}
+	if got := memoryMonitorInterval(false); got != 5*time.Second {
+		t.Fatalf("hidden memory monitor interval = %s, want 5s", got)
+	}
+}
+
+func TestDiagnosticLogPublishIntervalMatchesCanvasVisibility(t *testing.T) {
+	if got := diagnosticLogPublishInterval(true); got != 250*time.Millisecond {
+		t.Fatalf("visible diagnostic interval = %s, want 250ms", got)
+	}
+	if got := diagnosticLogPublishInterval(false); got != time.Second {
+		t.Fatalf("hidden diagnostic interval = %s, want 1s", got)
+	}
+}
+
 func TestMarshalLayerLabelsNormalizesNilSlice(t *testing.T) {
 	payload, err := marshalLayerLabels(nil)
 	if err != nil {
@@ -48,6 +75,20 @@ func TestViewportLayerLabelsCullOffscreenAndSampleDenseViews(t *testing.T) {
 	sampled, omitted := viewportLayerLabels(labels, native.Viewport{}, 10)
 	if len(sampled) != 10 || omitted != 90 || sampled[0].FeatureID != 0 || sampled[9].FeatureID != 90 {
 		t.Fatalf("sampled labels=%d omitted=%d first/last=%d/%d", len(sampled), omitted, sampled[0].FeatureID, sampled[len(sampled)-1].FeatureID)
+	}
+}
+
+func TestLayerLabelWithinViewportUsesTheSameFallbackAndBounds(t *testing.T) {
+	label := render.LayerLabel{X: 0.5, Y: 0.5}
+	if !layerLabelWithinViewport(label, native.Viewport{}) {
+		t.Fatal("invalid viewport should retain labels for the fallback path")
+	}
+	view := native.Viewport{Width: 1000, Height: 1000, ViewportWidth: 100, ViewportHeight: 100, Zoom: 1}
+	if !layerLabelWithinViewport(label, view) {
+		t.Fatal("center label was incorrectly filtered")
+	}
+	if layerLabelWithinViewport(render.LayerLabel{X: 0.99, Y: 0.99}, view) {
+		t.Fatal("far label was not filtered")
 	}
 }
 
@@ -211,6 +252,19 @@ func TestAttributePayloadCacheRespectsByteAndEntryLimits(t *testing.T) {
 	}
 }
 
+func TestReleaseAttributePayloadCacheClearsRetainedPages(t *testing.T) {
+	runtime := &demoRuntime{}
+	runtime.cacheAttributePayload(attributePageKey{layer: "roads", page: 0}, "page-0")
+	runtime.cacheAttributePayload(attributePageKey{layer: "roads", page: 1}, "page-1")
+	if len(runtime.attributeCache) != 2 || runtime.attributeCacheBytes == 0 {
+		t.Fatalf("cache was not populated: entries=%d bytes=%d", len(runtime.attributeCache), runtime.attributeCacheBytes)
+	}
+	runtime.releaseAttributePayloadCache()
+	if len(runtime.attributeCache) != 0 || len(runtime.attributeCacheOrder) != 0 || runtime.attributeCacheBytes != 0 {
+		t.Fatalf("attribute cache retained after release: entries=%d order=%d bytes=%d", len(runtime.attributeCache), len(runtime.attributeCacheOrder), runtime.attributeCacheBytes)
+	}
+}
+
 func TestEstimateAttributePayloadJSONBytesBoundsEscapedAndNestedValues(t *testing.T) {
 	payload := attributePayload{
 		Columns: []string{"name"},
@@ -305,6 +359,22 @@ func TestRetainVisibleWindowChunksReleasesOffscreenGeometry(t *testing.T) {
 	}
 }
 
+func TestRetainVisibleWindowChunksReusesUnchangedSnapshot(t *testing.T) {
+	key := render.ChunkKey{Layer: "parcels", ZoomBucket: 2, X: 1, Y: 1}
+	runtime := &demoRuntime{
+		windowVisibleKeys: map[render.ChunkKey]struct{}{key: {}},
+		features:          []render.HitFeature{{FeatureID: 10}},
+		mapLabels:         []render.LayerLabel{{FeatureID: 10, Text: "parcel"}},
+		hitIndexReady:     true,
+	}
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{key})
+	runtime.mu.Unlock()
+	if !runtime.hitIndexReady || len(runtime.features) != 1 || len(runtime.mapLabels) != 1 {
+		t.Fatal("unchanged viewport snapshot was unnecessarily rebuilt")
+	}
+}
+
 func TestRetainVisibleWindowChunksReleasesOffscreenOverviewLabels(t *testing.T) {
 	key := render.ChunkKey{Layer: "parcels", ZoomBucket: -7, X: 1, Y: 1}
 	runtime := &demoRuntime{
@@ -318,6 +388,56 @@ func TestRetainVisibleWindowChunksReleasesOffscreenOverviewLabels(t *testing.T) 
 	runtime.mu.Unlock()
 	if runtime.windowVisiblePayloadBytes != 0 || len(runtime.windowLabels) != 0 || len(runtime.mapLabels) != 0 {
 		t.Fatalf("offscreen overview labels retained: bytes=%d labels=%v", runtime.windowVisiblePayloadBytes, runtime.windowLabels)
+	}
+}
+
+func TestReleaseHiddenRenderResourcesDropsViewportState(t *testing.T) {
+	key := render.ChunkKey{Layer: "parcels", ZoomBucket: 2, X: 1, Y: 1}
+	scheduler := render.NewScheduler()
+	results := scheduler.RequestUnique(context.Background(), []render.ChunkKey{key}, func(_ context.Context, key render.ChunkKey) (render.Chunk, error) {
+		return render.Chunk{Key: key, Vertices: []render.Vertex{{X: 0.1, Y: 0.1}, {X: 0.2, Y: 0.2}}}, nil
+	})
+	for range results {
+	}
+	batchStore := render.NewBatchStore()
+	batchStore.BeginGenerationWithVisible(1, []render.ChunkKey{key})
+	if !batchStore.ApplyImmutable(render.ChunkResult{Key: key, Generation: 1, Chunk: render.Chunk{Key: key, Vertices: []render.Vertex{{X: 0.1, Y: 0.1}}}}) {
+		t.Fatal("failed to seed viewport batch")
+	}
+	runtime := &demoRuntime{
+		scheduler: scheduler, batchStore: batchStore, viewportReadOnly: true,
+		readOnlyBaseFeatures:      []render.HitFeature{{Layer: "base", FeatureID: 7}},
+		readOnlyBaseLabels:        []render.LayerLabel{{Layer: "base", FeatureID: 7, Text: "base"}},
+		windowVisibleKeys:         map[render.ChunkKey]struct{}{key: {}},
+		windowFeatureCounts:       map[render.ChunkKey]int{key: 1},
+		windowPayloadBytes:        map[render.ChunkKey]int64{key: 12},
+		windowVisibleFeatureCount: 1,
+		windowVisiblePayloadBytes: 12,
+		windowFeatureIDs:          map[render.ChunkKey][]uint64{key: {9}},
+		windowFeatureNames:        map[uint64]string{9: "window"},
+		windowHits:                map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 9}}},
+		windowLabels:              map[render.ChunkKey][]render.LayerLabel{key: {{Text: "window"}}},
+		hasCompleteFrame:          true,
+		completeFrameLayers:       "parcels",
+	}
+	runtime.features = append([]render.HitFeature(nil), runtime.readOnlyBaseFeatures...)
+	runtime.mapLabels = append([]render.LayerLabel(nil), runtime.readOnlyBaseLabels...)
+
+	runtime.releaseHiddenRenderResources()
+	if _, cached := scheduler.Cached(key); cached {
+		t.Fatal("hidden viewport chunk remained in scheduler cache")
+	}
+	if _, vertices := batchStore.Current(); len(vertices) != 0 {
+		t.Fatalf("hidden batch retained %d vertices", len(vertices))
+	}
+	if len(runtime.windowHits) != 0 || len(runtime.windowLabels) != 0 || len(runtime.windowFeatureNames) != 0 {
+		t.Fatal("hidden window feature payload remained retained")
+	}
+	if len(runtime.features) != 1 || runtime.features[0].FeatureID != 7 || len(runtime.mapLabels) != 1 || runtime.mapLabels[0].Text != "base" {
+		t.Fatalf("base read-only snapshot was not preserved: features=%#v labels=%#v", runtime.features, runtime.mapLabels)
+	}
+	if runtime.hasCompleteFrame || runtime.completeFrameLayers != "" {
+		t.Fatal("complete frame marker survived hidden resource release")
 	}
 }
 
