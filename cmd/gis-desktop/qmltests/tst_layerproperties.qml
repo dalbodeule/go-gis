@@ -56,6 +56,11 @@ TestCase {
         try {
             canvas.renderStatus = "Rendering";
             compare(syncTimer.interval, 33);
+            canvas.renderStatus = "Importing CSV";
+            compare(syncTimer.interval, 33);
+            compare(appWindow.statusIsBusy(canvas.renderStatus), true);
+            canvas.renderStatus = "CSV preview: 4 columns, 3 sample rows";
+            compare(syncTimer.interval, 125);
             canvas.renderStatus = "Spatial operation cancelled";
             compare(syncTimer.interval, 125);
             canvas.renderStatus = "Showing 200 labels in the current view; zoom in for more";
@@ -1768,5 +1773,120 @@ TestCase {
         } finally {
             appWindow.language = previousLanguage;
         }
+    }
+
+    function test_workflowDialogShowsRelevantInputsAndDispatchesStableOperation() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "workflowDialog");
+        var operation = findChild(appWindow, "workflowOperation");
+        var layer = findChild(appWindow, "workflowLayer");
+        var table = findChild(appWindow, "workflowTable");
+        var required = findChild(appWindow, "workflowRequired");
+        verify(canvas !== null && dialog !== null && operation !== null && layer !== null && table !== null && required !== null);
+        canvas.activeLayer = "assets";
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        compare(layer.text, "assets");
+        operation.currentIndex = 1;
+        compare(required.visible, true);
+        compare(table.visible, false);
+        required.text = "관리번호,등급";
+        var before = canvas.layerSettingsGeneration;
+        dialog.accept();
+        tryCompare(canvas, "layerSettingsGeneration", before + 1);
+        var request = JSON.parse(canvas.layerSettingsPayload);
+        compare(request.operation, "validate-layer");
+        compare(request.layerName, "assets");
+        compare(request.requiredFields, "관리번호,등급");
+        dialog.open();
+        operation.currentIndex = 4;
+        compare(table.visible, true);
+        compare(required.visible, false);
+        table.text = "";
+        dialog.submitWorkflow();
+        compare(dialog.visible, true);
+        verify(dialog.errorText !== "");
+        dialog.close();
+    }
+
+    function test_luaAndBoundaryWorkflowInputsDispatch() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "workflowDialog");
+        var operation = findChild(appWindow, "workflowOperation");
+        var layer = findChild(appWindow, "workflowLayer");
+        var script = findChild(appWindow, "workflowLuaScript");
+        var boundary = findChild(appWindow, "workflowBoundaryLayer");
+        verify(canvas && dialog && operation && layer && script && boundary);
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        layer.text = "survey";
+        operation.currentIndex = 7;
+        compare(script.visible, true);
+        script.text = "return feature.grade";
+        dialog.submitWorkflow();
+        compare(JSON.parse(canvas.layerSettingsPayload).operation, "lua-split");
+        compare(JSON.parse(canvas.layerSettingsPayload).luaScript, "return feature.grade");
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        operation.currentIndex = 8;
+        boundary.text = "survey_boundaries";
+        layer.text = "parcels";
+        dialog.submitWorkflow();
+        compare(JSON.parse(canvas.layerSettingsPayload).operation, "split-boundary");
+        compare(JSON.parse(canvas.layerSettingsPayload).boundaryLayer, "survey_boundaries");
+    }
+
+    function test_csvImportAcceptsMultiplePathsAndBoundaryGroup() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "importCsvDialog");
+        var paths = findChild(appWindow, "csvPathField");
+        var name = findChild(appWindow, "csvLayerField");
+        var x = findChild(appWindow, "csvXField");
+        var y = findChild(appWindow, "csvYField");
+        var crs = findChild(appWindow, "csvCrsField");
+        var boundary = findChild(appWindow, "csvBuildBoundary");
+        var group = findChild(appWindow, "csvBoundaryGroup");
+        verify(canvas && dialog && paths && name && x && y && crs && boundary && group);
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        paths.text = "/tmp/a.csv\n/tmp/b.csv";
+        name.text = "survey";
+        x.text = "X";
+        y.text = "Y";
+        crs.text = "EPSG:5186";
+        boundary.checked = true;
+        group.text = "block";
+        dialog.submitImport();
+        var request = JSON.parse(canvas.layerSettingsPayload);
+        compare(request.operation, "import-csv");
+        compare(request.inputPaths.length, 2);
+        compare(request.inputPaths[1], "/tmp/b.csv");
+        compare(request.buildBoundary, true);
+        compare(request.boundaryGroupField, "block");
+    }
+
+    function test_createEmptyLayerRequiresCRSAndDispatchesGeometryType() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "createLayerDialog");
+        var name = findChild(appWindow, "createLayerName");
+        var geometry = findChild(appWindow, "createLayerGeometry");
+        var crs = findChild(appWindow, "createLayerCRS");
+        verify(canvas !== null && dialog !== null && name !== null && geometry !== null && crs !== null);
+        dialog.open();
+        tryCompare(dialog, "visible", true);
+        name.text = "survey";
+        crs.text = "";
+        dialog.submitLayer();
+        compare(dialog.visible, true);
+        verify(dialog.errorText !== "");
+        geometry.currentIndex = 2;
+        crs.text = "EPSG:5186";
+        var before = canvas.layerSettingsGeneration;
+        dialog.submitLayer();
+        tryCompare(canvas, "layerSettingsGeneration", before + 1);
+        var request = JSON.parse(canvas.layerSettingsPayload);
+        compare(request.operation, "create-layer");
+        compare(request.geometryType, "POLYGON");
+        compare(request.crs, "EPSG:5186");
     }
 }

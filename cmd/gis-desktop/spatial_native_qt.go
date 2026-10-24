@@ -9,8 +9,51 @@ import (
 	"strings"
 
 	geosdriver "gogis/drivers/geos"
+	"gogis/internal/commands"
 	"gogis/ui/qt/native"
 )
+
+func splitLayerByBoundary(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" || request.BoundaryLayer == "" {
+		return fmt.Errorf("boundary split requires source and boundary layers")
+	}
+	runtime.mu.Lock()
+	service, readOnly := runtime.service, runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	source, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("source layer %q not found", request.LayerName)
+	}
+	boundaries, ok := service.Layer(request.BoundaryLayer)
+	if !ok {
+		return fmt.Errorf("boundary layer %q not found", request.BoundaryLayer)
+	}
+	prefix := strings.TrimSpace(request.OutputName)
+	if prefix == "" {
+		prefix = source.Name + "_split"
+	}
+	ctx, finish := cancellableDesktopWorkflow()
+	defer finish()
+	native.SetRenderStatus("Running boundary split")
+	layers, err := commands.SplitPolygonLayerByBoundaries(ctx, geosdriver.NewOperator(), source, boundaries, prefix, 200000)
+	if err != nil {
+		return err
+	}
+	if len(layers) == 0 {
+		return fmt.Errorf("no source polygons intersect the selected boundaries")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := addWorkflowLayers(runtime, layers); err != nil {
+		return err
+	}
+	native.SetRenderStatus(fmt.Sprintf("Boundary split complete: %d layers", len(layers)))
+	return nil
+}
 
 func applySpatialRequest(runtime *demoRuntime, payload string) error {
 	var request spatialOperationRequest

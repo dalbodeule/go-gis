@@ -2932,6 +2932,119 @@ func TestApplyLayerSettingsUpdatesDisplayNameAndVisibility(t *testing.T) {
 	}
 }
 
+func TestEmptyProjectWorkflowLayersBecomeRenderable(t *testing.T) {
+	runtime := newEmptyProjectRuntime()
+	create, err := json.Marshal(layerSettingsRequest{Operation: "create-layer", OutputName: "empty", GeometryType: "POINT", CRS: "EPSG:4326"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(create)); err != nil {
+		t.Fatal(err)
+	}
+	created, ok := runtime.service.Layer("empty")
+	if !ok || created.GeometryLocked || !runtime.visibility.IsVisible("empty") {
+		t.Fatalf("created layer unavailable or locked: found=%t layer=%+v", ok, created)
+	}
+	if _, ok := runtime.sources["empty"]; !ok {
+		t.Fatal("created layer has no render source")
+	}
+	path := filepath.Join(t.TempDir(), "points.csv")
+	if err := os.WriteFile(path, []byte("x,y,name\n126,37,first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	importRequest, err := json.Marshal(layerSettingsRequest{Operation: "import-csv", InputPath: path, OutputName: "points", XField: "x", YField: "y", CRS: "EPSG:4326"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(importRequest)); err != nil {
+		t.Fatal(err)
+	}
+	imported, ok := runtime.service.Layer("points")
+	if !ok || len(imported.Features) != 1 || !imported.GeometryLocked || !runtime.visibility.IsVisible("points") {
+		t.Fatalf("imported layer unavailable: found=%t layer=%+v", ok, imported)
+	}
+	if _, ok := runtime.sources["points"]; !ok {
+		t.Fatal("imported layer has no render source")
+	}
+	if runtime.mapExtent[0] > 126 || runtime.mapExtent[2] < 126 || runtime.mapExtent[1] > 37 || runtime.mapExtent[3] < 37 {
+		t.Fatalf("map extent %v excludes imported point", runtime.mapExtent)
+	}
+}
+
+func TestCSVBoundaryImportAndPolygonSplit(t *testing.T) {
+	runtime := newEmptyProjectRuntime()
+	path := filepath.Join(t.TempDir(), "survey.csv")
+	data := "block,x,y\nwest,0,0\neast,2,0\nwest,1,0\neast,3,0\nwest,1,1\neast,3,1\nwest,0,1\neast,2,1\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(layerSettingsRequest{Operation: "import-csv", InputPaths: []string{path}, OutputName: "survey", XField: "x", YField: "y", CRS: "EPSG:5186", BuildBoundary: true, BoundaryGroupField: "block"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(payload)); err != nil {
+		t.Fatal(err)
+	}
+	points, ok := runtime.service.Layer("survey")
+	if !ok || len(points.Features) != 8 {
+		t.Fatalf("imported points = %+v, found=%t", points, ok)
+	}
+	boundary, ok := runtime.service.Layer("survey_boundaries")
+	if !ok || len(boundary.Features) != 2 {
+		t.Fatalf("boundaries = %+v, found=%t", boundary, ok)
+	}
+	source := core.Layer{Name: "parcel", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, GeometryType: "POLYGON", Fields: []core.Field{{Name: "owner", Type: core.FieldTypeText}}, Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 3 0, 3 1, 0 1, 0 0))"}, Properties: map[string]any{"owner": "a"}}}}
+	if err := addWorkflowLayer(runtime, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := splitLayerByBoundary(runtime, layerSettingsRequest{LayerName: "parcel", BoundaryLayer: "survey_boundaries", OutputName: "cut"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"B000001", "B000002"} {
+		layer, exists := runtime.service.Layer("cut_" + id)
+		if !exists || len(layer.Features) != 1 || layer.Features[0].Properties["shape_id"] != id || !runtime.visibility.IsVisible(layer.Name) {
+			t.Fatalf("split %s = %+v found=%t", id, layer, exists)
+		}
+	}
+}
+
+func TestMultipleCSVAndLuaFilterSplitWorkflow(t *testing.T) {
+	runtime := newEmptyProjectRuntime()
+	directory := t.TempDir()
+	paths := []string{filepath.Join(directory, "one.csv"), filepath.Join(directory, "two.csv")}
+	for index, content := range []string{"group,x,y\nA,0,0\nB,1,1\n", "group,x,y\nA,2,2\n"} {
+		if err := os.WriteFile(paths[index], []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	importRequest, _ := json.Marshal(layerSettingsRequest{Operation: "import-csv", InputPaths: paths, OutputName: "combined", XField: "x", YField: "y", CRS: "EPSG:5186"})
+	if err := applyLayerSettings(runtime, string(importRequest)); err != nil {
+		t.Fatal(err)
+	}
+	combined, ok := runtime.service.Layer("combined")
+	if !ok || len(combined.Features) != 3 {
+		t.Fatalf("merged layer = %+v, found=%t", combined, ok)
+	}
+	split, _ := json.Marshal(layerSettingsRequest{Operation: "lua-split", LayerName: "combined", OutputName: "grouped", LuaScript: "return feature.group"})
+	if err := applyLayerSettings(runtime, string(split)); err != nil {
+		t.Fatal(err)
+	}
+	for name, count := range map[string]int{"grouped_A": 2, "grouped_B": 1} {
+		layer, exists := runtime.service.Layer(name)
+		if !exists || len(layer.Features) != count || !runtime.visibility.IsVisible(name) {
+			t.Fatalf("%s = %+v, found=%t", name, layer, exists)
+		}
+	}
+	filter, _ := json.Marshal(layerSettingsRequest{Operation: "lua-filter", LayerName: "combined", OutputName: "selected", LuaScript: `return feature.group == "A"`})
+	if err := applyLayerSettings(runtime, string(filter)); err != nil {
+		t.Fatal(err)
+	}
+	selected, ok := runtime.service.Layer("selected")
+	if !ok || len(selected.Features) != 2 {
+		t.Fatalf("filtered layer = %+v, found=%t", selected, ok)
+	}
+}
+
 func TestPolygonRuntimeBuilderPublishesClippedFillMeshWithOpacity(t *testing.T) {
 	style := core.DefaultLayerStyle()
 	layers := []core.Layer{{

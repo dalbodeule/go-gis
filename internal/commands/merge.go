@@ -42,10 +42,11 @@ func mergeLayers(ctx context.Context, cloneFeatures bool, layers ...core.Layer) 
 	}
 	base := layers[0]
 	result := core.Layer{
-		Name:     base.Name + "_merged",
-		CRS:      base.CRS,
-		Fields:   append([]core.Field(nil), base.Fields...),
-		Editable: true,
+		Name:         base.Name + "_merged",
+		CRS:          base.CRS,
+		GeometryType: base.GeometryType,
+		Fields:       append([]core.Field(nil), base.Fields...),
+		Editable:     true,
 	}
 	totalFeatures := 0
 	for layerIndex, layer := range layers {

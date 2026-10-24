@@ -10,10 +10,11 @@ import (
 
 // LayerItem is a row in a layer tree.
 type LayerItem struct {
-	Name        string
-	DisplayName string
-	CRS         string
-	Editable    bool
+	Name           string
+	DisplayName    string
+	CRS            string
+	Editable       bool
+	GeometryLocked bool
 }
 
 // LayerTree returns a stable, UI-ready layer list.
@@ -21,10 +22,11 @@ func LayerTree(project core.Project) []LayerItem {
 	items := make([]LayerItem, len(project.Layers))
 	for i, layer := range project.Layers {
 		items[i] = LayerItem{
-			Name:        layer.Name,
-			DisplayName: layer.DisplayName,
-			CRS:         layer.CRS.AuthorityCode,
-			Editable:    layer.Editable,
+			Name:           layer.Name,
+			DisplayName:    layer.DisplayName,
+			CRS:            layer.CRS.AuthorityCode,
+			Editable:       layer.Editable,
+			GeometryLocked: layer.GeometryLocked,
 		}
 	}
 	return items

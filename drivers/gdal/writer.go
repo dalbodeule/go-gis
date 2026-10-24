@@ -66,20 +66,33 @@ func (Writer) WriteLayers(ctx context.Context, destination string, layers []core
 		if layer.Name == "" {
 			return fmt.Errorf("layer name is required")
 		}
-		if len(layer.Features) == 0 {
-			return fmt.Errorf("layer %q has no features to infer geometry type", layer.Name)
+		if len(layer.Features) == 0 && layer.GeometryType == "" {
+			return fmt.Errorf("layer %q has no features or geometry type", layer.Name)
 		}
-		geometryType, err := ogrGeometryType(layer.Features[0])
+		var geometryType godal.GeometryType
+		var err error
+		if len(layer.Features) > 0 {
+			geometryType, err = ogrGeometryType(layer.Features[0])
+		} else {
+			geometryType, err = ogrGeometryTypeName(layer.GeometryType)
+		}
 		if err != nil {
 			return err
 		}
-		for _, feature := range layer.Features[1:] {
-			other, err := ogrGeometryType(feature)
-			if err != nil {
-				return err
+		if driver == godal.Shapefile {
+			if err := validateShapefileFields(layer.Fields); err != nil {
+				return fmt.Errorf("layer %q: %w", layer.Name, err)
 			}
-			if other != geometryType {
-				return fmt.Errorf("feature %d geometry type %v conflicts with %v in layer %q", feature.ID, other, geometryType, layer.Name)
+		}
+		if len(layer.Features) > 1 {
+			for _, feature := range layer.Features[1:] {
+				other, err := ogrGeometryType(feature)
+				if err != nil {
+					return err
+				}
+				if other != geometryType {
+					return fmt.Errorf("feature %d geometry type %v conflicts with %v in layer %q", feature.ID, other, geometryType, layer.Name)
+				}
 			}
 		}
 	}
@@ -91,6 +104,26 @@ func (Writer) WriteLayers(ctx context.Context, destination string, layers []core
 		}
 	}
 	return writeNewDataset(ctx, destination, driver, layers)
+}
+
+func validateShapefileFields(fields []core.Field) error {
+	seen := map[string]string{}
+	for _, field := range fields {
+		if field.Name == "" || len(field.Name) > 10 {
+			return fmt.Errorf("field %q must be 1..10 ASCII characters for Shapefile DBF; provide an explicit mapping", field.Name)
+		}
+		for _, character := range field.Name {
+			if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '_') {
+				return fmt.Errorf("field %q is not an ASCII DBF name; provide an explicit mapping", field.Name)
+			}
+		}
+		key := strings.ToUpper(field.Name)
+		if previous, exists := seen[key]; exists {
+			return fmt.Errorf("field names %q and %q collide case-insensitively", previous, field.Name)
+		}
+		seen[key] = field.Name
+	}
+	return nil
 }
 
 func replaceGeoPackage(ctx context.Context, destination string, layers []core.Layer) error {
@@ -176,7 +209,13 @@ func writeNewDataset(ctx context.Context, destination string, driver godal.Drive
 }
 
 func writeLayer(ctx context.Context, dataset *godal.Dataset, layer core.Layer) error {
-	geometryType, err := ogrGeometryType(layer.Features[0])
+	var geometryType godal.GeometryType
+	var err error
+	if len(layer.Features) > 0 {
+		geometryType, err = ogrGeometryType(layer.Features[0])
+	} else {
+		geometryType, err = ogrGeometryTypeName(layer.GeometryType)
+	}
 	if err != nil {
 		return err
 	}
@@ -246,6 +285,19 @@ func ogrGeometryType(feature core.Feature) (godal.GeometryType, error) {
 		return godal.GTPolygon, nil
 	default:
 		return godal.GTUnknown, fmt.Errorf("feature %d has unsupported geometry type %q", feature.ID, feature.Geometry.GeometryType())
+	}
+}
+
+func ogrGeometryTypeName(name string) (godal.GeometryType, error) {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "POINT":
+		return godal.GTPoint, nil
+	case "LINESTRING":
+		return godal.GTLineString, nil
+	case "POLYGON":
+		return godal.GTPolygon, nil
+	default:
+		return godal.GTUnknown, fmt.Errorf("unsupported or missing layer geometry type %q", name)
 	}
 }
 

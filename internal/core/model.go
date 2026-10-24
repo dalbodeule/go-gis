@@ -79,13 +79,17 @@ type Layer struct {
 	SourceEncoding  string
 	SourceCRS       string
 	CRS             CRS
+	GeometryType    string `json:"geometryType,omitempty"`
 	Fields          []Field
 	Features        []Feature
 	Editable        bool
-	Visible         bool
-	Style           LayerStyle
-	Labels          LabelSettings
-	DisplayRule     string `json:"displayRule,omitempty"`
+	// GeometryLocked is a user policy independent of source writability. Loaded
+	// layers default to locked; callers must explicitly unlock before geometry edits.
+	GeometryLocked bool `json:"geometryLocked,omitempty"`
+	Visible        bool
+	Style          LayerStyle
+	Labels         LabelSettings
+	DisplayRule    string `json:"displayRule,omitempty"`
 }
 
 // LayerStyle stores renderer-independent display options for a vector layer.

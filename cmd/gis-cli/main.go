@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -39,12 +40,13 @@ type mergeOptions struct {
 }
 
 type filterOptions struct {
-	input   string
-	layer   string
-	field   string
-	value   string
-	output  string
-	profile string
+	input    string
+	layer    string
+	field    string
+	value    string
+	output   string
+	profile  string
+	fieldMap string
 }
 
 type labelOptions struct {
@@ -64,6 +66,15 @@ type scriptOptions struct {
 	script      string
 	output      string
 	outputLayer string
+}
+
+type workflowOptions struct {
+	input, table, output, layer, outputLayer, xField, yField, crs, encoding, delimiter, layerKey, tableKey, required, unique, fieldMap, featureIDs, field, template, geometryType, groupField, sumField, numberFields, boolFields string
+	allowInvalid                                                                                                                                                                                                                  bool
+	inputs                                                                                                                                                                                                                        []string
+	buildBoundary                                                                                                                                                                                                                 bool
+	boundaryGroup                                                                                                                                                                                                                 string
+	boundaryFile, boundaryLayer                                                                                                                                                                                                   string
 }
 
 type postGISOptions struct {
@@ -101,12 +112,20 @@ func main() {
 
 	if *help || flag.NArg() == 0 {
 		fmt.Fprintln(os.Stdout, "gogis CLI")
-		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label|script|postgis-list|postgis-import|postgis-export|postgis-insert|postgis-delete]")
+		fmt.Fprintln(os.Stdout, "usage: gis-cli [--help|--version|convert|spatial|merge|filter|label|import-csv|split-boundary|join|validate|measure|script|postgis-list|postgis-import|postgis-export|postgis-insert|postgis-delete]")
 		fmt.Fprintln(os.Stdout, "       gis-cli convert --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli spatial --operation OP --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli merge --input SOURCE --input SOURCE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli filter --input SOURCE --field FIELD --value VALUE --output FILE [options]")
 		fmt.Fprintln(os.Stdout, "       gis-cli label --input SOURCE --field FIELD --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli create-layer --output FILE --output-layer NAME --geometry-type POINT|LINESTRING|POLYGON --crs EPSG:4326")
+		fmt.Fprintln(os.Stdout, "       gis-cli import-csv --input CSV [--input CSV...] --output FILE --x-field X --y-field Y --crs EPSG:4326 [--boundary --boundary-group FIELD]")
+		fmt.Fprintln(os.Stdout, "       gis-cli split-boundary --input SOURCE.shp --boundary-file BOUNDARIES.gpkg --boundary-layer NAME --output RESULT.gpkg")
+		fmt.Fprintln(os.Stdout, "       gis-cli join --input SOURCE --table CSV --layer-key FIELD --table-key FIELD --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli polygon --input SOURCE --layer NAME --feature-ids 1,2,3 --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli label-field --input SOURCE --field label_text --template '시설-{관리번호}' --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli validate|measure --input SOURCE --output FILE [options]")
+		fmt.Fprintln(os.Stdout, "       gis-cli aggregate --input SOURCE --group FIELD --sum FIELD --output REPORT.csv")
 		fmt.Fprintln(os.Stdout, "       gis-cli script --input SOURCE --script FILE.lua [--output RESULT.gpkg] [--output-layer NAME]")
 		fmt.Fprintln(os.Stdout, "       gis-cli postgis-import --input SOURCE --dsn DSN --table schema.table [--layer NAME]")
 		fmt.Fprintln(os.Stdout, "       gis-cli postgis-list --dsn DSN [--schema SCHEMA]")
@@ -164,6 +183,16 @@ func main() {
 			os.Exit(2)
 		}
 		if err := runLabel(context.Background(), options); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "create-layer", "import-csv", "split-boundary", "join", "validate", "measure", "polygon", "label-field", "aggregate":
+		options, err := parseWorkflowOptions(flag.Arg(0), flag.Args()[1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := runWorkflow(context.Background(), flag.Arg(0), options); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -355,6 +384,7 @@ func parseFilterOptions(args []string) (filterOptions, error) {
 	flags.StringVar(&options.value, "value", "", "property value to match")
 	flags.StringVar(&options.output, "output", "", "output DXF, GeoPackage, or SHP path")
 	flags.StringVar(&options.profile, "profile", "ares-utf8", "DXF profile: ares-utf8 or ares-cp949")
+	flags.StringVar(&options.fieldMap, "field-map", "", "output field mapping old=new[,old=new]")
 	if err := flags.Parse(args); err != nil {
 		return filterOptions{}, err
 	}
@@ -390,6 +420,92 @@ func parseLabelOptions(args []string) (labelOptions, error) {
 	}
 	if flags.NArg() != 0 {
 		return labelOptions{}, fmt.Errorf("unexpected label arguments: %v", flags.Args())
+	}
+	return options, nil
+}
+
+func parseWorkflowOptions(command string, args []string) (workflowOptions, error) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	var options workflowOptions
+	var inputs stringListFlag
+	flags.Var(&inputs, "input", "input source or CSV path (repeat for CSV merge)")
+	flags.StringVar(&options.table, "table", "", " 업무대장 CSV path")
+	flags.StringVar(&options.output, "output", "", "output GeoPackage or Shapefile path")
+	flags.StringVar(&options.layer, "layer", "", "input layer name")
+	flags.StringVar(&options.outputLayer, "output-layer", "", "output layer name")
+	flags.StringVar(&options.xField, "x-field", "", "X coordinate field")
+	flags.StringVar(&options.yField, "y-field", "", "Y coordinate field")
+	flags.StringVar(&options.crs, "crs", "", "source CRS, for example EPSG:4326")
+	flags.StringVar(&options.encoding, "encoding", "UTF-8", "UTF-8 or CP949")
+	flags.StringVar(&options.delimiter, "delimiter", ",", "CSV delimiter, for example ',' or tab")
+	flags.StringVar(&options.layerKey, "layer-key", "", "layer join key")
+	flags.StringVar(&options.tableKey, "table-key", "", "table join key")
+	flags.StringVar(&options.required, "required", "", "comma-separated required fields")
+	flags.StringVar(&options.unique, "unique", "", "unique key field")
+	flags.StringVar(&options.fieldMap, "field-map", "", "output field mapping old=new[,old=new]")
+	flags.StringVar(&options.featureIDs, "feature-ids", "", "ordered feature IDs, comma-separated")
+	flags.StringVar(&options.field, "field", "", "label field name")
+	flags.StringVar(&options.template, "template", "", "label template, for example 시설-{관리번호}")
+	flags.StringVar(&options.geometryType, "geometry-type", "", "empty layer geometry type")
+	flags.StringVar(&options.groupField, "group", "", "aggregation group field")
+	flags.StringVar(&options.sumField, "sum", "", "aggregation numeric sum field")
+	flags.StringVar(&options.numberFields, "number-fields", "", "comma-separated numeric CSV fields")
+	flags.StringVar(&options.boolFields, "bool-fields", "", "comma-separated boolean CSV fields")
+	flags.BoolVar(&options.allowInvalid, "allow-invalid", false, "import valid rows while reporting rejected rows")
+	flags.BoolVar(&options.buildBoundary, "boundary", false, "calculate convex boundaries and shape IDs from CSV points")
+	flags.StringVar(&options.boundaryGroup, "boundary-group", "", "optional CSV field that identifies independent boundary groups")
+	flags.StringVar(&options.boundaryFile, "boundary-file", "", "GeoPackage containing identified boundary polygons")
+	flags.StringVar(&options.boundaryLayer, "boundary-layer", "", "boundary layer name")
+	if err := flags.Parse(args); err != nil {
+		return workflowOptions{}, err
+	}
+	options.inputs = append([]string(nil), inputs...)
+	if len(inputs) > 0 {
+		options.input = inputs[0]
+	}
+	if len(inputs) > 1 && command != "import-csv" {
+		return workflowOptions{}, fmt.Errorf("repeated --input is only supported for import-csv")
+	}
+	if flags.NArg() != 0 {
+		return workflowOptions{}, fmt.Errorf("unexpected %s arguments: %v", command, flags.Args())
+	}
+	switch command {
+	case "import-csv":
+		if options.input == "" || options.output == "" || options.xField == "" || options.yField == "" || options.crs == "" {
+			return workflowOptions{}, errors.New("import-csv requires --input, --output, --x-field, --y-field, and --crs")
+		}
+		if options.buildBoundary && !strings.EqualFold(filepath.Ext(options.output), ".gpkg") {
+			return workflowOptions{}, errors.New("--boundary requires GeoPackage output for point and boundary layers")
+		}
+	case "split-boundary":
+		if options.input == "" || options.boundaryFile == "" || options.boundaryLayer == "" || options.output == "" || !strings.EqualFold(filepath.Ext(options.output), ".gpkg") {
+			return workflowOptions{}, errors.New("split-boundary requires --input, --boundary-file, --boundary-layer, and --output RESULT.gpkg")
+		}
+	case "create-layer":
+		if options.output == "" || options.outputLayer == "" || options.geometryType == "" || options.crs == "" {
+			return workflowOptions{}, errors.New("create-layer requires --output, --output-layer, --geometry-type, and --crs")
+		}
+	case "join":
+		if options.input == "" || options.table == "" || options.output == "" || options.layerKey == "" || options.tableKey == "" {
+			return workflowOptions{}, errors.New("join requires --input, --table, --output, --layer-key, and --table-key")
+		}
+	case "polygon":
+		if options.input == "" || options.output == "" || options.featureIDs == "" {
+			return workflowOptions{}, errors.New("polygon requires --input, --feature-ids, and --output")
+		}
+	case "label-field":
+		if options.input == "" || options.output == "" || options.field == "" {
+			return workflowOptions{}, errors.New("label-field requires --input, --field, and --output")
+		}
+	case "aggregate":
+		if options.input == "" || options.output == "" || options.groupField == "" {
+			return workflowOptions{}, errors.New("aggregate requires --input, --group, and --output")
+		}
+	default:
+		if options.input == "" || options.output == "" {
+			return workflowOptions{}, fmt.Errorf("%s requires --input and --output", command)
+		}
 	}
 	return options, nil
 }

@@ -25,6 +25,7 @@ type Layer struct {
 	SourceEncoding  string             `json:"sourceEncoding,omitempty"`
 	SourceCRS       string             `json:"sourceCrs,omitempty"`
 	CRS             string             `json:"crs,omitempty"`
+	GeometryType    string             `json:"geometryType,omitempty"`
 	Visible         bool               `json:"visible"`
 	Style           core.LayerStyle    `json:"style"`
 	Labels          core.LabelSettings `json:"labels"`
@@ -53,7 +54,8 @@ func FromProject(project core.Project) Document {
 		doc.Layers[index] = Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath, SourceLayerName: layer.SourceLayerName,
 			SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS, CRS: layer.CRS.AuthorityCode, Visible: layer.Visible,
-			Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
+			GeometryType: layer.GeometryType,
+			Style:        layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return doc
@@ -82,7 +84,7 @@ func (d Document) Project() (core.Project, error) {
 		project.Layers[index] = core.Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath, SourceLayerName: layer.SourceLayerName,
 			SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS, CRS: core.CRS{AuthorityCode: layer.CRS},
-			Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
+			GeometryType: layer.GeometryType, GeometryLocked: true, Visible: layer.Visible, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
 	return project, nil

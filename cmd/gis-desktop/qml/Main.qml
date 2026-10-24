@@ -241,13 +241,15 @@ ApplicationWindow {
         var status = String(raw || "").toLowerCase();
         if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
         if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
-        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
         if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0 || status.indexOf("project crs set") >= 0) return "#2e7d32";
         return "#65717d";
     }
 
     function statusIsBusy(raw) {
         var status = String(raw || "").toLowerCase();
+        if (status.indexOf("csv preview:") === 0 || status.indexOf("csv imported:") === 0 || status.indexOf("validation complete:") === 0 || status.indexOf("join complete:") === 0)
+            return false;
         // Terminal messages can contain the same operation word as their
         // running state (for example "spatial operation cancelled").
         if (status.indexOf("cancel") >= 0 || status.indexOf("failed") >= 0 ||
@@ -257,7 +259,7 @@ ApplicationWindow {
             status.indexOf("removed") >= 0 || status.indexOf("exported") >= 0 ||
             status.indexOf("ready") >= 0)
             return false;
-        return status.indexOf("loading") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
+        return status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
     }
 
     function renderProgressSnapshot(raw) {
@@ -563,9 +565,205 @@ ApplicationWindow {
             onTriggered: spatialOperationDialog.open()
         }
         MenuItem {
+            objectName: "importCsvAction"
+            text: rootWindow.language === "ko" ? "CSV/TSV 좌표 추가…" : rootWindow.language === "jp" ? "CSV/TSV座標を追加…" : "Import CSV/TSV points…"
+            onTriggered: importCsvDialog.open()
+        }
+        MenuItem {
+            objectName: "createEmptyLayerAction"
+            text: rootWindow.language === "ko" ? "빈 레이어 만들기…" : "Create empty layer…"
+            onTriggered: createLayerDialog.open()
+        }
+        MenuItem {
+            objectName: "workflowAction"
+            text: rootWindow.language === "ko" ? "업무 워크플로우…" : "Workflow tools…"
+            enabled: layerModel.count > 0
+            onTriggered: workflowDialog.open()
+        }
+        MenuItem {
             objectName: "saveWorkspaceAction"
             text: rootWindow.tr("Save workspace")
             onTriggered: workspaceDialog.open()
+        }
+    }
+
+    Dialog {
+        id: createLayerDialog
+        objectName: "createLayerDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "빈 레이어 만들기" : "Create empty layer"
+        width: Math.min(450, rootWindow.width - 32)
+        property string errorText: ""
+        function submitLayer() {
+            if (createLayerName.text.trim() === "" || createLayerCRS.text.trim() === "") {
+                errorText = rootWindow.language === "ko" ? "레이어 이름과 CRS를 입력하세요." : "Enter a layer name and CRS.";
+                return;
+            }
+            errorText = "";
+            accept();
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 16
+            TextField { id: createLayerName; objectName: "createLayerName"; Layout.fillWidth: true; placeholderText: rootWindow.language === "ko" ? "레이어 이름" : "Layer name" }
+            ComboBox { id: createLayerGeometry; objectName: "createLayerGeometry"; Layout.fillWidth: true; model: rootWindow.language === "ko" ? ["점", "선", "면"] : ["Point", "Line", "Polygon"] }
+            TextField { id: createLayerCRS; objectName: "createLayerCRS"; Layout.fillWidth: true; placeholderText: "CRS (e.g. EPSG:5186)" }
+            Label { Layout.fillWidth: true; visible: createLayerDialog.errorText !== ""; color: "#b42318"; text: createLayerDialog.errorText; wrapMode: Text.WordWrap }
+        }
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { text: rootWindow.tr("Cancel"); onClicked: createLayerDialog.reject() }
+            Button { text: rootWindow.language === "ko" ? "만들기" : "Create"; onClicked: createLayerDialog.submitLayer() }
+        }
+        onAccepted: {
+            var types = ["POINT", "LINESTRING", "POLYGON"];
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "create-layer", outputName: createLayerName.text.trim(), geometryType: types[createLayerGeometry.currentIndex], crs: createLayerCRS.text.trim().toUpperCase()});
+            mapCanvas.layerSettingsGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: importCsvDialog
+        objectName: "importCsvDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "CSV/TSV 좌표 추가" : "Import CSV/TSV points"
+        width: Math.min(650, rootWindow.width - 32)
+        property string inputPath: ""
+        property string previewText: ""
+        property string errorText: ""
+        onOpened: { previewText = ""; errorText = ""; }
+        function submitImport() {
+            if (csvPathField.text.trim() === "" || csvLayerField.text.trim() === "" || csvXField.text.trim() === "" || csvYField.text.trim() === "" || csvCrsField.text.trim() === "") {
+                errorText = rootWindow.language === "ko" ? "파일·레이어명·X/Y 필드·CRS를 모두 입력하세요." : "Enter a file, layer name, X/Y fields, and CRS.";
+                return;
+            }
+            errorText = "";
+            accept();
+        }
+        Connections {
+            target: mapCanvas
+            function onRenderStatusChanged() {
+                if (mapCanvas.renderStatus.indexOf("CSV preview:") === 0)
+                    importCsvDialog.previewText = mapCanvas.renderStatus;
+            }
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 16
+            TextArea { id: csvPathField; objectName: "csvPathField"; Layout.fillWidth: true; Layout.preferredHeight: 72; placeholderText: rootWindow.language === "ko" ? "CSV/TSV 경로 (파일마다 한 줄)" : "CSV/TSV paths (one per line)"; text: importCsvDialog.inputPath; wrapMode: TextEdit.NoWrap }
+            Button { text: rootWindow.language === "ko" ? "파일 여러 개 선택" : "Choose CSV files"; onClicked: csvOpenDialog.open() }
+            TextField { id: csvLayerField; objectName: "csvLayerField"; Layout.fillWidth: true; placeholderText: "Layer name"; text: "csv_points" }
+            RowLayout {
+                TextField { id: csvXField; objectName: "csvXField"; Layout.fillWidth: true; placeholderText: "X field" }
+                TextField { id: csvYField; objectName: "csvYField"; Layout.fillWidth: true; placeholderText: "Y field" }
+            }
+            RowLayout {
+                TextField { id: csvCrsField; objectName: "csvCrsField"; Layout.fillWidth: true; placeholderText: "CRS (EPSG:4326)" }
+                TextField { id: csvEncodingField; Layout.fillWidth: true; placeholderText: "Encoding"; text: "UTF-8" }
+            }
+            TextField { id: csvDelimiterField; Layout.fillWidth: true; placeholderText: "Delimiter (, or tab)"; text: "," }
+            TextField { id: csvNumberFields; Layout.fillWidth: true; placeholderText: "Numeric fields (comma-separated, optional)" }
+            TextField { id: csvBoolFields; Layout.fillWidth: true; placeholderText: "Boolean fields (comma-separated, optional)" }
+            CheckBox { id: csvBuildBoundary; objectName: "csvBuildBoundary"; Layout.fillWidth: true; text: rootWindow.language === "ko" ? "좌표로 볼록 외곽선 계산하고 도형 식별자 부여" : "Calculate convex boundary and assign shape IDs" }
+            TextField { id: csvBoundaryGroup; objectName: "csvBoundaryGroup"; Layout.fillWidth: true; visible: csvBuildBoundary.checked; placeholderText: rootWindow.language === "ko" ? "경계 그룹 필드 (비우면 모든 점을 한 경계로)" : "Boundary group field (blank means one boundary)" }
+            Label { Layout.fillWidth: true; visible: importCsvDialog.errorText !== ""; color: "#b42318"; text: importCsvDialog.errorText; wrapMode: Text.WordWrap }
+            Button {
+                text: rootWindow.language === "ko" ? "미리보기" : "Preview"
+                onClicked: {
+                    var path = csvPathField.text.trim().split(/\r?\n/)[0];
+                    if (path === "") return;
+                    mapCanvas.layerSettingsPayload = JSON.stringify({operation: "preview-csv", inputPath: path, encoding: csvEncodingField.text.trim() || "UTF-8", delimiter: csvDelimiterField.text});
+                    mapCanvas.layerSettingsGeneration += 1;
+                }
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 105
+                TextArea {
+                    objectName: "csvPreviewText"
+                    readOnly: true
+                    wrapMode: TextEdit.NoWrap
+                    text: importCsvDialog.previewText !== "" ? importCsvDialog.previewText : (rootWindow.language === "ko" ? "파일과 구분자를 선택한 후 미리보기를 누르세요." : "Choose a file and delimiter, then preview.")
+                }
+            }
+        }
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { text: rootWindow.tr("Cancel"); onClicked: importCsvDialog.reject() }
+            Button { text: rootWindow.language === "ko" ? "가져오기" : "Import"; onClicked: importCsvDialog.submitImport() }
+        }
+        onAccepted: {
+            var paths = csvPathField.text.trim().split(/\r?\n/).map(function(path) { return path.trim(); }).filter(function(path) { return path !== ""; });
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: "import-csv", inputPaths: paths, outputName: csvLayerField.text.trim(), xField: csvXField.text.trim(), yField: csvYField.text.trim(), crs: csvCrsField.text.trim().toUpperCase(), encoding: csvEncodingField.text.trim() || "UTF-8", delimiter: csvDelimiterField.text, numberFields: csvNumberFields.text, boolFields: csvBoolFields.text, buildBoundary: csvBuildBoundary.checked, boundaryGroupField: csvBoundaryGroup.text.trim()});
+            mapCanvas.layerSettingsGeneration += 1;
+        }
+    }
+
+    Dialog {
+        id: workflowDialog
+        objectName: "workflowDialog"
+        modal: true
+        title: rootWindow.language === "ko" ? "업무 워크플로우" : "Workflow tools"
+        width: Math.min(560, rootWindow.width - 32)
+        property var operationCodes: ["measure-layer", "validate-layer", "filter-layer", "polygon-layer", "join-table", "label-field", "lua-filter", "lua-split", "split-boundary"]
+        property string selectedOperation: operationCodes[workflowOperation.currentIndex]
+        property string errorText: ""
+        onOpened: { workflowLayer.text = mapCanvas.activeLayer; errorText = ""; }
+        function submitWorkflow() {
+            if (workflowLayer.text.trim() === "" ||
+                (selectedOperation === "join-table" && (workflowTable.text.trim() === "" || workflowLayerKey.text.trim() === "" || workflowTableKey.text.trim() === "")) ||
+                (selectedOperation === "polygon-layer" && workflowFeatureIds.text.trim() === "") ||
+                (selectedOperation === "label-field" && workflowLabelField.text.trim() === "") ||
+                (selectedOperation === "filter-layer" && workflowFilterField.text.trim() === "") ||
+                ((selectedOperation === "lua-filter" || selectedOperation === "lua-split") && workflowLuaScript.text.trim() === "") ||
+                (selectedOperation === "split-boundary" && workflowBoundaryLayer.text.trim() === "")) {
+                errorText = rootWindow.language === "ko" ? "이 작업에 필요한 입력을 모두 채우세요." : "Fill in the required fields for this tool.";
+                return;
+            }
+            errorText = "";
+            accept();
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 16
+            ComboBox { id: workflowOperation; objectName: "workflowOperation"; Layout.fillWidth: true; model: rootWindow.language === "ko" ? ["길이·면적 계산", "데이터 검수", "속성 필터", "점으로 폴리곤", "업무대장 조인", "레이블 필드 생성", "Lua 필터", "Lua로 레이어 나누기", "경계 식별자로 SHP 면 분리"] : ["Calculate length and area", "Validate data", "Filter features", "Polygon from points", "Join table", "Generate label field", "Lua filter", "Split layers with Lua", "Split SHP polygons by boundaries"] }
+            TextField { id: workflowLayer; objectName: "workflowLayer"; Layout.fillWidth: true; placeholderText: rootWindow.language === "ko" ? "대상 레이어명" : "Source layer name" }
+            TextField { id: workflowOutput; Layout.fillWidth: true; visible: workflowDialog.selectedOperation !== "validate-layer"; placeholderText: rootWindow.language === "ko" ? "결과 레이어명 (선택)" : "Result layer name (optional)" }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: workflowDialog.selectedOperation === "join-table"
+                TextField { id: workflowTable; objectName: "workflowTable"; Layout.fillWidth: true; placeholderText: rootWindow.language === "ko" ? "업무대장 CSV/TSV 경로" : "Table CSV/TSV path" }
+                Button { text: rootWindow.language === "ko" ? "찾기" : "Browse"; onClicked: workflowTableOpenDialog.open() }
+            }
+            TextField { id: workflowLayerKey; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "join-table"; placeholderText: rootWindow.language === "ko" ? "레이어 연결 키" : "Layer key" }
+            TextField { id: workflowTableKey; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "join-table"; placeholderText: rootWindow.language === "ko" ? "대장 연결 키" : "Table key" }
+            TextField { id: workflowEncoding; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "join-table"; placeholderText: "Encoding"; text: "UTF-8" }
+            TextField { id: workflowDelimiter; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "join-table"; placeholderText: "Delimiter (, or tab)"; text: "," }
+            TextField { id: workflowFeatureIds; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "polygon-layer"; placeholderText: rootWindow.language === "ko" ? "연결 순서대로 피처 ID (예: 1,2,3)" : "Ordered feature IDs, e.g. 1,2,3" }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: workflowDialog.selectedOperation === "validate-layer"
+                TextField { id: workflowOutputPath; Layout.fillWidth: true; placeholderText: rootWindow.language === "ko" ? "검수 결과 CSV 경로 (선택)" : "Validation CSV output path (optional)" }
+                Button { text: rootWindow.language === "ko" ? "저장 위치" : "Choose"; onClicked: workflowValidationSaveDialog.open() }
+            }
+            TextField { id: workflowRequired; objectName: "workflowRequired"; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "validate-layer"; placeholderText: rootWindow.language === "ko" ? "필수 필드명 (쉼표로 구분)" : "Required fields (comma-separated)" }
+            TextField { id: workflowUnique; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "validate-layer"; placeholderText: rootWindow.language === "ko" ? "고유값 필드명 (선택)" : "Unique key field (optional)" }
+            TextField { id: workflowFilterField; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "filter-layer"; placeholderText: rootWindow.language === "ko" ? "필터 필드명" : "Filter field" }
+            TextField { id: workflowFilterValue; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "filter-layer"; placeholderText: rootWindow.language === "ko" ? "필터 값" : "Filter value" }
+            TextArea { id: workflowLuaScript; objectName: "workflowLuaScript"; Layout.fillWidth: true; Layout.preferredHeight: 80; visible: workflowDialog.selectedOperation === "lua-filter" || workflowDialog.selectedOperation === "lua-split"; placeholderText: workflowDialog.selectedOperation === "lua-split" ? "return feature.grade" : "return feature.grade == \"A\""; wrapMode: TextEdit.Wrap }
+            TextField { id: workflowBoundaryLayer; objectName: "workflowBoundaryLayer"; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "split-boundary"; placeholderText: rootWindow.language === "ko" ? "CSV에서 만든 경계 레이어명 (*_boundaries)" : "Boundary layer from CSV (*_boundaries)" }
+            TextField { id: workflowLabelField; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "label-field"; placeholderText: rootWindow.language === "ko" ? "새 레이블 필드명" : "New label field name" }
+            TextField { id: workflowLabelTemplate; Layout.fillWidth: true; visible: workflowDialog.selectedOperation === "label-field"; placeholderText: rootWindow.language === "ko" ? "레이블 형식 (예: 시설-{관리번호})" : "Label template (e.g. Asset-{id})" }
+            Label { Layout.fillWidth: true; visible: workflowDialog.errorText !== ""; color: "#b42318"; text: workflowDialog.errorText; wrapMode: Text.WordWrap }
+        }
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { text: rootWindow.tr("Cancel"); onClicked: workflowDialog.reject() }
+            Button { text: rootWindow.language === "ko" ? "실행" : "Run"; onClicked: workflowDialog.submitWorkflow() }
+        }
+        onAccepted: {
+            mapCanvas.layerSettingsPayload = JSON.stringify({operation: workflowDialog.selectedOperation, layerName: workflowLayer.text.trim(), outputName: workflowOutput.text.trim(), tablePath: workflowTable.text.trim(), layerKey: workflowLayerKey.text.trim(), tableKey: workflowTableKey.text.trim(), featureIds: workflowFeatureIds.text.trim(), outputPath: workflowOutputPath.text.trim(), filterField: workflowFilterField.text.trim(), filterValue: workflowFilterValue.text, luaScript: workflowLuaScript.text, boundaryLayer: workflowBoundaryLayer.text.trim(), requiredFields: workflowRequired.text, uniqueField: workflowUnique.text.trim(), encoding: workflowEncoding.text.trim(), delimiter: workflowDelimiter.text, field: workflowLabelField.text.trim(), template: workflowLabelTemplate.text});
+            mapCanvas.layerSettingsGeneration += 1;
         }
     }
 
@@ -598,6 +796,19 @@ ApplicationWindow {
             objectName: "layerContextLabels"
             text: rootWindow.tr("Labels and expressions")
             onTriggered: mapViewport.openLayerPropertiesForCategory(layerContextMenu.targetLayerName, "labels")
+        }
+        MenuItem {
+            objectName: "layerContextToggleGeometryLock"
+            text: {
+                var index = mapViewport.findLayerIndex(layerContextMenu.targetLayerName);
+                var locked = index >= 0 && layerModel.get(index).geometryLocked === true;
+                return locked ? "Unlock geometry editing" : "Lock geometry editing";
+            }
+            enabled: mapViewport.findLayerIndex(layerContextMenu.targetLayerName) >= 0 && layerModel.get(mapViewport.findLayerIndex(layerContextMenu.targetLayerName)).editable === true
+            onTriggered: {
+                mapCanvas.editAction = "toggleGeometryLock";
+                mapCanvas.editValue = layerContextMenu.targetLayerName;
+            }
         }
         MenuSeparator {}
         MenuItem {
@@ -785,6 +996,7 @@ ApplicationWindow {
         id: deleteRecordDialog
         objectName: "deleteRecordDialog"
         modal: true
+        implicitWidth: 420
         title: rootWindow.language === "ko" ? "레코드 삭제 확인" : rootWindow.language === "jp" ? "レコード削除の確認" : "Confirm record deletion"
         standardButtons: Dialog.Ok | Dialog.Cancel
         contentItem: Label {
@@ -1512,6 +1724,7 @@ ApplicationWindow {
                         boundsJson: JSON.stringify(layer.bounds || []),
                         layerVisible: layer.visible !== false,
                         editable: layer.editable === true,
+                        geometryLocked: layer.geometryLocked === true,
                         style: layer.style || ({}),
                         labels: layer.labels || ({
                             enabled: false,
@@ -1554,7 +1767,7 @@ ApplicationWindow {
                 function replaceLayerModel(layers) {
                     var roleNames = ["name", "displayName", "sourcePath", "sourceLayerName",
                                      "sourceEncoding", "sourceCrs", "sourceError", "crs",
-                                     "geometryType", "boundsJson", "layerVisible", "editable",
+                                     "geometryType", "boundsJson", "layerVisible", "editable", "geometryLocked",
                                      "style", "labels"];
                     var sharedCount = Math.min(layerModel.count, layers.length);
                     for (var index = 0; index < sharedCount; ++index) {
@@ -1592,6 +1805,15 @@ ApplicationWindow {
                         var layer = layerModel.get(i);
                         if (layer.name === activeLayer)
                             return layer.editable === true;
+                    }
+                    return false;
+                }
+
+                function activeLayerGeometryEditable() {
+                    for (var i = 0; i < layerModel.count; ++i) {
+                        var layer = layerModel.get(i);
+                        if (layer.name === activeLayer)
+                            return layer.editable === true && layer.geometryLocked !== true;
                     }
                     return false;
                 }
@@ -2747,7 +2969,7 @@ ApplicationWindow {
                     Button {
                         objectName: "deleteSelectedRecordButton"
                         text: rootWindow.language === "ko" ? "레코드 삭제…" : rootWindow.language === "jp" ? "レコード削除…" : "Delete record…"
-                        enabled: mapViewport.activeLayerEditable()
+                        enabled: mapViewport.activeLayerGeometryEditable()
                         onClicked: deleteRecordDialog.open()
                     }
                 }
@@ -2755,7 +2977,7 @@ ApplicationWindow {
                     objectName: "addRecordButton"
                     Layout.fillWidth: true
                     text: rootWindow.language === "ko" ? "레코드 추가…" : rootWindow.language === "jp" ? "レコード追加…" : "Add record…"
-                    enabled: mapViewport.activeLayer !== "" && mapViewport.activeLayerEditable()
+                    enabled: mapViewport.activeLayer !== "" && mapViewport.activeLayerGeometryEditable()
                     onClicked: addRecordDialog.open()
                 }
                 GridLayout {
@@ -2838,7 +3060,7 @@ ApplicationWindow {
                                 model: mapViewport.attributeColumns
                                 delegate: RowLayout {
                                     required property string modelData
-                                    width: parent.width
+                                    width: parent ? parent.width : 0
                                     spacing: 8
                                     Label {
                                         text: modelData
@@ -2984,7 +3206,7 @@ ApplicationWindow {
                 }
                 Button {
                     objectName: "cancelWorkButton"
-                    text: rootWindow.tr("Cancel loading/render")
+                    text: mapViewport.renderStatus.indexOf("Importing CSV") === 0 ? (rootWindow.language === "ko" ? "CSV 가져오기 취소" : "Cancel CSV import") : rootWindow.tr("Cancel loading/render")
                     enabled: rootWindow.statusIsBusy(mapViewport.renderStatus)
                     visible: enabled
                     onClicked: mapCanvas.cancelGeneration += 1
@@ -3975,6 +4197,38 @@ ApplicationWindow {
         fileMode: QuickDialogs.FileDialog.OpenFiles
         nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json *.dxf)", "All files (*)"]
         onAccepted: mapViewport.requestLoadFiles(selectedFiles)
+    }
+
+    QuickDialogs.FileDialog {
+        id: csvOpenDialog
+        title: "Open CSV/TSV"
+        fileMode: QuickDialogs.FileDialog.OpenFiles
+        nameFilters: ["Delimited text (*.csv *.tsv)", "All files (*)"]
+        onAccepted: {
+            var paths = [];
+            for (var index = 0; index < selectedFiles.length; index++)
+                paths.push(mapViewport.localPathFromUrl(selectedFiles[index]));
+            csvPathField.text = paths.join("\n");
+        }
+    }
+
+    Platform.FileDialog {
+        id: workflowTableOpenDialog
+        title: rootWindow.language === "ko" ? "업무대장 열기" : "Open table CSV/TSV"
+        fileMode: Platform.FileDialog.OpenFile
+        nameFilters: ["Delimited text (*.csv *.tsv)", "All files (*)"]
+        onAccepted: workflowTable.text = mapViewport.localPathFromUrl(file)
+    }
+
+    Platform.FileDialog {
+        id: workflowValidationSaveDialog
+        title: rootWindow.language === "ko" ? "검수 결과 저장" : "Save validation report"
+        fileMode: Platform.FileDialog.SaveFile
+        nameFilters: ["CSV (*.csv)"]
+        onAccepted: {
+            var path = mapViewport.localPathFromUrl(file);
+            workflowOutputPath.text = path.toLowerCase().endsWith(".csv") ? path : path + ".csv";
+        }
     }
 
     Platform.FileDialog {

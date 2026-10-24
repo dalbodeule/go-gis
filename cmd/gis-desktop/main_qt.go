@@ -5,13 +5,17 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -420,12 +424,45 @@ func newEmptyProjectRuntime() *demoRuntime {
 		layerBounds:        make(map[string][4]float64),
 		layerFeatureCounts: make(map[string]int),
 		layerStyleMu:       &sync.RWMutex{},
+		sources:            make(map[string]render.LayerSource),
+		sourcesMu:          &sync.RWMutex{},
 		mapExtent:          [4]float64{0, 0, 1, 1},
 		mapFitExtent:       [4]float64{0, 0, 1, 1},
 		service:            commands.NewProjectService("Untitled", core.CRS{}),
-		builder: func(context.Context, render.ChunkKey) (render.Chunk, error) {
-			return render.Chunk{}, nil
-		},
+	}
+	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+		runtime.sourcesMu.RLock()
+		source, ok := runtime.sources[key.Layer]
+		runtime.sourcesMu.RUnlock()
+		if !ok {
+			return render.Chunk{}, fmt.Errorf("render source for layer %q is missing", key.Layer)
+		}
+		chunk, err := source.Builder(ctx, key)
+		if err != nil {
+			return render.Chunk{}, err
+		}
+		runtime.layerStyleMu.RLock()
+		style := runtime.layerStyles[key.Layer]
+		baseStyle := runtime.baseLayerStyles[key.Layer]
+		geometryType := runtime.layerGeometryTypes[key.Layer]
+		runtime.layerStyleMu.RUnlock()
+		if style != baseStyle {
+			chunk.Vertices = append([]render.Vertex(nil), chunk.Vertices...)
+			for index := range chunk.Vertices {
+				vertex := &chunk.Vertices[index]
+				switch vertex.Kind {
+				case render.VertexFill:
+					vertex.Color = render.ColorForPolygonFill(style)
+				case render.VertexPoint:
+					vertex.Color = render.ColorForGeometry(style, "POINT")
+					vertex.SizeMM = float32(style.PointSizeMM)
+				default:
+					vertex.Color = render.ColorForGeometry(style, geometryType)
+					vertex.SizeMM = float32(style.LineWidthMM)
+				}
+			}
+		}
+		return chunk, nil
 	}
 	return runtime
 }
@@ -470,6 +507,7 @@ type layerTreePayloadRow struct {
 	GeometryType    string             `json:"geometryType,omitempty"`
 	Bounds          *[4]float64        `json:"bounds,omitempty"`
 	Editable        bool               `json:"editable"`
+	GeometryLocked  bool               `json:"geometryLocked"`
 }
 
 func (r *demoRuntime) publishLayerTree() {
@@ -493,11 +531,15 @@ func (r *demoRuntime) publishLayerTree() {
 		if displayName == "" {
 			displayName = name
 		}
+		geometryType := r.layerGeometryTypes[name]
+		if geometryType == "" {
+			geometryType = layer.GeometryType
+		}
 		rows[index] = layerTreePayloadRow{
 			Name: name, DisplayName: displayName, SourcePath: layer.SourcePath,
 			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
 			CRS: layer.CRS.AuthorityCode, Visible: visible, SourceError: r.unavailableSources[name].Reason, Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
-			GeometryType: r.layerGeometryTypes[name], Editable: layer.Editable,
+			GeometryType: geometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked,
 		}
 		if bounds, exists := r.layerBounds[name]; exists {
 			boundsCopy := bounds
@@ -2040,6 +2082,25 @@ func (r *demoRuntime) edit(event native.EditEvent) {
 	readOnly := r.readOnly
 	service := r.service
 	r.mu.Unlock()
+	if event.Action == "toggleGeometryLock" {
+		if service == nil || readOnly {
+			native.SetRenderStatus("Geometry lock change is unavailable in read-only mode")
+			return
+		}
+		name := strings.TrimSpace(event.Value)
+		layer, exists := service.LayerProperties(name)
+		if !exists {
+			native.SetRenderStatus("Layer not found: " + name)
+			return
+		}
+		if err := service.SetGeometryLocked(name, !layer.GeometryLocked); err != nil {
+			native.SetRenderStatus("Geometry lock change failed: " + err.Error())
+			return
+		}
+		r.publishLayerTree()
+		native.SetRenderStatus(fmt.Sprintf("Geometry %s: %s", map[bool]string{true: "locked", false: "unlocked"}[!layer.GeometryLocked], name))
+		return
+	}
 	if event.Action == "addFeature" {
 		if err := r.addFeature(event.Value); err != nil {
 			native.SetRenderStatus("Record add failed: " + err.Error())
@@ -2404,11 +2465,17 @@ func startViewportSync(runtime *demoRuntime) {
 				if err := applyLayerSettings(runtime, payload); err != nil {
 					if action.Operation == "remove" {
 						native.SetRenderStatus("Remove layer failed: " + err.Error())
+					} else if errors.Is(err, context.Canceled) {
+						if action.Operation == "import-csv" {
+							native.SetRenderStatus("CSV import cancelled")
+						} else {
+							native.SetRenderStatus("Operation cancelled")
+						}
 					} else {
 						native.SetRenderStatus("Layer settings failed: " + err.Error())
 					}
 					runtime.publishLayerTree()
-				} else if action.Operation != "remove" {
+				} else if action.Operation != "remove" && action.Operation != "preview-csv" && action.Operation != "import-csv" && action.Operation != "join-table" && action.Operation != "validate-layer" && action.Operation != "lua-filter" && action.Operation != "lua-split" && action.Operation != "split-boundary" {
 					native.SetRenderStatus("Layer settings applied")
 				}
 			}
@@ -2570,18 +2637,45 @@ func (r *demoRuntime) postGISTableCatalogPayload(ctx context.Context, schema str
 }
 
 type layerSettingsRequest struct {
-	Operation       string             `json:"operation,omitempty"`
-	ProjectCRS      string             `json:"projectCrs,omitempty"`
-	Name            string             `json:"name"`
-	DisplayName     string             `json:"displayName"`
-	SourcePath      string             `json:"sourcePath"`
-	SourceLayerName string             `json:"sourceLayerName"`
-	SourceEncoding  string             `json:"sourceEncoding"`
-	SourceCRS       string             `json:"sourceCrs"`
-	Visible         bool               `json:"visible"`
-	Style           core.LayerStyle    `json:"style"`
-	Labels          core.LabelSettings `json:"labels"`
-	DisplayRule     string             `json:"displayRule,omitempty"`
+	Operation          string             `json:"operation,omitempty"`
+	ProjectCRS         string             `json:"projectCrs,omitempty"`
+	Name               string             `json:"name"`
+	DisplayName        string             `json:"displayName"`
+	SourcePath         string             `json:"sourcePath"`
+	SourceLayerName    string             `json:"sourceLayerName"`
+	SourceEncoding     string             `json:"sourceEncoding"`
+	SourceCRS          string             `json:"sourceCrs"`
+	Visible            bool               `json:"visible"`
+	Style              core.LayerStyle    `json:"style"`
+	Labels             core.LabelSettings `json:"labels"`
+	DisplayRule        string             `json:"displayRule,omitempty"`
+	InputPath          string             `json:"inputPath,omitempty"`
+	InputPaths         []string           `json:"inputPaths,omitempty"`
+	LayerName          string             `json:"layerName,omitempty"`
+	OutputName         string             `json:"outputName,omitempty"`
+	XField             string             `json:"xField,omitempty"`
+	YField             string             `json:"yField,omitempty"`
+	Delimiter          string             `json:"delimiter,omitempty"`
+	CRS                string             `json:"crs,omitempty"`
+	Encoding           string             `json:"encoding,omitempty"`
+	Field              string             `json:"field,omitempty"`
+	Template           string             `json:"template,omitempty"`
+	TablePath          string             `json:"tablePath,omitempty"`
+	LayerKey           string             `json:"layerKey,omitempty"`
+	TableKey           string             `json:"tableKey,omitempty"`
+	FeatureIDs         string             `json:"featureIds,omitempty"`
+	OutputPath         string             `json:"outputPath,omitempty"`
+	FilterField        string             `json:"filterField,omitempty"`
+	FilterValue        string             `json:"filterValue,omitempty"`
+	NumberFields       string             `json:"numberFields,omitempty"`
+	BoolFields         string             `json:"boolFields,omitempty"`
+	RequiredFields     string             `json:"requiredFields,omitempty"`
+	UniqueField        string             `json:"uniqueField,omitempty"`
+	GeometryType       string             `json:"geometryType,omitempty"`
+	LuaScript          string             `json:"luaScript,omitempty"`
+	BuildBoundary      bool               `json:"buildBoundary,omitempty"`
+	BoundaryGroupField string             `json:"boundaryGroupField,omitempty"`
+	BoundaryLayer      string             `json:"boundaryLayer,omitempty"`
 }
 
 type spatialOperationRequest struct {
@@ -2605,6 +2699,39 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 	}
 	if request.Operation == "project-crs" {
 		return runtime.startProjectCRSChange(strings.TrimSpace(request.ProjectCRS))
+	}
+	if request.Operation == "import-csv" {
+		return importCSVLayer(runtime, request)
+	}
+	if request.Operation == "create-layer" {
+		return createWorkflowLayer(runtime, request)
+	}
+	if request.Operation == "preview-csv" {
+		return previewCSV(runtime, request)
+	}
+	if request.Operation == "label-field" {
+		return generateLayerLabelField(runtime, request)
+	}
+	if request.Operation == "join-table" {
+		return joinTableLayer(runtime, request)
+	}
+	if request.Operation == "measure-layer" {
+		return measureLayer(runtime, request)
+	}
+	if request.Operation == "polygon-layer" {
+		return polygonLayer(runtime, request)
+	}
+	if request.Operation == "validate-layer" {
+		return validateLayer(runtime, request)
+	}
+	if request.Operation == "filter-layer" {
+		return filterLayer(runtime, request)
+	}
+	if request.Operation == "lua-filter" || request.Operation == "lua-split" {
+		return luaFilterOrSplitLayer(runtime, request)
+	}
+	if request.Operation == "split-boundary" {
+		return splitLayerByBoundary(runtime, request)
 	}
 	if request.Name == "" {
 		return fmt.Errorf("layer identity is missing")
@@ -2740,6 +2867,587 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 		}
 	} else if styleChanged || presentationChanged {
 		runtime.refreshCurrentViewport()
+	}
+	runtime.publishLayerTree()
+	return nil
+}
+
+func importCSVLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	paths := request.InputPaths
+	if len(paths) == 0 && request.InputPath != "" {
+		paths = []string{request.InputPath}
+	}
+	if runtime == nil || len(paths) == 0 || request.OutputName == "" || request.XField == "" || request.YField == "" || request.CRS == "" {
+		return fmt.Errorf("CSV import requires input path, output name, X/Y fields, and CRS")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	readOnly := runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	files := make([]*os.File, 0, len(paths))
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
+	inputs := make([]io.Reader, 0, len(paths))
+	var totalBytes int64
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return fmt.Errorf("CSV input path must not be blank")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		files = append(files, file)
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		totalBytes += info.Size()
+		if totalBytes > 16<<20 {
+			return fmt.Errorf("CSV inputs exceed the 16 MiB interactive file limit; split them or use the CLI")
+		}
+		inputs = append(inputs, file)
+	}
+	ctx, finish := cancellableDesktopWorkflow()
+	defer finish()
+	native.SetRenderStatus("Importing CSV")
+	result, err := commands.ImportCSVPointFiles(ctx, inputs, commands.CSVOptions{Delimiter: workflowDelimiterForDesktop(request.Delimiter), HasHeader: true, Encoding: request.Encoding, XField: request.XField, YField: request.YField, CRS: core.CRS{AuthorityCode: request.CRS}, LayerName: request.OutputName, FieldTypes: desktopCSVFieldTypes(request.NumberFields, request.BoolFields), MaxRows: 100000})
+	if err != nil {
+		return err
+	}
+	if result.Rejected > 0 {
+		return fmt.Errorf("CSV import rejected %d rows; first row %d: %s", result.Rejected, result.Errors[0].Row, result.Errors[0].Reason)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	currentService := runtime.service
+	readOnly = runtime.readOnly
+	runtime.mu.Unlock()
+	if currentService != service || readOnly {
+		return fmt.Errorf("project changed while importing CSV; retry with the current project")
+	}
+	if request.BuildBoundary {
+		tagged, boundaries, err := commands.BuildBoundaryHulls(ctx, result.Layer, request.XField, request.YField, strings.TrimSpace(request.BoundaryGroupField), result.Layer.Name+"_boundaries")
+		if err != nil {
+			return err
+		}
+		if len(boundaries.Features) > 64 {
+			return fmt.Errorf("CSV creates %d boundaries; the interactive limit is 64 groups", len(boundaries.Features))
+		}
+		if err := addWorkflowLayers(runtime, []core.Layer{tagged, boundaries}); err != nil {
+			return err
+		}
+		native.SetRenderStatus(fmt.Sprintf("CSV imported: %d points and %d boundaries", result.Accepted, len(boundaries.Features)))
+		return nil
+	}
+	if err := addWorkflowLayer(runtime, result.Layer); err != nil {
+		return err
+	}
+	native.SetRenderStatus(fmt.Sprintf("CSV imported: %d points in %s", result.Accepted, result.Layer.Name))
+	return nil
+}
+
+func createWorkflowLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	name := strings.TrimSpace(request.OutputName)
+	geometryType := strings.ToUpper(strings.TrimSpace(request.GeometryType))
+	if name == "" || request.CRS == "" {
+		return fmt.Errorf("empty layer requires a name and CRS")
+	}
+	if geometryType != "POINT" && geometryType != "LINESTRING" && geometryType != "POLYGON" {
+		return fmt.Errorf("unsupported empty layer geometry type %q", request.GeometryType)
+	}
+	return addWorkflowLayer(runtime, core.Layer{Name: name, CRS: core.CRS{AuthorityCode: request.CRS}, GeometryType: geometryType})
+}
+
+func desktopCSVFieldTypes(numberFields, boolFields string) map[string]core.FieldType {
+	result := map[string]core.FieldType{}
+	for _, name := range strings.Split(numberFields, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			result[name] = core.FieldTypeNumber
+		}
+	}
+	for _, name := range strings.Split(boolFields, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			result[name] = core.FieldTypeBool
+		}
+	}
+	return result
+}
+
+func previewCSV(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.InputPath == "" {
+		return fmt.Errorf("CSV preview requires an input path")
+	}
+	file, err := os.Open(request.InputPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	delimiter := workflowDelimiterForDesktop(request.Delimiter)
+	preview, err := commands.PreviewCSV(context.Background(), file, delimiter, request.Encoding, 3)
+	if err != nil {
+		return err
+	}
+	sample := make([]string, 0, len(preview.Rows)+1)
+	for i, header := range preview.Headers {
+		if i >= 6 {
+			sample = append(sample, "…")
+			break
+		}
+		sample = append(sample, truncatePreviewCell(header))
+	}
+	lines := []string{strings.Join(sample, " | ")}
+	sample = sample[:0]
+	for _, row := range preview.Rows {
+		for i, value := range row {
+			if i >= 6 {
+				sample = append(sample, "…")
+				break
+			}
+			sample = append(sample, truncatePreviewCell(value))
+		}
+		lines = append(lines, strings.Join(sample, " | "))
+		sample = sample[:0]
+	}
+	status := fmt.Sprintf("CSV preview: %d columns, %d sample rows, %d malformed rows\n%s", len(preview.Headers), len(preview.Rows), len(preview.Errors), strings.Join(lines, "\n"))
+	native.SetRenderStatus(status)
+	return nil
+}
+
+func truncatePreviewCell(value string) string {
+	value = strings.ReplaceAll(strings.ReplaceAll(value, "\n", " "), "\r", " ")
+	runes := []rune(value)
+	if len(runes) > 32 {
+		return string(runes[:32]) + "…"
+	}
+	return value
+}
+
+func workflowDelimiterForDesktop(value string) rune {
+	if value == "\\t" || strings.EqualFold(value, "tab") {
+		return '\t'
+	}
+	runes := []rune(value)
+	if len(runes) == 1 {
+		return runes[0]
+	}
+	return ','
+}
+
+func generateLayerLabelField(runtime *demoRuntime, request layerSettingsRequest) error {
+	if runtime == nil || request.LayerName == "" || request.Field == "" {
+		return fmt.Errorf("label-field requires layer name and field")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	readOnly := runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	result, err := commands.GenerateLabelField(layer, request.Field, request.Template)
+	if err != nil {
+		return err
+	}
+	if request.OutputName != "" {
+		result.Name = request.OutputName
+	} else {
+		result.Name = layer.Name + "_labeled"
+	}
+	return addWorkflowLayer(runtime, result)
+}
+
+func addWorkflowLayer(runtime *demoRuntime, layer core.Layer) error {
+	if runtime == nil || layer.Name == "" {
+		return fmt.Errorf("workflow result has no layer name")
+	}
+	// A derived result is an independent in-memory layer. Keeping the source
+	// path would make workspace reload replace it with the unmodified input.
+	layer.SourcePath = ""
+	layer.SourceLayerName = ""
+	layer.SourceEncoding = ""
+	layer.SourceCRS = ""
+	layer.DisplayName = layer.Name
+	layer.Editable = true
+	layer.GeometryLocked = len(layer.Features) > 0
+	layer.Visible = true
+	if layer.Style == (core.LayerStyle{}) {
+		layer.Style = core.DefaultLayerStyle()
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	readOnly := runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	projectName, projectCRS := service.ProjectInfo()
+	if layer.CRS.AuthorityCode == "" {
+		return fmt.Errorf("workflow result requires an explicit CRS")
+	}
+	if projectCRS.AuthorityCode != "" && !strings.EqualFold(projectCRS.AuthorityCode, layer.CRS.AuthorityCode) {
+		return fmt.Errorf("layer CRS %s differs from project CRS %s; reproject before adding it", layer.CRS.AuthorityCode, projectCRS.AuthorityCode)
+	}
+	if err := service.BeginEdit(); err != nil {
+		return err
+	}
+	if err := service.AddLayer(layer); err != nil {
+		_ = service.Rollback()
+		return err
+	}
+	if err := service.Commit(); err != nil {
+		return err
+	}
+	if projectCRS.AuthorityCode == "" {
+		service.SetProjectInfo(projectName, layer.CRS)
+	}
+	installInMemoryAttributeReaders(runtime, nil)
+	if err := runtime.rebuildEditedLayer(layer.Name); err != nil {
+		return err
+	}
+	runtime.publishLayerTree()
+	return nil
+}
+
+func joinTableLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" || request.TablePath == "" || request.LayerKey == "" || request.TableKey == "" {
+		return fmt.Errorf("join requires layer, table path, and both key fields")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	runtime.mu.Lock()
+	readOnly := runtime.readOnly
+	runtime.mu.Unlock()
+	if readOnly {
+		return fmt.Errorf("project is read-only")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	file, err := os.Open(request.TablePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if info, statErr := file.Stat(); statErr != nil {
+		return statErr
+	} else if info.Size() > 16<<20 {
+		return fmt.Errorf("join table exceeds the 16 MiB interactive file limit; split it or use the CLI")
+	}
+	table, diagnostics, err := commands.ReadCSVTableLimited(context.Background(), file, workflowDelimiterForDesktop(request.Delimiter), request.Encoding, 100000)
+	if err != nil {
+		return err
+	}
+	if len(diagnostics) > 0 {
+		return fmt.Errorf("join table has malformed rows; first row %d: %s", diagnostics[0].Row, diagnostics[0].Reason)
+	}
+	result, report, err := commands.JoinLayerTable(layer, table, request.LayerKey, request.TableKey)
+	if err != nil {
+		return err
+	}
+	result.Name = request.OutputName
+	if result.Name == "" {
+		result.Name = layer.Name + "_join"
+	}
+	if err := addWorkflowLayer(runtime, result); err != nil {
+		return err
+	}
+	native.SetRenderStatus(fmt.Sprintf("Join complete: %d matched, %d unmatched features, %d unmatched table rows", report.Matched, report.UnmatchedFeatures, report.UnmatchedRows))
+	return nil
+}
+
+func measureLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" {
+		return fmt.Errorf("measure requires a layer")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	result, err := commands.CalculatePlanarMetrics(layer)
+	if err != nil {
+		return err
+	}
+	if request.OutputName != "" {
+		result.Name = request.OutputName
+	} else {
+		result.Name = layer.Name + "_measured"
+	}
+	return addWorkflowLayer(runtime, result)
+}
+
+func polygonLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" || strings.TrimSpace(request.FeatureIDs) == "" {
+		return fmt.Errorf("polygon requires a layer and ordered feature IDs")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	byID := make(map[uint64]core.Feature, len(layer.Features))
+	for _, feature := range layer.Features {
+		byID[feature.ID] = feature
+	}
+	points := make([]core.Feature, 0)
+	for _, token := range strings.Split(request.FeatureIDs, ",") {
+		id, err := strconv.ParseUint(strings.TrimSpace(token), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid feature ID %q", token)
+		}
+		feature, exists := byID[id]
+		if !exists {
+			return fmt.Errorf("feature %d not found", id)
+		}
+		points = append(points, feature)
+	}
+	result, err := commands.PolygonFromOrderedPoints(points, request.OutputName)
+	if err != nil {
+		return err
+	}
+	if request.OutputName == "" {
+		result.Name = layer.Name + "_polygon"
+	}
+	result.CRS = layer.CRS
+	return addWorkflowLayer(runtime, result)
+}
+
+func validateLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" {
+		return fmt.Errorf("validate requires a layer")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	required := make([]string, 0)
+	for _, field := range strings.Split(request.RequiredFields, ",") {
+		if field = strings.TrimSpace(field); field != "" {
+			required = append(required, field)
+		}
+	}
+	issues := commands.ValidateLayer(layer, required, strings.TrimSpace(request.UniqueField))
+	if request.OutputPath != "" {
+		if err := writeValidationReport(request.OutputPath, issues); err != nil {
+			return err
+		}
+	}
+	if len(issues) > 0 {
+		native.SetSelection(request.LayerName, fmt.Sprintf("%s feature #%d", request.LayerName, issues[0].FeatureID), issues[0].Reason, "Validation issue")
+		native.SetRenderStatus(fmt.Sprintf("Validation found %d issue(s); first feature %d: %s", len(issues), issues[0].FeatureID, issues[0].Reason))
+		return nil
+	}
+	native.SetRenderStatus("Validation complete: no issues")
+	return nil
+}
+
+func writeValidationReport(path string, issues []commands.ValidationIssue) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	if err := writer.Write([]string{"feature_id", "rule", "reason"}); err != nil {
+		return err
+	}
+	for _, issue := range issues {
+		if err := writer.Write([]string{strconv.FormatUint(issue.FeatureID, 10), issue.Rule, issue.Reason}); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+func filterLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" || request.FilterField == "" {
+		return fmt.Errorf("filter requires a layer and field")
+	}
+	runtime.mu.Lock()
+	service := runtime.service
+	runtime.mu.Unlock()
+	if service == nil {
+		return fmt.Errorf("no project is loaded")
+	}
+	layer, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	result, err := commands.FilterLayerByProperty(context.Background(), layer, request.FilterField, request.FilterValue)
+	if err != nil {
+		return err
+	}
+	if request.OutputName != "" {
+		result.Name = request.OutputName
+	} else {
+		result.Name = layer.Name + "_filtered"
+	}
+	return addWorkflowLayer(runtime, result)
+}
+
+func luaFilterOrSplitLayer(runtime *demoRuntime, request layerSettingsRequest) error {
+	if request.LayerName == "" || strings.TrimSpace(request.LuaScript) == "" {
+		return fmt.Errorf("Lua operation requires a source layer and script")
+	}
+	runtime.mu.Lock()
+	service, readOnly := runtime.service, runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	source, ok := service.Layer(request.LayerName)
+	if !ok {
+		return fmt.Errorf("layer %q not found", request.LayerName)
+	}
+	ctx, finish := cancellableDesktopWorkflow()
+	defer finish()
+	native.SetRenderStatus("Running Lua workflow")
+	if request.Operation == "lua-filter" {
+		result, err := scripting.FilterLayerByLua(ctx, source, request.LuaScript)
+		if err != nil {
+			return err
+		}
+		result.Name = strings.TrimSpace(request.OutputName)
+		if result.Name == "" {
+			result.Name = source.Name + "_lua_filtered"
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := addWorkflowLayer(runtime, result); err != nil {
+			return err
+		}
+		native.SetRenderStatus(fmt.Sprintf("Lua filter complete: %d features in %s", len(result.Features), result.Name))
+		return nil
+	}
+	prefix := strings.TrimSpace(request.OutputName)
+	if prefix == "" {
+		prefix = source.Name + "_split"
+	}
+	groups, err := scripting.SplitLayerByLua(ctx, source, prefix, request.LuaScript, 64)
+	if err != nil {
+		return err
+	}
+	if len(groups) == 0 {
+		return fmt.Errorf("Lua split produced no result layers")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := addWorkflowLayers(runtime, groups); err != nil {
+		return err
+	}
+	native.SetRenderStatus(fmt.Sprintf("Lua split complete: %d layers", len(groups)))
+	return nil
+}
+
+func cancellableDesktopWorkflow() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	started := native.CancelGeneration()
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-finished:
+				return
+			case <-ticker.C:
+				if native.CancelGeneration() != started {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() { close(finished); cancel() }
+}
+
+func addWorkflowLayers(runtime *demoRuntime, layers []core.Layer) error {
+	if len(layers) == 0 {
+		return fmt.Errorf("no result layers")
+	}
+	runtime.mu.Lock()
+	service, readOnly := runtime.service, runtime.readOnly
+	runtime.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("project is read-only or unavailable")
+	}
+	_, projectCRS := service.ProjectInfo()
+	seen := make(map[string]bool, len(layers))
+	for i := range layers {
+		layer := &layers[i]
+		if layer.Name == "" || seen[layer.Name] {
+			return fmt.Errorf("duplicate or empty result layer name %q", layer.Name)
+		}
+		seen[layer.Name] = true
+		if _, exists := service.LayerProperties(layer.Name); exists {
+			return fmt.Errorf("layer %q already exists", layer.Name)
+		}
+		if layer.CRS.AuthorityCode == "" || projectCRS.AuthorityCode != "" && !strings.EqualFold(layer.CRS.AuthorityCode, projectCRS.AuthorityCode) {
+			return fmt.Errorf("result layer %q requires project CRS %s", layer.Name, projectCRS.AuthorityCode)
+		}
+		layer.SourcePath, layer.SourceLayerName, layer.SourceEncoding, layer.SourceCRS = "", "", "", ""
+		layer.DisplayName, layer.Visible, layer.Editable = layer.Name, true, true
+		layer.GeometryLocked = len(layer.Features) > 0
+		if layer.Style == (core.LayerStyle{}) {
+			layer.Style = core.DefaultLayerStyle()
+		}
+	}
+	if err := service.BeginEdit(); err != nil {
+		return err
+	}
+	for _, layer := range layers {
+		if err := service.AddLayer(layer); err != nil {
+			_ = service.Rollback()
+			return err
+		}
+	}
+	if err := service.Commit(); err != nil {
+		_ = service.Rollback()
+		return err
+	}
+	installInMemoryAttributeReaders(runtime, nil)
+	for _, layer := range layers {
+		if err := runtime.rebuildEditedLayer(layer.Name); err != nil {
+			return err
+		}
 	}
 	runtime.publishLayerTree()
 	return nil

@@ -66,10 +66,51 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter, spatial ...
 		"spatial":      runtime.spatialOperation,
 		"filter":       runtime.filter,
 		"filter_lua":   runtime.filterLua,
+		"split_lua":    runtime.splitLua,
 		"label":        runtime.label,
 		"label_lua":    runtime.labelLua,
 	}))
 	return runtime
+}
+
+func (r *Runtime) splitLua(state *lua.LState) int {
+	sourceName := state.CheckString(1)
+	prefix := state.CheckString(2)
+	script := state.CheckString(3)
+	source, ok := r.service.Layer(sourceName)
+	if !ok {
+		state.RaiseError("split_lua: source layer %q not found", sourceName)
+		return 0
+	}
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	layers, err := SplitLayerByLua(ctx, source, prefix, script, 64)
+	if err != nil {
+		state.RaiseError("split_lua: %v", err)
+		return 0
+	}
+	if len(layers) == 0 {
+		state.RaiseError("split_lua: script produced no result layers")
+		return 0
+	}
+	if err := r.service.BeginEdit(); err != nil {
+		state.RaiseError("split_lua: %v", err)
+		return 0
+	}
+	for _, layer := range layers {
+		if err := r.service.AddLayer(layer); err != nil {
+			_ = r.service.Rollback()
+			state.RaiseError("split_lua: %v", err)
+			return 0
+		}
+	}
+	if err := r.service.Commit(); err != nil {
+		_ = r.service.Rollback()
+		state.RaiseError("split_lua: %v", err)
+	}
+	return 0
 }
 
 func (r *Runtime) filterLua(state *lua.LState) int {

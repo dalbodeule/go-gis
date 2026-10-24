@@ -123,6 +123,23 @@ func TestParsePostGISExportRequiresOutput(t *testing.T) {
 	}
 }
 
+func TestParseWorkflowOptions(t *testing.T) {
+	options, err := parseWorkflowOptions("import-csv", []string{"--input", "points.csv", "--output", "points.gpkg", "--x-field", "X", "--y-field", "Y", "--crs", "EPSG:4326"})
+	if err != nil || options.xField != "X" || options.crs != "EPSG:4326" {
+		t.Fatalf("unexpected import options: %#v, %v", options, err)
+	}
+	if _, err := parseWorkflowOptions("join", []string{"--input", "a.gpkg", "--output", "b.gpkg"}); err == nil {
+		t.Fatal("join accepted missing table keys")
+	}
+	merged, err := parseWorkflowOptions("import-csv", []string{"--input", "one.csv", "--input", "two.csv", "--output", "survey.gpkg", "--x-field", "X", "--y-field", "Y", "--crs", "EPSG:5186", "--boundary", "--boundary-group", "block"})
+	if err != nil || len(merged.inputs) != 2 || !merged.buildBoundary || merged.boundaryGroup != "block" {
+		t.Fatalf("multi-CSV boundary options = %+v, err=%v", merged, err)
+	}
+	if _, err := parseWorkflowOptions("split-boundary", []string{"--input", "parcels.shp", "--boundary-file", "survey.gpkg", "--boundary-layer", "survey_boundaries", "--output", "cut.gpkg"}); err != nil {
+		t.Fatalf("valid boundary split options rejected: %v", err)
+	}
+}
+
 func TestParsePostGISInsertAndDeleteOptions(t *testing.T) {
 	insert, err := parsePostGISOptions("postgis-insert", []string{
 		"--dsn", "postgres://gis", "--table", "public.roads", "--id", "7",

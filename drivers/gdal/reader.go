@@ -398,6 +398,10 @@ func readAttributePageLayer(ctx context.Context, layer godal.Layer, offset, limi
 		}
 		feature.Close()
 	}
+	// Loaded data starts locked. A genuinely empty, writable source is the
+	// exception used for creating new geometry; viewport/filtered emptiness does
+	// not pass through this full materialization path.
+	result.GeometryLocked = len(result.Features) > 0
 	return result, nil
 }
 
@@ -908,7 +912,8 @@ func addEstimatedPropertyValue(add func(int64), value any) {
 }
 
 func readLayerHeader(layer godal.Layer) core.Layer {
-	result := core.Layer{Name: layer.Name(), Editable: true}
+	result := core.Layer{Name: layer.Name(), Editable: true, GeometryLocked: true}
+	result.GeometryType = coreGeometryType(layer.Type())
 	if spatialRef := layer.SpatialRef(); spatialRef != nil {
 		defer spatialRef.Close()
 		authorityName := spatialRef.AuthorityName("")
@@ -927,6 +932,27 @@ func readLayerHeader(layer godal.Layer) core.Layer {
 		}
 	}
 	return result
+}
+
+func coreGeometryType(value godal.GeometryType) string {
+	switch value {
+	case godal.GTPoint, godal.GTPoint25D:
+		return "POINT"
+	case godal.GTLineString, godal.GTLineString25D:
+		return "LINESTRING"
+	case godal.GTPolygon, godal.GTPolygon25D:
+		return "POLYGON"
+	case godal.GTMultiPoint, godal.GTMultiPoint25D:
+		return "MULTIPOINT"
+	case godal.GTMultiLineString, godal.GTMultiLineString25D:
+		return "MULTILINESTRING"
+	case godal.GTMultiPolygon, godal.GTMultiPolygon25D:
+		return "MULTIPOLYGON"
+	case godal.GTGeometryCollection, godal.GTGeometryCollection25D:
+		return "GEOMETRYCOLLECTION"
+	default:
+		return ""
+	}
 }
 
 func readFeature(feature *godal.Feature, id uint64, includeProperties bool) (core.Feature, error) {

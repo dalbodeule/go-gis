@@ -118,6 +118,29 @@ func TestWriterRoundTripsShapefile(t *testing.T) {
 	assertRoundTrip(t, got)
 }
 
+func TestWriterCreatesTypedEmptyLayer(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "empty.gpkg")
+	layer := core.Layer{Name: "survey_points", GeometryType: "POINT", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Editable: true}
+	if err := (Writer{}).Write(context.Background(), destination, layer); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := (Reader{}).Open(context.Background(), destination, "survey_points")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opened.Features) != 0 || opened.GeometryType != "POINT" {
+		t.Fatalf("unexpected empty layer: %+v", opened)
+	}
+}
+
+func TestWriterRejectsAmbiguousShapefileFieldNamesBeforeCreate(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "bad.shp")
+	layer := core.Layer{Name: "roads", GeometryType: "POINT", Fields: []core.Field{{Name: "관리번호", Type: core.FieldTypeText}}}
+	if err := (Writer{}).Write(context.Background(), destination, layer); err == nil {
+		t.Fatal("invalid DBF field name accepted")
+	}
+}
+
 func TestWriterRoundTripsWKBGeometry(t *testing.T) {
 	destination := filepath.Join(t.TempDir(), "wkb.gpkg")
 	data, err := hex.DecodeString("0101000000000000000000f03f0000000000000040")

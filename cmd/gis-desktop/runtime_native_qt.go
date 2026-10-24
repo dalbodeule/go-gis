@@ -2332,6 +2332,7 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 	r.mu.Lock()
 	service := r.service
 	bounds := r.mapExtent
+	hasRenderedFeatures := len(r.features) > 0
 	r.mu.Unlock()
 	if service == nil || r.sourcesMu == nil {
 		return fmt.Errorf("render sources are unavailable")
@@ -2340,53 +2341,130 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 	if !ok {
 		return fmt.Errorf("layer %q was not found", layerName)
 	}
-	if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
-		return fmt.Errorf("layer %q display rule: %w", layerName, err)
+	rebase := false
+	if len(layer.Features) > 0 {
+		layerExtent, err := render.LayerExtent([]core.Layer{layer})
+		if err != nil {
+			return err
+		}
+		if !hasRenderedFeatures {
+			bounds = layerExtent
+			rebase = true
+		} else if expanded, _ := mergeExtent(bounds, true, layerExtent); expanded != bounds {
+			bounds = expanded
+			rebase = true
+		}
 	}
-	if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
+	layers := []core.Layer{layer}
+	if rebase {
+		layers = service.ProjectRenderSnapshot().Layers
+	}
+	for i := range layers {
+		if err := applyFeatureDisplayRule(context.Background(), &layers[i]); err != nil {
+			return fmt.Errorf("layer %q display rule: %w", layers[i].Name, err)
+		}
+	}
+	if err := prepareLayerLabels(context.Background(), layers); err != nil {
 		return err
 	}
-	newSources, newFeatures, err := render.NewLayerSourcesWithExtent([]core.Layer{layer}, bounds)
+	newSources, newFeatures, err := render.NewLayerSourcesWithExtent(layers, bounds)
 	if err != nil {
 		return err
 	}
 	updatedSources := make(map[string]render.LayerSource)
-	r.sourcesMu.RLock()
-	for name, source := range r.sources {
+	if !rebase {
+		r.sourcesMu.RLock()
+		for name, source := range r.sources {
+			updatedSources[name] = source
+		}
+		r.sourcesMu.RUnlock()
+	}
+	for name, source := range newSources {
 		updatedSources[name] = source
 	}
-	r.sourcesMu.RUnlock()
-	updatedSources[layerName] = newSources[layerName]
-	if err := attachPolygonFillGeometry(context.Background(), []core.Layer{layer}, updatedSources); err != nil {
+	if err := attachPolygonFillGeometry(context.Background(), layers, updatedSources); err != nil {
 		return err
 	}
-	source := updatedSources[layerName]
 	r.sourcesMu.Lock()
-	r.sources[layerName] = source
+	r.sources = updatedSources
 	r.sourcesMu.Unlock()
 	r.mu.Lock()
-	features := make([]render.HitFeature, 0, len(r.features)-len(source.Features)+len(newFeatures))
-	for _, feature := range r.features {
-		if feature.Layer != layerName {
-			features = append(features, feature)
+	if rebase {
+		r.mapExtent = bounds
+		r.batchStore = render.NewBatchStore()
+		r.hasCompleteFrame = false
+		r.completeFrameLayers = ""
+		for name := range updatedSources {
+			r.scheduler.InvalidateLayer(name)
 		}
+		r.features = newFeatures
+	} else {
+		features := make([]render.HitFeature, 0, len(r.features)+len(newFeatures))
+		for _, feature := range r.features {
+			if feature.Layer != layerName {
+				features = append(features, feature)
+			}
+		}
+		features = append(features, newFeatures...)
+		r.features = features
 	}
-	features = append(features, newFeatures...)
-	r.features = features
+	r.dataMode = true
+	if r.mapCRS == "" {
+		r.mapCRS = layer.CRS.AuthorityCode
+	}
+	if r.visibleLayers == nil {
+		r.visibleLayers = map[string]bool{}
+	}
+	if _, registered := r.visibleLayers[layerName]; !registered {
+		r.visibleLayers[layerName] = layer.Visible
+		r.visibility.Add(layerName)
+		r.visibility.Set(layerName, layer.Visible)
+	}
+	if r.layerStyles == nil {
+		r.layerStyles = map[string]core.LayerStyle{}
+	}
+	if r.baseLayerStyles == nil {
+		r.baseLayerStyles = map[string]core.LayerStyle{}
+	}
+	if _, exists := r.layerStyles[layerName]; !exists {
+		r.layerStyles[layerName] = layer.Style
+		r.baseLayerStyles[layerName] = layer.Style
+	}
+	geometryType := layer.GeometryType
+	if geometryType == "" && len(layer.Features) > 0 && layer.Features[0].Geometry != nil {
+		geometryType = layer.Features[0].Geometry.GeometryType()
+	}
+	r.layerGeometryTypes[layerName] = geometryType
+	r.layerFeatureCounts[layerName] = len(layer.Features)
+	if rebase {
+		for name, source := range updatedSources {
+			if layerBounds, exists := layerSourceBounds(source); exists {
+				r.layerBounds[name] = layerBounds
+			}
+		}
+	} else if layerBounds, exists := layerSourceBounds(updatedSources[layerName]); exists {
+		r.layerBounds[layerName] = layerBounds
+	}
+	r.mapFitExtent = preferredMapFitExtent(r.mapExtent, r.layerBounds, r.layerGeometryTypes)
+	r.planner.Domain = [4]float64{0, 0, 1, 1}
+	r.planner.HasDomain = true
 	r.hitIndexReady = false
 	labels := make([]render.LayerLabel, 0)
-	r.sourcesMu.RLock()
-	for _, current := range r.sources {
+	for _, current := range updatedSources {
 		labels = append(labels, current.Labels...)
 	}
-	r.sourcesMu.RUnlock()
 	r.mapLabels = labels
 	r.labelRevision++
 	selected := r.selected
+	selectedFeatures := newFeatures
+	if selected.Layer != layerName {
+		selectedFeatures = r.features
+	}
 	r.mu.Unlock()
+	r.publishMapMetadata()
 	r.publishLayerLabels()
 	r.refreshCurrentViewport()
-	r.publishVertexHandles(selected, newFeatures, false)
+	r.publishVertexHandles(selected, selectedFeatures, false)
 	return nil
 }
 
@@ -3480,7 +3558,7 @@ func workspaceViewFromViewport(view native.Viewport, activeLayer string) workspa
 // installInMemoryAttributeReaders keeps rebuilt layers independent of any
 // source path: editable features may have unsaved attribute changes, and
 // read-only base layers may never have had a source file at all.
-func installInMemoryAttributeReaders(runtime *demoRuntime, layers []core.Layer) {
+func installInMemoryAttributeReaders(runtime *demoRuntime, _ []core.Layer) {
 	runtime.attributePageReader = func(_ context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
 		page, total, ok := runtime.service.LayerAttributePageOwned(layerName, offset, limit)
 		if !ok {
@@ -3489,16 +3567,10 @@ func installInMemoryAttributeReaders(runtime *demoRuntime, layers []core.Layer) 
 		return page, total, nil
 	}
 	runtime.attributeFeatureReader = func(_ context.Context, layerName string, featureID uint64) (core.Feature, error) {
-		for _, layer := range layers {
-			if layer.Name != layerName {
-				continue
+		if runtime.service != nil {
+			if feature, ok := runtime.service.FeatureSnapshot(layerName, featureID); ok {
+				return feature, nil
 			}
-			for _, feature := range layer.Features {
-				if feature.ID == featureID {
-					return feature, nil
-				}
-			}
-			break
 		}
 		return core.Feature{}, fmt.Errorf("feature %d not found in layer %q", featureID, layerName)
 	}

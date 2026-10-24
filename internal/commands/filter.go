@@ -30,7 +30,7 @@ func FilterLayerByPredicate(ctx context.Context, layer core.Layer, predicate Fea
 		return core.Layer{}, errors.New("filter predicate is required")
 	}
 	result := core.Layer{
-		Name: layer.Name, CRS: layer.CRS, Editable: layer.Editable,
+		Name: layer.Name, CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked,
 		Fields:   append([]core.Field(nil), layer.Fields...),
 		Features: make([]core.Feature, 0),
 	}
@@ -58,9 +58,9 @@ func filterLayerByProperty(ctx context.Context, layer core.Layer, field, expecte
 	}
 	matcher := newPropertyMatcher(expected)
 	result := core.Layer{
-		Name:     layer.Name,
-		CRS:      layer.CRS,
-		Editable: layer.Editable,
+		Name: layer.Name,
+		CRS:  layer.CRS, GeometryType: layer.GeometryType,
+		Editable: layer.Editable, GeometryLocked: layer.GeometryLocked,
 		Fields:   append([]core.Field(nil), layer.Fields...),
 		Features: make([]core.Feature, 0),
 	}

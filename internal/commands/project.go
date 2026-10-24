@@ -12,10 +12,11 @@ import (
 )
 
 var (
-	ErrEditNotActive = errors.New("edit transaction is not active")
-	ErrLayerExists   = errors.New("layer already exists")
-	ErrLayerMissing  = errors.New("layer not found")
-	ErrNoLayers      = errors.New("project has no layers")
+	ErrEditNotActive  = errors.New("edit transaction is not active")
+	ErrLayerExists    = errors.New("layer already exists")
+	ErrLayerMissing   = errors.New("layer not found")
+	ErrNoLayers       = errors.New("project has no layers")
+	ErrGeometryLocked = errors.New("layer geometry is locked")
 )
 
 const maxAttributePageSize = 1_000
@@ -160,6 +161,7 @@ func (s *ProjectService) UpdateLayerSettings(name string, updated core.Layer) er
 		s.project.Layers[index].Visible = updated.Visible
 		s.project.Layers[index].Style = updated.Style
 		s.project.Layers[index].Labels = updated.Labels
+		s.project.Layers[index].DisplayRule = updated.DisplayRule
 		return nil
 	}
 	return ErrLayerMissing
@@ -185,7 +187,7 @@ func (s *ProjectService) LayerProperties(name string) (core.Layer, bool) {
 			return core.Layer{
 				Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
 				SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
-				CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
+				CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked, Visible: layer.Visible,
 				Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 			}, true
 		}
@@ -201,7 +203,7 @@ func (s *ProjectService) ProjectLayerProperties() []core.Layer {
 		result[index] = core.Layer{
 			Name: layer.Name, DisplayName: layer.DisplayName, SourcePath: layer.SourcePath,
 			SourceLayerName: layer.SourceLayerName, SourceEncoding: layer.SourceEncoding, SourceCRS: layer.SourceCRS,
-			CRS: layer.CRS, Editable: layer.Editable, Visible: layer.Visible,
+			CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked, Visible: layer.Visible,
 			Style: layer.Style, Labels: layer.Labels, DisplayRule: layer.DisplayRule,
 		}
 	}
@@ -273,6 +275,29 @@ func (s *ProjectService) LayerEditable(name string) bool {
 	return false
 }
 
+// SetGeometryLocked changes the explicit geometry-edit policy for a layer.
+// It is intentionally available only as a command-layer operation so GUI,
+// CLI, and scripts cannot bypass the same policy.
+func (s *ProjectService) SetGeometryLocked(name string, locked bool) error {
+	for index := range s.project.Layers {
+		if s.project.Layers[index].Name == name {
+			s.project.Layers[index].GeometryLocked = locked
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrLayerMissing, name)
+}
+
+func geometryEditAllowed(layer core.Layer) error {
+	if !layer.Editable {
+		return fmt.Errorf("layer %q is not editable", layer.Name)
+	}
+	if layer.GeometryLocked {
+		return fmt.Errorf("%w: %s", ErrGeometryLocked, layer.Name)
+	}
+	return nil
+}
+
 // LayerAttributes returns a detached layer snapshot containing only schema
 // and properties. Geometry is intentionally omitted for attribute-table paths.
 func (s *ProjectService) LayerAttributes(name string) (core.Layer, bool) {
@@ -280,7 +305,7 @@ func (s *ProjectService) LayerAttributes(name string) (core.Layer, bool) {
 		if layer.Name != name {
 			continue
 		}
-		result := core.Layer{Name: layer.Name, CRS: layer.CRS, Editable: layer.Editable, Fields: append([]core.Field(nil), layer.Fields...)}
+		result := core.Layer{Name: layer.Name, CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked, Fields: append([]core.Field(nil), layer.Fields...)}
 		result.Features = make([]core.Feature, len(layer.Features))
 		for index, feature := range layer.Features {
 			result.Features[index] = core.Feature{ID: feature.ID, Properties: maps.Clone(feature.Properties)}
@@ -324,7 +349,7 @@ func (s *ProjectService) layerAttributePage(name string, offset, limit int, clon
 		} else {
 			end = total
 		}
-		result := core.Layer{Name: layer.Name, CRS: layer.CRS, Editable: layer.Editable, Fields: append([]core.Field(nil), layer.Fields...)}
+		result := core.Layer{Name: layer.Name, CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked, Fields: append([]core.Field(nil), layer.Fields...)}
 		result.Features = make([]core.Feature, end-offset)
 		for index, feature := range layer.Features[offset:end] {
 			properties := feature.Properties
@@ -346,6 +371,24 @@ func (s *ProjectService) HasFeature(layerName string, featureID uint64) bool {
 	}
 	_, ok = index[featureID]
 	return ok
+}
+
+// FeatureSnapshot copies only the requested feature for attribute inspection.
+// It avoids retaining an obsolete full-layer snapshot after an edit.
+func (s *ProjectService) FeatureSnapshot(layerName string, featureID uint64) (core.Feature, bool) {
+	layerIndex, ok := s.layerIndexForName(layerName)
+	if !ok {
+		return core.Feature{}, false
+	}
+	index, ok := s.featureIndexForLayer(layerName)
+	if !ok {
+		return core.Feature{}, false
+	}
+	featureIndex, ok := index[featureID]
+	if !ok {
+		return core.Feature{}, false
+	}
+	return s.project.Layers[layerIndex].Features[featureIndex].Clone(), true
 }
 
 // FeatureProperty returns one property without cloning the containing feature.
@@ -628,8 +671,8 @@ func (s *ProjectService) SetFeatureGeometry(layerName string, featureID uint64, 
 		if layer.Name != layerName {
 			continue
 		}
-		if !layer.Editable {
-			return fmt.Errorf("layer %q is not editable", layerName)
+		if err := geometryEditAllowed(*layer); err != nil {
+			return err
 		}
 		index, indexed := s.featureIndexForLayer(layerName)
 		featureIndex, exists := index[featureID]
