@@ -8,6 +8,12 @@ import (
 	"gogis/internal/core"
 )
 
+// BoundaryBatchIntersector is an optional native fast path. It reads each
+// source geometry once and returns only non-empty polygon intersections.
+type BoundaryBatchIntersector interface {
+	IntersectPolygonBoundaries(context.Context, core.Layer, core.Layer, int) ([][]core.Feature, error)
+}
+
 // SplitPolygonLayerByBoundaries clips polygon features to each identified
 // boundary. A native SpatialOperator performs geometry work behind its driver
 // boundary; the command layer owns naming, CRS, and attribute policy.
@@ -21,7 +27,8 @@ func SplitPolygonLayerByBoundaries(ctx context.Context, operator SpatialOperator
 	if prefix == "" {
 		return nil, fmt.Errorf("result prefix is required")
 	}
-	if maxPairs > 0 && len(source.Features) > 0 && len(boundaries.Features) > maxPairs/len(source.Features) {
+	_, batchCapable := operator.(BoundaryBatchIntersector)
+	if !batchCapable && maxPairs > 0 && len(source.Features) > 0 && len(boundaries.Features) > maxPairs/len(source.Features) {
 		return nil, fmt.Errorf("boundary split exceeds %d geometry comparisons; reduce the input or use CLI", maxPairs)
 	}
 	for _, field := range source.Fields {
@@ -37,9 +44,9 @@ func SplitPolygonLayerByBoundaries(ctx context.Context, operator SpatialOperator
 			return nil, fmt.Errorf("source feature %d is not a polygon", feature.ID)
 		}
 	}
-	results := make([]core.Layer, 0, len(boundaries.Features))
-	seen := make(map[string]bool)
-	for _, boundary := range boundaries.Features {
+	identifiers := make([]string, len(boundaries.Features))
+	seen := make(map[string]bool, len(boundaries.Features))
+	for index, boundary := range boundaries.Features {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -51,29 +58,53 @@ func SplitPolygonLayerByBoundaries(ctx context.Context, operator SpatialOperator
 			return nil, fmt.Errorf("boundary feature %d has invalid or duplicate shape ID", boundary.ID)
 		}
 		seen[identifier] = true
-		paired := core.Layer{CRS: boundaries.CRS, Features: make([]core.Feature, len(source.Features))}
-		for index := range paired.Features {
-			paired.Features[index] = core.Feature{ID: source.Features[index].ID, Geometry: boundary.Geometry}
-		}
-		clipped, err := operator.Intersect(ctx, source, paired)
+		identifiers[index] = identifier
+	}
+	var batches [][]core.Feature
+	if batchOperator, ok := operator.(BoundaryBatchIntersector); ok {
+		var err error
+		batches, err = batchOperator.IntersectPolygonBoundaries(ctx, source, boundaries, maxPairs)
 		if err != nil {
-			return nil, fmt.Errorf("clip boundary %s: %w", identifier, err)
+			return nil, err
+		}
+		if len(batches) != len(boundaries.Features) {
+			return nil, fmt.Errorf("boundary intersector returned %d groups for %d boundaries", len(batches), len(boundaries.Features))
+		}
+	}
+	results := make([]core.Layer, 0, len(boundaries.Features))
+	for boundaryIndex, boundary := range boundaries.Features {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		identifier := identifiers[boundaryIndex]
+		var clippedFeatures []core.Feature
+		if batches != nil {
+			clippedFeatures = batches[boundaryIndex]
+		} else {
+			paired := core.Layer{CRS: boundaries.CRS, Features: make([]core.Feature, len(source.Features))}
+			for index := range paired.Features {
+				paired.Features[index] = core.Feature{ID: source.Features[index].ID, Geometry: boundary.Geometry}
+			}
+			clipped, err := operator.Intersect(ctx, source, paired)
+			if err != nil {
+				return nil, fmt.Errorf("clip boundary %s: %w", identifier, err)
+			}
+			clippedFeatures = clipped.Features
 		}
 		result := core.Layer{Name: prefix + "_" + identifier, DisplayName: prefix + "_" + identifier, CRS: source.CRS, GeometryType: "POLYGON", Editable: true, GeometryLocked: true,
 			Fields: append(append([]core.Field(nil), source.Fields...), core.Field{Name: BoundaryIdentifierField, Type: core.FieldTypeText})}
-		for _, feature := range clipped.Features {
+		for _, feature := range clippedFeatures {
 			if feature.Geometry == nil {
 				continue
 			}
-			wkt, err := core.ToWKT(feature.Geometry)
-			if err != nil {
-				return nil, err
-			}
-			if strings.Contains(strings.ToUpper(wkt.WKT), "EMPTY") {
-				continue
-			}
-			if !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
-				continue // Border-only intersection has no area to deliver.
+			if batches == nil {
+				wkt, err := core.ToWKT(feature.Geometry)
+				if err != nil {
+					return nil, err
+				}
+				if strings.Contains(strings.ToUpper(wkt.WKT), "EMPTY") || !strings.Contains(strings.ToUpper(feature.Geometry.GeometryType()), "POLYGON") {
+					continue
+				}
 			}
 			if feature.Properties == nil {
 				feature.Properties = make(map[string]any)

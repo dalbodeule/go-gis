@@ -77,7 +77,7 @@ func (r *Runtime) splitLua(state *lua.LState) int {
 	sourceName := state.CheckString(1)
 	prefix := state.CheckString(2)
 	script := state.CheckString(3)
-	source, ok := r.service.Layer(sourceName)
+	source, ok := r.service.ProjectLayerRenderSnapshot(sourceName)
 	if !ok {
 		state.RaiseError("split_lua: source layer %q not found", sourceName)
 		return 0

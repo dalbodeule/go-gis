@@ -76,22 +76,7 @@ func runWorkflow(ctx context.Context, command string, options workflowOptions) e
 		if len(paths) == 0 {
 			paths = []string{options.input}
 		}
-		files := make([]*os.File, 0, len(paths))
-		defer func() {
-			for _, file := range files {
-				_ = file.Close()
-			}
-		}()
-		inputs := make([]io.Reader, 0, len(paths))
-		for _, path := range paths {
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			files = append(files, file)
-			inputs = append(inputs, file)
-		}
-		result, err := commands.ImportCSVPointFiles(ctx, inputs, commands.CSVOptions{Delimiter: workflowDelimiter(options.delimiter), HasHeader: true, Encoding: options.encoding, XField: options.xField, YField: options.yField, CRS: core.CRS{AuthorityCode: options.crs}, LayerName: options.outputLayer, FieldTypes: parseCSVFieldTypes(options.numberFields, options.boolFields)})
+		result, err := commands.ImportCSVPointSources(ctx, len(paths), func(index int) (io.ReadCloser, error) { return os.Open(paths[index]) }, commands.CSVOptions{Delimiter: workflowDelimiter(options.delimiter), HasHeader: true, Encoding: options.encoding, XField: options.xField, YField: options.yField, CRS: core.CRS{AuthorityCode: options.crs}, LayerName: options.outputLayer, FieldTypes: parseCSVFieldTypes(options.numberFields, options.boolFields)})
 		if err != nil {
 			return err
 		}

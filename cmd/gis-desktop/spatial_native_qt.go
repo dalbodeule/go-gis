@@ -23,11 +23,11 @@ func splitLayerByBoundary(runtime *demoRuntime, request layerSettingsRequest) er
 	if service == nil || readOnly {
 		return fmt.Errorf("project is read-only or unavailable")
 	}
-	source, ok := service.Layer(request.LayerName)
+	source, ok := service.ProjectLayerRenderSnapshot(request.LayerName)
 	if !ok {
 		return fmt.Errorf("source layer %q not found", request.LayerName)
 	}
-	boundaries, ok := service.Layer(request.BoundaryLayer)
+	boundaries, ok := service.ProjectLayerRenderSnapshot(request.BoundaryLayer)
 	if !ok {
 		return fmt.Errorf("boundary layer %q not found", request.BoundaryLayer)
 	}
@@ -87,11 +87,17 @@ func applySpatialRequest(runtime *demoRuntime, payload string) error {
 		runtime.mu.Unlock()
 		return fmt.Errorf("another spatial operation is already running")
 	}
+	baseService := runtime.service
+	projectSnapshot := baseService.ProjectRenderSnapshot()
+	service, err := commands.NewProjectServiceWithLayers(projectSnapshot.Name, projectSnapshot.CRS, projectSnapshot.Layers)
+	if err != nil {
+		runtime.mu.Unlock()
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	runtime.operationCancel = cancel
 	runtime.operationGeneration++
 	operationGeneration := runtime.operationGeneration
-	service := runtime.service
 	saveDestination := runtime.saveDestination
 	runtime.mu.Unlock()
 
@@ -124,7 +130,7 @@ func applySpatialRequest(runtime *demoRuntime, payload string) error {
 			return
 		}
 		runtime.mu.Lock()
-		stale := runtime.service != service || runtime.operationGeneration != operationGeneration
+		stale := runtime.service != baseService || runtime.operationGeneration != operationGeneration
 		runtime.mu.Unlock()
 		if stale {
 			if next.closeAttributeSource != nil {

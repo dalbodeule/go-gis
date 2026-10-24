@@ -9,7 +9,9 @@ import (
 )
 
 func TestLuaFilterAndSplitLayer(t *testing.T) {
-	layer := core.Layer{Name: "source", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, Features: []core.Feature{
+	style := core.DefaultLayerStyle()
+	style.PointColor = "#123456"
+	layer := core.Layer{Name: "source", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, SourcePath: "original.shp", Style: style, Features: []core.Feature{
 		{ID: 1, Properties: map[string]any{"grade": "A"}},
 		{ID: 2, Properties: map[string]any{"grade": "B"}},
 		{ID: 3, Properties: map[string]any{"grade": "A"}},
@@ -17,6 +19,9 @@ func TestLuaFilterAndSplitLayer(t *testing.T) {
 	filtered, err := FilterLayerByLua(context.Background(), layer, `return feature.grade == "A"`)
 	if err != nil || len(filtered.Features) != 2 {
 		t.Fatalf("filtered=%+v err=%v", filtered, err)
+	}
+	if filtered.Style != style || filtered.SourcePath != "" || !filtered.Visible {
+		t.Fatalf("filtered presentation/source metadata = %+v", filtered)
 	}
 	groups, err := SplitLayerByLua(context.Background(), layer, "result", `return feature.grade`, 2)
 	if err != nil || len(groups) != 2 || groups[0].Name != "result_A" || len(groups[0].Features) != 2 || groups[1].Name != "result_B" {

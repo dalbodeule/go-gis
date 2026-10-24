@@ -35,7 +35,9 @@ func BuildBoundaryHulls(ctx context.Context, points core.Layer, xField, yField, 
 		return core.Layer{}, core.Layer{}, fmt.Errorf("boundary coordinate or group field is missing")
 	}
 	for name := range fieldNames {
-		if strings.EqualFold(name, BoundaryIdentifierField) { return core.Layer{}, core.Layer{}, fmt.Errorf("field %q already exists", name) }
+		if strings.EqualFold(name, BoundaryIdentifierField) {
+			return core.Layer{}, core.Layer{}, fmt.Errorf("field %q already exists", name)
+		}
 	}
 	groups := make([]boundaryGroup, 0)
 	byKey := make(map[string]int)
@@ -43,17 +45,25 @@ func BuildBoundaryHulls(ctx context.Context, points core.Layer, xField, yField, 
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, core.Layer{}, err
 		}
-		x, ex := strconv.ParseFloat(strings.TrimSpace(fmt.Sprint(feature.Properties[xField])), 64)
-		y, ey := strconv.ParseFloat(strings.TrimSpace(fmt.Sprint(feature.Properties[yField])), 64)
-		if ex != nil || ey != nil || math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+		x, xOK := numericValue(feature.Properties[xField])
+		y, yOK := numericValue(feature.Properties[yField])
+		if !xOK || !yOK || math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
 			return core.Layer{}, core.Layer{}, fmt.Errorf("feature %d has invalid boundary coordinates", feature.ID)
 		}
 		key := ""
 		if groupField != "" {
-			if feature.Properties[groupField] == nil || strings.TrimSpace(fmt.Sprint(feature.Properties[groupField])) == "" {
+			value := feature.Properties[groupField]
+			if value == nil {
 				return core.Layer{}, core.Layer{}, fmt.Errorf("feature %d has empty boundary group", feature.ID)
 			}
-			key = fmt.Sprint(feature.Properties[groupField])
+			if text, ok := value.(string); ok {
+				key = text
+			} else {
+				key = fmt.Sprint(value)
+			}
+			if strings.TrimSpace(key) == "" {
+				return core.Layer{}, core.Layer{}, fmt.Errorf("feature %d has empty boundary group", feature.ID)
+			}
 		}
 		groupIndex, exists := byKey[key]
 		if !exists {
@@ -91,19 +101,37 @@ func BuildBoundaryHulls(ctx context.Context, points core.Layer, xField, yField, 
 			}
 			tagged.Features[pointIndex].Properties[BoundaryIdentifierField] = group.identifier
 		}
-		coords := make([]string, 0, len(hulls[index])+1)
-		for _, point := range hulls[index] {
-			coords = append(coords, strconv.FormatFloat(point.x, 'g', -1, 64)+" "+strconv.FormatFloat(point.y, 'g', -1, 64))
-		}
-		coords = append(coords, coords[0])
 		props := map[string]any{BoundaryIdentifierField: group.identifier}
 		if groupField != "" {
 			first := group.indices[0]
 			props[groupField] = fmt.Sprint(points.Features[first].Properties[groupField])
 		}
-		boundaries.Features = append(boundaries.Features, core.Feature{ID: uint64(index + 1), Geometry: core.WKTGeometry{WKT: "POLYGON ((" + strings.Join(coords, ", ") + "))"}, Properties: props})
+		boundaries.Features = append(boundaries.Features, core.Feature{ID: uint64(index + 1), Geometry: core.WKTGeometry{WKT: boundaryHullWKT(hulls[index])}, Properties: props})
 	}
 	return tagged, boundaries, nil
+}
+
+func boundaryHullWKT(hull []boundaryPoint) string {
+	capacity := 8 << 20
+	if len(hull) < capacity/48 {
+		capacity = 16 + (len(hull)+1)*48
+	}
+	text := make([]byte, 0, capacity)
+	text = append(text, "POLYGON (("...)
+	for index := 0; index <= len(hull); index++ {
+		if index > 0 {
+			text = append(text, ',', ' ')
+		}
+		point := hull[0]
+		if index < len(hull) {
+			point = hull[index]
+		}
+		text = strconv.AppendFloat(text, point.x, 'g', -1, 64)
+		text = append(text, ' ')
+		text = strconv.AppendFloat(text, point.y, 'g', -1, 64)
+	}
+	text = append(text, ')', ')')
+	return string(text)
 }
 
 func convexBoundary(input []boundaryPoint) []boundaryPoint {

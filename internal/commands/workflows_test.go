@@ -6,11 +6,69 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
 	"gogis/internal/core"
 )
+
+type countedCSVReader struct {
+	io.Reader
+	onClose  func()
+	closeErr error
+}
+
+type failingCSVReader struct{ data []byte }
+
+func (reader *failingCSVReader) Read(buffer []byte) (int, error) {
+	if len(reader.data) == 0 {
+		return 0, errors.New("persistent disk read failure")
+	}
+	count := copy(buffer, reader.data)
+	reader.data = reader.data[count:]
+	return count, nil
+}
+
+func TestCSVReadersStopOnPersistentIOFailure(t *testing.T) {
+	newReader := func() io.Reader { return &failingCSVReader{data: []byte("x,y\n1,2\n")} }
+	if _, err := ImportCSVPoints(context.Background(), newReader(), CSVOptions{HasHeader: true, XField: "x", YField: "y"}); err == nil || !strings.Contains(err.Error(), "persistent disk") {
+		t.Fatalf("point importer did not stop on IO error: %v", err)
+	}
+	if _, _, err := ReadCSVTable(context.Background(), newReader(), ',', "UTF-8"); err == nil || !strings.Contains(err.Error(), "persistent disk") {
+		t.Fatalf("table importer did not stop on IO error: %v", err)
+	}
+	if _, err := PreviewCSV(context.Background(), newReader(), ',', "UTF-8", 3); err == nil || !strings.Contains(err.Error(), "persistent disk") {
+		t.Fatalf("preview did not stop on IO error: %v", err)
+	}
+}
+
+func (reader countedCSVReader) Close() error { reader.onClose(); return reader.closeErr }
+
+func TestImportCSVPointSourcesClosesEachFileBeforeNext(t *testing.T) {
+	data := []string{"x,y\n0,0\n", "x,y\n1,1\n", "x,y\n2,2\n"}
+	openCount, maxOpen := 0, 0
+	result, err := ImportCSVPointSources(context.Background(), len(data), func(index int) (io.ReadCloser, error) {
+		openCount++
+		if openCount > maxOpen {
+			maxOpen = openCount
+		}
+		return countedCSVReader{Reader: strings.NewReader(data[index]), onClose: func() { openCount-- }}, nil
+	}, CSVOptions{HasHeader: true, XField: "x", YField: "y"})
+	if err != nil || result.Accepted != 3 || maxOpen != 1 || openCount != 0 {
+		t.Fatalf("sequential CSV open failed: accepted=%d maxOpen=%d stillOpen=%d err=%v", result.Accepted, maxOpen, openCount, err)
+	}
+}
+
+func TestImportCSVPointSourcesReportsCloseFailure(t *testing.T) {
+	_, err := ImportCSVPointSources(context.Background(), 1, func(int) (io.ReadCloser, error) {
+		return countedCSVReader{Reader: strings.NewReader("x,y\n1,2\n"), onClose: func() {}, closeErr: errors.New("close failure")}, nil
+	}, CSVOptions{HasHeader: true, XField: "x", YField: "y"})
+	if err == nil || !strings.Contains(err.Error(), "close failure") {
+		t.Fatalf("close error was lost: %v", err)
+	}
+}
 
 func TestImportCSVPointFilesCombinesAndRejectsSchemaMismatch(t *testing.T) {
 	options := CSVOptions{HasHeader: true, XField: "x", YField: "y", CRS: core.CRS{AuthorityCode: "EPSG:4326"}, LayerName: "combined"}
@@ -47,6 +105,43 @@ func TestImportCSVPointsPreservesIdentifiersAndReportsBadRows(t *testing.T) {
 	}
 	if result.Accepted != 1 || result.Rejected != 1 || result.Layer.Features[0].Properties["관리번호"] != "0012" {
 		t.Fatalf("unexpected import result: %+v", result)
+	}
+}
+
+func TestImportCSVPointsKeepsEarlierRowsAfterRecordReuse(t *testing.T) {
+	result, err := ImportCSVPoints(context.Background(), strings.NewReader("id,x,y\n001,1,2\n002,3,4\n"), CSVOptions{HasHeader: true, XField: "x", YField: "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Layer.Features) != 2 || result.Layer.Features[0].Properties["id"] != "001" || result.Layer.Features[1].Properties["id"] != "002" {
+		t.Fatalf("import reused a prior row: %+v", result.Layer.Features)
+	}
+}
+
+func TestCSVTextRejectsReplacementCharacter(t *testing.T) {
+	result, err := ImportCSVPoints(context.Background(), strings.NewReader("id,x,y,name\n001,1,2,\ufffd\n002,3,4,서울\ufffc\n"), CSVOptions{HasHeader: true, XField: "x", YField: "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rejected != 1 || result.Accepted != 1 || result.Layer.Features[0].Properties["name"] != "서울\ufffc" {
+		t.Fatalf("UTF-8 validation result = %+v", result)
+	}
+}
+
+func TestCSVPointWKTFormatting(t *testing.T) {
+	for _, coordinates := range [][2]float64{{0, math.Copysign(0, -1)}, {127.123456789, 37.987654321}, {1e-12, 1e20}} {
+		got := csvPointWKT(coordinates[0], coordinates[1]).WKT
+		want := fmt.Sprintf("POINT (%s %s)", strconv.FormatFloat(coordinates[0], 'g', -1, 64), strconv.FormatFloat(coordinates[1], 'g', -1, 64))
+		if got != want {
+			t.Fatalf("CSV point WKT = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestBoundaryHullWKTClosesWithFirstPoint(t *testing.T) {
+	hull := []boundaryPoint{{1.25, 2.5}, {3, 4}, {5, 6}}
+	if got, want := boundaryHullWKT(hull), "POLYGON ((1.25 2.5, 3 4, 5 6, 1.25 2.5))"; got != want {
+		t.Fatalf("boundary WKT = %q, want %q", got, want)
 	}
 }
 

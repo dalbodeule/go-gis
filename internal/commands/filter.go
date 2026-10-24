@@ -29,11 +29,11 @@ func FilterLayerByPredicate(ctx context.Context, layer core.Layer, predicate Fea
 	if predicate == nil {
 		return core.Layer{}, errors.New("filter predicate is required")
 	}
-	result := core.Layer{
-		Name: layer.Name, CRS: layer.CRS, GeometryType: layer.GeometryType, Editable: layer.Editable, GeometryLocked: layer.GeometryLocked,
-		Fields:   append([]core.Field(nil), layer.Fields...),
-		Features: make([]core.Feature, 0),
-	}
+	result := layer
+	result.SourcePath, result.SourceLayerName, result.SourceEncoding, result.SourceCRS = "", "", "", ""
+	result.Visible = true
+	result.Fields = append([]core.Field(nil), layer.Fields...)
+	result.Features = make([]core.Feature, 0)
 	for _, feature := range layer.Features {
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err

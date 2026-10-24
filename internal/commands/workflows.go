@@ -46,12 +46,47 @@ type CSVImportResult struct {
 // Every file is parsed with the same explicit mapping and CRS; no partial
 // result is returned when a file has an invalid schema or the limit is hit.
 func ImportCSVPointFiles(ctx context.Context, inputs []io.Reader, options CSVOptions) (CSVImportResult, error) {
-	if len(inputs) == 0 {
+	return importCSVPointFiles(ctx, len(inputs), func(index int, fileOptions CSVOptions) (CSVImportResult, error) {
+		if inputs[index] == nil {
+			return CSVImportResult{}, fmt.Errorf("CSV input %d is nil", index+1)
+		}
+		return ImportCSVPoints(ctx, inputs[index], fileOptions)
+	}, options)
+}
+
+// ImportCSVPointSources opens and closes inputs one at a time. Desktop and CLI
+// callers use this to avoid exhausting file descriptors for large selections.
+func ImportCSVPointSources(ctx context.Context, count int, open func(int) (io.ReadCloser, error), options CSVOptions) (CSVImportResult, error) {
+	if open == nil {
+		return CSVImportResult{}, errors.New("CSV opener is required")
+	}
+	return importCSVPointFiles(ctx, count, func(index int, fileOptions CSVOptions) (CSVImportResult, error) {
+		input, err := open(index)
+		if err != nil {
+			return CSVImportResult{}, err
+		}
+		if input == nil {
+			return CSVImportResult{}, errors.New("CSV opener returned no input")
+		}
+		part, readErr := ImportCSVPoints(ctx, input, fileOptions)
+		closeErr := input.Close()
+		if readErr != nil {
+			return CSVImportResult{}, readErr
+		}
+		if closeErr != nil {
+			return CSVImportResult{}, fmt.Errorf("close CSV input: %w", closeErr)
+		}
+		return part, nil
+	}, options)
+}
+
+func importCSVPointFiles(ctx context.Context, count int, readOne func(int, CSVOptions) (CSVImportResult, error), options CSVOptions) (CSVImportResult, error) {
+	if count <= 0 {
 		return CSVImportResult{}, errors.New("at least one CSV input is required")
 	}
 	var combined CSVImportResult
 	var maxFeatureID uint64
-	for index, input := range inputs {
+	for index := 0; index < count; index++ {
 		if err := ctx.Err(); err != nil {
 			return CSVImportResult{}, err
 		}
@@ -63,7 +98,7 @@ func ImportCSVPointFiles(ctx context.Context, inputs []io.Reader, options CSVOpt
 			}
 			fileOptions.MaxRows = remaining
 		}
-		part, err := ImportCSVPoints(ctx, input, fileOptions)
+		part, err := readOne(index, fileOptions)
 		if err != nil {
 			return CSVImportResult{}, fmt.Errorf("CSV input %d: %w", index+1, err)
 		}
@@ -168,6 +203,9 @@ func PreviewCSV(ctx context.Context, r io.Reader, delimiter rune, encoding strin
 			break
 		}
 		if readErr != nil {
+			if !isCSVParseError(readErr) {
+				return CSVPreview{}, fmt.Errorf("read CSV preview: %w", readErr)
+			}
 			preview.Errors = append(preview.Errors, CSVRowError{csvSourceLine(reader, readErr, row), readErr.Error()})
 			continue
 		}
@@ -233,6 +271,9 @@ func ReadCSVTableLimited(ctx context.Context, r io.Reader, delimiter rune, encod
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
+		if readErr != nil && !isCSVParseError(readErr) {
+			return nil, nil, fmt.Errorf("read CSV table: %w", readErr)
+		}
 		if maxRows > 0 && row-1 > maxRows {
 			return nil, nil, fmt.Errorf("CSV table exceeds the %d-row interactive limit; split the file or use the CLI", maxRows)
 		}
@@ -293,7 +334,8 @@ func ImportCSVPoints(ctx context.Context, r io.Reader, options CSVOptions) (CSVI
 	reader := csv.NewReader(decoded)
 	reader.Comma = options.Delimiter
 	reader.FieldsPerRecord = -1
-	reader.ReuseRecord = false
+	// Each row is copied into properties before the next Read call.
+	reader.ReuseRecord = true
 	first, err := reader.Read()
 	if err != nil {
 		return CSVImportResult{}, fmt.Errorf("read CSV header: %w", err)
@@ -338,6 +380,9 @@ func ImportCSVPoints(ctx context.Context, r io.Reader, options CSVOptions) (CSVI
 		record, readErr := reader.Read()
 		if errors.Is(readErr, io.EOF) {
 			break
+		}
+		if readErr != nil && !isCSVParseError(readErr) {
+			return CSVImportResult{}, fmt.Errorf("read CSV points: %w", readErr)
 		}
 		if options.MaxRows > 0 && row-1 > options.MaxRows {
 			return CSVImportResult{}, fmt.Errorf("CSV exceeds the %d-row interactive limit; split the file or use the CLI", options.MaxRows)
@@ -388,10 +433,20 @@ func ImportCSVPoints(ctx context.Context, r io.Reader, options CSVOptions) (CSVI
 			}
 			continue
 		}
-		result.Layer.Features = append(result.Layer.Features, core.Feature{ID: uint64(row - 1), Geometry: core.WKTGeometry{WKT: fmt.Sprintf("POINT (%s %s)", strconv.FormatFloat(x, 'g', -1, 64), strconv.FormatFloat(y, 'g', -1, 64))}, Properties: props})
+		result.Layer.Features = append(result.Layer.Features, core.Feature{ID: uint64(row - 1), Geometry: csvPointWKT(x, y), Properties: props})
 		result.Accepted++
 	}
 	return result, nil
+}
+
+func csvPointWKT(x, y float64) core.WKTGeometry {
+	var buffer [96]byte
+	text := append(buffer[:0], "POINT ("...)
+	text = strconv.AppendFloat(text, x, 'g', -1, 64)
+	text = append(text, ' ')
+	text = strconv.AppendFloat(text, y, 'g', -1, 64)
+	text = append(text, ')')
+	return core.WKTGeometry{WKT: string(text)}
 }
 
 func csvSourceLine(reader *csv.Reader, readErr error, fallback int) int {
@@ -407,17 +462,37 @@ func csvSourceLine(reader *csv.Reader, readErr error, fallback int) int {
 	return fallback
 }
 
+func isCSVParseError(err error) bool {
+	var parseErr *csv.ParseError
+	return errors.As(err, &parseErr)
+}
+
 func validateCSVText(record []string) error {
 	for i, value := range record {
-		if !utf8.ValidString(value) || strings.ContainsRune(value, utf8.RuneError) {
+		if !utf8.ValidString(value) || containsReplacementRune(value) {
 			return fmt.Errorf("column %d contains undecodable text; check the selected encoding", i+1)
 		}
 	}
 	return nil
 }
 
+// IndexByte uses the standard library's architecture-specific byte search on
+// longer fields, while avoiding a second UTF-8 rune decode after ValidString.
+func containsReplacementRune(value string) bool {
+	for {
+		index := strings.IndexByte(value, 0xef)
+		if index < 0 {
+			return false
+		}
+		if len(value)-index >= 3 && value[index+1] == 0xbf && value[index+2] == 0xbd {
+			return true
+		}
+		value = value[index+1:]
+	}
+}
+
 func parseCSVField(value string, fieldType core.FieldType) (any, error) {
-	if strings.TrimSpace(value) == "" && fieldType != core.FieldTypeText {
+	if fieldType != core.FieldTypeText && strings.TrimSpace(value) == "" {
 		return nil, nil
 	}
 	switch fieldType {

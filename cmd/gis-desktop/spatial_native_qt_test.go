@@ -38,17 +38,17 @@ func TestApplySpatialRequestBuildsResultLayerInDesktopRuntime(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		runtime.mu.Lock()
-		service := runtime.service
-		_, found := service.Layer("intersection")
 		operationRunning := runtime.operationCancel != nil
-		runtime.mu.Unlock()
-		if found && !operationRunning {
+		service := runtime.service
+		if !operationRunning {
 			layer, ok := service.Layer("intersection")
+			runtime.mu.Unlock()
 			if !ok || len(layer.Features) == 0 {
 				t.Fatal("spatial result layer has no features")
 			}
 			return
 		}
+		runtime.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("desktop spatial operation did not publish its result layer")

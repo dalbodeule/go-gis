@@ -67,6 +67,7 @@ func main() {
 	runtime := loadEmptyProject()
 	native.RegisterMapCanvas()
 	engine := qml.NewQQmlApplicationEngine()
+	configureQmlImportPaths(engine)
 	rootContext := engine.RootContext()
 	for name, value := range map[string]string{
 		"appLanguage":       language,
@@ -85,6 +86,56 @@ func main() {
 	startDiagnosticLogPublisher()
 	startInitialDataLoad(runtime, os.Args)
 	qt.QApplication_Exec()
+}
+
+func configureQmlImportPaths(engine *qml.QQmlApplicationEngine) {
+	seen := make(map[string]struct{})
+	paths := make([]string, 0, len(engine.ImportPathList())+8)
+	addPath := func(path string) {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "." || path == "" {
+			return
+		}
+		if _, exists := seen[path]; exists {
+			return
+		}
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			return
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	for _, path := range engine.ImportPathList() {
+		addPath(path)
+	}
+	for _, envName := range []string{"QML_IMPORT_PATH", "QML2_IMPORT_PATH"} {
+		for _, path := range filepath.SplitList(os.Getenv(envName)) {
+			addPath(path)
+		}
+	}
+	for _, path := range qt.QCoreApplication_LibraryPaths() {
+		addPath(filepath.Join(filepath.Dir(path), "qml"))
+		addPath(filepath.Join(path, "qml"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		addPath(filepath.Join(cwd, "cmd", "gis-desktop", "qml"))
+		addPath(filepath.Join(cwd, "cmd", "gis-desktop", "qmltests"))
+	}
+	for _, path := range []string{
+		"/opt/homebrew/opt/qt/lib/qml",
+		"/opt/homebrew/lib/qt6/qml",
+		"/usr/local/opt/qt/lib/qml",
+		"/usr/local/lib/qt6/qml",
+		"/usr/lib/qt6/qml",
+		"/usr/lib/x86_64-linux-gnu/qt6/qml",
+		"/usr/lib/qt/qml",
+		"/usr/local/lib/qt/qml",
+	} {
+		addPath(path)
+	}
+	if len(paths) != 0 {
+		engine.SetImportPathList(paths)
+	}
 }
 
 func desktopShapefileIndexThreshold() int {
@@ -2887,38 +2938,36 @@ func importCSVLayer(runtime *demoRuntime, request layerSettingsRequest) error {
 	if service == nil || readOnly {
 		return fmt.Errorf("project is read-only or unavailable")
 	}
-	files := make([]*os.File, 0, len(paths))
-	defer func() {
-		for _, file := range files {
-			_ = file.Close()
-		}
-	}()
-	inputs := make([]io.Reader, 0, len(paths))
 	var totalBytes int64
-	for _, path := range paths {
+	for index, path := range paths {
 		path = strings.TrimSpace(path)
 		if path == "" {
 			return fmt.Errorf("CSV input path must not be blank")
 		}
-		file, err := os.Open(path)
+		paths[index] = path
+		info, err := os.Stat(path)
 		if err != nil {
 			return err
 		}
-		files = append(files, file)
-		info, err := file.Stat()
-		if err != nil {
-			return err
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("CSV input %q is not a regular file", path)
 		}
 		totalBytes += info.Size()
 		if totalBytes > 16<<20 {
 			return fmt.Errorf("CSV inputs exceed the 16 MiB interactive file limit; split them or use the CLI")
 		}
-		inputs = append(inputs, file)
 	}
 	ctx, finish := cancellableDesktopWorkflow()
 	defer finish()
 	native.SetRenderStatus("Importing CSV")
-	result, err := commands.ImportCSVPointFiles(ctx, inputs, commands.CSVOptions{Delimiter: workflowDelimiterForDesktop(request.Delimiter), HasHeader: true, Encoding: request.Encoding, XField: request.XField, YField: request.YField, CRS: core.CRS{AuthorityCode: request.CRS}, LayerName: request.OutputName, FieldTypes: desktopCSVFieldTypes(request.NumberFields, request.BoolFields), MaxRows: 100000})
+	remainingBytes := int64(16 << 20)
+	result, err := commands.ImportCSVPointSources(ctx, len(paths), func(index int) (io.ReadCloser, error) {
+		file, err := os.Open(paths[index])
+		if err != nil {
+			return nil, err
+		}
+		return &budgetedCSVFile{ReadCloser: file, remaining: &remainingBytes}, nil
+	}, commands.CSVOptions{Delimiter: workflowDelimiterForDesktop(request.Delimiter), HasHeader: true, Encoding: request.Encoding, XField: request.XField, YField: request.YField, CRS: core.CRS{AuthorityCode: request.CRS}, LayerName: request.OutputName, FieldTypes: desktopCSVFieldTypes(request.NumberFields, request.BoolFields), MaxRows: 100000})
 	if err != nil {
 		return err
 	}
@@ -2954,6 +3003,36 @@ func importCSVLayer(runtime *demoRuntime, request layerSettingsRequest) error {
 	}
 	native.SetRenderStatus(fmt.Sprintf("CSV imported: %d points in %s", result.Accepted, result.Layer.Name))
 	return nil
+}
+
+var errDesktopCSVByteLimit = errors.New("CSV inputs exceed the 16 MiB interactive file limit; split them or use the CLI")
+
+type budgetedCSVFile struct {
+	io.ReadCloser
+	remaining *int64
+}
+
+func (file *budgetedCSVFile) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	if *file.remaining <= 0 {
+		var probe [1]byte
+		count, err := file.ReadCloser.Read(probe[:])
+		if count > 0 {
+			return 0, errDesktopCSVByteLimit
+		}
+		if err == nil {
+			return 0, io.ErrNoProgress
+		}
+		return 0, err
+	}
+	if int64(len(buffer)) > *file.remaining {
+		buffer = buffer[:int(*file.remaining)]
+	}
+	count, err := file.ReadCloser.Read(buffer)
+	*file.remaining -= int64(count)
+	return count, err
 }
 
 func createWorkflowLayer(runtime *demoRuntime, request layerSettingsRequest) error {
@@ -3331,7 +3410,7 @@ func luaFilterOrSplitLayer(runtime *demoRuntime, request layerSettingsRequest) e
 	if service == nil || readOnly {
 		return fmt.Errorf("project is read-only or unavailable")
 	}
-	source, ok := service.Layer(request.LayerName)
+	source, ok := service.ProjectLayerRenderSnapshot(request.LayerName)
 	if !ok {
 		return fmt.Errorf("layer %q not found", request.LayerName)
 	}

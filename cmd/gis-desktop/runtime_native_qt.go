@@ -2420,6 +2420,10 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 		r.visibility.Add(layerName)
 		r.visibility.Set(layerName, layer.Visible)
 	}
+	if r.layerStyleMu == nil {
+		r.layerStyleMu = &sync.RWMutex{}
+	}
+	r.layerStyleMu.Lock()
 	if r.layerStyles == nil {
 		r.layerStyles = map[string]core.LayerStyle{}
 	}
@@ -2435,6 +2439,7 @@ func (r *demoRuntime) rebuildEditedLayer(layerName string) error {
 		geometryType = layer.Features[0].Geometry.GeometryType()
 	}
 	r.layerGeometryTypes[layerName] = geometryType
+	r.layerStyleMu.Unlock()
 	r.layerFeatureCounts[layerName] = len(layer.Features)
 	if rebase {
 		for name, source := range updatedSources {

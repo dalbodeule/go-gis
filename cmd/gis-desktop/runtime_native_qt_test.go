@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -28,6 +30,21 @@ import (
 
 	"github.com/airbusgeo/godal"
 )
+
+func TestBudgetedCSVFileEnforcesActualBytesAcrossFiles(t *testing.T) {
+	remaining := int64(5)
+	first := &budgetedCSVFile{ReadCloser: io.NopCloser(strings.NewReader("abc")), remaining: &remaining}
+	second := &budgetedCSVFile{ReadCloser: io.NopCloser(strings.NewReader("def")), remaining: &remaining}
+	if data, err := io.ReadAll(first); err != nil || string(data) != "abc" {
+		t.Fatalf("first input = %q, %v", data, err)
+	}
+	if _, err := io.ReadAll(second); !errors.Is(err, errDesktopCSVByteLimit) {
+		t.Fatalf("combined byte limit error = %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining budget = %d", remaining)
+	}
+}
 
 func TestContextSemaphoreHonorsCapacityAndCancellation(t *testing.T) {
 	semaphore := newContextSemaphore(2)
@@ -3042,6 +3059,41 @@ func TestMultipleCSVAndLuaFilterSplitWorkflow(t *testing.T) {
 	selected, ok := runtime.service.Layer("selected")
 	if !ok || len(selected.Features) != 2 {
 		t.Fatalf("filtered layer = %+v, found=%t", selected, ok)
+	}
+}
+
+func TestLoadedShapefileSplitsByImportedCSVBoundary(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	shp := filepath.Join(directory, "parcel.shp")
+	parcel := core.Layer{Name: "parcel", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, GeometryType: "POLYGON", Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 3 0, 3 1, 0 1, 0 0))"}}}}
+	if err := (gdal.Writer{}).Write(ctx, shp, parcel); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadDataRuntimeFiles(ctx, []string{shp}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := runtime.service.LayerNames()
+	if len(names) != 1 {
+		t.Fatalf("loaded SHP layers = %v", names)
+	}
+	csvPath := filepath.Join(directory, "blocks.csv")
+	if err := os.WriteFile(csvPath, []byte("block,x,y\nA,0,0\nA,1,0\nA,0,1\nB,2,0\nB,3,0\nB,2,1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(layerSettingsRequest{Operation: "import-csv", InputPath: csvPath, OutputName: "blocks", XField: "x", YField: "y", CRS: "EPSG:5186", BuildBoundary: true, BoundaryGroupField: "block"})
+	if err := applyLayerSettings(runtime, string(request)); err != nil {
+		t.Fatal(err)
+	}
+	if err := splitLayerByBoundary(runtime, layerSettingsRequest{LayerName: names[0], BoundaryLayer: "blocks_boundaries", OutputName: "parts"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"B000001", "B000002"} {
+		layer, found := runtime.service.Layer("parts_" + id)
+		if !found || len(layer.Features) != 1 || layer.Features[0].Properties["shape_id"] != id {
+			t.Fatalf("SHP split %s = %+v found=%t", id, layer, found)
+		}
 	}
 }
 
