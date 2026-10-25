@@ -39,7 +39,21 @@ $Prefix = Join-Path $MsysRoot $Environment
 $MsysBin = Join-Path $MsysRoot 'usr\bin'
 $BinDir = Join-Path $Prefix 'bin'
 $QmlDir = Join-Path $RootDir 'cmd\gis-desktop\qml'
-$RuntimeOSArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$OSArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($null -ne $OSArchitecture) {
+    $RuntimeOSArch = $OSArchitecture.ToString()
+} else {
+    # Some Windows PowerShell/.NET hosts do not provide OSArchitecture.
+    $RuntimeOSArch = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    if ($RuntimeOSArch -eq 'AMD64') { $RuntimeOSArch = 'X64' }
+}
+if (-not $RuntimeOSArch) {
+    throw 'Unable to determine the Windows OS architecture.'
+}
 if ($RuntimeOSArch -ne $ExpectedGoArch) {
     throw "Building $Arch requires a native $Arch Windows host. Current OS architecture is $RuntimeOSArch."
 }
@@ -78,8 +92,13 @@ if (-not $env:GOCACHE) {
     $env:GOCACHE = Join-Path ([System.IO.Path]::GetTempPath()) 'gogis-go-build'
 }
 
-$GoArch = (& go env GOARCH).Trim()
-if ($LASTEXITCODE -ne 0 -or $GoArch -ne $Arch) {
+$GoArchOutput = @(& go env GOHOSTARCH 2>&1)
+$GoArchExitCode = $LASTEXITCODE
+if ($GoArchExitCode -ne 0 -or $GoArchOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$GoArchOutput[0])) {
+    throw ('Unable to read GOHOSTARCH from the Go toolchain (exit {0}): {1}' -f $GoArchExitCode, ($GoArchOutput -join ' '))
+}
+$GoArch = ([string]$GoArchOutput[0]).Trim()
+if ($GoArch -ne $Arch) {
     throw "Go toolchain architecture is $GoArch, but package target is $Arch. Use the native Go distribution for that architecture."
 }
 foreach ($Module in @('gdal', 'proj', 'geos', 'Qt6Core', 'Qt6Quick', 'Qt6Qml')) {
@@ -89,8 +108,17 @@ foreach ($Module in @('gdal', 'proj', 'geos', 'Qt6Core', 'Qt6Quick', 'Qt6Qml')) 
     }
 }
 
+$GdalProbe = Join-Path $BinDir 'gdalinfo.exe'
+$GdalVersionOutput = @(& $GdalProbe --version 2>&1)
+$GdalVersionExitCode = $LASTEXITCODE
+if ($GdalVersionExitCode -ne 0 -or $GdalVersionOutput.Count -eq 0 -or
+    [string]::IsNullOrWhiteSpace(($GdalVersionOutput -join ' '))) {
+    throw ('GDAL runtime cannot start in {0} (exit {1}). Check MSYS2 DLL compatibility, especially netCDF/HDF5. Output: {2}' -f
+        $BinDir, $GdalVersionExitCode, ($GdalVersionOutput -join ' '))
+}
+
 Write-Host "Building GoGIS Windows $Arch with MSYS2 $Environment"
-Write-Host "GDAL $((& (Join-Path $BinDir 'gdalinfo.exe') --version) -join ' ')"
+Write-Host "GDAL $($GdalVersionOutput -join ' ')"
 Write-Host "PROJ data: $env:PROJ_DATA"
 Write-Host "GDAL data: $env:GDAL_DATA"
 
@@ -159,7 +187,12 @@ function Resolve-DllClosure {
 
         $MsysPath = $Matches['path']
         if (-not $MsysPath.StartsWith('/')) { continue }
-        $ResolvedPath = (& $Cygpath -w $MsysPath).Trim()
+        $ResolvedPathOutput = @(& $Cygpath -w $MsysPath 2>&1)
+        $CygpathExitCode = $LASTEXITCODE
+        if ($CygpathExitCode -ne 0 -or $ResolvedPathOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$ResolvedPathOutput[0])) {
+            throw ('cygpath failed for {0} imported by {1} (exit {2}): {3}' -f $MsysPath, $Path, $CygpathExitCode, ($ResolvedPathOutput -join ' '))
+        }
+        $ResolvedPath = ([string]$ResolvedPathOutput[0]).Trim()
         if (-not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) { continue }
         $ResolvedPath = (Resolve-Path -LiteralPath $ResolvedPath).Path
         if ($ResolvedPath.StartsWith($WindowsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }

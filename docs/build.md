@@ -391,6 +391,12 @@ $env:Path = "C:\tools\msys64\ucrt64\bin;C:\tools\msys64\usr\bin;$env:Path"
 출력물이 있으면 덮어쓰지 않고 중단합니다. Inno Setup 6 `ISCC.exe`가 설치된 경우
 `-BuildInstaller`를 추가해 사용자 범위 설치 프로그램도 생성할 수 있습니다.
 
+패키징 전에 스크립트가 해당 MSYS2 환경의 `gdalinfo.exe --version`을 실행해 DLL
+로딩 실패를 검사합니다. 이 단계가 실패하면 먼저 MSYS2의 GDAL 의존성 호환성을
+확인해야 합니다. 예를 들어 `libnetcdf.dll`이 `H5Pset_fapl_ros3`를 요구하지만
+`libhdf5-320.dll`이 이를 내보내지 않으면 실행 파일도 시작되지 않습니다.
+이미 생성된 폴더나 ZIP은 의존성을 수정한 뒤 새 버전으로 다시 만들어야 합니다.
+
 ```powershell
 .\scripts\package_windows.ps1 -Arch amd64 -Version 0.1.0-dev -BuildInstaller
 ```
