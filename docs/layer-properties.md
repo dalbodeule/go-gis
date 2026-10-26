@@ -13,6 +13,10 @@ Appending another layer keeps the current map center and zoom while expanding
 the combined extent. Start the desktop in Korean or Japanese with
 `./build/gogis-desktop-native --lang=ko` or `--lang=jp`; English is the default.
 The **About GoGIS** window shows version, runtime, build target, and license.
+At the minimum window width, **Project CRS**, **Edit vertices**, **About GoGIS**,
+and **Settings** move into the toolbar's **More** menu so every action remains
+reachable. **Add vector files**, **PostGIS tables**, **Open workspace**,
+**Attributes**, and **Save / Export** remain on the toolbar.
 Right-click a layer and choose **Remove layer…** to remove it from the current
 project after confirmation. Its SHP, GeoPackage, or other source file is not
 deleted. Clicking outside the layer menu closes it. Adding or removing other
@@ -90,13 +94,17 @@ eligible labels instead of applying the screen decluttering. DXF point labels
 use the same compass direction and text justification, with the configured
 offset scaled proportionally to the exported text height in drawing units.
 
-The **Open Lua editor and examples…** dialog shows the active layer's field
-names and provides separate editors for three conditions: feature display,
-label visibility, and label text. The feature display filter determines which
-features are drawn and returned by map hit testing; it only filters the render
-view and does not delete or modify source features. Its script must return a
-boolean. The optional label rule only suppresses labels and must also return a
-boolean. The label script replaces the property template and must return a
+The **Open Lua editor and examples…** dialog provides tabs for three scripts:
+feature display, label visibility, and label text. Switch tabs to edit each
+script; the field picker inserts into the selected script, and **Examples**
+shows examples for that tab. **Lua helpers** expands the available function
+signatures. **OK** applies all three scripts to the layer settings; **Cancel**
+discards changes made in the editor. The feature display filter determines
+which features are drawn and returned by map hit testing;
+it only filters the render view and does not delete or modify source features.
+Its script must return a boolean. The optional label rule only suppresses
+labels and must also return a boolean. The label script replaces the property
+template and must return a
 string, number, or `nil`. All scripts read attributes through the read-only
 `feature` table, for example:
 
@@ -107,6 +115,9 @@ return string.format("%s (%s)", feature.name, feature.class)
 ```lua
 return feature.class == "primary"
 ```
+
+Each tab gives its code editor the available space, including at the minimum
+window height. The display filter tab opens first.
 
 The field picker inserts bracket syntax for Lua keywords and field names that
 cannot use dot syntax. Quotes, backslashes, and control characters in a field

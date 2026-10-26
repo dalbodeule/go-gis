@@ -694,6 +694,72 @@ TestCase {
         dialog.close();
     }
 
+    function test_compactToolbarKeepsSecondaryActionsReachable() {
+        var previousWidth = appWindow.width;
+        var more = findChild(appWindow, "moreActionsButton");
+        var menu = findChild(appWindow, "moreActionsMenu");
+        var about = findChild(appWindow, "moreAboutAction");
+        var settings = findChild(appWindow, "moreSettingsAction");
+        var crs = findChild(appWindow, "moreProjectCRSAction");
+        var vertexEdit = findChild(appWindow, "moreVertexEditAction");
+        var aboutDialog = findChild(appWindow, "aboutDialog");
+        var settingsDialog = findChild(appWindow, "applicationSettingsDialog");
+        var crsDialog = findChild(appWindow, "projectCRSDialog");
+        var store = findChild(appWindow, "applicationSettingsStore");
+        verify(more !== null && menu !== null && about !== null && settings !== null &&
+               crs !== null && vertexEdit !== null && store !== null && settingsDialog !== null && crsDialog !== null);
+        var previousPreference = store.interfaceLanguage;
+        try {
+            appWindow.width = 960;
+            tryCompare(appWindow, "compactToolbar", true);
+            compare(more.visible, true);
+            compare(findChild(appWindow, "aboutButton").visible, false);
+            for (var language of ["en", "ko", "jp"]) {
+                store.interfaceLanguage = language;
+                tryCompare(appWindow, "language", language);
+                var rightEdge = more.mapToItem(null, more.width, 0).x;
+                verify(rightEdge <= appWindow.width - 5,
+                       language + " More button must remain inside the minimum-width window: " + rightEdge);
+            }
+            mouseClick(more);
+            tryCompare(menu, "visible", true);
+            mouseClick(about);
+            tryCompare(aboutDialog, "visible", true);
+            aboutDialog.close();
+            mouseClick(more);
+            tryCompare(menu, "visible", true);
+            mouseClick(settings);
+            tryCompare(settingsDialog, "visible", true);
+            settingsDialog.close();
+            mouseClick(more);
+            tryCompare(menu, "visible", true);
+            mouseClick(crs);
+            tryCompare(crsDialog, "visible", true);
+            crsDialog.close();
+            appWindow.width = 1360;
+            tryCompare(appWindow, "compactToolbar", false);
+            var settingsButton = findChild(appWindow, "applicationSettingsButton");
+            var wideEdges = [];
+            for (var wideLanguage of ["en", "ko", "jp"]) {
+                store.interfaceLanguage = wideLanguage;
+                tryCompare(appWindow, "language", wideLanguage);
+                var wideRightEdge = settingsButton.mapToItem(null, settingsButton.width, 0).x;
+                wideEdges.push(wideLanguage + ":" + wideRightEdge);
+            }
+            verify(wideEdges.every(function(edge) { return Number(edge.split(":")[1]) <= appWindow.width - 5; }),
+                   "settings button must fit at the expanded-toolbar threshold: " + wideEdges.join(", "));
+        } finally {
+            menu.close();
+            aboutDialog.close();
+            settingsDialog.close();
+            crsDialog.close();
+            store.interfaceLanguage = previousPreference;
+            appWindow.width = previousWidth;
+        }
+        tryCompare(appWindow, "compactToolbar", false);
+        compare(findChild(appWindow, "aboutButton").visible, true);
+    }
+
     function test_applicationSettingsExposeLanguageAndRestoreDefaults() {
         var button = findChild(appWindow, "applicationSettingsButton");
         var dialog = findChild(appWindow, "applicationSettingsDialog");
@@ -709,6 +775,7 @@ TestCase {
             tryCompare(dialog, "visible", true);
             compare(language.valueAt(language.currentIndex), previousPreference);
             compare(indexThreshold.value, 10000);
+            compare(indexThreshold.textFromValue(10000, Qt.locale("en_US")), "10,000");
             indexThreshold.value = 50000;
             indexThreshold.valueModified();
             compare(store.shapefileIndexThreshold, 50000);
@@ -732,8 +799,11 @@ TestCase {
         var viewport = findChild(appWindow, "mapViewport");
         verify(editor !== null);
         verify(displayEditor !== null);
+        var tabs = findChild(dialog, "luaEditorTabs");
+        verify(tabs !== null);
         dialog.open();
         tryCompare(dialog, "visible", true);
+        tabs.currentIndex = 2;
         var keywordScript = 'if feature.NAME then return "road" end';
         editor.text = keywordScript;
         compare(editor.text, keywordScript);
@@ -797,11 +867,11 @@ TestCase {
         var concatenationExample = findChild(appWindow, "insertLuaConcatenationExampleButton");
         var numberFormatExample = findChild(appWindow, "insertLuaNumberFormatExampleButton");
         verify(likeExample !== null && concatenationExample !== null && numberFormatExample !== null);
-        likeExample.clicked();
+        likeExample.triggered();
         verify(displayEditor.text.indexOf("gogis.contains") >= 0 && displayEditor.text.indexOf("true)") >= 0);
-        concatenationExample.clicked();
+        concatenationExample.triggered();
         verify(editor.text.indexOf("..") >= 0 && editor.text.indexOf("gogis.coalesce") >= 0);
-        numberFormatExample.clicked();
+        numberFormatExample.triggered();
         verify(editor.text.indexOf("gogis.format_number(feature.AREA, 2)") >= 0);
         verify(findChild(dialog, "luaShortcutHelp") !== null);
         var manyFields = [{name: "road class", type: "text"}];
@@ -820,7 +890,7 @@ TestCase {
         var browseFields = findChild(dialog, "luaBrowseFieldsButton");
         verify(fieldSummary !== null && browseFields !== null);
         verify(fieldSummary.text.indexOf("31") >= 0 && fieldSummary.text.length < 80);
-        editor.text = "return " + "feature.A3 .. ".repeat(60);
+        editor.text = "return " + "feature.A3 .. ".repeat(200);
         sourceArea.cursorPosition = editor.text.length;
         sourceArea.forceActiveFocus();
         tryCompare(sourceArea, "activeFocus", true);
@@ -829,6 +899,7 @@ TestCase {
                "long lines should wrap into visible rows rather than clipping horizontally");
         editor.text = "return ";
         editor.cursorPosition = editor.text.length;
+        tabs.currentIndex = 2;
         browseFields.clicked();
         var fieldPopup = findChild(appWindow, "labelFieldHintPopup");
         tryCompare(fieldPopup, "visible", true);
@@ -850,7 +921,63 @@ TestCase {
         tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
         mouseClick(fieldList.itemAtIndex(0));
         compare(editor.text, 'return feature["end"]');
+        tabs.currentIndex = 0;
+        displayEditor.text = "return ";
+        displayEditor.cursorPosition = displayEditor.text.length;
+        browseFields.clicked();
+        tryCompare(fieldPopup, "visible", true);
+        tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
+        mouseClick(fieldList.itemAtIndex(0));
+        compare(displayEditor.text, 'return feature["end"]');
+        compare(editor.text, 'return feature["end"]', "switching tabs must preserve label text");
+        tabs.currentIndex = 1;
+        var ruleEditor = findChild(dialog, "labelRuleEditor");
+        ruleEditor.text = "return ";
+        ruleEditor.cursorPosition = ruleEditor.text.length;
+        browseFields.clicked();
+        tryCompare(fieldPopup, "visible", true);
+        tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
+        mouseClick(fieldList.itemAtIndex(0));
+        compare(ruleEditor.text, 'return feature["end"]');
         dialog.close();
+    }
+
+    function test_luaEditorTabsFitAtMinimumHeight() {
+        var previousHeight = appWindow.height;
+        var dialog = findChild(appWindow, "luaEditorDialog");
+        var editor = findChild(dialog, "labelLuaField");
+        var tabs = findChild(dialog, "luaEditorTabs");
+        var examplesButton = findChild(dialog, "luaExamplesButton");
+        var examplesMenu = findChild(dialog, "luaExamplesMenu");
+        var helpButton = findChild(dialog, "luaHelpButton");
+        var helpDetails = findChild(dialog, "luaHelperDetails");
+        verify(examplesButton !== null && examplesMenu !== null);
+        verify(helpButton !== null && helpDetails !== null);
+        try {
+            appWindow.height = 640;
+            dialog.open();
+            tryCompare(dialog, "visible", true);
+            tryCompare(tabs, "currentIndex", 0);
+            compare(helpDetails.visible, false);
+            mouseClick(helpButton);
+            compare(helpDetails.visible, true);
+            for (var index = 0; index < 3; ++index) {
+                tabs.currentIndex = index;
+                var active = index === 0 ? findChild(dialog, "featureDisplayRuleEditor")
+                    : index === 1 ? findChild(dialog, "labelRuleEditor") : editor;
+                tryVerify(function() { return active.visible && active.height >= 200; });
+                verify(active.mapToItem(dialog.contentItem, 0, active.height).y < dialog.contentItem.height,
+                       "active editor must fit above the dialog buttons");
+                examplesButton.clicked();
+                tryCompare(examplesMenu, "visible", true);
+                compare(findChild(dialog, "insertLuaLikeExampleButton").visible, index === 0);
+                compare(findChild(dialog, "insertLuaNumberFormatExampleButton").visible, index === 2);
+                examplesMenu.close();
+            }
+        } finally {
+            dialog.close();
+            appWindow.height = previousHeight;
+        }
     }
 
     function test_mapDragPansViewport() {

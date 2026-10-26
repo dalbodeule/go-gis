@@ -36,6 +36,7 @@ ApplicationWindow {
         });
     }
     property bool vertexEditMode: false
+    property bool compactToolbar: width < 1360
     property string language: appLanguagePreference === "system" ? systemInterfaceLanguage() : appLanguagePreference
     readonly property string appLanguagePreference: typeof appLanguage === "undefined" ? "system" : appLanguage
     property string versionText: typeof appVersion === "undefined" ? "0.1.0-dev" : appVersion
@@ -86,6 +87,7 @@ ApplicationWindow {
 
     property var luaTranslations: ({
         en: ({
+            "Lua editor": "Lua editor", "Display filter": "Display filter", "Label rule": "Label rule", "Label text": "Label text", "Examples": "Examples", "Lua helpers": "Lua helpers",
             "Lua label editor": "Lua label editor",
             "Export project layers to DXF": "Export project layers to DXF",
             "Feature display filter — return true to draw this feature": "Feature display filter — return true to draw this feature",
@@ -103,6 +105,7 @@ ApplicationWindow {
             "Lua field types": "Lua field types", "Open the attribute table to inspect the layer schema.": "Open the attribute table to inspect the layer schema."
         }),
         ko: ({
+            "Lua editor": "Lua 편집기", "Display filter": "표시 필터", "Label rule": "레이블 규칙", "Label text": "레이블 문자", "Examples": "예제", "Lua helpers": "Lua 함수 도움말",
             "Lua label editor": "Lua 레이블 편집기",
             "Export project layers to DXF": "프로젝트 레이어를 DXF로 내보내기",
             "Feature display filter — return true to draw this feature": "피처 표시 필터 — 그릴 피처는 true 반환",
@@ -120,6 +123,7 @@ ApplicationWindow {
             "Lua field types": "Lua 필드 형식", "Open the attribute table to inspect the layer schema.": "레이어 필드를 확인하려면 속성 테이블을 여세요."
         }),
         jp: ({
+            "Lua editor": "Luaエディター", "Display filter": "表示フィルター", "Label rule": "ラベルルール", "Label text": "ラベル文字", "Examples": "例", "Lua helpers": "Lua関数のヘルプ",
             "Lua label editor": "Luaラベルエディター",
             "Export project layers to DXF": "プロジェクトのレイヤーをDXFにエクスポート",
             "Feature display filter — return true to draw this feature": "地物表示フィルター — 描画する地物はtrueを返す",
@@ -447,11 +451,13 @@ ApplicationWindow {
             }
             Button {
                 objectName: "projectCRSButton"
+                visible: !rootWindow.compactToolbar
                 text: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project CRS"
                 onClicked: projectCRSDialog.open()
             }
             Button {
                 objectName: "toggleVertexEditButton"
+                visible: !rootWindow.compactToolbar
                 text: rootWindow.vertexEditMode ? "Finish vertex edit" : "Edit vertices"
                 enabled: layerModel.count > 0 && mapCanvas.visible
                 onClicked: rootWindow.vertexEditMode = !rootWindow.vertexEditMode
@@ -463,18 +469,54 @@ ApplicationWindow {
                 onClicked: projectActionsMenu.popup(projectActionsButtonControl, 0, projectActionsButtonControl.height)
             }
             Button {
+                id: moreActionsButton
+                objectName: "moreActionsButton"
+                visible: rootWindow.compactToolbar
+                text: rootWindow.language === "ko" ? "더보기" : rootWindow.language === "jp" ? "その他" : "More"
+                onClicked: moreActionsMenu.popup(moreActionsButton, 0, moreActionsButton.height)
+            }
+            Button {
                 objectName: "aboutButton"
+                visible: !rootWindow.compactToolbar
                 text: rootWindow.tr("About GoGIS")
                 onClicked: aboutDialog.open()
             }
             Button {
                 objectName: "applicationSettingsButton"
+                visible: !rootWindow.compactToolbar
                 text: "⚙"
                 Accessible.name: rootWindow.language === "ko" ? "설정" : rootWindow.language === "jp" ? "設定" : "Settings"
                 ToolTip.visible: hovered
                 ToolTip.text: Accessible.name
                 onClicked: applicationSettingsDialog.open()
             }
+        }
+    }
+
+    Menu {
+        id: moreActionsMenu
+        objectName: "moreActionsMenu"
+        MenuItem {
+            objectName: "moreProjectCRSAction"
+            text: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project CRS"
+            onTriggered: projectCRSDialog.open()
+        }
+        MenuItem {
+            objectName: "moreVertexEditAction"
+            text: rootWindow.vertexEditMode ? "Finish vertex edit" : "Edit vertices"
+            enabled: layerModel.count > 0 && mapCanvas.visible
+            onTriggered: rootWindow.vertexEditMode = !rootWindow.vertexEditMode
+        }
+        MenuSeparator {}
+        MenuItem {
+            objectName: "moreAboutAction"
+            text: rootWindow.tr("About GoGIS")
+            onTriggered: aboutDialog.open()
+        }
+        MenuItem {
+            objectName: "moreSettingsAction"
+            text: rootWindow.language === "ko" ? "설정" : rootWindow.language === "jp" ? "設定" : "Settings"
+            onTriggered: applicationSettingsDialog.open()
         }
     }
 
@@ -528,6 +570,7 @@ ApplicationWindow {
         id: createLayerDialog
         objectName: "createLayerDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "빈 레이어 만들기" : "Create empty layer"
         width: Math.min(450, rootWindow.width - 32)
         property string errorText: ""
@@ -563,6 +606,7 @@ ApplicationWindow {
         id: importCsvDialog
         objectName: "importCsvDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "CSV/TSV 좌표 추가" : "Import CSV/TSV points"
         width: Math.min(650, rootWindow.width - 32)
         property string inputPath: ""
@@ -640,6 +684,7 @@ ApplicationWindow {
         id: workflowDialog
         objectName: "workflowDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "업무 워크플로우" : "Workflow tools"
         width: Math.min(560, rootWindow.width - 32)
         property var operationCodes: ["measure-layer", "validate-layer", "filter-layer", "polygon-layer", "join-table", "label-field", "lua-filter", "lua-split", "split-boundary"]
@@ -762,6 +807,7 @@ ApplicationWindow {
         id: spatialOperationDialog
         objectName: "spatialOperationDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "공간 연산" : rootWindow.language === "jp" ? "空間演算" : "Spatial operation"
         standardButtons: Dialog.Ok | Dialog.Cancel
         width: Math.min(520, rootWindow.width - 48)
@@ -845,6 +891,7 @@ ApplicationWindow {
         id: postGISTableDialog
         objectName: "postGISTableDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "PostGIS 테이블 목록" : rootWindow.language === "jp" ? "PostGISテーブル一覧" : "PostGIS table catalog"
         width: Math.min(620, rootWindow.width - 48)
         height: Math.min(560, rootWindow.height - 80)
@@ -933,6 +980,7 @@ ApplicationWindow {
         id: deleteRecordDialog
         objectName: "deleteRecordDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         implicitWidth: 420
         title: rootWindow.language === "ko" ? "레코드 삭제 확인" : rootWindow.language === "jp" ? "レコード削除の確認" : "Confirm record deletion"
         standardButtons: Dialog.Ok | Dialog.Cancel
@@ -951,6 +999,7 @@ ApplicationWindow {
         id: addRecordDialog
         objectName: "addRecordDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "레코드 추가" : rootWindow.language === "jp" ? "レコード追加" : "Add record"
         width: Math.min(560, rootWindow.width - 48)
         contentItem: ColumnLayout {
@@ -1009,6 +1058,7 @@ ApplicationWindow {
         id: removeLayerDialog
         objectName: "removeLayerDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.tr("Remove layer from project")
         standardButtons: Dialog.Ok | Dialog.Cancel
         width: Math.min(440, rootWindow.width - 48)
@@ -2717,6 +2767,7 @@ ApplicationWindow {
         id: applicationSettingsDialog
         objectName: "applicationSettingsDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "GoGIS 설정" : rootWindow.language === "jp" ? "GoGIS 設定" : "GoGIS Settings"
         width: Math.min(480, rootWindow.width - 48)
         standardButtons: Dialog.Close
@@ -2760,7 +2811,7 @@ ApplicationWindow {
                     stepSize: 1000
                     editable: true
                     value: userSettings.shapefileIndexThreshold
-                    textFromValue: function(value, locale) { return value === 0 ? (rootWindow.language === "ko" ? "사용 안 함" : rootWindow.language === "jp" ? "無効" : "Off") : Number(value).toLocaleString(locale) }
+                    textFromValue: function(value, locale) { return value === 0 ? (rootWindow.language === "ko" ? "사용 안 함" : rootWindow.language === "jp" ? "無効" : "Off") : Number(value).toLocaleString(locale, 'f', 0) }
                     valueFromText: function(text, locale) { return Number.fromLocaleString(locale, text.replace(/[^0-9]/g, "")) }
                     onValueModified: userSettings.shapefileIndexThreshold = value
                 }
@@ -2786,6 +2837,7 @@ ApplicationWindow {
         id: aboutDialog
         objectName: "aboutDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.tr("About GoGIS")
         width: Math.min(460, rootWindow.width - 48)
         standardButtons: Dialog.Close
@@ -2814,6 +2866,7 @@ ApplicationWindow {
         id: attributeDialog
         objectName: "attributeDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.tr("Attributes") + " — " + mapViewport.activeLayer
         width: Math.min(780, rootWindow.width - 48)
         height: Math.min(680, rootWindow.height - 80)
@@ -3236,6 +3289,7 @@ ApplicationWindow {
         id: layerSettingsDialog
         objectName: "layerSettingsDialog"
         modal: true
+        anchors.centerIn: Overlay.overlay
         title: rootWindow.tr("Layer properties") + " — " + targetLayerName
         width: Math.min(720, rootWindow.width - 48)
         height: Math.max(320, Math.min(760, rootWindow.height - 80))
@@ -4008,11 +4062,14 @@ ApplicationWindow {
         id: luaEditorDialog
         objectName: "luaEditorDialog"
         modal: true
-        title: rootWindow.tr("Lua label editor") + " — " + layerSettingsDialog.targetLayerName
+        anchors.centerIn: Overlay.overlay
+        title: rootWindow.tr("Lua editor") + " — " + layerSettingsDialog.targetLayerName
         width: Math.min(760, rootWindow.width - 64)
-        height: Math.min(680, rootWindow.height - 80)
+        height: Math.min(620, rootWindow.height - 64)
         standardButtons: Dialog.Ok | Dialog.Cancel
         onOpened: {
+            luaEditorTabs.currentIndex = 0;
+            luaHelpButton.checked = false;
             labelRuleEditor.text = labelRuleField.text;
             labelLuaField.text = layerSettingsDialog.labelLuaSource;
             featureDisplayRuleEditor.text = layerSettingsDialog.displayRuleSource;
@@ -4022,155 +4079,145 @@ ApplicationWindow {
             layerSettingsDialog.labelLuaSource = labelLuaField.text;
             layerSettingsDialog.displayRuleSource = featureDisplayRuleEditor.text;
         }
-        contentItem: ScrollView {
-            clip: true
-            contentWidth: availableWidth
-            ColumnLayout {
-                width: parent.width
-                spacing: 8
+        function activeEditor() {
+            if (luaEditorTabs.currentIndex === 0) return featureDisplayRuleEditor;
+            if (luaEditorTabs.currentIndex === 1) return labelRuleEditor;
+            return labelLuaField;
+        }
+        contentItem: ColumnLayout {
+            spacing: 10
+            TabBar {
+                id: luaEditorTabs
+                objectName: "luaEditorTabs"
+                Layout.fillWidth: true
+                TabButton { text: rootWindow.tr("Display filter") }
+                TabButton { text: rootWindow.tr("Label rule") }
+                TabButton { text: rootWindow.tr("Label text") }
+            }
             Label {
                 Layout.fillWidth: true
-                text: rootWindow.tr("Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.")
+                text: luaEditorTabs.currentIndex === 0
+                    ? rootWindow.tr("Feature display filter — return true to draw this feature")
+                    : luaEditorTabs.currentIndex === 1
+                        ? rootWindow.tr("Display rule — return true to show this feature's label")
+                        : rootWindow.tr("Label text — return string, number, or nil")
                 wrapMode: Text.WordWrap
                 color: "#45515c"
             }
             Label {
-                objectName: "luaFieldSummary"
-                text: mapViewport.luaFieldHintText()
                 Layout.fillWidth: true
+                visible: luaEditorTabs.currentIndex === 0
+                text: rootWindow.tr("Feature display filter hides features from the map only; source data stays unchanged.")
+                wrapMode: Text.WordWrap
                 color: "#65717d"
             }
-            Button {
-                objectName: "luaBrowseFieldsButton"
-                text: rootWindow.tr("Available fields…")
-                enabled: mapViewport.attributeFieldHints.length > 0
-                onClicked: {
-                    labelFieldHintPopup.targetEditor = labelLuaField;
-                    labelFieldHintPopup.open();
+            Item {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                LuaCodeEditor {
+                    id: featureDisplayRuleEditor
+                    objectName: "featureDisplayRuleEditor"
+                    anchors.fill: parent
+                    visible: luaEditorTabs.currentIndex === 0
+                    placeholderText: "return feature.STATUS ~= \"retired\""
+                }
+                LuaCodeEditor {
+                    id: labelRuleEditor
+                    objectName: "labelRuleEditor"
+                    anchors.fill: parent
+                    visible: luaEditorTabs.currentIndex === 1
+                    placeholderText: "return feature.CLASS == \"primary\""
+                }
+                LuaCodeEditor {
+                    id: labelLuaField
+                    objectName: "labelLuaField"
+                    anchors.fill: parent
+                    visible: luaEditorTabs.currentIndex === 2
+                    placeholderText: "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
                 }
             }
             Label {
+                objectName: "luaFieldSummary"
                 Layout.fillWidth: true
-                text: rootWindow.tr("Lua API help")
-                wrapMode: Text.WordWrap
-                color: "#45515c"
+                text: mapViewport.luaFieldHintText()
+                color: "#65717d"
+                elide: Text.ElideRight
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Button {
+                    objectName: "luaBrowseFieldsButton"
+                    text: rootWindow.tr("Available fields…")
+                    enabled: mapViewport.attributeFieldHints.length > 0
+                    onClicked: {
+                        labelFieldHintPopup.targetEditor = luaEditorDialog.activeEditor();
+                        labelFieldHintPopup.open();
+                    }
+                }
+                Button {
+                    id: luaHelpButton
+                    objectName: "luaHelpButton"
+                    text: rootWindow.tr("Lua helpers")
+                    checkable: true
+                }
+                Item { Layout.fillWidth: true }
+                Button {
+                    objectName: "luaExamplesButton"
+                    text: rootWindow.tr("Examples")
+                    onClicked: luaExamplesMenu.open()
+                    Menu {
+                        id: luaExamplesMenu
+                        objectName: "luaExamplesMenu"
+                        MenuItem {
+                            text: rootWindow.tr("Insert filter example")
+                            visible: luaEditorTabs.currentIndex === 0
+                            onTriggered: featureDisplayRuleEditor.text = "return feature.STATUS ~= \"retired\""
+                        }
+                        MenuItem {
+                            objectName: "insertLuaLikeExampleButton"
+                            text: rootWindow.tr("Insert LIKE example")
+                            visible: luaEditorTabs.currentIndex === 0
+                            onTriggered: featureDisplayRuleEditor.text = "return gogis.contains(feature.NAME, \"road\", true)"
+                        }
+                        MenuItem {
+                            text: rootWindow.tr("Insert rule example")
+                            visible: luaEditorTabs.currentIndex === 1
+                            onTriggered: labelRuleEditor.text = "return feature.CLASS == \"primary\""
+                        }
+                        MenuItem {
+                            text: rootWindow.tr("Insert label example")
+                            visible: luaEditorTabs.currentIndex === 2
+                            onTriggered: labelLuaField.text = "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
+                        }
+                        MenuItem {
+                            objectName: "insertLuaConcatenationExampleButton"
+                            text: rootWindow.tr("Insert concatenation example")
+                            visible: luaEditorTabs.currentIndex === 2
+                            onTriggered: labelLuaField.text = "return tostring(gogis.coalesce(feature.NAME, \"\")) .. \" / \" .. tostring(gogis.coalesce(feature.CODE, \"\"))"
+                        }
+                        MenuItem {
+                            objectName: "insertLuaNumberFormatExampleButton"
+                            text: rootWindow.tr("Insert number format example")
+                            visible: luaEditorTabs.currentIndex === 2
+                            onTriggered: labelLuaField.text = "return gogis.format_number(feature.AREA, 2)"
+                        }
+                    }
+                }
             }
             Label {
                 objectName: "luaShortcutHelp"
                 Layout.fillWidth: true
+                text: rootWindow.tr("Scripts run once for each feature. The read-only `feature` table exposes the layer's attributes. Use feature.FIELD or feature[\"FIELD NAME\"] for field names with spaces.")
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+            }
+            Label {
+                objectName: "luaHelperDetails"
+                Layout.fillWidth: true
+                visible: luaHelpButton.checked
                 text: "gogis.format_number(value, decimals) · gogis.coalesce(a, b) · gogis.trim(text) · gogis.contains(text, part, ignoreCase)"
                 wrapMode: Text.WordWrap
                 color: "#526578"
-            }
-            Label {
-                text: rootWindow.tr("Feature display filter — return true to draw this feature")
-                font.bold: true
-            }
-            LuaCodeEditor {
-                id: featureDisplayRuleEditor
-                objectName: "featureDisplayRuleEditor"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 105
-                placeholderText: "return feature.STATUS ~= \"retired\""
-            }
-            ComboBox {
-                objectName: "insertLuaDisplayFilterFieldCombo"
-                Layout.fillWidth: true
-                model: mapViewport.attributeFieldHints
-                textRole: "name"
-                enabled: mapViewport.attributeFieldHints.length > 0
-                displayText: rootWindow.tr("Insert field into display filter…")
-                onActivated: function(index) {
-                    var fieldName = mapViewport.attributeFieldHints[index].name;
-                    featureDisplayRuleEditor.insert(featureDisplayRuleEditor.cursorPosition, mapViewport.luaFieldAccess(fieldName));
-                    currentIndex = -1;
-                }
-            }
-            Label {
-                text: rootWindow.tr("Display rule — return true to show this feature's label")
-                font.bold: true
-            }
-            LuaCodeEditor {
-                id: labelRuleEditor
-                objectName: "labelRuleEditor"
-                Layout.fillWidth: true
-                Layout.preferredHeight: 100
-                placeholderText: "return feature.CLASS == \"primary\""
-            }
-            ComboBox {
-                objectName: "insertLuaRuleFieldCombo"
-                Layout.fillWidth: true
-                model: mapViewport.attributeFieldHints
-                textRole: "name"
-                enabled: mapViewport.attributeFieldHints.length > 0
-                displayText: rootWindow.tr("Insert field into rule…")
-                onActivated: function(index) {
-                    var fieldName = mapViewport.attributeFieldHints[index].name;
-                    labelRuleEditor.insert(labelRuleEditor.cursorPosition, mapViewport.luaFieldAccess(fieldName));
-                    currentIndex = -1;
-                }
-            }
-            Label {
-                text: rootWindow.tr("Label text — return string, number, or nil")
-                font.bold: true
-            }
-            LuaCodeEditor {
-                id: labelLuaField
-                objectName: "labelLuaField"
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                placeholderText: "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
-            }
-            ComboBox {
-                objectName: "insertLuaLabelFieldCombo"
-                Layout.fillWidth: true
-                model: mapViewport.attributeFieldHints
-                textRole: "name"
-                enabled: mapViewport.attributeFieldHints.length > 0
-                displayText: rootWindow.tr("Insert field into label…")
-                onActivated: function(index) {
-                    var fieldName = mapViewport.attributeFieldHints[index].name;
-                    labelLuaField.insert(labelLuaField.cursorPosition, mapViewport.luaFieldAccess(fieldName));
-                    currentIndex = -1;
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Label { Layout.fillWidth: true }
-                Button {
-                    text: rootWindow.tr("Insert label example")
-                    onClicked: labelLuaField.text = "return string.format(\"%s (%s)\", feature.NAME, feature.CLASS)"
-                }
-                Button {
-                    text: rootWindow.tr("Insert rule example")
-                    onClicked: labelRuleEditor.text = "return feature.CLASS == \"primary\""
-                }
-                Button {
-                    text: rootWindow.tr("Insert filter example")
-                    onClicked: featureDisplayRuleEditor.text = "return feature.STATUS ~= \"retired\""
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Button {
-                    Layout.fillWidth: true
-                    objectName: "insertLuaLikeExampleButton"
-                    text: rootWindow.tr("Insert LIKE example")
-                    onClicked: featureDisplayRuleEditor.text = "return gogis.contains(feature.NAME, \"road\", true)"
-                }
-                Button {
-                    Layout.fillWidth: true
-                    objectName: "insertLuaConcatenationExampleButton"
-                    text: rootWindow.tr("Insert concatenation example")
-                    onClicked: labelLuaField.text = "return tostring(gogis.coalesce(feature.NAME, \"\")) .. \" / \" .. tostring(gogis.coalesce(feature.CODE, \"\"))"
-                }
-                Button {
-                    Layout.fillWidth: true
-                    objectName: "insertLuaNumberFormatExampleButton"
-                    text: rootWindow.tr("Insert number format example")
-                    onClicked: labelLuaField.text = "return gogis.format_number(feature.AREA, 2)"
-                }
-            }
             }
         }
     }

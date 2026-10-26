@@ -23,7 +23,7 @@
 - GEOS: 교차·합집합·차집합·버퍼 등 공간 연산
 - PostgreSQL/PostGIS: 트랜잭션 기반 DB 읽기·쓰기
 - DXF exporter: 자체 포맷 경계와 실제 ARES Commander 검증을 거쳐 채택
-- GUI: Qt 바인딩과 Wails+WebGL/WebGPU를 수직 프로토타입으로 비교한 뒤 결정
+- GUI: 현재 Qt 6 Quick/MIQT 데스크톱 구현 사용. Wails+WebGL/WebGPU 비교와 최종 기술 확정은 별도 결정
 - Lua: 안전한 공개 명령 API 위에 최소 스크립팅 계층으로 추가
 
 네이티브 의존성은 Go 코어에 직접 섞지 않고 `drivers/` 경계에 둡니다. 바인딩 모듈은 `go.mod`에 등록되어 있지만 실제 CGO import 경계는 `native` build tag 아래에 있으므로, 기본 CLI 빌드는 네이티브 GIS 설치 없이도 가능합니다. 운영체제별 설치와 네이티브 빌드는 [빌드 가이드](docs/build.md)를 따릅니다.
@@ -113,7 +113,13 @@ go test ./...
 
 # Qt Quick 데스크톱 빌드: build/gogis-desktop
 ./scripts/build.sh desktop
+
+# SHP/GeoPackage 등 네이티브 GIS 입력을 포함한 데스크톱: build/gogis-desktop-native
+./scripts/build.sh desktop-native
 ```
+
+`desktop`은 Qt 화면 프로토타입이고, 실제 벡터 파일 입출력을 확인하려면
+GDAL/PROJ/GEOS가 연결된 `desktop-native`를 사용합니다.
 
 네이티브 GIS 드라이버를 포함한 CLI는 다음과 같이 빌드합니다.
 
@@ -145,6 +151,8 @@ MVP 요구사항별 자동·수동 검증 범위는 [MVP 체크리스트](docs/v
 현재 구현 범위와 우선순위별 다음 목표는 [진행 현황과 다음 목표](docs/next-steps.md)를
 참고하세요. ARES Commander 실사용은 사용자가 완료했다고 확인했으며, Windows/Linux
 앱 빌드와 세 OS 배포 패키지 검증은 아직 남아 있습니다.
+좁은 창의 도구 모음과 로컬 성능 측정 범위는
+[UI·성능 점검 기록](docs/verification/ui-ux-performance-2026-10-26.md)에 남겼습니다.
 
 공간 연산은 native CLI에서 다음과 같이 실행합니다. `buffer`는 `--distance`를
 사용하고, 이외의 연산은 `--right-input`을 추가로 지정합니다. 출력 확장자는
