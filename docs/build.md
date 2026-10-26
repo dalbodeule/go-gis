@@ -371,6 +371,16 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build.ps1 clean
 ```
 
+`native`, `desktop`, `desktop-native`, `all`, `all-native`는 CGO를 켜고 C/C++
+컴파일러 및 `pkg-config`를 검사합니다. 컴파일러가 PATH에 없으면
+`MSYS2_ROOT`(설정된 경우), `C:\tools\msys64`, `C:\msys64` 순서로 현재 Go
+아키텍처에 맞는 UCRT64/CLANGARM64 환경을 찾습니다. 다른 위치에 설치했다면
+`$env:MSYS2_ROOT = '설치 경로'`를 먼저 지정하세요. 이미 `CC`와 PATH를
+설정한 개발 환경은 그대로 사용합니다. GIS/Qt 개발 패키지가 없으면 필요한
+`pkg-config` 모듈 이름을 출력합니다. `CGO_ENABLED=0`인 상태에서 `-tags native`
+빌드를 직접 실행하면 바인딩의 CGO 정의가 제외되어 `undefined: Coord`,
+`undefined: Context`, `undefined: Band` 같은 오류가 발생할 수 있습니다.
+
 ### Windows 포터블 패키지와 설치 프로그램
 
 MSYS2 UCRT64가 `C:\tools\msys64`에 설치된 AMD64 PC에서는 다음과 같이 native
