@@ -716,7 +716,7 @@ func loadReadOnlyDataRuntimeWithBaseLayers(ctx context.Context, sources []vector
 			} else {
 				layer.Name = uniqueImportedLayerName(layer.Name, source.Path, usedNames)
 			}
-			layer.DisplayName = source.DisplayName
+			layer.DisplayName = sourceLayerDisplayName(source, layer.Name)
 			layer.Visible = source.Visible == nil || *source.Visible
 			if source.Style != (core.LayerStyle{}) {
 				layer.Style = source.Style
@@ -879,9 +879,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		if source.Name != "" {
 			layer.Name = source.Name
 		}
-		if source.DisplayName != "" {
-			layer.DisplayName = source.DisplayName
-		}
+		layer.DisplayName = sourceLayerDisplayName(source, layer.Name)
 		layers = append(layers, layer.WithDefaultPresentation())
 		usedNames[strings.ToLower(layer.Name)] = true
 		unavailable[layer.Name] = unavailableSource{
@@ -1059,6 +1057,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			} else {
 				layer.Name = uniqueImportedLayerName(layer.Name, source.Path, usedNames)
 			}
+			layer.DisplayName = sourceLayerDisplayName(source, layer.Name)
 			if source.Style == (core.LayerStyle{}) {
 				layer.Style = core.DefaultLayerStyle()
 			}
@@ -1337,7 +1336,14 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
 		polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
 		if polygonErr != nil {
-			return render.Chunk{}, polygonErr
+			if !strings.Contains(polygonErr.Error(), "exceeds the ") ||
+				!strings.Contains(polygonErr.Error(), "-vertex triangulation safety limit") {
+				return render.Chunk{}, polygonErr
+			}
+			// The outline path has its own larger bounded budget. If even that
+			// budget is exceeded, render the source outlines and skip fill
+			// triangulation for this dense window instead of failing the chunk.
+			polygonVertices = maxReadOnlyOutlinePolygonVertices + 1
 		}
 		if polygonVertices > maxReadOnlyWindowPolygonVertices {
 			// Keep rendering a dense tile's outlines when constrained triangulation
@@ -1876,7 +1882,7 @@ const (
 func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
 	open func([4]float64) (core.Layer, error)) (core.Layer, bool, error) {
 	root, err := open(bounds)
-	if err == nil || !strings.Contains(err.Error(), "feature limit of") {
+	if err == nil || !isReadOnlyWindowSubdivisionError(err) {
 		return root, false, err
 	}
 	children := splitReadOnlyWindowBounds(bounds)
@@ -1898,7 +1904,7 @@ func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
 		}
 		layer, err := open(current)
 		if err != nil {
-			if !strings.Contains(err.Error(), "feature limit of") || depth >= maxReadOnlyWindowSubdivisionDepth {
+			if !isReadOnlyWindowSubdivisionError(err) || depth >= maxReadOnlyWindowSubdivisionDepth {
 				return err
 			}
 			children := splitReadOnlyWindowBounds(current)
@@ -1943,6 +1949,16 @@ func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
 		}
 	}
 	return merged, true, nil
+}
+
+func isReadOnlyWindowSubdivisionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "feature limit of") ||
+		strings.Contains(message, "spatial window exceeds the limit of") ||
+		strings.Contains(message, "payload limit of")
 }
 
 func splitReadOnlyWindowBounds(bounds [4]float64) [][4]float64 {
@@ -2065,10 +2081,17 @@ func unavailableWorkspaceLayer(source vectorSourceSpec) core.Layer {
 	}
 	visible := source.Visible == nil || *source.Visible
 	return core.Layer{
-		Name: name, DisplayName: source.DisplayName, SourcePath: source.Path,
+		Name: name, DisplayName: sourceLayerDisplayName(source, name), SourcePath: source.Path,
 		SourceLayerName: source.LayerName, SourceEncoding: source.Encoding, SourceCRS: source.SourceCRS,
 		CRS: core.CRS{AuthorityCode: crs}, Visible: visible, Style: source.Style, Labels: source.Labels, DisplayRule: source.DisplayRule,
 	}.WithDefaultPresentation()
+}
+
+func sourceLayerDisplayName(source vectorSourceSpec, fallback string) string {
+	if strings.TrimSpace(source.DisplayName) != "" {
+		return source.DisplayName
+	}
+	return fallback
 }
 
 func uniqueImportedLayerName(original, sourcePath string, used map[string]bool) string {
@@ -2556,6 +2579,7 @@ func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer
 		verticesBeforeLayer := generatedVertices
 		operator := geosdriver.NewOperator()
 		fillVertexLimitExceeded := false
+		skippedPolygonFills := 0
 		for featureIndex, feature := range layer.Features {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -2587,7 +2611,13 @@ func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer
 			}
 			triangles, err := operator.ConstrainedTriangles(ctx, feature.Geometry)
 			if err != nil {
-				return fmt.Errorf("layer %q feature %d: %w", layer.Name, feature.ID, err)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				// A malformed polygon must not take down the render worker. Keep
+				// its outline from the source builder and omit only its fill.
+				skippedPolygonFills++
+				continue
 			}
 			for _, triangle := range triangles {
 				var normalized [3]render.Point
@@ -2604,6 +2634,10 @@ func attachPolygonFillGeometryWithLimit(ctx context.Context, layers []core.Layer
 			if fillVertexLimitExceeded {
 				return fmt.Errorf("polygon fill for layer %q exceeds the %d-vertex chunk limit", layer.Name, render.MaxChunkVertices)
 			}
+		}
+		if skippedPolygonFills > 0 {
+			native.RecordDiagnostic("render", fmt.Sprintf(
+				"skipped polygon fills for %d feature(s) in layer %q", skippedPolygonFills, layer.Name))
 		}
 		baseBuilder := source.Builder
 		source.Builder = func(buildContext context.Context, key render.ChunkKey) (render.Chunk, error) {
@@ -3271,7 +3305,7 @@ func loadDataRuntimeSourcesWithCRS(ctx context.Context, sources []vectorSourceSp
 			} else {
 				layer.Name = uniqueImportedLayerName(layer.Name, path, usedNames)
 			}
-			layer.DisplayName = source.DisplayName
+			layer.DisplayName = sourceLayerDisplayName(source, layer.Name)
 			layer.Visible = source.Visible == nil || *source.Visible
 			if source.Style != (core.LayerStyle{}) {
 				layer.Style = source.Style

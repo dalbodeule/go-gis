@@ -36,6 +36,121 @@ func TestLabelProgramEvaluatesPropertyTemplatesAndRules(t *testing.T) {
 	}
 }
 
+func TestLabelFeaturePairsEnumeratesReadOnlyAttributes(t *testing.T) {
+	program, err := CompileLabelProgram(`
+local values = {}
+for key, value in pairs(feature) do values[key] = value end
+return values.name .. ":" .. values.count
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+	got, err := program.EvaluateText(context.Background(), map[string]any{"name": "한강로", "count": 2})
+	if err != nil || got != "한강로:2" {
+		t.Fatalf("pairs(feature) = %q, %v; want attributes", got, err)
+	}
+	keysProgram, err := CompileLabelProgram(`local count = 0; for _ in pairs(feature) do count = count + 1 end; return count`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keysProgram.Close()
+	for _, entry := range []struct {
+		properties map[string]any
+		want       string
+	}{
+		{map[string]any{"name": "한강로", "count": 2}, "2"},
+		{map[string]any{"name": "세종로"}, "1"},
+	} {
+		value, evaluateErr := keysProgram.EvaluateText(context.Background(), entry.properties)
+		if evaluateErr != nil || value != entry.want {
+			t.Fatalf("feature keys after update = %q, %v; want %q", value, evaluateErr, entry.want)
+		}
+	}
+	for _, test := range []struct {
+		script string
+		want   string
+	}{
+		{`local key, value = next(feature); return tostring(key ~= nil and value ~= nil)`, "true"},
+		{`local values = {a = 1, b = 2}; local count = 0; for _ in pairs(values) do count = count + 1 end; return count`, "2"},
+		{`local values = {a = 1}; local key, value = next(values); return key .. value`, "a1"},
+	} {
+		entry, compileErr := CompileLabelProgram(test.script)
+		if compileErr != nil {
+			t.Fatal(compileErr)
+		}
+		value, evaluateErr := entry.EvaluateText(context.Background(), map[string]any{"name": "한강로", "count": 2})
+		entry.Close()
+		if evaluateErr != nil || value != test.want {
+			t.Fatalf("%q = %q, %v; want %q", test.script, value, evaluateErr, test.want)
+		}
+	}
+	mutator, err := CompileLabelProgram(`local _, state = pairs(feature); state.name = "changed"; return feature.name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mutator.Close()
+	if _, err := mutator.EvaluateText(context.Background(), map[string]any{"name": "original"}); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("pairs exposed mutable feature data: %v", err)
+	}
+}
+
+func TestLabelFieldAccessSupportsReservedAndEscapedNames(t *testing.T) {
+	program, err := CompileLabelProgram(`return feature["end"] .. ":" .. feature["a\000b"] .. ":" .. feature["a\"b\\c"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+	got, err := program.EvaluateText(context.Background(), map[string]any{
+		"end": "reserved", "a\x00b": "control", "a\"b\\c": "quoted",
+	})
+	if err != nil || got != "reserved:control:quoted" {
+		t.Fatalf("escaped field names = %q, %v", got, err)
+	}
+}
+
+func TestLuaShortcutsAvailableInLabelsAndRuntime(t *testing.T) {
+	program, err := CompileLabelProgram(`return gogis.format_number(feature.amount, 2) .. "|" .. gogis.trim(feature.name) .. "|" .. tostring(gogis.contains(feature.name, "서울", true)) .. "|" .. tostring(gogis.coalesce(feature.missing, "fallback"))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+	got, err := program.EvaluateText(context.Background(), map[string]any{"amount": -1234567.5, "name": "  서울  "})
+	if err != nil || got != "-1,234,567.50|서울|true|fallback" {
+		t.Fatalf("label shortcuts = %q, %v", got, err)
+	}
+	for _, test := range []struct{ script, want string }{
+		{`return gogis.format_number("1234567.89")`, "1,234,568"},
+		{`return gogis.format_number(nil)`, ""},
+		{`return gogis.format_number("not a number")`, ""},
+		{`return tostring(gogis.coalesce(nil, "", 0))`, "0"},
+		{`return tostring(gogis.contains(nil, "x"))`, "false"},
+	} {
+		entry, compileErr := CompileLabelProgram(test.script)
+		if compileErr != nil {
+			t.Fatal(compileErr)
+		}
+		value, evaluateErr := entry.EvaluateText(context.Background(), nil)
+		entry.Close()
+		if evaluateErr != nil || value != test.want {
+			t.Fatalf("%s = %q, %v; want %q", test.script, value, evaluateErr, test.want)
+		}
+	}
+	badPrecision, err := CompileLabelProgram(`return gogis.format_number(12, 7)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badPrecision.Close()
+	if _, err := badPrecision.EvaluateText(context.Background(), nil); err == nil {
+		t.Fatal("out-of-range decimal precision was accepted")
+	}
+	runtime := NewRuntime(commands.NewProjectService("shortcuts", core.CRS{}), nil)
+	defer runtime.Close()
+	if err := runtime.Run(context.Background(), `assert(gogis.format_number(1234567, 0) == "1,234,567"); assert(gogis.contains("Seoul", "seo", true)); assert(gogis.trim("  A  ") == "A"); assert(gogis.coalesce(nil, "", false) == false)`); err != nil {
+		t.Fatalf("runtime shortcuts: %v", err)
+	}
+}
+
 func TestValidateLabelComposerScriptsCompilesWithoutFeatures(t *testing.T) {
 	if err := ValidateLabelComposerScripts(`return feature.NAME`, `return feature.ACTIVE == true`); err != nil {
 		t.Fatalf("valid label scripts rejected: %v", err)

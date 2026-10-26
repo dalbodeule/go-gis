@@ -1598,11 +1598,11 @@ func TestDesktopAddsMultipleVectorFilesAsLayers(t *testing.T) {
 		t.Fatalf("combined feature count = %d, want 2", len(added.features))
 	}
 	roads, ok := added.service.Layer("roads")
-	if !ok || roads.SourcePath != firstPath || roads.SourceLayerName != "roads" || roads.Style != core.DefaultLayerStyle() {
+	if !ok || roads.DisplayName != "roads" || roads.SourcePath != firstPath || roads.SourceLayerName != "roads" || roads.Style != core.DefaultLayerStyle() {
 		t.Fatalf("first layer source/presentation = %+v, found=%t", roads, ok)
 	}
 	addedRoads, ok := added.service.Layer("roads_roads")
-	if !ok || addedRoads.SourcePath != secondPath || addedRoads.SourceLayerName != "roads" {
+	if !ok || addedRoads.DisplayName != "roads_roads" || addedRoads.SourcePath != secondPath || addedRoads.SourceLayerName != "roads" {
 		t.Fatalf("added layer source identity = %+v, found=%t", addedRoads, ok)
 	}
 	if added.mapExtent != [4]float64{127, 37, 128, 38} {
@@ -3254,6 +3254,22 @@ func TestReadOnlyPolygonFillBuildsOnlyRequestedChunk(t *testing.T) {
 	}
 	if fillCount == 0 || len(other.Vertices) != 0 {
 		t.Fatalf("target fill vertices=%d, off-target vertices=%d", fillCount, len(other.Vertices))
+	}
+}
+
+func TestPolygonFillSkipsGEOSFailureWithoutAbortingLayer(t *testing.T) {
+	layer := core.Layer{Name: "parcels", Style: core.DefaultLayerStyle(), Features: []core.Feature{{
+		ID: 1,
+		// The interior ring lies outside the shell. GEOS can throw while
+		// triangulating this invalid polygon, but rendering should keep going.
+		Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (5 5, 5 15, 15 15, 15 5, 5 5))"},
+	}}}
+	sources, _, err := render.NewLayerSourcesWithExtent([]core.Layer{layer}, [4]float64{0, 0, 20, 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attachPolygonFillGeometry(context.Background(), []core.Layer{layer}, sources); err != nil {
+		t.Fatalf("invalid polygon fill aborted layer render: %v", err)
 	}
 }
 

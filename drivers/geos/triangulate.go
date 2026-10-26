@@ -22,7 +22,17 @@ const maxConstrainedTriangles = 250_000
 
 // ConstrainedTriangles tessellates polygonal input while respecting interior
 // rings. Non-polygon geometry components in collections are ignored.
-func (o *Operator) ConstrainedTriangles(ctx context.Context, geometry core.Geometry) ([]Triangle, error) {
+func (o *Operator) ConstrainedTriangles(ctx context.Context, geometry core.Geometry) (triangles []Triangle, err error) {
+	// GEOS may throw a C++ exception through the go-geos binding for malformed
+	// polygon topology that passes the inexpensive WKB size/count checks. Keep
+	// that native failure inside the driver boundary so one bad feature cannot
+	// terminate a desktop render worker (or the whole application).
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			triangles = nil
+			err = fmt.Errorf("GEOS constrained triangulation failed: %v", recovered)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -54,7 +64,7 @@ func (o *Operator) ConstrainedTriangles(ctx context.Context, geometry core.Geome
 	}
 	defer triangulated.Destroy()
 	capacity := min(triangulated.NumGeometries(), maxConstrainedTriangles)
-	triangles := make([]Triangle, 0, capacity)
+	triangles = make([]Triangle, 0, capacity)
 	var appendGeometry func(*geoslib.Geom) error
 	appendGeometry = func(candidate *geoslib.Geom) error {
 		if err := ctx.Err(); err != nil {

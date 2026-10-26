@@ -93,9 +93,12 @@ ApplicationWindow {
             "Feature display filter hides features from the map only; source data stays unchanged.": "Feature display filter hides features from the map only; source data stays unchanged.",
             "Open Lua editor and examples…": "Open Lua editor and examples…",
             "Lua field access hint": "feature.FIELD reads an attribute; use feature[\"field name\"] when a field contains spaces. Types: %1",
-            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). Return boolean from rules and string/number/nil from label text.",
+            "Lua API help": "These pure helpers work in label text, display rules, and project Lua scripts. Rules return boolean; label text returns string, number, or nil.",
             "Insert field into rule…": "Insert field into rule…",
             "Insert field into label…": "Insert field into label…",
+            "Insert LIKE example": "Insert LIKE example",
+            "Insert concatenation example": "Insert concatenation example",
+            "Insert number format example": "Insert number format example",
             "Center": "Center", "Center + rotation": "Center + rotation", "Free angle": "Free angle",
             "Lua field types": "Lua field types", "Open the attribute table to inspect the layer schema.": "Open the attribute table to inspect the layer schema."
         }),
@@ -107,9 +110,12 @@ ApplicationWindow {
             "Feature display filter hides features from the map only; source data stays unchanged.": "피처 표시 필터는 지도에서만 숨기며 원본 데이터는 바뀌지 않습니다.",
             "Open Lua editor and examples…": "Lua 편집기 및 예제 열기…",
             "Lua field access hint": "feature.FIELD로 속성을 읽습니다. 필드명에 공백이 있으면 feature[\"필드 이름\"]을 사용하세요. 필드 형식: %1",
-            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style). 규칙은 boolean, 레이블 식은 string/number/nil을 반환합니다.",
+            "Lua API help": "아래 보조 함수는 레이블·표시 규칙과 프로젝트 Lua 스크립트에서 사용할 수 있습니다. 규칙은 boolean, 레이블 식은 string/number/nil을 반환합니다.",
             "Insert field into rule…": "규칙에 필드 삽입…",
             "Insert field into label…": "레이블에 필드 삽입…",
+            "Insert LIKE example": "LIKE(포함) 예제 삽입",
+            "Insert concatenation example": "문자열 합치기 예제 삽입",
+            "Insert number format example": "숫자 포맷 예제 삽입",
             "Center": "중앙", "Center + rotation": "중앙 + 회전", "Free angle": "자유 각도",
             "Lua field types": "Lua 필드 형식", "Open the attribute table to inspect the layer schema.": "레이어 필드를 확인하려면 속성 테이블을 여세요."
         }),
@@ -121,9 +127,12 @@ ApplicationWindow {
             "Feature display filter hides features from the map only; source data stays unchanged.": "地物表示フィルターは地図上で非表示にするだけで、元データは変更しません。",
             "Open Lua editor and examples…": "Luaエディターと例を開く…",
             "Lua field access hint": "feature.FIELDで属性を読み取ります。空白を含むフィールド名にはfeature[\"フィールド名\"]を使用します。型: %1",
-            "Lua API help": "Lua API: gogis.layers(); gogis.filter_lua(source, result, predicate); gogis.label_lua(source, result, text, rule, height, style)。ルールはboolean、ラベル式はstring/number/nilを返します。",
+            "Lua API help": "以下の補助関数はラベル・表示ルールとプロジェクトLuaスクリプトで使用できます。ルールはboolean、ラベル式はstring/number/nilを返します。",
             "Insert field into rule…": "ルールにフィールドを挿入…",
             "Insert field into label…": "ラベルにフィールドを挿入…",
+            "Insert LIKE example": "LIKE例を挿入",
+            "Insert concatenation example": "文字列連結例を挿入",
+            "Insert number format example": "数値フォーマット例を挿入",
             "Center": "中央", "Center + rotation": "中央 + 回転", "Free angle": "自由角度",
             "Lua field types": "Luaフィールド型", "Open the attribute table to inspect the layer schema.": "レイヤーの項目を確認するには属性テーブルを開いてください。"
         })
@@ -283,38 +292,39 @@ ApplicationWindow {
         property alias text: sourceArea.text
         property alias placeholderText: sourceArea.placeholderText
         property alias cursorPosition: sourceArea.cursorPosition
-        property string highlightedHTML: ""
-        property string highlightedLineNumbers: "1"
-        // Rich-text highlighting keeps both the editor source and a rendered
-        // HTML copy alive. Fall back to the native TextArea for unusually
-        // large scripts so typing remains responsive and bounded.
-        readonly property int maxHighlightSourceLength: 128 * 1024
-        readonly property bool syntaxHighlightingEnabled: sourceArea.text.length <= maxHighlightSourceLength
-        readonly property var keywordLookup: ({"and": true, "break": true, "do": true, "else": true, "elseif": true, "end": true, "false": true, "for": true, "function": true, "if": true, "in": true, "local": true, "nil": true, "not": true, "or": true, "repeat": true, "return": true, "then": true, "true": true, "until": true, "while": true})
-        readonly property var apiLookup: ({"feature": true, "gogis": true, "math": true, "string": true, "table": true, "ipairs": true, "pairs": true, "tonumber": true, "tostring": true, "type": true})
+        property var lineStarts: [0]
         implicitHeight: 144
         clip: true
 
-        function scheduleHighlight() {
-            highlightTimer.restart();
-        }
-
-        Timer {
-            id: highlightTimer
-            interval: 75
-            repeat: false
-            onTriggered: {
-                if (!luaCodeEditor.syntaxHighlightingEnabled) {
-                    luaCodeEditor.highlightedHTML = "";
-                    luaCodeEditor.highlightedLineNumbers = "";
-                    return;
-                }
-                luaCodeEditor.highlightedHTML = luaCodeEditor.highlightLua(sourceArea.text);
-                luaCodeEditor.highlightedLineNumbers = luaCodeEditor.lineNumberText(sourceArea.text);
+        function updateLineStarts() {
+            var starts = [0];
+            for (var index = 0; index < sourceArea.text.length; ++index) {
+                if (sourceArea.text[index] === "\n") starts.push(index + 1);
             }
+            lineStarts = starts;
         }
 
-        Component.onCompleted: scheduleHighlight()
+        function visibleLines() {
+            var starts = lineStarts;
+            var top = sourceFlickable.contentY;
+            var bottom = top + sourceFlickable.height;
+            var low = 0;
+            var high = starts.length;
+            while (low < high) {
+                var middle = Math.floor((low + high) / 2);
+                if (sourceArea.positionToRectangle(starts[middle]).y < top)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            var result = [];
+            for (var line = Math.max(0, low - 1); line < starts.length; ++line) {
+                var rectangle = sourceArea.positionToRectangle(starts[line]);
+                if (rectangle.y > bottom) break;
+                result.push({number: line + 1, y: rectangle.y - top, height: rectangle.height});
+            }
+            return result;
+        }
 
         Rectangle {
             anchors.fill: parent
@@ -324,150 +334,77 @@ ApplicationWindow {
             radius: 3
         }
 
-        function escapeHtml(text) {
-            return text.replace(/[&<>\"]/g, escapeHtmlCharacter);
-        }
-
-        function escapeHtmlCharacter(character) {
-            if (character === "&") return "&amp;";
-            if (character === "<") return "&lt;";
-            if (character === ">") return "&gt;";
-            return "&quot;";
-        }
-
-        function lineNumberText(source) {
-            var count = 1;
-            for (var index = 0; index < source.length; ++index) {
-                if (source[index] === "\n") ++count;
-            }
-            var lines = [];
-            for (var line = 1; line <= count; ++line) lines.push(line);
-            return lines.join("\n");
-        }
-
         function insert(position, value) {
             sourceArea.insert(position, value);
         }
-
-        function longBracketLevel(source, start) {
-            if (source[start] !== "[") return -1;
-            var cursor = start + 1;
-            while (source[cursor] === "=") ++cursor;
-            return source[cursor] === "[" ? cursor - start - 1 : -1;
-        }
-
-        function longBracketEnd(source, start, level) {
-            var closing = "]";
-            for (var equals = 0; equals < level; ++equals) closing += "=";
-            closing += "]";
-            var closeIndex = source.indexOf(closing, start);
-            return closeIndex < 0 ? source.length : closeIndex + closing.length;
-        }
-
-        function highlightLua(source) {
-            var output = ["<pre style='margin:0'>"];
-            var index = 0;
-            while (index < source.length) {
-                var start = index;
-                var character = source[index];
-                var category = "";
-                if (character === "-" && source[index + 1] === "-") {
-                    category = "comment";
-                    var commentLevel = longBracketLevel(source, index + 2);
-                    if (commentLevel >= 0)
-                        index = longBracketEnd(source, index + 2 + commentLevel + 2, commentLevel);
-                    else
-                        while (index < source.length && source[index] !== "\n") index++;
-                } else if (character === "[") {
-                    var stringLevel = longBracketLevel(source, index);
-                    if (stringLevel >= 0) {
-                        category = "string";
-                        index = longBracketEnd(source, index + stringLevel + 2, stringLevel);
-                    } else {
-                        index++;
-                    }
-                } else if (character === "\"" || character === "'") {
-                    category = "string";
-                    var quote = character;
-                    index++;
-                    while (index < source.length) {
-                        if (source[index] === "\\") { index += 2; continue; }
-                        if (source[index++] === quote) break;
-                    }
-                } else if (/[A-Za-z_]/.test(character)) {
-                    index++;
-                    while (index < source.length && /[A-Za-z0-9_]/.test(source[index])) index++;
-                    var identifier = source.slice(start, index);
-                    if (keywordLookup[identifier]) category = "keyword";
-                    else if (apiLookup[identifier]) category = "api";
-                } else if (/[0-9]/.test(character)) {
-                    category = "number";
-                    index++;
-                    while (index < source.length && /[0-9.eE+-]/.test(source[index])) index++;
-                } else {
-                    index++;
+        Flickable {
+            id: sourceFlickable
+            objectName: "luaSourceFlickable"
+            anchors.fill: parent
+            clip: true
+            contentWidth: width
+            contentHeight: sourceArea.height
+            boundsBehavior: Flickable.StopAtBounds
+            TextArea.flickable: TextArea {
+                id: sourceArea
+                objectName: "luaSourceArea"
+                width: sourceFlickable.width
+                height: Math.max(sourceFlickable.height, implicitHeight)
+                leftPadding: 66
+                rightPadding: 8
+                topPadding: 8
+                bottomPadding: 8
+                wrapMode: TextEdit.WrapAnywhere
+                textFormat: TextEdit.PlainText
+                selectByMouse: true
+                font.family: Qt.platform.os === "osx" ? "Menlo" : Qt.platform.os === "windows" ? "Consolas" : "DejaVu Sans Mono"
+                font.pixelSize: 14
+                color: "#263238"
+                selectedTextColor: "#ffffff"
+                selectionColor: "#557aa6d6"
+                background: null
+                cursorDelegate: Rectangle {
+                    width: 1
+                    color: "#263238"
                 }
-                var token = source.slice(start, index);
-                var escaped = escapeHtml(token);
-                if (category === "keyword") output.push("<span style='color:#7b2cbf;font-weight:600'>", escaped, "</span>");
-                else if (category === "string") output.push("<span style='color:#16803c'>", escaped, "</span>");
-                else if (category === "number") output.push("<span style='color:#b45309'>", escaped, "</span>");
-                else if (category === "comment") output.push("<span style='color:#78838e;font-style:italic'>", escaped, "</span>");
-                else if (category === "api") output.push("<span style='color:#1769aa'>", escaped, "</span>");
-                else output.push(escaped);
+                onTextChanged: luaCodeEditor.updateLineStarts()
             }
-            output.push("</pre>");
-            return output.join("");
         }
-
-        Text {
-            id: lineNumbers
-            x: 6
-            y: sourceArea.topPadding - sourceArea.contentY
-            width: 30
-            text: luaCodeEditor.highlightedLineNumbers
-            horizontalAlignment: Text.AlignRight
-            color: "#8a949e"
-            font: sourceArea.font
+        Item {
+            objectName: "luaLineNumberGutter"
+            x: 0
+            y: 0
+            width: 50
+            height: parent.height
+            clip: true
+            z: 1
+            Repeater {
+                model: luaCodeEditor.visibleLines()
+                delegate: Text {
+                    required property var modelData
+                    objectName: "luaLineNumber" + modelData.number
+                    x: 8
+                    y: modelData.y
+                    width: 40
+                    height: modelData.height
+                    text: String(modelData.number)
+                    horizontalAlignment: Text.AlignRight
+                    color: "#8a949e"
+                    font: sourceArea.font
+                }
+            }
         }
         Rectangle {
-            x: 43
+            x: 56
             y: 0
             width: 1
             height: parent.height
             color: "#e2e6ea"
         }
-        Text {
-            id: syntaxText
-            x: sourceArea.leftPadding - sourceArea.contentX
-            y: sourceArea.topPadding - sourceArea.contentY
-            width: Math.max(sourceArea.contentWidth, sourceArea.width)
-            text: luaCodeEditor.highlightedHTML
-            textFormat: Text.RichText
-            font: sourceArea.font
-            color: "#263238"
-            visible: luaCodeEditor.syntaxHighlightingEnabled
-        }
-        TextArea {
-            id: sourceArea
-            objectName: "luaSourceArea"
-            anchors.fill: parent
-            leftPadding: 52
-            rightPadding: 8
-            topPadding: 8
-            bottomPadding: 8
-            wrapMode: TextEdit.NoWrap
-            selectByMouse: true
-            font.family: Qt.platform.os === "osx" ? "Menlo" : Qt.platform.os === "windows" ? "Consolas" : "DejaVu Sans Mono"
-            color: luaCodeEditor.syntaxHighlightingEnabled ? "transparent" : "#263238"
-            selectedTextColor: "transparent"
-            selectionColor: "#557aa6d6"
-            background: null
-            cursorDelegate: Rectangle {
-                width: 1
-                color: "#263238"
-            }
-            onTextChanged: luaCodeEditor.scheduleHighlight()
+        LuaHighlighter {
+            objectName: "luaHighlighter"
+            visible: false
+            property var textDocument: sourceArea.textDocument
         }
     }
 
@@ -2046,18 +1983,28 @@ ApplicationWindow {
                 }
 
                 function luaFieldAccess(name) {
-                    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? "feature." + name : "feature[" + JSON.stringify(name) + "]";
+                    var keywords = ["and", "break", "do", "else", "elseif", "end", "false", "for",
+                                    "function", "if", "in", "local", "nil", "not", "or", "repeat",
+                                    "return", "then", "true", "until", "while"];
+                    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && keywords.indexOf(name) < 0)
+                        return "feature." + name;
+                    var quoted = '"';
+                    for (var index = 0; index < name.length; ++index) {
+                        var code = name.charCodeAt(index);
+                        if (code === 34) quoted += '\\"';
+                        else if (code === 92) quoted += "\\\\";
+                        else if (code < 32 || code === 127)
+                            quoted += "\\" + ("000" + String(code)).slice(-3);
+                        else quoted += name[index];
+                    }
+                    return "feature[" + quoted + '"]';
                 }
 
                 function luaFieldHintText() {
                     if (!attributeFieldHints.length)
-                        return rootWindow.tr("Open the attribute table to inspect the layer schema.");
-                    var hints = [];
-                    for (var i = 0; i < attributeFieldHints.length; ++i) {
-                        var field = attributeFieldHints[i];
-                        hints.push(luaFieldAccess(field.name) + " : " + (field.type || "unknown"));
-                    }
-                    return hints.join("   ·   ");
+                        return rootWindow.language === "ko" ? "필드를 불러오는 중이거나 사용할 수 없습니다" : rootWindow.language === "jp" ? "フィールドを読み込み中、または利用できません" : "Fields are loading or unavailable";
+                    var count = attributeFieldHints.length;
+                    return rootWindow.language === "ko" ? count + "개 필드 사용 가능" : rootWindow.language === "jp" ? count + " 件のフィールドを利用可能" : count + (count === 1 ? " field available" : " fields available");
                 }
 
                 function currentScaleText() {
@@ -2460,7 +2407,8 @@ ApplicationWindow {
                         }
                         if (mapCanvas.attributePayloadGeneration !== mapViewport.attributePayloadGenerationSeen) {
                             mapViewport.attributePayloadGenerationSeen = mapCanvas.attributePayloadGeneration;
-                            if (attributeDialog.visible) {
+                            var fieldHintsVisible = attributeDialog.visible || layerSettingsDialog.visible;
+                            if (fieldHintsVisible) {
                                 var table = mapViewport.parseJSONObject(mapCanvas.attributePayload);
                                 var columns = Array.isArray(table.columns) ? table.columns.slice(0, mapViewport.maxAttributeColumns) : [];
                                 mapViewport.attributeColumns = columns;
@@ -2475,9 +2423,10 @@ ApplicationWindow {
                                 var rows = Array.isArray(table.rows) ? table.rows.slice(0, mapViewport.maxAttributeRows) : [];
                                 // Replace one bounded page at once instead of
                                 // emitting one ListModel change per record.
-                                attributeModel.rows = rows;
+                                attributeModel.rows = attributeDialog.visible ? rows : [];
                             } else {
                                 attributeModel.rows = [];
+                                mapViewport.attributeFieldHints = [];
                             }
                         }
                         if (mapCanvas.postGISCatalogPayloadGeneration !== mapViewport.postGISCatalogPayloadSeen) {
@@ -3424,7 +3373,24 @@ ApplicationWindow {
             mapCanvas.layerSettingsGeneration += 1;
         }
 
-        onOpened: loadLayer()
+        onOpened: {
+            loadLayer();
+            // Labels and expressions use the same bounded schema payload as
+            // the attribute table. Request it while layer properties is open
+            // so field hints are available without opening another dialog.
+            mapCanvas.attributePayloadVisible = true;
+            mapCanvas.attributePage = 0;
+            mapCanvas.attributePageGeneration += 1;
+            mapViewport.attributePayloadGenerationSeen = -1;
+        }
+        onClosed: {
+            if (!attributeDialog.visible) {
+                mapCanvas.attributePayloadVisible = false;
+                mapCanvas.attributePayload = "[]";
+                mapViewport.attributeFieldHints = [];
+                mapViewport.attributePayloadGenerationSeen = mapCanvas.attributePayloadGeneration;
+            }
+        }
         onApplied: submitLayer()
         onAccepted: submitLayer()
 
@@ -3790,7 +3756,10 @@ ApplicationWindow {
                         id: labelFieldHintButton
                         objectName: "labelFieldHintButton"
                         text: rootWindow.tr("Available fields…")
-                        onClicked: labelFieldHintPopup.open()
+                        onClicked: {
+                            labelFieldHintPopup.targetEditor = null;
+                            labelFieldHintPopup.open();
+                        }
                     }
                 }
                 TextField {
@@ -3963,6 +3932,14 @@ ApplicationWindow {
         width: Math.min(460, rootWindow.width - 64)
         height: Math.min(450, rootWindow.height - 96)
         padding: 16
+        property var targetEditor: null
+        property var matchingFields: mapViewport.attributeFieldHints.filter(function(field) {
+            var query = fieldSearch.text.trim().toLowerCase();
+            return query === "" || String(field.name).toLowerCase().indexOf(query) >= 0 ||
+                   String(field.type || "").toLowerCase().indexOf(query) >= 0;
+        })
+        onOpened: fieldSearch.text = ""
+        onClosed: targetEditor = null
         contentItem: ColumnLayout {
             spacing: 8
             Label {
@@ -3972,9 +3949,17 @@ ApplicationWindow {
             }
             Label {
                 Layout.fillWidth: true
-                text: rootWindow.tr("Click a field to insert ${FIELD} at the cursor. A single field name also works.")
+                text: labelFieldHintPopup.targetEditor ?
+                    (rootWindow.language === "ko" ? "필드를 선택하면 편집기 커서 위치에 삽입됩니다." : rootWindow.language === "jp" ? "フィールドを選ぶとエディターのカーソル位置に挿入します。" : "Select a field to insert it at the editor cursor.") :
+                    rootWindow.tr("Click a field to insert ${FIELD} at the cursor. A single field name also works.")
                 wrapMode: Text.WordWrap
                 color: "#65717d"
+            }
+            TextField {
+                id: fieldSearch
+                objectName: "labelFieldSearch"
+                Layout.fillWidth: true
+                placeholderText: rootWindow.language === "ko" ? "필드 이름 또는 형식 검색" : rootWindow.language === "jp" ? "フィールド名または型を検索" : "Search field name or type"
             }
             Label {
                 Layout.fillWidth: true
@@ -3990,7 +3975,7 @@ ApplicationWindow {
                 clip: true
                 reuseItems: true
                 cacheBuffer: 0
-                model: mapViewport.attributeFieldHints
+                model: labelFieldHintPopup.matchingFields
                 spacing: 4
                 delegate: Button {
                     required property var modelData
@@ -3998,7 +3983,15 @@ ApplicationWindow {
                     width: labelFieldList.width
                     text: modelData.name + "  ·  " + (modelData.type || "unknown")
                     onClicked: {
-                        layerSettingsDialog.insertLabelField(modelData.name);
+                        if (labelFieldHintPopup.targetEditor) {
+                            var editor = labelFieldHintPopup.targetEditor;
+                            var access = mapViewport.luaFieldAccess(modelData.name);
+                            var position = editor.cursorPosition;
+                            editor.insert(position, access);
+                            editor.cursorPosition = position + access.length;
+                        } else {
+                            layerSettingsDialog.insertLabelField(modelData.name);
+                        }
                         labelFieldHintPopup.close();
                     }
                 }
@@ -4042,16 +4035,32 @@ ApplicationWindow {
                 color: "#45515c"
             }
             Label {
-                text: rootWindow.tr("Lua field access hint").replace("%1", mapViewport.luaFieldHintText())
+                objectName: "luaFieldSummary"
+                text: mapViewport.luaFieldHintText()
                 Layout.fillWidth: true
-                wrapMode: Text.WordWrap
                 color: "#65717d"
+            }
+            Button {
+                objectName: "luaBrowseFieldsButton"
+                text: rootWindow.tr("Available fields…")
+                enabled: mapViewport.attributeFieldHints.length > 0
+                onClicked: {
+                    labelFieldHintPopup.targetEditor = labelLuaField;
+                    labelFieldHintPopup.open();
+                }
             }
             Label {
                 Layout.fillWidth: true
                 text: rootWindow.tr("Lua API help")
                 wrapMode: Text.WordWrap
                 color: "#45515c"
+            }
+            Label {
+                objectName: "luaShortcutHelp"
+                Layout.fillWidth: true
+                text: "gogis.format_number(value, decimals) · gogis.coalesce(a, b) · gogis.trim(text) · gogis.contains(text, part, ignoreCase)"
+                wrapMode: Text.WordWrap
+                color: "#526578"
             }
             Label {
                 text: rootWindow.tr("Feature display filter — return true to draw this feature")
@@ -4139,6 +4148,27 @@ ApplicationWindow {
                 Button {
                     text: rootWindow.tr("Insert filter example")
                     onClicked: featureDisplayRuleEditor.text = "return feature.STATUS ~= \"retired\""
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Button {
+                    Layout.fillWidth: true
+                    objectName: "insertLuaLikeExampleButton"
+                    text: rootWindow.tr("Insert LIKE example")
+                    onClicked: featureDisplayRuleEditor.text = "return gogis.contains(feature.NAME, \"road\", true)"
+                }
+                Button {
+                    Layout.fillWidth: true
+                    objectName: "insertLuaConcatenationExampleButton"
+                    text: rootWindow.tr("Insert concatenation example")
+                    onClicked: labelLuaField.text = "return tostring(gogis.coalesce(feature.NAME, \"\")) .. \" / \" .. tostring(gogis.coalesce(feature.CODE, \"\"))"
+                }
+                Button {
+                    Layout.fillWidth: true
+                    objectName: "insertLuaNumberFormatExampleButton"
+                    text: rootWindow.tr("Insert number format example")
+                    onClicked: labelLuaField.text = "return gogis.format_number(feature.AREA, 2)"
                 }
             }
             }
@@ -4375,7 +4405,7 @@ ApplicationWindow {
                     CheckBox {
                         text: model.cadName + " (" + model.geometryType + ")"
                         checked: model.included
-                        onToggled: dxfLayerOptions.setProperty(index, "included", checked)
+                        onClicked: dxfLayerOptions.setProperty(index, "included", checked)
                     }
                     Label {
                         Layout.fillWidth: true
@@ -4392,7 +4422,11 @@ ApplicationWindow {
                         TextField {
                             Layout.fillWidth: true
                             text: model.cadName
-                            onTextChanged: dxfLayerOptions.setProperty(index, "cadName", text)
+                            // Do not write the initial binding value back to
+                            // the ListModel. On macOS the native control can
+                            // emit textChanged while the delegate is being
+                            // constructed, which used to erase CAD names.
+                            onTextChanged: if (activeFocus) dxfLayerOptions.setProperty(index, "cadName", text)
                         }
                     }
                     RowLayout {
@@ -4400,12 +4434,12 @@ ApplicationWindow {
                         CheckBox {
                             text: rootWindow.language === "ko" ? "도형" : "Geometry"
                             checked: model.geometryEnabled
-                            onToggled: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
+                            onClicked: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
                         }
                         CheckBox {
                             text: rootWindow.language === "ko" ? "레이블" : "Labels"
                             checked: model.labelsEnabled
-                            onToggled: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
+                            onClicked: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
                         }
                     }
                 }

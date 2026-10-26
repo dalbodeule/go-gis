@@ -1265,16 +1265,16 @@ func newLayerSource(layer core.Layer, parsed []parsedFeaturePoints, lineFlags []
 	if layer.Features[0].Geometry != nil {
 		geometryType = strings.ToUpper(layer.Features[0].Geometry.GeometryType())
 	}
-	color := style.PolygonColor
-	if strings.Contains(geometryType, "POINT") {
-		color = style.PointColor
-	} else if strings.Contains(geometryType, "LINE") || strings.Contains(geometryType, "CURVE") {
-		color = style.LineColor
-	}
-	packedColor := styleColor(color)
 	for key, vertices := range chunkVertices {
 		for index := range vertices {
-			vertices[index].Color = packedColor
+			switch vertices[index].Kind {
+			case VertexFill:
+				vertices[index].Color = ColorForPolygonFill(style)
+			case VertexPoint:
+				vertices[index].Color = ColorForGeometry(style, "POINT")
+			default:
+				vertices[index].Color = ColorForGeometry(style, geometryType)
+			}
 		}
 		chunkVertices[key] = vertices
 	}

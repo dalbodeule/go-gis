@@ -70,6 +70,11 @@ Lua에서는 predicate filter를 순서대로 연결할 수 있습니다. 조건
 일치하지 않은 피처도 결과 레이어에 보존하고 라벨만 비워 둡니다. 라벨 텍스트는
 여러 필드를 Lua식으로 조합할 수 있습니다.
 
+레이블·표시 규칙에서는 `gogis.format_number(feature.AREA, 2)`로
+`1,234.50`처럼 천 단위 구분자를 넣고, `gogis.coalesce`, `gogis.trim`,
+`gogis.contains`로 빈 값 대체·공백 정리·문자열 포함 검사를 작성할 수 있습니다.
+이 함수들은 프로젝트 Lua 스크립트에도 동일하게 제공됩니다.
+
 ```lua
 gogis.filter_lua("roads", "major_roads", [[return feature.CLASS == "primary"]])
 gogis.filter_lua("major_roads", "wide_roads", [[return feature.LANES >= 4]])

@@ -108,13 +108,23 @@ return string.format("%s (%s)", feature.name, feature.class)
 return feature.class == "primary"
 ```
 
+The field picker inserts bracket syntax for Lua keywords and field names that
+cannot use dot syntax. Quotes, backslashes, and control characters in a field
+name are escaped in the inserted Lua string. `pairs(feature)` can enumerate
+attributes without allowing the script to modify the source record.
+
 The feature display filter and label rule are independent. A feature can be
 hidden from the map while its source record remains in the project; a visible
 feature can also have its label suppressed by the label rule.
 
 The label Lua context exposes only base, table, string, and math libraries; it
-does not expose filesystem or process libraries. Scripts are size-limited and
-observe cancellation.
+also exposes pure `gogis` formatting helpers. For example,
+`gogis.format_number(feature.AREA, 2)` produces `1,234.50`,
+`gogis.coalesce(feature.NAME, "Unnamed")` supplies a fallback,
+`gogis.trim(feature.NAME)` removes surrounding space, and
+`gogis.contains(feature.NAME, "road", true)` tests a literal substring without
+case sensitivity. The context does not expose filesystem or process libraries.
+Scripts are size-limited and observe cancellation.
 
 Use **Export project layers to DXF** in the top toolbar, choose a text encoding,
 then select an output path. The initial choice follows the interface language:

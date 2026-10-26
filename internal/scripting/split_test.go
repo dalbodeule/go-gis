@@ -20,6 +20,10 @@ func TestLuaFilterAndSplitLayer(t *testing.T) {
 	if err != nil || len(filtered.Features) != 2 {
 		t.Fatalf("filtered=%+v err=%v", filtered, err)
 	}
+	iterated, err := FilterLayerByLua(context.Background(), layer, `local count = 0; for _ in pairs(feature) do count = count + 1 end; return count == 1 and feature.grade == "A"`)
+	if err != nil || len(iterated.Features) != 2 {
+		t.Fatalf("filter using pairs(feature)=%+v err=%v", iterated, err)
+	}
 	if filtered.Style != style || filtered.SourcePath != "" || !filtered.Visible {
 		t.Fatalf("filtered presentation/source metadata = %+v", filtered)
 	}

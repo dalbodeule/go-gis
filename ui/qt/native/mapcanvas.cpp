@@ -880,8 +880,11 @@ private:
     float rendered_pixels_per_mm_ = -1.0f;
 };
 
+void gogis_register_lua_highlighter_type();
+
 extern "C" void gogis_register_qml_types(void) {
     qmlRegisterType<GoGISMapCanvas>("GoGIS", 1, 0, "MapCanvas");
+    gogis_register_lua_highlighter_type();
 }
 
 extern "C" void gogis_set_vertices(const float* xy, int vertex_count) {

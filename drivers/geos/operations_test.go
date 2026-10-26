@@ -32,6 +32,15 @@ func TestConstrainedTrianglesRespectPolygonHole(t *testing.T) {
 	}
 }
 
+func TestConstrainedTrianglesConvertsGEOSPanicsToErrors(t *testing.T) {
+	// The interior ring is outside the shell. GEOS may throw an exception
+	// while constrained triangulation inspects this invalid topology.
+	geometry := core.WKTGeometry{WKT: "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (5 5, 5 15, 15 15, 15 5, 5 5))"}
+	if _, err := NewOperator().ConstrainedTriangles(context.Background(), geometry); err == nil {
+		t.Fatal("invalid polygon triangulation returned nil error")
+	}
+}
+
 func TestSimplifyForDisplayReducesGeometryWithoutMutatingSource(t *testing.T) {
 	coordinates := make([]string, 0, 44)
 	for index := 0; index <= 40; index++ {

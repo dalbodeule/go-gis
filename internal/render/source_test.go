@@ -67,6 +67,38 @@ func TestLayerSourceCarriesConfiguredGeometryColor(t *testing.T) {
 	}
 }
 
+func TestPolygonSourceUsesConfiguredOutlineColor(t *testing.T) {
+	style := core.LayerStyle{
+		LineColor: "#112233", PolygonColor: "#aabbcc", FillOpacity: 0.5,
+		LineWidthMM: 0.8,
+	}
+	source, err := NewLayerSource(core.Layer{
+		Name: "parcels", Style: style, Features: []core.Feature{{
+			ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := source.Builder(context.Background(), ChunkKey{Layer: "parcels", X: 0, Y: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOutline := ColorForGeometry(style, "POLYGON")
+	outlines := 0
+	for _, vertex := range chunk.Vertices {
+		if vertex.Kind == VertexLine {
+			outlines++
+			if vertex.Color != wantOutline {
+				t.Fatalf("polygon outline color = %#08x, want %#08x", vertex.Color, wantOutline)
+			}
+		}
+	}
+	if outlines == 0 {
+		t.Fatal("polygon source did not contain outline vertices")
+	}
+}
+
 func TestPointRenderVerticesCarryPhysicalSymbolSize(t *testing.T) {
 	style := core.LayerStyle{LineColor: "#111111", PointColor: "#010203", PolygonColor: "#ffffff", LineWidthMM: 0.5, PointSizeMM: 4.25}
 	source, err := NewLayerSource(core.Layer{Name: "places", Style: style, Features: []core.Feature{{

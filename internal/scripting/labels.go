@@ -55,6 +55,7 @@ func newLabelState() *lua.LState {
 		state.SetGlobal(name, lua.LNil)
 	}
 	installBoundedLuaStringRep(state)
+	state.SetGlobal("gogis", installLuaHelpers(state))
 	return state
 }
 
@@ -431,7 +432,35 @@ func newReadOnlyFeature(state *lua.LState) (*lua.LTable, *lua.LTable) {
 	metatable.RawSetString("__metatable", lua.LString("protected feature table"))
 	state.SetMetatable(proxy, metatable)
 	guardFeatureTableMutators(state, proxy)
+	installReadOnlyFeatureIteration(state, proxy, data)
 	return proxy, data
+}
+
+// GopherLua implements Lua 5.1 pairs/next with raw table iteration. The
+// protected feature proxy has no raw entries, so those functions need to
+// enumerate its backing table without returning that mutable table to Lua.
+func installReadOnlyFeatureIteration(state *lua.LState, feature, data *lua.LTable) {
+	featureNext := state.NewFunction(func(state *lua.LState) int {
+		table := state.CheckTable(1)
+		if table == feature {
+			table = data
+		}
+		key, value := table.Next(state.Get(2))
+		state.Push(key)
+		if key == lua.LNil {
+			return 1
+		}
+		state.Push(value)
+		return 2
+	})
+	state.SetGlobal("next", featureNext)
+	state.SetGlobal("pairs", state.NewFunction(func(state *lua.LState) int {
+		table := state.CheckTable(1)
+		state.Push(featureNext)
+		state.Push(table)
+		state.Push(lua.LNil)
+		return 3
+	}))
 }
 
 // table.insert/remove/sort mutate LTable values directly and bypass Lua's

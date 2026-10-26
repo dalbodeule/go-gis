@@ -736,37 +736,120 @@ TestCase {
         tryCompare(dialog, "visible", true);
         var keywordScript = 'if feature.NAME then return "road" end';
         editor.text = keywordScript;
-        tryVerify(function() { return editor.highlightedHTML.indexOf("road") >= 0 && editor.highlightedHTML.indexOf("#7b2cbf") >= 0 && editor.highlightedHTML.indexOf("#16803c") >= 0; });
-        verify(editor.highlightedHTML.indexOf("#7b2cbf") >= 0, "Lua keywords should be highlighted");
-        verify(editor.highlightedHTML.indexOf("#16803c") >= 0, "Lua strings should be highlighted");
+        compare(editor.text, keywordScript);
         displayEditor.text = 'return feature.ACTIVE == true';
-        tryVerify(function() { return displayEditor.highlightedHTML.indexOf("#7b2cbf") >= 0; });
+        compare(displayEditor.text, 'return feature.ACTIVE == true');
         var escapedScript = 'return feature["road<&\"name"] -- <safe>';
         editor.text = escapedScript;
-        tryVerify(function() { return editor.highlightedHTML.indexOf("road&lt;&amp;") >= 0 && editor.highlightedHTML.indexOf("<safe>") < 0; });
-        verify(editor.highlightedHTML.indexOf("road&lt;&amp;") >= 0, "source text must be escaped before rendering as rich text");
-        verify(editor.highlightedHTML.indexOf("&quot;") >= 0, "quotes must be escaped before rendering as rich text");
+        compare(editor.text, escapedScript);
         var longBracketScript = "local value = [[<literal>]]\n--[=[ <block comment> ]=]";
         editor.text = longBracketScript;
-        tryVerify(function() { return editor.highlightedHTML.indexOf("&lt;literal&gt;") >= 0 && editor.highlightedHTML.indexOf("&lt;block comment&gt;") >= 0; });
-        verify(editor.highlightedHTML.indexOf("#16803c") >= 0, "Lua long-bracket strings should be highlighted");
-        verify(editor.highlightedHTML.indexOf("#78838e") >= 0, "Lua long-bracket comments should be highlighted");
-        verify(editor.highlightedHTML.indexOf("&lt;literal&gt;") >= 0, "long-bracket strings must remain escaped");
-        compare(editor.lineNumberText("first\nsecond\nthird"), "1\n2\n3");
-        // Exercise highlighting close to the 64 KiB label-script source cap.
+        compare(editor.text, longBracketScript);
+        compare(editor.lineStarts.length, 2);
+        compare(editor.lineStarts[1], longBracketScript.indexOf("\n") + 1);
+        // Exercise line numbering close to the 64 KiB label-script source cap.
         var longScript = "local n = 1\n".repeat(5000);
         editor.text = longScript;
-        tryVerify(function() { return editor.highlightedHTML.length > longScript.length && editor.highlightedHTML.indexOf("local") >= 0; });
-        verify(editor.highlightedHTML.length > longScript.length, "large scripts should still be highlighted");
-        compare(editor.highlightedLineNumbers.split("\n").length, 5001);
-        var oversizedScript = "local n = 1\n".repeat(12000);
-        editor.text = oversizedScript;
-        tryVerify(function() { return !editor.syntaxHighlightingEnabled && editor.highlightedHTML === ""; });
+        compare(editor.lineStarts.length, 5001);
         var sourceArea = findChild(editor, "luaSourceArea");
         verify(sourceArea !== null);
         compare(sourceArea.color, "#263238");
-        viewport.attributeFieldHints = [{name: "road class", type: "text"}];
+        verify(sourceArea.leftPadding >= 64, "Lua editor gutter should leave enough room for the cursor and source text");
+        compare(sourceArea.wrapMode, TextEdit.WrapAnywhere);
+        verify(findChild(editor, "luaLineNumberGutter") !== null);
+        var sourceFlickable = findChild(editor, "luaSourceFlickable");
+        verify(sourceFlickable !== null);
+        editor.text = "first\nsecond";
+        tryVerify(function() { return editor.visibleLines().length >= 2; });
+        compare(editor.visibleLines()[0].number, 1);
+        compare(editor.visibleLines()[1].number, 2);
+        var secondLineNumber = findChild(editor, "luaLineNumber2");
+        verify(secondLineNumber !== null, "second line number should be rendered");
+        verify(Math.abs(secondLineNumber.y -
+                        (sourceArea.positionToRectangle(editor.lineStarts[1]).y - sourceFlickable.contentY)) < 1,
+               "rendered line number must align with its source line");
+        verify(Math.abs(editor.visibleLines()[0].y -
+                        (sourceArea.positionToRectangle(0).y - sourceFlickable.contentY)) < 1,
+               "line number must share the source row's vertical position: gutter=" +
+               editor.visibleLines()[0].y + " text=" + sourceArea.positionToRectangle(0).y +
+               " scroll=" + sourceFlickable.contentY);
+        editor.text = "return " + "feature.NAME .. ".repeat(8) + "\nsecond";
+        tryVerify(function() { return sourceArea.positionToRectangle(editor.lineStarts[1]).y >
+                                      sourceArea.positionToRectangle(0).y + 2 * sourceArea.font.pixelSize; });
+        var wrappedSecondLine = findChild(editor, "luaLineNumber2");
+        verify(wrappedSecondLine !== null);
+        verify(Math.abs(wrappedSecondLine.y -
+                        (sourceArea.positionToRectangle(editor.lineStarts[1]).y - sourceFlickable.contentY)) < 1,
+               "line number after wrapped text must align with its source line");
+        verify(Math.abs(sourceFlickable.contentWidth - sourceFlickable.width) < 1,
+               "wrapped editor should not need horizontal scrolling");
+        editor.text = "line\n".repeat(100);
+        sourceArea.cursorPosition = editor.text.length;
+        sourceArea.forceActiveFocus();
+        tryVerify(function() { return editor.visibleLines().length > 0 && editor.visibleLines()[0].number > 1; });
+        verify(editor.visibleLines().length < 30, "gutter should create only visible line numbers");
+        var visibleLine = editor.visibleLines()[0];
+        var scrolledLineNumber = findChild(editor, "luaLineNumber" + visibleLine.number);
+        verify(scrolledLineNumber !== null, "scrolled line number should be rendered");
+        verify(Math.abs(scrolledLineNumber.y - visibleLine.y) < 1,
+               "rendered line number must follow vertical scrolling");
+        var likeExample = findChild(appWindow, "insertLuaLikeExampleButton");
+        var concatenationExample = findChild(appWindow, "insertLuaConcatenationExampleButton");
+        var numberFormatExample = findChild(appWindow, "insertLuaNumberFormatExampleButton");
+        verify(likeExample !== null && concatenationExample !== null && numberFormatExample !== null);
+        likeExample.clicked();
+        verify(displayEditor.text.indexOf("gogis.contains") >= 0 && displayEditor.text.indexOf("true)") >= 0);
+        concatenationExample.clicked();
+        verify(editor.text.indexOf("..") >= 0 && editor.text.indexOf("gogis.coalesce") >= 0);
+        numberFormatExample.clicked();
+        verify(editor.text.indexOf("gogis.format_number(feature.AREA, 2)") >= 0);
+        verify(findChild(dialog, "luaShortcutHelp") !== null);
+        var manyFields = [{name: "road class", type: "text"}];
+        for (var fieldIndex = 0; fieldIndex < 30; ++fieldIndex)
+            manyFields.push({name: "A" + fieldIndex, type: "number"});
+        viewport.attributeFieldHints = manyFields;
         compare(viewport.luaFieldAccess("road class"), 'feature["road class"]');
+        compare(viewport.luaFieldAccess("end"), 'feature["end"]');
+        compare(viewport.luaFieldAccess("local"), 'feature["local"]');
+        compare(viewport.luaFieldAccess("name"), "feature.name");
+        compare(viewport.luaFieldAccess('a"b\\c'), 'feature["a\\"b\\\\c"]');
+        compare(viewport.luaFieldAccess("a\nb"), 'feature["a\\010b"]');
+        compare(viewport.luaFieldAccess("a\u0000b"), 'feature["a\\000b"]');
+        verify(viewport.luaFieldHintText().length < 80, "field summary should remain compact");
+        var fieldSummary = findChild(dialog, "luaFieldSummary");
+        var browseFields = findChild(dialog, "luaBrowseFieldsButton");
+        verify(fieldSummary !== null && browseFields !== null);
+        verify(fieldSummary.text.indexOf("31") >= 0 && fieldSummary.text.length < 80);
+        editor.text = "return " + "feature.A3 .. ".repeat(60);
+        sourceArea.cursorPosition = editor.text.length;
+        sourceArea.forceActiveFocus();
+        tryCompare(sourceArea, "activeFocus", true);
+        compare(sourceArea.color, "#263238");
+        verify(sourceArea.contentHeight > editor.height,
+               "long lines should wrap into visible rows rather than clipping horizontally");
+        editor.text = "return ";
+        editor.cursorPosition = editor.text.length;
+        browseFields.clicked();
+        var fieldPopup = findChild(appWindow, "labelFieldHintPopup");
+        tryCompare(fieldPopup, "visible", true);
+        var fieldList = findChild(fieldPopup, "labelFieldList");
+        tryCompare(fieldList, "count", 31);
+        var fieldSearch = findChild(fieldPopup, "labelFieldSearch");
+        fieldSearch.text = "road class";
+        tryCompare(fieldList, "count", 1);
+        tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
+        var fieldRow = fieldList.itemAtIndex(0);
+        mouseClick(fieldRow);
+        compare(editor.text, 'return feature["road class"]');
+        viewport.attributeFieldHints = [{name: "end", type: "text"}];
+        editor.text = "return ";
+        editor.cursorPosition = editor.text.length;
+        browseFields.clicked();
+        tryCompare(fieldPopup, "visible", true);
+        tryCompare(fieldList, "count", 1);
+        tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
+        mouseClick(fieldList.itemAtIndex(0));
+        compare(editor.text, 'return feature["end"]');
         dialog.close();
     }
 
@@ -981,6 +1064,10 @@ TestCase {
             tryCompare(layerModel, "count", 3);
             dialog.open();
             tryCompare(options, "count", 3);
+            compare(options.get(0).cadName, "0-연속지적도");
+            verify(options.get(0).included);
+            verify(options.get(0).geometryEnabled);
+            verify(options.get(0).labelsEnabled);
             options.setProperty(1, "included", false);
             options.setProperty(2, "cadName", "Buildings CAD");
             options.setProperty(2, "labelsEnabled", false);
@@ -1639,6 +1726,10 @@ TestCase {
         verify(fieldList !== null);
         compare(viewport.attributeFieldHints.length, 2);
         compare(fieldList.count, 2);
+        var fieldSearch = findChild(hintPopup, "labelFieldSearch");
+        verify(fieldSearch !== null);
+        fieldSearch.text = "lot";
+        tryCompare(fieldList, "count", 1);
         verify(fieldList.height > 0, "field list needs available height");
         tryVerify(function() { return fieldList.itemAtIndex(0) !== null; });
         var fieldRow = fieldList.itemAtIndex(0);

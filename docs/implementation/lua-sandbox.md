@@ -7,6 +7,17 @@ GoGIS의 Lua runtime은 내부 Go 포인터나 UI 객체를 노출하지 않고,
 
 - Lua base 문법과 `assert`, `pairs`, `ipairs`, `pcall` 등 순수 언어 기능
 - 제한된 `table`, `string`, `math` 라이브러리
+- 작업 스크립트와 피처별 레이블·표시 필터에서 공통으로 쓰는 순수 함수:
+  - `gogis.format_number(value[, decimals])`: 천 단위 쉼표를 넣고 0~6자리
+    소수점으로 반올림한다. 기본은 0자리다. 숫자 및 숫자 문자열을 허용하며
+    `nil`이나 숫자가 아닌 문자열은 `nil`을 반환한다.
+  - `gogis.coalesce(a, b, ...)`: 첫 번째 `nil`이 아니고 빈 문자열도 아닌
+    값을 돌려준다. `0`과 `false`는 유효한 값이다.
+  - `gogis.trim(text)`: 문자열 양끝의 유니코드 공백을 제거한다.
+    `nil` 입력은 `nil`이다.
+  - `gogis.contains(text, part[, ignoreCase])`: Lua 패턴이 아닌 리터럴
+    부분 문자열 포함 여부를 돌려준다. 선택적인 세 번째 인자가 `true`면
+    대소문자를 무시한다. `nil` 입력은 `false`다.
 - `gogis.layers()`
 - `gogis.set_property(layer, featureID, field, value)`
 - `gogis.export_dxf(destination, layer[, profile])`. 이것은 Lua에 부여한 명시적
@@ -59,6 +70,8 @@ gogis.label_lua("roads", "roads_with_labels", [[
 프로세스를 실행하거나 외부 Lua 모듈을 가져올 수 없다.
 
 레이블/필터의 `feature`는 backing property table을 가리키는 보호된 proxy다.
+`pairs(feature)`와 `next(feature)`는 속성을 열거하지만, 반복자에서 원본
+속성 테이블을 직접 돌려주지 않는다.
 `table.insert`, `table.remove`, `table.sort`는 내부에서 `__newindex` 없이 원본
 table을 직접 바꿀 수 있으므로 proxy에 대해서만 오류를 발생시킨다. 스크립트가
 직접 만든 일반 Lua table에는 이 표준 변경 함수들을 계속 사용할 수 있다.
@@ -91,6 +104,7 @@ quota로 사용하지 않는다. 해당 호출은 GoGIS에서 제거했다. 신�
 없으며, `byte`는 대형 속성 문자열 하나에서 수백만 개의 Lua 반환값을 만들 수 있고,
 `gsub`는 매칭마다 전체 결과를 재복사한다. `table.concat`은 결과 길이를 1 MiB로
 제한하고 사전 계량 후에만 할당하며, 계량 중 context 취소도 확인한다.
+`format_number`, `trim`, `contains`의 문자열 입력도 1 MiB로 제한한다.
 
 ## 취소와 동시성
 

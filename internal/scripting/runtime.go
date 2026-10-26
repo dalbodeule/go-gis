@@ -59,7 +59,7 @@ func NewRuntime(service *commands.ProjectService, exporter Exporter, spatial ...
 		spatialOperator = spatial[0]
 	}
 	runtime := &Runtime{state: state, service: service, exporter: exporter, spatial: spatialOperator}
-	runtime.state.SetGlobal("gogis", runtime.state.SetFuncs(runtime.state.NewTable(), map[string]lua.LGFunction{
+	runtime.state.SetGlobal("gogis", runtime.state.SetFuncs(installLuaHelpers(runtime.state), map[string]lua.LGFunction{
 		"layers":       runtime.layers,
 		"set_property": runtime.setProperty,
 		"export_dxf":   runtime.exportDXF,
