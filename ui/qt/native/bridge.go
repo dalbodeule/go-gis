@@ -13,7 +13,6 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"unsafe"
 
 	"gogis/internal/render"
@@ -320,9 +319,6 @@ func CurrentActiveLayer() string {
 func SetRenderStatus(status string) {
 	if isDiagnosticStatus(status) {
 		RecordDiagnostic("application", status)
-		// Keep errors visible when the desktop app is launched from a terminal.
-		// stdout is captured by the same bounded in-memory diagnostics pipeline.
-		_, _ = fmt.Fprintln(os.Stdout, "GoGIS:", status)
 	}
 	cStatus := C.CString(status)
 	defer C.free(unsafe.Pointer(cStatus))

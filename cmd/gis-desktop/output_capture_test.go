@@ -20,10 +20,13 @@ func TestDesktopOutputCapturePreservesConsoleAndCapturesStandardStreams(t *testi
 	if err != nil {
 		t.Fatalf("capture subprocess failed: %v\n%s", err, output)
 	}
-	for _, expected := range []string{"capture-subprocess-stdout", "capture-subprocess-stderr", "GoGIS: Render incomplete; capture-subprocess-error", "GoGIS: No visible layers"} {
+	for _, expected := range []string{"capture-subprocess-stdout", "capture-subprocess-stderr"} {
 		if !strings.Contains(string(output), expected) {
 			t.Fatalf("mirrored console output %q missing from %q", expected, output)
 		}
+	}
+	if strings.Contains(string(output), "GoGIS: Render incomplete; capture-subprocess-error") || strings.Contains(string(output), "GoGIS: No visible layers") {
+		t.Fatalf("application diagnostics were mirrored into stdout: %q", output)
 	}
 }
 

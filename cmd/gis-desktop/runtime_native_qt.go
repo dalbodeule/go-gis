@@ -275,7 +275,14 @@ func (r *demoRuntime) startDataLoad(input, layerName, sourceCRS, targetCRS, save
 			next.workspaceView = initialFitWorkspaceView(next, native.CurrentViewport())
 		}
 		r.replaceWithLoaded(next, generation)
-		if largeReadOnly {
+		if len(next.unavailableSources) > 0 {
+			warningNames := make([]string, 0, len(next.unavailableSources))
+			for name := range next.unavailableSources {
+				warningNames = append(warningNames, name)
+			}
+			sort.Strings(warningNames)
+			native.SetRenderStatus("Source unavailable; edit layer properties: " + strings.Join(warningNames, ", "))
+		} else if largeReadOnly {
 			native.SetRenderStatus(largeDatasetReadOnlyStatus(featureCount))
 		}
 	}()
@@ -347,6 +354,7 @@ func loadDataRuntimeModeContextWithEncodingAndSession(ctx context.Context, input
 			initialSession = nil // ownership transfers to the windowed loader
 			windowed, ok, err := tryLoadWindowedReadOnlyRuntimeWithSession(ctx, []vectorSourceSpec{{
 				Path: input, LayerName: layerName, SourceCRS: sourceCRS, Encoding: encoding,
+				AllowUnavailable: true,
 			}}, targetCRS, sessionForWindowedLoad)
 			if err != nil || ok {
 				return windowed, err
@@ -1016,6 +1024,15 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				sourceCRS = source.FallbackCRS
 			}
 			if metadataErr := validateReadOnlyWindowMetadata(overview.Name, sourceCRS, overview.HasBounds); metadataErr != nil {
+				if source.AllowUnavailable && ctx.Err() == nil {
+					missing := source
+					missing.LayerName = overview.Name
+					if missing.Name == "" {
+						missing.Name = overview.Name
+					}
+					addUnavailable(missing, metadataErr)
+					continue
+				}
 				return nil, true, metadataErr
 			}
 			if targetCRS == "" {
@@ -1075,7 +1092,13 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 		}
 	}
 	if !hasExtent {
-		return nil, false, nil
+		if len(unavailable) == 0 {
+			return nil, false, nil
+		}
+		// No source geometry is exposed until the missing CRS or extent is
+		// repaired. Keep an empty view so the source remains editable in the
+		// layer properties dialog without reading the full dataset.
+		extent = [4]float64{0, 0, 1, 1}
 	}
 	for index := range layers {
 		if layers[index].CRS.AuthorityCode == "" {
@@ -1142,6 +1165,13 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			if layer.Name == layerName {
 				return inMemoryLayerAttributePage(layer, offset, limit)
 			}
+		}
+		if _, missing := unavailable[layerName]; missing {
+			layer, ok := runtime.service.LayerProperties(layerName)
+			if !ok {
+				return core.Layer{}, 0, fmt.Errorf("layer %q not found", layerName)
+			}
+			return layer, 0, nil
 		}
 		binding, ok := bindings[layerName]
 		if !ok {
@@ -1691,8 +1721,11 @@ func prepareReadOnlyWindowLabels(ctx context.Context, window *core.Layer, overvi
 }
 
 func validateReadOnlyWindowMetadata(layerName, sourceCRS string, hasBounds bool) error {
-	if strings.TrimSpace(sourceCRS) == "" || !hasBounds {
-		return fmt.Errorf("layer %q cannot be safely opened read-only: viewport rendering requires a declared source CRS and valid extent; refusing a full-geometry fallback (specify --source-crs or repair the dataset metadata)", layerName)
+	if strings.TrimSpace(sourceCRS) == "" {
+		return fmt.Errorf("layer %q cannot be safely opened read-only: source CRS is missing; refusing a full-geometry fallback (set the source CRS in layer properties or specify --source-crs)", layerName)
+	}
+	if !hasBounds {
+		return fmt.Errorf("layer %q cannot be safely opened read-only: source extent is missing or invalid; refusing a full-geometry fallback (repair the dataset metadata)", layerName)
 	}
 	return nil
 }

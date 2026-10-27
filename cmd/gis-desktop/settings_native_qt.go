@@ -19,6 +19,9 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 		return fmt.Errorf("no project is loaded")
 	}
 	layers := r.service.ProjectLayerProperties()
+	oldExtent := r.mapExtent
+	oldCRS := r.mapCRS
+	pendingView := r.workspaceView
 	baseLayers := []core.Layer(nil)
 	if !readOnly {
 		baseLayers = r.service.ProjectLayersExcept(request.Name)
@@ -59,7 +62,7 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 		}
 		visible := layer.Visible
 		missing, wasUnavailable := unavailable[layer.Name]
-		allowUnavailable := wasUnavailable && missing.Path == layer.SourcePath &&
+		allowUnavailable := !targetLayer && wasUnavailable && missing.Path == layer.SourcePath &&
 			missing.LayerName == layer.SourceLayerName && missing.Encoding == layer.SourceEncoding
 		source := vectorSourceSpec{
 			Path: layer.SourcePath, LayerName: layer.SourceLayerName, SourceCRS: layer.SourceCRS,
@@ -122,8 +125,14 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 			r.publishLayerTree()
 			return
 		}
-		view := workspaceViewFromViewport(native.CurrentViewport(), native.CurrentActiveLayer())
-		next.workspaceView = &view
+		oldView := native.CurrentViewport()
+		activeLayer := native.CurrentActiveLayer()
+		metadataPending := native.AppliedMapMetadataGeneration() < native.MapMetadataGeneration()
+		if pendingView != nil && (metadataPending || viewportCanvasAspectIsStale(oldView, oldExtent, oldCRS)) {
+			next.workspaceView = preserveSavedMapWorldView(*pendingView, oldView, oldExtent, next.mapExtent, oldCRS, activeLayer)
+		} else {
+			next.workspaceView = preserveMapWorldViewCRS(oldView, oldExtent, next.mapExtent, oldCRS, activeLayer)
+		}
 		r.replaceWithLoaded(next, generation)
 		native.SetRenderStatus("Layer source reloaded")
 	}()

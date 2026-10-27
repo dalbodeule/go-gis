@@ -23,6 +23,7 @@ import (
 	"gogis/drivers/gdal"
 	geosdriver "gogis/drivers/geos"
 	projdriver "gogis/drivers/proj"
+	"gogis/internal/commands"
 	"gogis/internal/core"
 	"gogis/internal/render"
 	"gogis/internal/workspace"
@@ -1147,6 +1148,12 @@ func TestReadOnlyWindowRequiresCRSAndExtent(t *testing.T) {
 		if err != nil && !strings.Contains(err.Error(), "refusing a full-geometry fallback") {
 			t.Errorf("unsafe fallback error is not explicit: %v", err)
 		}
+		if test.name == "unknown-crs" && err != nil && !strings.Contains(err.Error(), "source CRS is missing") {
+			t.Errorf("missing CRS error is not specific: %v", err)
+		}
+		if test.name == "unknown-bounds" && err != nil && !strings.Contains(err.Error(), "source extent is missing or invalid") {
+			t.Errorf("invalid extent error is not specific: %v", err)
+		}
 	}
 }
 
@@ -2171,6 +2178,33 @@ func TestInitialFitViewExistsBeforeFirstLayerMetadataIsApplied(t *testing.T) {
 	}
 	if got := initialFitWorkspaceView(runtime, native.Viewport{}); got != nil {
 		t.Fatalf("headless viewport should defer first fit to QML, got %+v", got)
+	}
+}
+
+func TestInitialFitWorldCenterAndScaleIgnorePointOutlierExtent(t *testing.T) {
+	fit := [4]float64{100, 100, 200, 200}
+	viewport := native.Viewport{ViewportWidth: 1200, ViewportHeight: 800}
+	service, err := commands.NewProjectServiceWithLayers("loaded", core.CRS{AuthorityCode: "EPSG:5186"},
+		[]core.Layer{{Name: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worldView := func(extent [4]float64) (float64, float64, float64) {
+		runtime := &demoRuntime{service: service, mapExtent: extent, mapFitExtent: fit, mapCRS: "EPSG:5186"}
+		view := initialFitWorkspaceView(runtime, viewport)
+		if view == nil {
+			t.Fatal("initial fit view is missing")
+		}
+		canvasWidth := math.Min(viewport.ViewportWidth, viewport.ViewportHeight*extentAspectMeters(extent, runtime.mapCRS))
+		return extent[0] + view.CenterX*(extent[2]-extent[0]),
+			extent[1] + view.CenterY*(extent[3]-extent[1]),
+			(extent[2] - extent[0]) / (canvasWidth * view.Zoom)
+	}
+	baseX, baseY, baseScale := worldView(fit)
+	outlierX, outlierY, outlierScale := worldView([4]float64{0, 0, 10000, 12000})
+	if math.Abs(outlierX-baseX) > 1e-6 || math.Abs(outlierY-baseY) > 1e-6 || math.Abs(outlierScale-baseScale) > 1e-9 {
+		t.Fatalf("point outlier changed initial world view: base=(%g,%g,%g) outlier=(%g,%g,%g)",
+			baseX, baseY, baseScale, outlierX, outlierY, outlierScale)
 	}
 }
 

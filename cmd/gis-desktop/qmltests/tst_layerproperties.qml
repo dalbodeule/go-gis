@@ -743,14 +743,14 @@ TestCase {
         mouseClick(removeItem);
         tryCompare(removeDialog, "visible", true);
         compare(removeDialog.targetLayerName, "roads");
-        mouseClick(removeDialog.standardButton(Dialog.Cancel));
+        mouseClick(findChild(removeDialog, "removeLayerCancelButton"));
         tryCompare(removeDialog, "visible", false);
         compare(canvas.layerSettingsGeneration, beforeRemoveGeneration);
         menu.popup();
         tryCompare(menu, "visible", true);
         mouseClick(removeItem);
         tryCompare(removeDialog, "visible", true);
-        mouseClick(removeDialog.standardButton(Dialog.Ok));
+        mouseClick(findChild(removeDialog, "removeLayerConfirmButton"));
         tryCompare(canvas, "layerSettingsGeneration", beforeRemoveGeneration + 1);
         compare(JSON.parse(canvas.layerSettingsPayload).operation, "remove");
         compare(JSON.parse(canvas.layerSettingsPayload).name, "roads");
@@ -1272,6 +1272,34 @@ TestCase {
         compare(choice.currentValue, "ares-shift-jis");
         encodingDialog.close();
         appWindow.language = "en";
+    }
+
+    function test_confirmationButtonsStayOnTheRight() {
+        var previousLanguage = appWindow.language;
+        var cases = [
+            {dialog: "spatialOperationDialog", cancel: "spatialCancelButton", confirm: "spatialOkButton"},
+            {dialog: "deleteRecordDialog", cancel: "deleteRecordCancelButton", confirm: "deleteRecordConfirmButton"},
+            {dialog: "removeLayerDialog", cancel: "removeLayerCancelButton", confirm: "removeLayerConfirmButton"},
+            {dialog: "projectCRSDialog", cancel: "projectCRSCancelButton", confirm: "projectCRSApplyButton"},
+            {dialog: "dxfEncodingDialog", cancel: "dxfExportCancelButton", confirm: "dxfExportConfirmButton"}
+        ];
+        try {
+            appWindow.language = "ko";
+            for (var i = 0; i < cases.length; ++i) {
+                var current = cases[i];
+                var dialog = findChild(appWindow, current.dialog);
+                var cancel = findChild(dialog, current.cancel);
+                var confirm = findChild(dialog, current.confirm);
+                verify(dialog && cancel && confirm, current.dialog + " buttons missing");
+                dialog.open();
+                tryCompare(dialog, "visible", true);
+                verify(confirm.x > cancel.x, current.dialog + " confirmation must be to the right");
+                verify(confirm.x > dialog.width / 2, current.dialog + " confirmation must be on the right side");
+                dialog.reject();
+            }
+        } finally {
+            appWindow.language = previousLanguage;
+        }
     }
 
     function test_dxfLayerExportPlanCanExcludeAndRenameLayers() {

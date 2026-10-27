@@ -257,6 +257,11 @@ ApplicationWindow {
         var exact = dictionary[status];
         if (exact !== undefined) return exact;
         if (status.indexOf("Workspace loaded; relink unavailable layers: ") === 0 && language === "ko") return "작업공간을 열었습니다. 다시 연결할 레이어: " + status.substring("Workspace loaded; relink unavailable layers: ".length);
+        if (status.indexOf("Source unavailable; edit layer properties: ") === 0) {
+            var names = status.substring("Source unavailable; edit layer properties: ".length);
+            if (language === "ko") return "원본 좌표계 또는 범위를 확인하세요. 레이어 속성: " + names;
+            if (language === "jp") return "ソースの座標系または範囲を確認してください。レイヤーのプロパティ: " + names;
+        }
         var prefixes = statusPrefixCache[language];
         if (prefixes === undefined) {
             prefixes = Object.keys(dictionary).sort(function(a, b) { return b.length - a.length; });
@@ -838,7 +843,11 @@ ApplicationWindow {
         modal: true
         anchors.centerIn: Overlay.overlay
         title: rootWindow.language === "ko" ? "공간 연산" : rootWindow.language === "jp" ? "空間演算" : "Spatial operation"
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { objectName: "spatialCancelButton"; text: rootWindow.tr("Cancel"); onClicked: spatialOperationDialog.reject() }
+            Button { objectName: "spatialOkButton"; text: rootWindow.language === "ko" ? "확인" : rootWindow.language === "jp" ? "確認" : "OK"; onClicked: spatialOperationDialog.accept() }
+        }
         width: Math.min(520, rootWindow.width - 48)
         property string selectedOperation: spatialOperationChoice.currentValue
         contentItem: ColumnLayout {
@@ -1012,7 +1021,11 @@ ApplicationWindow {
         anchors.centerIn: Overlay.overlay
         implicitWidth: 420
         title: rootWindow.language === "ko" ? "레코드 삭제 확인" : rootWindow.language === "jp" ? "レコード削除の確認" : "Confirm record deletion"
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { objectName: "deleteRecordCancelButton"; text: rootWindow.tr("Cancel"); onClicked: deleteRecordDialog.reject() }
+            Button { objectName: "deleteRecordConfirmButton"; text: rootWindow.language === "ko" ? "삭제" : rootWindow.language === "jp" ? "削除" : "Delete"; onClicked: deleteRecordDialog.accept() }
+        }
         contentItem: Label {
             text: rootWindow.language === "ko" ? "선택한 레코드를 삭제하고 PostGIS/원본에 저장할까요?" : rootWindow.language === "jp" ? "選択したレコードを削除してPostGIS/ソースに保存しますか？" : "Delete the selected record and save the change to PostGIS/source?"
             wrapMode: Text.WordWrap
@@ -1089,7 +1102,11 @@ ApplicationWindow {
         modal: true
         anchors.centerIn: Overlay.overlay
         title: rootWindow.tr("Remove layer from project")
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { objectName: "removeLayerCancelButton"; text: rootWindow.tr("Cancel"); onClicked: removeLayerDialog.reject() }
+            Button { objectName: "removeLayerConfirmButton"; text: rootWindow.language === "ko" ? "제거" : rootWindow.language === "jp" ? "削除" : "Remove"; onClicked: removeLayerDialog.accept() }
+        }
         width: Math.min(440, rootWindow.width - 48)
         property string targetLayerName: ""
         contentItem: Label {
@@ -1107,7 +1124,11 @@ ApplicationWindow {
         objectName: "projectCRSDialog"
         modal: true
         title: rootWindow.language === "ko" ? "프로젝트 좌표계" : rootWindow.language === "jp" ? "プロジェクト座標系" : "Project coordinate reference system"
-        standardButtons: Dialog.Apply | Dialog.Cancel
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { objectName: "projectCRSCancelButton"; text: rootWindow.tr("Cancel"); onClicked: projectCRSDialog.reject() }
+            Button { objectName: "projectCRSApplyButton"; text: rootWindow.language === "ko" ? "적용" : rootWindow.language === "jp" ? "適用" : "Apply"; onClicked: projectCRSDialog.accept() }
+        }
         width: Math.min(650, rootWindow.width - 48)
         height: Math.min(630, rootWindow.height - 48)
         anchors.centerIn: Overlay.overlay
@@ -1555,6 +1576,8 @@ ApplicationWindow {
                         implicitHeight: 36
                         text: (sourceError ? "⚠ " : "") + (displayName === "" ? name : displayName)
                         checked: layerVisible
+                        ToolTip.visible: hovered && sourceError !== ""
+                        ToolTip.text: sourceError
                         onClicked: {
                             if (index < 0 || index >= layerModel.count || layerModel.get(index).name !== name)
                                 return;
@@ -3038,16 +3061,16 @@ ApplicationWindow {
                 }
                 RowLayout {
                     visible: mapViewport.selectedFeature !== ""
+                    Layout.fillWidth: true
                     Button {
-                        text: rootWindow.tr("Save")
-                        enabled: mapViewport.activeLayerEditable()
-                        onClicked: {
-                            mapCanvas.editAction = "commit";
-                            mapCanvas.editValue = mapViewport.editorValue;
-                            mapCanvas.editGeneration += 1;
-                        }
+                        objectName: "deleteSelectedRecordButton"
+                        text: rootWindow.language === "ko" ? "레코드 삭제…" : rootWindow.language === "jp" ? "レコード削除…" : "Delete record…"
+                        enabled: mapViewport.activeLayerGeometryEditable()
+                        onClicked: deleteRecordDialog.open()
                     }
+                    Item { Layout.fillWidth: true }
                     Button {
+                        objectName: "featureEditCancelButton"
                         text: rootWindow.tr("Cancel")
                         enabled: mapViewport.activeLayerEditable()
                         onClicked: {
@@ -3058,10 +3081,14 @@ ApplicationWindow {
                         }
                     }
                     Button {
-                        objectName: "deleteSelectedRecordButton"
-                        text: rootWindow.language === "ko" ? "레코드 삭제…" : rootWindow.language === "jp" ? "レコード削除…" : "Delete record…"
-                        enabled: mapViewport.activeLayerGeometryEditable()
-                        onClicked: deleteRecordDialog.open()
+                        objectName: "featureEditSaveButton"
+                        text: rootWindow.tr("Save")
+                        enabled: mapViewport.activeLayerEditable()
+                        onClicked: {
+                            mapCanvas.editAction = "commit";
+                            mapCanvas.editValue = mapViewport.editorValue;
+                            mapCanvas.editGeneration += 1;
+                        }
                     }
                 }
                 Button {
@@ -4534,7 +4561,11 @@ ApplicationWindow {
         objectName: "dxfEncodingDialog"
         modal: true
         title: rootWindow.language === "ko" ? "DXF 내보내기 설정" : rootWindow.language === "jp" ? "DXF書き出し設定" : "DXF export settings"
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: RowLayout {
+            Item { Layout.fillWidth: true }
+            Button { objectName: "dxfExportCancelButton"; text: rootWindow.tr("Cancel"); onClicked: dxfEncodingDialog.reject() }
+            Button { objectName: "dxfExportConfirmButton"; text: rootWindow.language === "ko" ? "확인" : rootWindow.language === "jp" ? "確認" : "OK"; onClicked: dxfEncodingDialog.accept() }
+        }
         width: Math.min(640, rootWindow.width - 48)
         anchors.centerIn: Overlay.overlay
         property string validationMessage: ""
@@ -4747,7 +4778,6 @@ ApplicationWindow {
         nameFilters: ["Vector files (*.shp *.gpkg *.geojson *.json *.dxf)", "All files (*)"]
         onAccepted: {
             sourcePathField.text = mapViewport.localPathFromUrl(file);
-            sourceCRSField.text = "";
         }
     }
 }
