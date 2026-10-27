@@ -6,10 +6,13 @@ import (
 	"context"
 	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gogis/internal/commands"
 	"gogis/internal/core"
+
+	"github.com/airbusgeo/godal"
 )
 
 func BenchmarkNewOGRGeometryWKBPoint(b *testing.B) {
@@ -93,6 +96,70 @@ func TestWriterSingleLayerUpdatePreservesOtherGeoPackageLayers(t *testing.T) {
 		if _, err := (Reader{}).Open(context.Background(), destination, name); err != nil {
 			t.Fatalf("layer %s was not preserved: %v", name, err)
 		}
+	}
+}
+
+func TestWriterSingleLayerUpdateDoesNotMaterializeUntouchedGeoPackageLayer(t *testing.T) {
+	ctx := context.Background()
+	destination := filepath.Join(t.TempDir(), "large-property.gpkg")
+	writer := Writer{}
+	large := writableLayer()
+	large.Name = "large"
+	large.Features[0].Properties["name"] = strings.Repeat("x", maxMaterializedSnapshotFeatureBytes+1)
+	if err := writer.WriteLayers(ctx, destination, []core.Layer{large, writableLayer()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Reader{}).Open(ctx, destination, "large"); err == nil {
+		t.Fatal("test fixture must exceed the interactive materialization limit")
+	}
+	replacement := writableLayer()
+	replacement.Features[0].Properties["name"] = "updated"
+	if err := writer.Write(ctx, destination, replacement); err != nil {
+		t.Fatal(err)
+	}
+	dataset, err := godal.Open(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataset.Close()
+	for _, layer := range dataset.Layers() {
+		if layer.Name() == "large" {
+			feature := layer.NextFeature()
+			if feature == nil {
+				t.Fatal("untouched large layer lost its feature")
+			}
+			defer feature.Close()
+			if got := len(feature.Fields()["name"].String()); got != maxMaterializedSnapshotFeatureBytes+1 {
+				t.Fatalf("untouched attribute length = %d", got)
+			}
+			return
+		}
+	}
+	t.Fatal("untouched large layer was removed")
+}
+
+func TestWriterSingleLayerUpdateFailureKeepsOriginalGeoPackage(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	destination := filepath.Join(directory, "project.gpkg")
+	writer := Writer{}
+	if err := writer.Write(ctx, destination, writableLayer()); err != nil {
+		t.Fatal(err)
+	}
+	invalid := writableLayer()
+	invalid.Features[0].Geometry = nil
+	if err := writer.Write(ctx, destination, invalid); err == nil {
+		t.Fatal("invalid replacement layer was accepted")
+	}
+	if _, err := (Reader{}).Open(ctx, destination, "roads"); err != nil {
+		t.Fatalf("original layer was lost after replacement failure: %v", err)
+	}
+	staged, err := filepath.Glob(filepath.Join(directory, ".gogis-save-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 0 {
+		t.Fatalf("staged GeoPackages remain after failure: %v", staged)
 	}
 }
 

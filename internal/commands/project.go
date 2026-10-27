@@ -44,6 +44,19 @@ type LayerCollectionWriter interface {
 	WriteLayers(ctx context.Context, destination string, layers []core.Layer) error
 }
 
+// LayerCollectionBorrowedWriter promises to read feature geometry and property
+// maps without mutating or retaining them. The command layer can then pass a
+// copy-on-write render snapshot instead of cloning every WKB and attribute.
+type LayerCollectionBorrowedWriter interface {
+	WriteLayersBorrowed(ctx context.Context, destination string, layers []core.Layer) error
+}
+
+// LayerBorrowedWriter follows the same no-mutation and no-retention contract
+// for one layer. Writers without this contract still receive a full clone.
+type LayerBorrowedWriter interface {
+	WriteBorrowed(ctx context.Context, destination string, layer core.Layer) error
+}
+
 // NewProjectService creates a service with an empty project.
 func NewProjectService(name string, crs core.CRS) *ProjectService {
 	project := core.Project{Name: name, CRS: crs}
@@ -686,9 +699,9 @@ func (s *ProjectService) SetFeatureGeometry(layerName string, featureID uint64, 
 	return fmt.Errorf("%w: %s", ErrLayerMissing, layerName)
 }
 
-// SaveLayer persists one committed layer through the injected writer. The
-// committed snapshot is cloned before crossing the adapter boundary so a
-// writer cannot mutate the service's project state.
+// SaveLayer persists one committed layer through the injected writer. Writers
+// with the borrowed contract receive detached feature headers and shared
+// immutable payload; other writers receive a full clone.
 func (s *ProjectService) SaveLayer(ctx context.Context, writer LayerWriter, destination, layerName string) error {
 	if writer == nil {
 		return errors.New("layer writer is required")
@@ -704,6 +717,9 @@ func (s *ProjectService) SaveLayer(ctx context.Context, writer LayerWriter, dest
 	}
 	for _, layer := range s.project.Layers {
 		if layer.Name == layerName {
+			if borrowed, ok := writer.(LayerBorrowedWriter); ok {
+				return borrowed.WriteBorrowed(ctx, destination, layerRenderSnapshot(layer))
+			}
 			return writer.Write(ctx, destination, layer.Clone())
 		}
 	}
@@ -715,6 +731,13 @@ func (s *ProjectService) SaveLayer(ctx context.Context, writer LayerWriter, dest
 func (s *ProjectService) SaveAllLayers(ctx context.Context, writer LayerWriter, destination string) error {
 	if writer == nil {
 		return errors.New("layer writer is required")
+	}
+	if borrowed, ok := writer.(LayerCollectionBorrowedWriter); ok {
+		project := s.ProjectRenderSnapshot()
+		if len(project.Layers) == 0 {
+			return ErrNoLayers
+		}
+		return borrowed.WriteLayersBorrowed(ctx, destination, project.Layers)
 	}
 	project := s.Project()
 	if len(project.Layers) == 0 {

@@ -36,6 +36,16 @@ ApplicationWindow {
         });
     }
     property bool vertexEditMode: false
+    property bool exportPending: false
+    function syncExportBlocker() {
+        Qt.callLater(function() {
+            if (rootWindow.exportPending || mapCanvas.exportActive)
+                exportBlocker.open();
+            else
+                exportBlocker.close();
+        });
+    }
+    onExportPendingChanged: syncExportBlocker()
     property bool compactToolbar: width < 1360
     property string language: appLanguagePreference === "system" ? systemInterfaceLanguage() : appLanguagePreference
     readonly property string appLanguagePreference: typeof appLanguage === "undefined" ? "system" : appLanguage
@@ -184,6 +194,12 @@ ApplicationWindow {
 
     function localizedStatus(raw) {
         var status = String(raw || "");
+        if (status === "Exporting DXF")
+            return language === "ko" ? "DXF 내보내는 중" : language === "jp" ? "DXFを書き出し中" : status;
+        if (status.indexOf("DXF exported: ") === 0)
+            return (language === "ko" ? "DXF 내보내기 완료: " : language === "jp" ? "DXF書き出し完了: " : "DXF exported: ") + status.substring("DXF exported: ".length);
+        if (status.indexOf("DXF export failed: ") === 0)
+            return (language === "ko" ? "DXF 내보내기 실패: " : language === "jp" ? "DXF書き出し失敗: " : "DXF export failed: ") + status.substring("DXF export failed: ".length);
         var renderReady = /^Render ready: (\d+)\/(\d+) chunks contain geometry$/.exec(status);
         if (renderReady) {
             if (language === "ko") return "타일 렌더링 완료 · " + renderReady[1] + "/" + renderReady[2] + "개 청크에 도형 포함";
@@ -252,11 +268,22 @@ ApplicationWindow {
         return status;
     }
 
+    function localizedExportProgress(raw) {
+        var message = String(raw || "");
+        if (message === "Preparing DXF export")
+            return language === "ko" ? "내보내기를 준비 중입니다…" : language === "jp" ? "書き出しを準備しています…" : message;
+        var match = /^DXF layer (\d+)\/(\d+): (.+) \((\d+) features\)$/.exec(message);
+        if (match)
+            return language === "ko" ? "레이어 " + match[1] + "/" + match[2] + " · " + match[3] + " · " + match[4] + "개 피처 처리" :
+                   language === "jp" ? "レイヤー " + match[1] + "/" + match[2] + " · " + match[3] + " · " + match[4] + " 件処理" : message;
+        return message;
+    }
+
     function statusColor(raw) {
         var status = String(raw || "").toLowerCase();
         if (status.indexOf("failed") >= 0 || status.indexOf("error") >= 0 || status.indexOf("invalid") >= 0 || status.indexOf("exceeds") >= 0 || status.indexOf("incomplete") >= 0 || status.indexOf("stopped") >= 0 || status.indexOf("requires") >= 0) return "#b42318";
         if (status.indexOf("cancel") >= 0 || status.indexOf("unavailable") >= 0 || status.indexOf("cannot") >= 0 || status.indexOf("skipped") >= 0 || status.indexOf("relink") >= 0) return "#9a6700";
-        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
+        if (status.indexOf("read-only") >= 0 || status.indexOf("readonly") >= 0 || status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("exporting") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("checking") >= 0 || status.indexOf("reprojecting") >= 0) return "#175cd3";
         if (status.indexOf("saved") >= 0 || status.indexOf("applied") >= 0 || status.indexOf("loaded") >= 0 || status.indexOf("removed") >= 0 || status.indexOf("ready") >= 0 || status.indexOf("project crs set") >= 0) return "#2e7d32";
         return "#65717d";
     }
@@ -274,7 +301,7 @@ ApplicationWindow {
             status.indexOf("removed") >= 0 || status.indexOf("exported") >= 0 ||
             status.indexOf("ready") >= 0)
             return false;
-        return status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
+        return status.indexOf("loading") >= 0 || status.indexOf("importing") >= 0 || status.indexOf("saving") >= 0 || status.indexOf("exporting") >= 0 || status.indexOf("running ") >= 0 || status.indexOf("spatial") >= 0 || status.indexOf("rendering") >= 0 || status.indexOf("preview") >= 0 || status.indexOf("removing") >= 0 || status.indexOf("reprojecting") >= 0;
     }
 
     function renderProgressSnapshot(raw) {
@@ -2203,6 +2230,15 @@ ApplicationWindow {
                     property string activeLayer: ""
                     property int activeLayerGeneration: 0
                     property string renderStatus: "Ready"
+                    property bool exportActive: false
+                    property string exportMessage: ""
+                    property int exportRequestGeneration: 0
+                    property int exportStateGeneration: 0
+                    onExportStateGenerationChanged: {
+                        if (exportRequestGeneration === saveGeneration)
+                            rootWindow.exportPending = false;
+                        rootWindow.syncExportBlocker();
+                    }
                     // Must be a declared QML property so updates from the
                     // native bridge notify bindings such as the Logs dialog.
                     property string diagnosticLogPayload: "[]"
@@ -4441,10 +4477,55 @@ ApplicationWindow {
             var path = mapViewport.localPathFromUrl(file);
             if (!path.toLowerCase().endsWith(".dxf"))
                 path += ".dxf";
+            rootWindow.exportPending = true;
             mapCanvas.savePath = path;
             mapCanvas.saveProfile = selectedProfile;
             mapCanvas.saveOptions = selectedOptions;
             mapCanvas.saveGeneration += 1;
+        }
+    }
+
+    Popup {
+        id: exportBlocker
+        objectName: "dxfExportBlocker"
+        parent: Overlay.overlay
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        width: rootWindow.width
+        height: rootWindow.height
+        x: 0
+        y: 0
+        background: Rectangle { color: "#990f172a" }
+        contentItem: ColumnLayout {
+            anchors.centerIn: parent
+            width: Math.min(460, rootWindow.width - 80)
+            spacing: 14
+            Label {
+                Layout.alignment: Qt.AlignHCenter
+                text: rootWindow.language === "ko" ? "DXF 내보내는 중" : rootWindow.language === "jp" ? "DXFを書き出し中" : "Exporting DXF"
+                color: "white"
+                font.pixelSize: 22
+                font.bold: true
+            }
+            ProgressBar {
+                objectName: "dxfExportProgressBar"
+                Layout.fillWidth: true
+                indeterminate: true
+            }
+            Label {
+                objectName: "dxfExportProgressText"
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                color: "white"
+                wrapMode: Text.WordWrap
+                text: rootWindow.localizedExportProgress(mapCanvas.exportMessage || "Preparing DXF export")
+            }
+            Label {
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                color: "#dbeafe"
+                text: rootWindow.language === "ko" ? "완료될 때까지 프로젝트 편집을 잠시 막습니다." : rootWindow.language === "jp" ? "完了までプロジェクトの編集を一時停止します。" : "Project editing is paused until export finishes."
+            }
         }
     }
 

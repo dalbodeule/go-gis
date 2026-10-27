@@ -334,6 +334,17 @@ func RenderStatusGeneration() uint64 {
 	return uint64(C.gogis_render_status_generation())
 }
 
+// SetExportState publishes DXF progress and edit lock state to the QML window.
+func SetExportState(saveGeneration uint64, active bool, message string) {
+	cMessage := C.CString(message)
+	defer C.free(unsafe.Pointer(cMessage))
+	state := C.int(0)
+	if active {
+		state = 1
+	}
+	C.gogis_set_export_state(C.ulonglong(saveGeneration), state, cMessage)
+}
+
 // SetDiagnosticLogPayload publishes the current bounded process log to QML.
 func SetDiagnosticLogPayload(payload string) {
 	cPayload := C.CString(payload)

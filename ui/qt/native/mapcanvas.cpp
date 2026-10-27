@@ -116,6 +116,11 @@ std::atomic<unsigned long long> g_active_layer_generation{0};
 std::mutex g_render_status_mutex;
 std::string g_render_status;
 std::atomic<unsigned long long> g_render_status_generation{0};
+std::mutex g_export_state_mutex;
+std::string g_export_message;
+bool g_export_active = false;
+unsigned long long g_export_request_generation = 0;
+std::atomic<unsigned long long> g_export_state_generation{0};
 std::mutex g_diagnostic_log_mutex;
 std::string g_diagnostic_log_payload = "[]";
 std::atomic<unsigned long long> g_diagnostic_log_generation{0};
@@ -486,6 +491,16 @@ public:
                 std::lock_guard<std::mutex> lock(g_render_status_mutex);
                 setProperty("renderStatus", QString::fromStdString(g_render_status));
                 render_status_generation_ = render_status_generation;
+            }
+
+            const auto export_state_generation = g_export_state_generation.load(std::memory_order_acquire);
+            if (export_state_generation != export_state_generation_) {
+                std::lock_guard<std::mutex> lock(g_export_state_mutex);
+                setProperty("exportActive", g_export_active);
+                setProperty("exportMessage", QString::fromStdString(g_export_message));
+                setProperty("exportRequestGeneration", QVariant::fromValue<qulonglong>(g_export_request_generation));
+                setProperty("exportStateGeneration", QVariant::fromValue<qulonglong>(export_state_generation));
+                export_state_generation_ = export_state_generation;
             }
 
             const auto diagnostic_log_generation = g_diagnostic_log_generation.load(std::memory_order_relaxed);
@@ -868,6 +883,7 @@ private:
     unsigned long long layer_label_generation_ = 0;
     unsigned long long vertex_handle_generation_ = 0;
     unsigned long long render_status_generation_ = 0;
+    unsigned long long export_state_generation_ = 0;
     unsigned long long diagnostic_log_generation_ = 0;
     unsigned long long memory_status_generation_ = 0;
     unsigned long long map_metadata_generation_ = 0;
@@ -1252,6 +1268,16 @@ extern "C" void gogis_set_render_status(const char* status) {
 
 extern "C" unsigned long long gogis_render_status_generation(void) {
     return g_render_status_generation.load(std::memory_order_relaxed);
+}
+
+extern "C" void gogis_set_export_state(unsigned long long save_generation, int active, const char* message) {
+    {
+        std::lock_guard<std::mutex> lock(g_export_state_mutex);
+        g_export_active = active != 0;
+        g_export_request_generation = save_generation;
+        g_export_message = message != nullptr ? message : "";
+    }
+    g_export_state_generation.fetch_add(1, std::memory_order_release);
 }
 
 extern "C" void gogis_set_diagnostic_log_payload(const char* payload) {

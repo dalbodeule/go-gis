@@ -20,24 +20,19 @@ import (
 // write GeoPackage and ESRI Shapefile datasets.
 type Writer struct{}
 
+// WriteBorrowed reads the layer synchronously without mutating or retaining
+// any shared geometry or property snapshots.
+func (writer Writer) WriteBorrowed(ctx context.Context, destination string, layer core.Layer) error {
+	return writer.Write(ctx, destination, layer)
+}
+
 var shapefileConfigMu sync.Mutex
 
 // Write creates a single-layer vector dataset.
 func (writer Writer) Write(ctx context.Context, destination string, layer core.Layer) error {
 	if strings.EqualFold(filepath.Ext(destination), ".gpkg") {
 		if _, err := os.Stat(destination); err == nil {
-			existing, err := (Reader{}).OpenAll(ctx, destination)
-			if err != nil {
-				return fmt.Errorf("read existing GeoPackage layers: %w", err)
-			}
-			layers := make([]core.Layer, 0, len(existing)+1)
-			for _, current := range existing {
-				if current.Name != layer.Name {
-					layers = append(layers, current)
-				}
-			}
-			layers = append(layers, layer)
-			return writer.WriteLayers(ctx, destination, layers)
+			return writer.replaceGeoPackageLayer(ctx, destination, layer)
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("inspect destination %q: %w", destination, err)
 		}
@@ -106,6 +101,12 @@ func (Writer) WriteLayers(ctx context.Context, destination string, layers []core
 	return writeNewDataset(ctx, destination, driver, layers)
 }
 
+// WriteLayersBorrowed reads the detached feature headers synchronously. It
+// never mutates or retains the shared geometry and property values.
+func (writer Writer) WriteLayersBorrowed(ctx context.Context, destination string, layers []core.Layer) error {
+	return writer.WriteLayers(ctx, destination, layers)
+}
+
 func validateShapefileFields(fields []core.Field) error {
 	seen := map[string]string{}
 	for _, field := range fields {
@@ -127,6 +128,49 @@ func validateShapefileFields(fields []core.Field) error {
 }
 
 func replaceGeoPackage(ctx context.Context, destination string, layers []core.Layer) error {
+	return replaceGeoPackageTransaction(destination, func(temporaryPath string) error {
+		return writeNewDataset(ctx, temporaryPath, godal.GeoPackage, layers)
+	})
+}
+
+// replaceGeoPackageLayer copies untouched layers inside GDAL instead of
+// materializing their geometry and attributes in Go. The staged file is only
+// installed after every copy and the replacement layer have closed.
+func (writer Writer) replaceGeoPackageLayer(ctx context.Context, destination string, layer core.Layer) error {
+	return replaceGeoPackageTransaction(destination, func(temporaryPath string) error {
+		if err := writer.WriteLayers(ctx, temporaryPath, []core.Layer{layer}); err != nil {
+			return err
+		}
+		source, err := godal.Open(destination)
+		if err != nil {
+			return fmt.Errorf("open existing GeoPackage %q: %w", destination, err)
+		}
+		defer source.Close()
+		target, err := godal.Open(temporaryPath, godal.Update())
+		if err != nil {
+			return fmt.Errorf("open staged GeoPackage %q for update: %w", temporaryPath, err)
+		}
+		for _, existing := range source.Layers() {
+			if err := ctx.Err(); err != nil {
+				_ = target.Close()
+				return err
+			}
+			if existing.Name() == layer.Name {
+				continue
+			}
+			if _, err := target.CopyLayer(existing, existing.Name()); err != nil {
+				_ = target.Close()
+				return fmt.Errorf("copy existing layer %q: %w", existing.Name(), err)
+			}
+		}
+		if err := target.Close(); err != nil {
+			return fmt.Errorf("close staged GeoPackage %q: %w", temporaryPath, err)
+		}
+		return ctx.Err()
+	})
+}
+
+func replaceGeoPackageTransaction(destination string, writeStaged func(string) error) error {
 	directory := filepath.Dir(destination)
 	temporaryDirectory, err := os.MkdirTemp(directory, ".gogis-save-*")
 	if err != nil {
@@ -134,7 +178,7 @@ func replaceGeoPackage(ctx context.Context, destination string, layers []core.La
 	}
 	defer os.RemoveAll(temporaryDirectory)
 	temporaryPath := filepath.Join(temporaryDirectory, filepath.Base(destination))
-	if err := writeNewDataset(ctx, temporaryPath, godal.GeoPackage, layers); err != nil {
+	if err := writeStaged(temporaryPath); err != nil {
 		return err
 	}
 	backupFile, err := os.CreateTemp(directory, ".gogis-backup-*")

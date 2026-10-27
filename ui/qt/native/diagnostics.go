@@ -59,6 +59,7 @@ func RecordDiagnostic(stream, message string) {
 		oldest := diagnosticLog.entries[0]
 		diagnosticLog.bytes -= len(oldest.Time) + len(oldest.Stream) + len(oldest.Message) + 32
 		copy(diagnosticLog.entries, diagnosticLog.entries[1:])
+		diagnosticLog.entries[len(diagnosticLog.entries)-1] = diagnosticLogEntry{}
 		diagnosticLog.entries = diagnosticLog.entries[:len(diagnosticLog.entries)-1]
 	}
 	atomic.AddUint64(&diagnosticLogGeneration, 1)

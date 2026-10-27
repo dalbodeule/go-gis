@@ -2609,8 +2609,28 @@ func TestDesktopReadOnlyDXFExportCrossesBatchBoundary(t *testing.T) {
 	}
 	defer runtime.closeAttributeSource()
 	destination := filepath.Join(t.TempDir(), "many-points.dxf")
-	if err := runtime.exportProjectLayersDXF(destination, "ares-utf8"); err != nil {
+	type progressEvent struct {
+		features int
+		complete bool
+	}
+	var progress []progressEvent
+	if err := runtime.exportProjectLayersDXFWithProgress(destination, "ares-utf8", "",
+		func(layerIndex, layerCount int, name string, count int, complete bool) {
+			if layerIndex != 1 || layerCount != 1 || name == "" {
+				t.Errorf("invalid DXF progress: layer=%d/%d name=%q", layerIndex, layerCount, name)
+			}
+			progress = append(progress, progressEvent{features: count, complete: complete})
+		}); err != nil {
 		t.Fatal(err)
+	}
+	if len(progress) < 4 || progress[0] != (progressEvent{}) ||
+		progress[len(progress)-1] != (progressEvent{features: len(features), complete: true}) {
+		t.Fatalf("DXF progress across batches = %+v", progress)
+	}
+	for index := 1; index < len(progress); index++ {
+		if progress[index].features < progress[index-1].features {
+			t.Fatalf("DXF progress decreased: %+v", progress)
+		}
 	}
 	data, err := os.ReadFile(destination)
 	if err != nil {

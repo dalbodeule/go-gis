@@ -3417,10 +3417,24 @@ func (r *demoRuntime) saveDatasetWithOptions(destination, profile, options strin
 		return
 	}
 	if strings.EqualFold(filepath.Ext(destination), ".dxf") {
-		if err := r.exportProjectLayersDXFWithOptions(destination, profile, options); err != nil {
+		started := time.Now()
+		saveGeneration := native.SaveGeneration()
+		native.SetExportState(saveGeneration, true, "Preparing DXF export")
+		defer native.SetExportState(saveGeneration, false, "")
+		native.SetRenderStatus("Exporting DXF")
+		native.RecordDiagnostic("dxf", fmt.Sprintf("started destination=%q profile=%q", destination, profile))
+		progress := func(layerIndex, layerCount int, name string, features int, complete bool) {
+			native.SetExportState(saveGeneration, true, fmt.Sprintf("DXF layer %d/%d: %s (%d features)", layerIndex, layerCount, name, features))
+			if complete {
+				native.RecordDiagnostic("dxf", fmt.Sprintf("layer %d/%d name=%q exported_features=%d", layerIndex, layerCount, name, features))
+			}
+		}
+		if err := r.exportProjectLayersDXFWithProgress(destination, profile, options, progress); err != nil {
+			native.RecordDiagnostic("dxf", fmt.Sprintf("failed elapsed=%s: %v", time.Since(started).Round(time.Millisecond), err))
 			native.SetRenderStatus("DXF export failed: " + err.Error())
 			return
 		}
+		native.RecordDiagnostic("dxf", fmt.Sprintf("completed destination=%q elapsed=%s", destination, time.Since(started).Round(time.Millisecond)))
 		native.SetRenderStatus("DXF exported: " + destination)
 		return
 	}
@@ -3470,6 +3484,11 @@ type desktopDXFLayerOption struct {
 }
 
 func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, optionsJSON string) error {
+	return r.exportProjectLayersDXFWithProgress(destination, profile, optionsJSON, nil)
+}
+
+func (r *demoRuntime) exportProjectLayersDXFWithProgress(destination, profile, optionsJSON string,
+	progress func(layerIndex, layerCount int, name string, features int, complete bool)) error {
 	r.mu.Lock()
 	service := r.service
 	readOnly := r.readOnly
@@ -3550,6 +3569,10 @@ func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, op
 	produce := func(index int, emit func(core.Layer) error) error {
 		property := selected[index]
 		layerName := property.Name
+		processed := 0
+		if progress != nil {
+			progress(index+1, len(selected), specs[index].Name, 0, false)
+		}
 		prepareAndEmit := func(layer core.Layer) error {
 			layer.Name = property.Name
 			layer.DisplayName = property.DisplayName
@@ -3561,7 +3584,14 @@ func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, op
 			if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
 				return fmt.Errorf("prepare layer labels: %w", err)
 			}
-			return emit(layer)
+			if err := emit(layer); err != nil {
+				return err
+			}
+			processed += len(layer.Features)
+			if progress != nil {
+				progress(index+1, len(selected), specs[index].Name, processed, false)
+			}
+			return nil
 		}
 		if readOnly && property.SourcePath != "" {
 			var source *vectorSourceSpec
@@ -3600,13 +3630,22 @@ func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, op
 			if err != nil {
 				return fmt.Errorf("read layer for export: %w", err)
 			}
+			if progress != nil {
+				progress(index+1, len(selected), specs[index].Name, processed, true)
+			}
 			return nil
 		}
 		layer, ok := service.ProjectLayerRenderSnapshot(layerName)
 		if !ok {
 			return fmt.Errorf("layer %q data was not found", layerName)
 		}
-		return prepareAndEmit(layer)
+		if err := prepareAndEmit(layer); err != nil {
+			return err
+		}
+		if progress != nil {
+			progress(index+1, len(selected), specs[index].Name, processed, true)
+		}
+		return nil
 	}
 	if profile == "" {
 		profile = "ares-utf8"

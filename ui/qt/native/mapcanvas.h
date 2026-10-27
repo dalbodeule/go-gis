@@ -97,6 +97,8 @@ void gogis_active_layer(char* buffer, int buffer_length);
 // Publishes the current Go-side render request status to QML.
 void gogis_set_render_status(const char* status);
 unsigned long long gogis_render_status_generation(void);
+// Publishes a dedicated DXF export state independently of render status.
+void gogis_set_export_state(unsigned long long save_generation, int active, const char* message);
 void gogis_set_diagnostic_log_payload(const char* payload);
 void gogis_set_memory_status(unsigned long long process_bytes,
                              unsigned long long go_heap_bytes,

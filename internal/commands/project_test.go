@@ -378,6 +378,25 @@ type recordingLayerCollectionWriter struct {
 	layers      []core.Layer
 }
 
+type recordingBorrowedWriter struct {
+	layers []core.Layer
+	layer  core.Layer
+}
+
+func (w *recordingBorrowedWriter) Write(_ context.Context, _ string, _ core.Layer) error {
+	return errors.New("single-layer writer should not be used")
+}
+
+func (w *recordingBorrowedWriter) WriteLayersBorrowed(_ context.Context, _ string, layers []core.Layer) error {
+	w.layers = layers
+	return nil
+}
+
+func (w *recordingBorrowedWriter) WriteBorrowed(_ context.Context, _ string, layer core.Layer) error {
+	w.layer = layer
+	return nil
+}
+
 func (w *recordingLayerCollectionWriter) Write(_ context.Context, destination string, layer core.Layer) error {
 	w.destination = destination
 	w.layers = []core.Layer{layer}
@@ -419,6 +438,36 @@ func TestProjectSaveAllLayersUsesCollectionWriterAndDetachedSnapshot(t *testing.
 	}
 }
 
+func TestProjectSaveAllLayersBorrowedWriterSharesImmutablePayloadOnly(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{Name: "large", Features: []core.Feature{{ID: 1,
+		Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3}}, Properties: map[string]any{"name": "original"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writer := &recordingBorrowedWriter{}
+	if err := service.SaveAllLayers(context.Background(), writer, "all.gpkg"); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.layers) != 1 || len(writer.layers[0].Features) != 1 {
+		t.Fatalf("borrowed snapshot layers = %+v", writer.layers)
+	}
+	source := service.ProjectRenderSnapshot().Layers[0].Features[0].Geometry.(core.WKBGeometry)
+	borrowed := writer.layers[0].Features[0].Geometry.(core.WKBGeometry)
+	if &source.WKB[0] != &borrowed.WKB[0] {
+		t.Fatal("borrowed writer cloned WKB payload")
+	}
+	writer.layers[0].Features[0].ID = 99
+	if got := service.ProjectRenderSnapshot().Layers[0].Features[0].ID; got != 1 {
+		t.Fatalf("borrowed writer changed project feature header: %d", got)
+	}
+}
+
 func TestProjectSaveLayerUsesCommittedClone(t *testing.T) {
 	service := NewProjectService("demo", core.CRS{AuthorityCode: "EPSG:4326"})
 	layer := core.Layer{
@@ -446,6 +495,33 @@ func TestProjectSaveLayerUsesCommittedClone(t *testing.T) {
 	writer.layer.Features[0].Properties["name"] = "writer mutation"
 	if got := service.Project().Layers[0].Features[0].Properties["name"]; got != "길" {
 		t.Fatalf("service was mutated by writer: %v", got)
+	}
+}
+
+func TestProjectSaveLayerBorrowedWriterSharesImmutablePayloadOnly(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{Name: "large", Features: []core.Feature{{ID: 1,
+		Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3}}, Properties: map[string]any{"name": "original"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writer := &recordingBorrowedWriter{}
+	if err := service.SaveLayer(context.Background(), writer, "large.gpkg", "large"); err != nil {
+		t.Fatal(err)
+	}
+	source := service.ProjectRenderSnapshot().Layers[0].Features[0].Geometry.(core.WKBGeometry)
+	borrowed := writer.layer.Features[0].Geometry.(core.WKBGeometry)
+	if &source.WKB[0] != &borrowed.WKB[0] {
+		t.Fatal("single-layer borrowed writer cloned WKB payload")
+	}
+	writer.layer.Features[0].ID = 99
+	if got := service.ProjectRenderSnapshot().Layers[0].Features[0].ID; got != 1 {
+		t.Fatalf("borrowed writer changed project feature header: %d", got)
 	}
 }
 

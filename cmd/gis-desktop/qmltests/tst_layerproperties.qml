@@ -1308,7 +1308,10 @@ TestCase {
             compare(options.get(0).included, false);
             mouseClick(firstInclude);
             compare(options.get(0).included, true);
+            appWindow.requestActivate();
             mouseClick(firstCadName);
+            firstCadName.forceActiveFocus();
+            tryCompare(firstCadName, "activeFocus", true);
             firstCadName.text = "Parcel CAD";
             compare(options.get(0).cadName, "Parcel CAD");
             firstCadName.text = "0-연속지적도";
@@ -1371,6 +1374,42 @@ TestCase {
         } finally {
             dialog.close();
             canvas.layerTreePayload = originalPayload;
+        }
+    }
+
+    function test_dxfExportBlocksEditingUntilNativeCompletion() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var blocker = findChild(appWindow, "dxfExportBlocker");
+        var progress = findChild(appWindow, "dxfExportProgressBar");
+        var message = findChild(appWindow, "dxfExportProgressText");
+        var navigationButton = findChild(appWindow, "openCoordinateNavigationButton");
+        var navigationDialog = findChild(appWindow, "coordinateNavigationDialog");
+        verify(canvas && blocker && progress && message && navigationButton && navigationDialog);
+        appWindow.language = "ko";
+        try {
+            appWindow.exportPending = true;
+            tryCompare(blocker, "visible", true);
+            compare(blocker.modal, true);
+            compare(progress.indeterminate, true);
+            mouseClick(navigationButton);
+            compare(navigationDialog.visible, false);
+            canvas.exportActive = true;
+            canvas.exportMessage = "DXF layer 1/3: Buildings (5000 features)";
+            canvas.exportRequestGeneration = canvas.saveGeneration;
+            canvas.exportStateGeneration += 1;
+            tryCompare(appWindow, "exportPending", false);
+            compare(blocker.visible, true);
+            verify(message.text.indexOf("5000개 피처") >= 0);
+            canvas.exportActive = false;
+            canvas.exportMessage = "";
+            canvas.exportStateGeneration += 1;
+            tryCompare(blocker, "visible", false);
+        } finally {
+            canvas.exportActive = false;
+            canvas.exportMessage = "";
+            appWindow.exportPending = false;
+            appWindow.language = "en";
+            tryCompare(blocker, "visible", false);
         }
     }
 
