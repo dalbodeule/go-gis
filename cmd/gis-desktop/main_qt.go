@@ -65,6 +65,8 @@ func main() {
 	// Keep the event loop responsive while GDAL opens and snapshots a large
 	// dataset. Start from an empty project and replace it after QML is ready.
 	runtime := loadEmptyProject()
+	featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
+	runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
 	native.RegisterMapCanvas()
 	engine := qml.NewQQmlApplicationEngine()
 	configureQmlImportPaths(engine)
@@ -157,6 +159,48 @@ func desktopShapefileIndexThresholdFromSettings(settings *qt.QSettings) int {
 		return defaultThreshold
 	}
 	return threshold
+}
+
+const (
+	defaultVisibleFeatureLimit = 500_000
+	minVisibleFeatureLimit     = 50_000
+	maxVisibleFeatureLimit     = 1_000_000
+	defaultVisiblePayloadMiB   = 512
+	maxVisiblePayloadMiB       = 4096
+)
+
+func desktopReadOnlyViewportLimits() (int, int64) {
+	settings := qt.NewQSettings7("GoGIS", "GoGIS")
+	defer settings.Delete()
+	settings.Sync()
+	return desktopVisibleFeatureLimitFromSettings(settings),
+		int64(desktopVisiblePayloadLimitMiBFromSettings(settings)) << 20
+}
+
+func desktopVisibleFeatureLimitFromSettings(settings *qt.QSettings) int {
+	key := qt.NewQAnyStringView3("preferences/visibleFeatureLimit")
+	defer key.Delete()
+	if !settings.Contains(*key) {
+		return defaultVisibleFeatureLimit
+	}
+	limit := settings.ValueWithKey(*key).ToInt()
+	if limit < minVisibleFeatureLimit || limit > maxVisibleFeatureLimit {
+		return defaultVisibleFeatureLimit
+	}
+	return limit
+}
+
+func desktopVisiblePayloadLimitMiBFromSettings(settings *qt.QSettings) int {
+	key := qt.NewQAnyStringView3("preferences/visiblePayloadLimitMiB")
+	defer key.Delete()
+	if !settings.Contains(*key) {
+		return defaultVisiblePayloadMiB
+	}
+	limit := settings.ValueWithKey(*key).ToInt()
+	if limit < 0 || limit > maxVisiblePayloadMiB {
+		return defaultVisiblePayloadMiB
+	}
+	return limit // Zero disables the viewport and merged-chunk estimated payload budgets.
 }
 
 // configureBundledGISResources makes PROJ/GDAL data discoverable when the app
@@ -320,97 +364,100 @@ func desktopLanguageArgs(args []string) (string, []string) {
 }
 
 type demoRuntime struct {
-	scheduler                   *render.Scheduler
-	batchStore                  *render.BatchStore
-	publishedRevision           uint64
-	hasCompleteFrame            bool
-	completeFrameLayers         string
-	planner                     render.ChunkPlanner
-	visibility                  *render.LayerVisibility
-	visibleLayers               map[string]bool
-	layerStyles                 map[string]core.LayerStyle
-	baseLayerStyles             map[string]core.LayerStyle
-	layerGeometryTypes          map[string]string
-	layerBounds                 map[string][4]float64
-	layerFeatureCounts          map[string]int
-	layerStyleMu                *sync.RWMutex
-	layerTreePayloadMu          sync.Mutex
-	lastLayerTreePayload        string
-	hasLastLayerTreePayload     bool
-	mapLabels                   []render.LayerLabel
-	labelRevision               uint64
-	lastPublishedLabelRevision  uint64
-	lastPublishedLabelViewport  native.Viewport
-	lastPublishedLabelStatus    bool
-	hasPublishedLabelState      bool
-	builder                     render.ChunkBuilder
-	readOnlyBaseBuilder         render.ChunkBuilder
-	mu                          sync.Mutex
-	cancel                      context.CancelFunc
-	loadCancel                  context.CancelFunc
-	loadGeneration              uint64
-	pendingLoadBatches          [][]string
-	forceOverviewNext           bool
-	features                    []render.HitFeature
-	viewportReadOnly            bool
-	windowHits                  map[render.ChunkKey][]render.HitFeature
-	windowFeatureCounts         map[render.ChunkKey]int
-	windowFeatureIDs            map[render.ChunkKey][]uint64
-	windowVisibleFeatureCount   int
-	windowPayloadBytes          map[render.ChunkKey]int64
-	windowVisiblePayloadBytes   int64
-	windowVisibleKeys           map[render.ChunkKey]struct{}
-	windowFeatureNames          map[uint64]string
-	windowLabels                map[render.ChunkKey][]render.LayerLabel
-	nextWindowFeatureID         uint64
-	sources                     map[string]render.LayerSource
-	sourcesMu                   *sync.RWMutex
-	hitIndex                    render.HitIndex
-	hitIndexReady               bool
-	service                     *commands.ProjectService
-	dataMode                    bool
-	readOnly                    bool
-	previewLoading              bool
-	saveDestination             string
-	readOnlySources             []vectorSourceSpec
-	readOnlyBindings            map[string]readOnlyLayerBinding
-	readOnlyBaseLayers          []core.Layer
-	readOnlyBaseFeatures        []render.HitFeature
-	readOnlyBaseLabels          []render.LayerLabel
-	readOnlyDisplayCRS          string
-	preserveReadOnlyFeatureIDs  bool
-	unavailableSources          map[string]unavailableSource
-	mapExtent                   [4]float64
-	mapFitExtent                [4]float64
-	mapCRS                      string
-	workspaceView               *workspace.ViewState
-	persist                     func(context.Context, string) error
-	attributePageReader         func(context.Context, string, int, int) (core.Layer, int, error)
-	attributeFeatureReader      func(context.Context, string, uint64) (core.Feature, error)
-	closeAttributeSource        func()
-	postGISCatalogMu            sync.Mutex
-	postGISCatalogCancel        context.CancelFunc
-	postGISCatalogRequest       uint64
-	attributeLayer              string
-	attributePage               int
-	attributeReady              bool
-	attributeCache              map[attributePageKey]string
-	attributeCacheOrder         []attributePageKey
-	attributeCacheBytes         int64
-	attributeGeneration         uint64
-	attributeDispatchGeneration uint64
-	attributeCancel             context.CancelFunc
-	operationCancel             context.CancelFunc
-	operationGeneration         uint64
-	featureNameCacheLayer       string
-	featureNameCacheID          uint64
-	featureNameCacheValue       string
-	featureNameCacheReady       bool
-	selected                    render.HitResult
-	hasSelect                   bool
-	selectionGeneration         uint64
-	selectionCancel             context.CancelFunc
-	allowLargeEditable          bool
+	scheduler                     *render.Scheduler
+	batchStore                    *render.BatchStore
+	publishedRevision             uint64
+	hasCompleteFrame              bool
+	completeFrameLayers           string
+	planner                       render.ChunkPlanner
+	visibility                    *render.LayerVisibility
+	visibleLayers                 map[string]bool
+	layerStyles                   map[string]core.LayerStyle
+	baseLayerStyles               map[string]core.LayerStyle
+	layerGeometryTypes            map[string]string
+	layerBounds                   map[string][4]float64
+	layerFeatureCounts            map[string]int
+	layerStyleMu                  *sync.RWMutex
+	layerTreePayloadMu            sync.Mutex
+	lastLayerTreePayload          string
+	hasLastLayerTreePayload       bool
+	mapLabels                     []render.LayerLabel
+	labelRevision                 uint64
+	lastPublishedLabelRevision    uint64
+	lastPublishedLabelViewport    native.Viewport
+	lastPublishedLabelStatus      bool
+	hasPublishedLabelState        bool
+	builder                       render.ChunkBuilder
+	readOnlyBaseBuilder           render.ChunkBuilder
+	mu                            sync.Mutex
+	cancel                        context.CancelFunc
+	loadCancel                    context.CancelFunc
+	loadGeneration                uint64
+	pendingLoadBatches            [][]string
+	forceOverviewNext             bool
+	features                      []render.HitFeature
+	viewportReadOnly              bool
+	windowHits                    map[render.ChunkKey][]render.HitFeature
+	windowFeatureCounts           map[render.ChunkKey]int
+	windowFeatureIDs              map[render.ChunkKey][]uint64
+	windowVisibleFeatureCount     int
+	readOnlyVisibleFeatureLimit   int
+	readOnlyVisiblePayloadLimit   int64
+	visiblePayloadLimitConfigured bool
+	windowPayloadBytes            map[render.ChunkKey]int64
+	windowVisiblePayloadBytes     int64
+	windowVisibleKeys             map[render.ChunkKey]struct{}
+	windowFeatureNames            map[uint64]string
+	windowLabels                  map[render.ChunkKey][]render.LayerLabel
+	nextWindowFeatureID           uint64
+	sources                       map[string]render.LayerSource
+	sourcesMu                     *sync.RWMutex
+	hitIndex                      render.HitIndex
+	hitIndexReady                 bool
+	service                       *commands.ProjectService
+	dataMode                      bool
+	readOnly                      bool
+	previewLoading                bool
+	saveDestination               string
+	readOnlySources               []vectorSourceSpec
+	readOnlyBindings              map[string]readOnlyLayerBinding
+	readOnlyBaseLayers            []core.Layer
+	readOnlyBaseFeatures          []render.HitFeature
+	readOnlyBaseLabels            []render.LayerLabel
+	readOnlyDisplayCRS            string
+	preserveReadOnlyFeatureIDs    bool
+	unavailableSources            map[string]unavailableSource
+	mapExtent                     [4]float64
+	mapFitExtent                  [4]float64
+	mapCRS                        string
+	workspaceView                 *workspace.ViewState
+	persist                       func(context.Context, string) error
+	attributePageReader           func(context.Context, string, int, int) (core.Layer, int, error)
+	attributeFeatureReader        func(context.Context, string, uint64) (core.Feature, error)
+	closeAttributeSource          func()
+	postGISCatalogMu              sync.Mutex
+	postGISCatalogCancel          context.CancelFunc
+	postGISCatalogRequest         uint64
+	attributeLayer                string
+	attributePage                 int
+	attributeReady                bool
+	attributeCache                map[attributePageKey]string
+	attributeCacheOrder           []attributePageKey
+	attributeCacheBytes           int64
+	attributeGeneration           uint64
+	attributeDispatchGeneration   uint64
+	attributeCancel               context.CancelFunc
+	operationCancel               context.CancelFunc
+	operationGeneration           uint64
+	featureNameCacheLayer         string
+	featureNameCacheID            uint64
+	featureNameCacheValue         string
+	featureNameCacheReady         bool
+	selected                      render.HitResult
+	hasSelect                     bool
+	selectionGeneration           uint64
+	selectionCancel               context.CancelFunc
+	allowLargeEditable            bool
 }
 
 type vectorSourceSpec struct {
@@ -464,22 +511,25 @@ func loadEmptyProject() *demoRuntime {
 
 func newEmptyProjectRuntime() *demoRuntime {
 	runtime := &demoRuntime{
-		scheduler:          render.NewScheduler(),
-		batchStore:         render.NewBatchStore(),
-		planner:            render.NewChunkPlanner(),
-		visibility:         render.NewLayerVisibility(),
-		visibleLayers:      make(map[string]bool),
-		layerStyles:        make(map[string]core.LayerStyle),
-		baseLayerStyles:    make(map[string]core.LayerStyle),
-		layerGeometryTypes: make(map[string]string),
-		layerBounds:        make(map[string][4]float64),
-		layerFeatureCounts: make(map[string]int),
-		layerStyleMu:       &sync.RWMutex{},
-		sources:            make(map[string]render.LayerSource),
-		sourcesMu:          &sync.RWMutex{},
-		mapExtent:          [4]float64{0, 0, 1, 1},
-		mapFitExtent:       [4]float64{0, 0, 1, 1},
-		service:            commands.NewProjectService("Untitled", core.CRS{}),
+		readOnlyVisibleFeatureLimit:   defaultVisibleFeatureLimit,
+		readOnlyVisiblePayloadLimit:   int64(defaultVisiblePayloadMiB) << 20,
+		visiblePayloadLimitConfigured: true,
+		scheduler:                     render.NewScheduler(),
+		batchStore:                    render.NewBatchStore(),
+		planner:                       render.NewChunkPlanner(),
+		visibility:                    render.NewLayerVisibility(),
+		visibleLayers:                 make(map[string]bool),
+		layerStyles:                   make(map[string]core.LayerStyle),
+		baseLayerStyles:               make(map[string]core.LayerStyle),
+		layerGeometryTypes:            make(map[string]string),
+		layerBounds:                   make(map[string][4]float64),
+		layerFeatureCounts:            make(map[string]int),
+		layerStyleMu:                  &sync.RWMutex{},
+		sources:                       make(map[string]render.LayerSource),
+		sourcesMu:                     &sync.RWMutex{},
+		mapExtent:                     [4]float64{0, 0, 1, 1},
+		mapFitExtent:                  [4]float64{0, 0, 1, 1},
+		service:                       commands.NewProjectService("Untitled", core.CRS{}),
 	}
 	runtime.builder = func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
 		runtime.sourcesMu.RLock()
@@ -516,6 +566,43 @@ func newEmptyProjectRuntime() *demoRuntime {
 		return chunk, nil
 	}
 	return runtime
+}
+
+func (r *demoRuntime) setReadOnlyVisibleLimits(featureLimit int, payloadLimit int64) {
+	if featureLimit < minVisibleFeatureLimit || featureLimit > maxVisibleFeatureLimit {
+		featureLimit = defaultVisibleFeatureLimit
+	}
+	if payloadLimit < 0 || payloadLimit > int64(maxVisiblePayloadMiB)<<20 || payloadLimit%(1<<20) != 0 {
+		payloadLimit = int64(defaultVisiblePayloadMiB) << 20
+	}
+	r.mu.Lock()
+	changed := r.readOnlyVisibleFeatureLimit != featureLimit ||
+		(r.visiblePayloadLimitConfigured && r.readOnlyVisiblePayloadLimit != payloadLimit) ||
+		(!r.visiblePayloadLimitConfigured && payloadLimit != int64(defaultVisiblePayloadMiB)<<20)
+	r.readOnlyVisibleFeatureLimit = featureLimit
+	r.readOnlyVisiblePayloadLimit = payloadLimit
+	r.visiblePayloadLimitConfigured = true
+	var scheduler *render.Scheduler
+	if changed && r.viewportReadOnly {
+		r.retainVisibleWindowChunksLocked(nil)
+		r.hasCompleteFrame = false
+		r.completeFrameLayers = ""
+		scheduler = r.scheduler
+	}
+	r.mu.Unlock()
+	if scheduler != nil {
+		scheduler.RetainOnly(nil)
+	}
+}
+
+// readOnlyPayloadLimitLocked returns zero for an explicitly unlimited view.
+// The caller holds r.mu; old test/runtime constructors without settings use
+// the default rather than accidentally disabling the guard.
+func (r *demoRuntime) readOnlyPayloadLimitLocked() int64 {
+	if !r.visiblePayloadLimitConfigured {
+		return int64(defaultVisiblePayloadMiB) << 20
+	}
+	return r.readOnlyVisiblePayloadLimit
 }
 
 type attributePayload struct {
@@ -2450,6 +2537,8 @@ func startViewportSync(runtime *demoRuntime) {
 			if canvasVisibilityGeneration != lastCanvasVisibilityGeneration {
 				lastCanvasVisibilityGeneration = canvasVisibilityGeneration
 				if native.CanvasVisible() {
+					featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
+					runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
 					runtime.refreshCurrentViewport()
 				} else {
 					// Release viewport-derived native, scheduler, and window payload
@@ -2553,6 +2642,8 @@ func startViewportSync(runtime *demoRuntime) {
 			} else if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
 				pendingViewportRefresh = false
 				runtime.advanceRenderGeneration()
+				featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
+				runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
 				width, height := viewport.Width, viewport.Height
 				if width <= 0 {
 					width = 1

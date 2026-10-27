@@ -1229,12 +1229,17 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	_, visibleWindow := runtime.windowVisibleKeys[key]
 	visibleFeatureCount := runtime.windowVisibleFeatureCount
 	visiblePayloadBytes := runtime.windowVisiblePayloadBytes
+	visibleFeatureLimit := runtime.readOnlyVisibleFeatureLimit
+	visiblePayloadLimit := runtime.readOnlyPayloadLimitLocked()
 	runtime.mu.Unlock()
-	if visibleWindow && !readOnlyVisibleFeaturesFit(visibleFeatureCount, 1) {
-		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+	if visibleFeatureLimit == 0 {
+		visibleFeatureLimit = defaultVisibleFeatureLimit
 	}
-	if visibleWindow && visiblePayloadBytes >= maxReadOnlyVisibleBytes {
-		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
+	if visibleWindow && !readOnlyVisibleFeaturesFit(visibleFeatureLimit, visibleFeatureCount, 1) {
+		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", visibleFeatureLimit)
+	}
+	if visibleWindow && visiblePayloadLimit > 0 && visiblePayloadBytes >= visiblePayloadLimit {
+		return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", visiblePayloadLimit>>20)
 	}
 	lodBucket := readOnlyOverviewZoomBucket(key.ZoomBucket, runtime.mapExtent, runtime.mapFitExtent)
 	forceOverview, _ := ctx.Value(forceReadOnlyOverviewContextKey{}).(bool)
@@ -1296,10 +1301,11 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 	}
 	setStage("query-window")
-	window, _, err := openReadOnlyWindowWithSubdivision(ctx, queryBounds, func(bounds [4]float64) (core.Layer, error) {
-		return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
-			maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
-	})
+	window, subdivided, err := openReadOnlyWindowWithSubdivisionWithLimits(ctx, queryBounds,
+		visibleFeatureLimit, visiblePayloadLimit, func(bounds [4]float64) (core.Layer, error) {
+			return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
+				maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+		})
 	if binding.windowPool != nil {
 		binding.windowPool <- windowSession
 	}
@@ -1372,9 +1378,13 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		runtime.mu.Unlock()
 		return render.Chunk{Key: key}, nil
 	}
-	payloadBytes := estimateReadOnlyWindowPayloadBytes(window)
-	if payloadBytes > maxReadOnlyWindowBytes {
-		return render.Chunk{}, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
+	windowPayloadLimit := int64(maxReadOnlyWindowBytes)
+	if subdivided {
+		windowPayloadLimit = visiblePayloadLimit
+	}
+	payloadBytes, err := estimateReadOnlyChunkPayloadBytes(window, windowPayloadLimit)
+	if err != nil {
+		return render.Chunk{}, err
 	}
 	window = window.WithDefaultPresentation()
 	var featureNames map[uint64]string
@@ -1440,10 +1450,10 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	var labelBytes int64
 	for _, label := range newSources[key.Layer].Labels {
-		if payloadBytes > maxReadOnlyWindowBytes-int64(len(label.Text)+64) {
-			return render.Chunk{}, fmt.Errorf("spatial window labels exceed the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
-		}
 		bytes := int64(len(label.Text) + 64)
+		if !readOnlyVisiblePayloadFits(windowPayloadLimit, payloadBytes, bytes) {
+			return render.Chunk{}, fmt.Errorf("spatial window labels exceed the %d MiB payload budget", windowPayloadLimit>>20)
+		}
 		payloadBytes += bytes
 		labelBytes += bytes
 	}
@@ -1465,13 +1475,18 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		_, replacing := runtime.windowPayloadBytes[key]
 		runtime.removeWindowChunkLocked(key)
 		if !overview && !runtime.preserveReadOnlyFeatureIDs {
-			if !readOnlyVisibleFeaturesFit(runtime.windowVisibleFeatureCount, len(window.Features)) {
-				runtime.mu.Unlock()
-				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+			visibleFeatureLimit = runtime.readOnlyVisibleFeatureLimit
+			if visibleFeatureLimit == 0 {
+				visibleFeatureLimit = defaultVisibleFeatureLimit
 			}
-			if !readOnlyVisiblePayloadFits(runtime.windowVisiblePayloadBytes, payloadBytes) {
+			if !readOnlyVisibleFeaturesFit(visibleFeatureLimit, runtime.windowVisibleFeatureCount, len(window.Features)) {
 				runtime.mu.Unlock()
-				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", maxReadOnlyVisibleBytes>>20)
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d-feature safety limit", visibleFeatureLimit)
+			}
+			visiblePayloadLimit = runtime.readOnlyPayloadLimitLocked()
+			if !readOnlyVisiblePayloadFits(visiblePayloadLimit, runtime.windowVisiblePayloadBytes, payloadBytes) {
+				runtime.mu.Unlock()
+				return render.Chunk{}, fmt.Errorf("visible read-only data exceeds the %d MiB geometry/property budget", visiblePayloadLimit>>20)
 			}
 			runtime.windowVisibleFeatureCount += len(window.Features)
 			runtime.windowVisiblePayloadBytes += payloadBytes
@@ -1491,9 +1506,10 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		} else if labelBytes > 0 {
 			// Overview geometry is transient, but its small label payload is
 			// retained until this chunk leaves the viewport.
-			if !readOnlyVisiblePayloadFits(runtime.windowVisiblePayloadBytes, labelBytes) {
+			visiblePayloadLimit = runtime.readOnlyPayloadLimitLocked()
+			if !readOnlyVisiblePayloadFits(visiblePayloadLimit, runtime.windowVisiblePayloadBytes, labelBytes) {
 				runtime.mu.Unlock()
-				return render.Chunk{}, fmt.Errorf("visible read-only labels exceed the %d MiB payload budget", maxReadOnlyVisibleBytes>>20)
+				return render.Chunk{}, fmt.Errorf("visible read-only labels exceed the %d MiB payload budget", visiblePayloadLimit>>20)
 			}
 			runtime.windowVisiblePayloadBytes += labelBytes
 			runtime.windowPayloadBytes[key] = labelBytes
@@ -1688,14 +1704,14 @@ const (
 	maxReadOnlyWindowPolygonVertices = 250_000
 	// Bounds retained hit-test geometry across the active viewport. When a view
 	// exceeds this cap the affected chunk fails visibly and users can zoom in.
-	maxReadOnlyVisibleFeatures = 300_000
+	maxReadOnlyVisibleFeatures = defaultVisibleFeatureLimit
 	// Keep enough geometry-only features to preserve the parcel network in a
 	// citywide overview. Simplified polygon fills are generated when they fit
-	// the per-window and project vertex budgets; denser windows fall back to outlines.
+	// the query and project vertex budgets; denser windows fall back to outlines.
 	maxReadOnlyWindowBytes = 32 << 20
-	// The viewport can retain several individually bounded windows. Keep its
-	// aggregate budget separate from the per-window allocation guard.
-	maxReadOnlyVisibleBytes = 256 << 20
+	// Default aggregate budget for several individually bounded windows. The
+	// application setting may raise or disable this viewport and merged-chunk guard.
+	maxReadOnlyVisibleBytes = defaultVisiblePayloadMiB << 20
 	// Bounds all retained polygon fill meshes in a materialized desktop project
 	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
 	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
@@ -1706,14 +1722,16 @@ const (
 	maxDesktopDXFExportBytes       = 768 << 20
 )
 
-func readOnlyVisiblePayloadFits(current, additional int64) bool {
-	return current >= 0 && additional >= 0 && current <= maxReadOnlyVisibleBytes &&
-		additional <= maxReadOnlyVisibleBytes-current
+func readOnlyVisiblePayloadFits(limit, current, additional int64) bool {
+	if limit < 0 || current < 0 || additional < 0 || additional > int64(^uint64(0)>>1)-current {
+		return false
+	}
+	return limit == 0 || (current <= limit && additional <= limit-current)
 }
 
-func readOnlyVisibleFeaturesFit(current, additional int) bool {
-	return current >= 0 && additional >= 0 && current <= maxReadOnlyVisibleFeatures &&
-		additional <= maxReadOnlyVisibleFeatures-current
+func readOnlyVisibleFeaturesFit(limit, current, additional int) bool {
+	return limit >= minVisibleFeatureLimit && limit <= maxVisibleFeatureLimit &&
+		current >= 0 && additional >= 0 && current <= limit && additional <= limit-current
 }
 
 func isPolygonOverviewLayer(geometryType string) bool {
@@ -1872,6 +1890,28 @@ func estimateReadOnlyWindowPayloadBytes(layer core.Layer) int64 {
 	return total
 }
 
+func estimateReadOnlyChunkPayloadBytes(layer core.Layer, limit int64) (int64, error) {
+	if limit == maxReadOnlyWindowBytes {
+		bytes := estimateReadOnlyWindowPayloadBytes(layer)
+		if bytes > limit {
+			return 0, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", limit>>20)
+		}
+		return bytes, nil
+	}
+	var total int64
+	for _, feature := range layer.Features {
+		bytes := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{feature}})
+		if bytes > maxReadOnlyWindowBytes {
+			return 0, fmt.Errorf("spatial window feature exceeds the %d MiB geometry/property budget", maxReadOnlyWindowBytes>>20)
+		}
+		if !readOnlyVisiblePayloadFits(limit, total, bytes) {
+			return 0, fmt.Errorf("spatial window exceeds the %d MiB geometry/property budget", limit>>20)
+		}
+		total += bytes
+	}
+	return total, nil
+}
+
 const (
 	maxReadOnlyWindowSubdivisionDepth = 8
 	maxReadOnlyWindowSubdivisionCalls = 256
@@ -1880,6 +1920,15 @@ const (
 )
 
 func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
+	open func([4]float64) (core.Layer, error)) (core.Layer, bool, error) {
+	return openReadOnlyWindowWithSubdivisionWithLimits(ctx, bounds,
+		maxReadOnlyVisibleFeatures, maxReadOnlyWindowBytes, open)
+}
+
+// Each source read remains bounded to 32 MiB. A subdivided chunk may combine
+// several successful reads, so its merged estimate uses the viewport budget.
+func openReadOnlyWindowWithSubdivisionWithLimits(ctx context.Context, bounds [4]float64,
+	featureLimit int, payloadLimit int64,
 	open func([4]float64) (core.Layer, error)) (core.Layer, bool, error) {
 	root, err := open(bounds)
 	if err == nil || !isReadOnlyWindowSubdivisionError(err) {
@@ -1930,12 +1979,16 @@ func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
 			if _, duplicate := seen[fingerprint]; duplicate {
 				continue
 			}
-			if len(merged.Features) >= maxReadOnlyVisibleFeatures {
-				return fmt.Errorf("subdivided spatial window exceeds the %d-feature safety limit", maxReadOnlyVisibleFeatures)
+			if len(merged.Features) >= featureLimit {
+				return fmt.Errorf("subdivided spatial window exceeds the %d-feature safety limit", featureLimit)
 			}
-			featureBytes := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{feature}}) + readOnlyWindowFeatureHeaderBudget
-			if featureBytes > maxReadOnlyWindowBytes || payloadBytes > maxReadOnlyWindowBytes-featureBytes {
-				return fmt.Errorf("subdivided spatial window exceeds the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
+			featureBytes := estimateReadOnlyWindowPayloadBytes(core.Layer{Features: []core.Feature{feature}})
+			if featureBytes > maxReadOnlyWindowBytes {
+				return fmt.Errorf("subdivided spatial window feature exceeds the %d MiB payload budget", maxReadOnlyWindowBytes>>20)
+			}
+			featureBytes += readOnlyWindowFeatureHeaderBudget
+			if !readOnlyVisiblePayloadFits(payloadLimit, payloadBytes, featureBytes) {
+				return fmt.Errorf("subdivided spatial window exceeds the %d MiB payload budget", payloadLimit>>20)
 			}
 			payloadBytes += featureBytes
 			seen[fingerprint] = struct{}{}

@@ -65,6 +65,8 @@ ApplicationWindow {
         category: "preferences"
         property string interfaceLanguage: "system"
         property int shapefileIndexThreshold: 10000
+        property int visibleFeatureLimit: 500000
+        property int visiblePayloadLimitMiB: 512
     }
     Binding {
         target: rootWindow
@@ -1712,6 +1714,7 @@ ApplicationWindow {
                         layerVisible: layer.visible !== false,
                         editable: layer.editable === true,
                         geometryLocked: layer.geometryLocked === true,
+                        displayRule: layer.displayRule || "",
                         style: layer.style || ({}),
                         labels: layer.labels || ({
                             enabled: false,
@@ -1754,7 +1757,7 @@ ApplicationWindow {
                 function replaceLayerModel(layers) {
                     var roleNames = ["name", "displayName", "sourcePath", "sourceLayerName",
                                      "sourceEncoding", "sourceCrs", "sourceError", "crs",
-                                     "geometryType", "boundsJson", "layerVisible", "editable", "geometryLocked",
+                                     "geometryType", "boundsJson", "layerVisible", "editable", "geometryLocked", "displayRule",
                                      "style", "labels"];
                     var sharedCount = Math.min(layerModel.count, layers.length);
                     for (var index = 0; index < sharedCount; ++index) {
@@ -2816,11 +2819,58 @@ ApplicationWindow {
                     onValueModified: userSettings.shapefileIndexThreshold = value
                 }
             }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.language === "ko" ? "화면 피처 상한" : rootWindow.language === "jp" ? "画面の地物数上限" : "Visible feature limit"
+                }
+                SpinBox {
+                    objectName: "visibleFeatureLimitSpinBox"
+                    from: 50000
+                    to: 1000000
+                    stepSize: 50000
+                    editable: true
+                    value: userSettings.visibleFeatureLimit
+                    textFromValue: function(value, locale) { return Number(value).toLocaleString(locale, 'f', 0) }
+                    valueFromText: function(text, locale) { return Number.fromLocaleString(locale, text.replace(/[^0-9]/g, "")) }
+                    onValueModified: {
+                        userSettings.visibleFeatureLimit = value;
+                        mapViewport.viewportGeneration += 1;
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: rootWindow.language === "ko" ? "화면 데이터 예산 (MiB)" : rootWindow.language === "jp" ? "画面データの上限 (MiB)" : "Viewport data budget (MiB)"
+                }
+                SpinBox {
+                    objectName: "visiblePayloadLimitSpinBox"
+                    from: 0
+                    to: 4096
+                    stepSize: 128
+                    editable: true
+                    value: userSettings.visiblePayloadLimitMiB
+                    textFromValue: function(value, locale) {
+                        return value === 0 ? (rootWindow.language === "ko" ? "제한 없음" : rootWindow.language === "jp" ? "無制限" : "Unlimited") : Number(value).toLocaleString(locale, 'f', 0)
+                    }
+                    valueFromText: function(text, locale) {
+                        var digits = text.replace(/[^0-9]/g, "");
+                        return digits === "" ? 0 : Number.fromLocaleString(locale, digits);
+                    }
+                    onValueModified: {
+                        userSettings.visiblePayloadLimitMiB = value;
+                        mapViewport.viewportGeneration += 1;
+                    }
+                }
+            }
             Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 color: "#65717d"
-                text: rootWindow.language === "ko" ? "언어는 즉시 적용됩니다. Shapefile 인덱스 기준은 다음 실행부터 적용되며, 0은 인덱스 생성을 끕니다. 자동 생성은 원본 대신 임시 캐시를 사용해 원본 파일을 수정하지 않습니다." : rootWindow.language === "jp" ? "言語はすぐに適用されます。Shapefileインデックス基準は次回起動時から適用され、0で無効になります。元ファイルを変更せず一時キャッシュを使用します。" : "Language changes apply immediately. The Shapefile index threshold applies on next launch; 0 disables indexing. Generated indexes use a temporary cache and do not modify source files."
+                text: rootWindow.language === "ko" ? "화면 피처 상한과 데이터 예산은 즉시 적용됩니다. 데이터 예산은 분할 조회 결과를 합친 청크에도 적용됩니다. 0은 추정 예산을 해제하며, 개별 조회는 32 MiB로 제한됩니다. 실제 메모리 사용량은 별개입니다. Shapefile 인덱스 기준은 다음 실행부터 적용됩니다." : rootWindow.language === "jp" ? "画面の地物数上限とデータ上限はすぐに適用され、分割取得を結合したチャンクにも適用されます。0では推定上限が無効になります。個別の取得は32 MiBまでです。実際のメモリ使用量は別です。Shapefileインデックス基準は次回起動時から適用されます。" : "The visible feature limit and data budget apply immediately, including chunks merged from split queries. Zero disables the estimated budget; each source query stays limited to 32 MiB. Actual memory use is separate. The Shapefile index threshold applies on next launch."
             }
             Button {
                 objectName: "resetApplicationSettingsButton"
@@ -2828,6 +2878,9 @@ ApplicationWindow {
                 onClicked: {
                     userSettings.interfaceLanguage = "system";
                     userSettings.shapefileIndexThreshold = 10000;
+                    userSettings.visibleFeatureLimit = 500000;
+                    userSettings.visiblePayloadLimitMiB = 512;
+                    mapViewport.viewportGeneration += 1;
                 }
             }
         }
@@ -3293,7 +3346,20 @@ ApplicationWindow {
         title: rootWindow.tr("Layer properties") + " — " + targetLayerName
         width: Math.min(720, rootWindow.width - 48)
         height: Math.max(320, Math.min(760, rootWindow.height - 80))
-        standardButtons: Dialog.Apply | Dialog.Cancel
+        footer: RowLayout {
+            spacing: 8
+            Item { Layout.fillWidth: true }
+            Button {
+                objectName: "layerSettingsCancelButton"
+                text: rootWindow.tr("Cancel")
+                onClicked: layerSettingsDialog.reject()
+            }
+            Button {
+                objectName: "layerSettingsApplyButton"
+                text: rootWindow.language === "ko" ? "적용" : rootWindow.language === "jp" ? "適用" : "Apply"
+                onClicked: layerSettingsDialog.applied()
+            }
+        }
         property string targetLayerName: ""
         property string originalSourcePath: ""
         property string originalSourceLayerName: ""
@@ -3340,7 +3406,9 @@ ApplicationWindow {
         function loadLayer() {
             if (layerModel.count === 0)
                 return;
-            var rowIndex = Math.max(0, Math.min(attributeLayerTabs.currentIndex, layerModel.count - 1));
+            var rowIndex = mapViewport.findLayerIndex(targetLayerName);
+            if (rowIndex < 0)
+                return;
             var layer = layerModel.get(rowIndex);
             targetLayerName = layer.name;
             targetGeometryType = layer.geometryType || "";
@@ -4066,18 +4134,56 @@ ApplicationWindow {
         title: rootWindow.tr("Lua editor") + " — " + layerSettingsDialog.targetLayerName
         width: Math.min(760, rootWindow.width - 64)
         height: Math.min(620, rootWindow.height - 64)
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: RowLayout {
+            spacing: 8
+            Item { Layout.fillWidth: true }
+            Button {
+                objectName: "luaEditorCancelButton"
+                text: rootWindow.tr("Cancel")
+                onClicked: luaEditorDialog.reject()
+            }
+            Button {
+                objectName: "luaEditorOkButton"
+                text: rootWindow.language === "ko" ? "확인" : rootWindow.language === "jp" ? "確認" : "OK"
+                onClicked: luaEditorDialog.accept()
+            }
+        }
+        property bool initializing: false
+        property bool saved: false
+        property string originalLabelRule: ""
+        property string originalLabelLua: ""
+        property string originalDisplayRule: ""
+        function storeDraft() {
+            if (initializing)
+                return;
+            labelRuleField.text = labelRuleEditor.text;
+            layerSettingsDialog.labelLuaSource = labelLuaField.text;
+            layerSettingsDialog.displayRuleSource = featureDisplayRuleEditor.text;
+        }
         onOpened: {
+            initializing = true;
+            saved = false;
+            originalLabelRule = labelRuleField.text;
+            originalLabelLua = layerSettingsDialog.labelLuaSource;
+            originalDisplayRule = layerSettingsDialog.displayRuleSource;
             luaEditorTabs.currentIndex = 0;
             luaHelpButton.checked = false;
             labelRuleEditor.text = labelRuleField.text;
             labelLuaField.text = layerSettingsDialog.labelLuaSource;
             featureDisplayRuleEditor.text = layerSettingsDialog.displayRuleSource;
+            initializing = false;
         }
         onAccepted: {
-            labelRuleField.text = labelRuleEditor.text;
-            layerSettingsDialog.labelLuaSource = labelLuaField.text;
-            layerSettingsDialog.displayRuleSource = featureDisplayRuleEditor.text;
+            storeDraft();
+            saved = true;
+            layerSettingsDialog.submitLayer();
+        }
+        onClosed: {
+            if (!saved) {
+                labelRuleField.text = originalLabelRule;
+                layerSettingsDialog.labelLuaSource = originalLabelLua;
+                layerSettingsDialog.displayRuleSource = originalDisplayRule;
+            }
         }
         function activeEditor() {
             if (luaEditorTabs.currentIndex === 0) return featureDisplayRuleEditor;
@@ -4090,6 +4196,7 @@ ApplicationWindow {
                 id: luaEditorTabs
                 objectName: "luaEditorTabs"
                 Layout.fillWidth: true
+                onCurrentIndexChanged: luaEditorDialog.storeDraft()
                 TabButton { text: rootWindow.tr("Display filter") }
                 TabButton { text: rootWindow.tr("Label rule") }
                 TabButton { text: rootWindow.tr("Label text") }

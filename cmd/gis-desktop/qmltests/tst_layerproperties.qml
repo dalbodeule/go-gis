@@ -84,6 +84,84 @@ TestCase {
                                          {enabled: true, expression: "${id}"}));
     }
 
+    function test_luaScriptsStayWithTheirLayerAndSaveOnTabChangeAndConfirm() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var model = findChild(appWindow, "layerModel");
+        var settings = findChild(appWindow, "layerSettingsDialog");
+        var lua = findChild(appWindow, "luaEditorDialog");
+        var tabs = findChild(lua, "luaEditorTabs");
+        var display = findChild(lua, "featureDisplayRuleEditor");
+        var labelRule = findChild(lua, "labelRuleEditor");
+        var labelText = findChild(lua, "labelLuaField");
+        var originalLanguage = appWindow.language;
+        verify(canvas && viewport && model && settings && lua && tabs && display && labelRule && labelText);
+        try {
+            appWindow.language = "ko";
+            canvas.layerTreePayload = JSON.stringify([
+                {name: "parcels", sourcePath: "/data/parcels.shp", sourceLayerName: "parcels",
+                 displayRule: "return feature.CODE == 'old'", labels: {rule: "", luaScript: ""}},
+                {name: "points", sourcePath: "/data/points.shp", sourceLayerName: "points",
+                 displayRule: "return feature.COL_ADM_SE == '44150'", labels: {rule: "", luaScript: ""}}
+            ]);
+            canvas.layerTreePayloadGeneration += 1;
+            tryCompare(model, "count", 2);
+            compare(model.get(0).displayRule, "return feature.CODE == 'old'");
+            compare(model.get(1).displayRule, "return feature.COL_ADM_SE == '44150'");
+            viewport.openLayerPropertiesForCategory("points", "labels");
+            tryCompare(settings, "visible", true);
+            compare(settings.targetLayerName, "points");
+            compare(settings.displayRuleSource, "return feature.COL_ADM_SE == '44150'");
+            compare(findChild(settings, "layerSettingsCancelButton").text, "취소");
+            compare(findChild(settings, "layerSettingsApplyButton").text, "적용");
+            verify(findChild(settings, "layerSettingsApplyButton").x >
+                   findChild(settings, "layerSettingsCancelButton").x);
+            verify(findChild(settings, "layerSettingsApplyButton").x > settings.width / 2);
+            lua.open();
+            tryCompare(lua, "visible", true);
+            compare(display.text, "return feature.COL_ADM_SE == '44150'");
+            compare(findChild(lua, "luaEditorCancelButton").text, "취소");
+            compare(findChild(lua, "luaEditorOkButton").text, "확인");
+            verify(findChild(lua, "luaEditorOkButton").x > findChild(lua, "luaEditorCancelButton").x);
+            verify(findChild(lua, "luaEditorOkButton").x > lua.width / 2);
+            display.text = "return feature.COL_ADM_SE == '44150'";
+            tabs.currentIndex = 1;
+            compare(settings.displayRuleSource, display.text);
+            labelRule.text = "return true";
+            tabs.currentIndex = 2;
+            compare(findChild(appWindow, "labelRuleField").text, "return true");
+            labelText.text = "return feature.NAME";
+            var generation = canvas.layerSettingsGeneration;
+            mouseClick(findChild(lua, "luaEditorOkButton"));
+            tryCompare(lua, "visible", false);
+            compare(canvas.layerSettingsGeneration, generation + 1);
+            var saved = JSON.parse(canvas.layerSettingsPayload);
+            compare(saved.name, "points");
+            compare(saved.displayRule, "return feature.COL_ADM_SE == '44150'");
+            compare(saved.labels.rule, "return true");
+            compare(saved.labels.luaScript, "return feature.NAME");
+            settings.close();
+
+            viewport.openLayerPropertiesForCategory("parcels", "labels");
+            tryCompare(settings, "visible", true);
+            compare(settings.displayRuleSource, "return feature.CODE == 'old'");
+            lua.open();
+            tryCompare(lua, "visible", true);
+            compare(display.text, "return feature.CODE == 'old'");
+            display.text = "return false";
+            tabs.currentIndex = 1;
+            compare(settings.displayRuleSource, "return false");
+            mouseClick(findChild(lua, "luaEditorCancelButton"));
+            tryCompare(lua, "visible", false);
+            compare(settings.displayRuleSource, "return feature.CODE == 'old'");
+        } finally {
+            lua.close();
+            settings.close();
+            appWindow.language = originalLanguage;
+            compare(appWindow.language, originalLanguage);
+        }
+    }
+
     function test_selectingSameLayerDoesNotRefetchAttributes() {
         var viewport = findChild(appWindow, "mapViewport");
         var canvas = findChild(appWindow, "goGisMapCanvas");
@@ -766,28 +844,53 @@ TestCase {
         var language = findChild(appWindow, "interfaceLanguageCombo");
         var store = findChild(appWindow, "applicationSettingsStore");
         var indexThreshold = findChild(appWindow, "shapefileIndexThresholdSpinBox");
+        var featureLimit = findChild(appWindow, "visibleFeatureLimitSpinBox");
+        var payloadLimit = findChild(appWindow, "visiblePayloadLimitSpinBox");
         var reset = findChild(appWindow, "resetApplicationSettingsButton");
-        verify(button !== null && dialog !== null && language !== null && store !== null && indexThreshold !== null && reset !== null);
+        var viewport = findChild(appWindow, "mapViewport");
+        verify(button !== null && dialog !== null && language !== null && store !== null && indexThreshold !== null && featureLimit !== null && payloadLimit !== null && reset !== null && viewport !== null);
         var previousPreference = store.interfaceLanguage;
         var previousThreshold = store.shapefileIndexThreshold;
+        var previousFeatureLimit = store.visibleFeatureLimit;
+        var previousPayloadLimit = store.visiblePayloadLimitMiB;
         try {
             mouseClick(button);
             tryCompare(dialog, "visible", true);
             compare(language.valueAt(language.currentIndex), previousPreference);
             compare(indexThreshold.value, 10000);
             compare(indexThreshold.textFromValue(10000, Qt.locale("en_US")), "10,000");
+            compare(featureLimit.value, previousFeatureLimit);
+            compare(featureLimit.from, 50000);
+            compare(featureLimit.to, 1000000);
+            compare(payloadLimit.value, previousPayloadLimit);
+            compare(payloadLimit.to, 4096);
+            var generation = viewport.viewportGeneration;
+            featureLimit.value = 750000;
+            featureLimit.valueModified();
+            compare(store.visibleFeatureLimit, 750000);
+            compare(viewport.viewportGeneration, generation + 1);
+            payloadLimit.value = 0;
+            payloadLimit.valueModified();
+            compare(store.visiblePayloadLimitMiB, 0);
+            compare(viewport.viewportGeneration, generation + 2);
             indexThreshold.value = 50000;
             indexThreshold.valueModified();
             compare(store.shapefileIndexThreshold, 50000);
             language.currentIndex = language.indexOfValue("ko");
             compare(store.interfaceLanguage, "ko");
             tryCompare(appWindow, "language", "ko");
+            compare(payloadLimit.textFromValue(0, Qt.locale("ko_KR")), "제한 없음");
             mouseClick(reset);
             compare(store.interfaceLanguage, "system");
             compare(store.shapefileIndexThreshold, 10000);
+            compare(store.visibleFeatureLimit, 500000);
+            compare(store.visiblePayloadLimitMiB, 512);
+            compare(viewport.viewportGeneration, generation + 3);
         } finally {
             store.interfaceLanguage = previousPreference;
             store.shapefileIndexThreshold = previousThreshold;
+            store.visibleFeatureLimit = previousFeatureLimit;
+            store.visiblePayloadLimitMiB = previousPayloadLimit;
             dialog.close();
         }
     }
@@ -1748,7 +1851,7 @@ TestCase {
         labelRuleEditor.text = "return feature.active == true";
         labelLua.text = "return feature.name";
         displayRuleEditor.text = "return feature.visible == true";
-        var luaOkButton = luaDialog.standardButton(Dialog.Ok);
+        var luaOkButton = findChild(luaDialog, "luaEditorOkButton");
         verify(luaOkButton !== null);
         mouseClick(luaOkButton);
         tryCompare(luaDialog, "visible", false);
@@ -1757,13 +1860,13 @@ TestCase {
         labelHeight.text = "3";
         labelMinScale.text = "1000";
         labelMaxScale.text = "50000";
-        var applyButton = dialog.standardButton(Dialog.Apply);
+        var applyButton = findChild(dialog, "layerSettingsApplyButton");
         verify(applyButton !== null);
         verify(applyButton.enabled);
         mouseClick(applyButton);
 
         tryCompare(appliedSpy, "count", 1);
-        compare(canvas.layerSettingsGeneration, 1);
+        compare(canvas.layerSettingsGeneration, 2);
         var request = JSON.parse(canvas.layerSettingsPayload);
         compare(request.name, "roads");
         compare(request.displayName, "Renamed roads");

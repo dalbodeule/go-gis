@@ -115,13 +115,17 @@ function Invoke-GoBuild {
     param(
         [string[]]$Tags,
         [string]$Output,
-        [string]$Package = './cmd/gis-cli'
+        [string]$Package = './cmd/gis-cli',
+        [switch]$WindowsGUI
     )
 
     Ensure-BuildDirectory
     $arguments = @('build')
     if ($Tags.Count -gt 0) {
         $arguments += @('-tags', ($Tags -join ' '))
+    }
+    if ($WindowsGUI) {
+        $arguments += @('-ldflags', '-H=windowsgui')
     }
     $arguments += @('-o', (Join-Path $BuildDir $Output), $Package)
     & go @arguments
@@ -140,21 +144,21 @@ try {
         }
         'desktop' {
             Initialize-CgoEnvironment -NeedsQt $true -NeedsNative $false
-            Invoke-GoBuild -Tags @('qt') -Output 'gogis-desktop.exe' -Package './cmd/gis-desktop'
+            Invoke-GoBuild -Tags @('qt') -Output 'gogis-desktop.exe' -Package './cmd/gis-desktop' -WindowsGUI
         }
         'desktop-native' {
             Initialize-CgoEnvironment -NeedsQt $true -NeedsNative $true
-            Invoke-GoBuild -Tags @('qt', 'native') -Output 'gogis-desktop-native.exe' -Package './cmd/gis-desktop'
+            Invoke-GoBuild -Tags @('qt', 'native') -Output 'gogis-desktop-native.exe' -Package './cmd/gis-desktop' -WindowsGUI
         }
         'all' {
             Invoke-GoBuild -Tags @() -Output 'gis-cli.exe'
             Initialize-CgoEnvironment -NeedsQt $true -NeedsNative $false
-            Invoke-GoBuild -Tags @('qt') -Output 'gogis-desktop.exe' -Package './cmd/gis-desktop'
+            Invoke-GoBuild -Tags @('qt') -Output 'gogis-desktop.exe' -Package './cmd/gis-desktop' -WindowsGUI
         }
         'all-native' {
             Initialize-CgoEnvironment -NeedsQt $true -NeedsNative $true
             Invoke-GoBuild -Tags @('native') -Output 'gis-cli-native.exe'
-            Invoke-GoBuild -Tags @('qt', 'native') -Output 'gogis-desktop-native.exe' -Package './cmd/gis-desktop'
+            Invoke-GoBuild -Tags @('qt', 'native') -Output 'gogis-desktop-native.exe' -Package './cmd/gis-desktop' -WindowsGUI
         }
         'clean' {
             if (Test-Path -LiteralPath $BuildDir) {

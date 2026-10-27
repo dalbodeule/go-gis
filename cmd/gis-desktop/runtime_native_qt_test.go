@@ -1175,48 +1175,57 @@ func TestReadOnlyWindowPayloadEstimateSaturatesAtBudget(t *testing.T) {
 }
 
 func TestReadOnlyVisiblePayloadBudgetIsSeparateFromWindowBudget(t *testing.T) {
-	if maxReadOnlyWindowBytes != 32<<20 || maxReadOnlyVisibleBytes != 256<<20 {
+	if maxReadOnlyWindowBytes != 32<<20 || maxReadOnlyVisibleBytes != 512<<20 {
 		t.Fatalf("read-only byte budgets: window=%d visible=%d", maxReadOnlyWindowBytes, maxReadOnlyVisibleBytes)
 	}
-	if maxReadOnlyWindowFeatures != 20_000 || maxReadOnlyVisibleFeatures != 300_000 {
+	if maxReadOnlyWindowFeatures != 20_000 || maxReadOnlyVisibleFeatures != 500_000 {
 		t.Fatalf("read-only feature budgets: window=%d visible=%d", maxReadOnlyWindowFeatures, maxReadOnlyVisibleFeatures)
 	}
 	for _, test := range []struct {
-		current, additional int64
-		want                bool
+		limit, current, additional int64
+		want                       bool
 	}{
-		{32 << 20, 16 << 20, true},
-		{64 << 20, 32 << 20, true},
-		{96 << 20, 32 << 20, true},
-		{96 << 20, 32<<20 + 1, true},
-		{224 << 20, 32 << 20, true},
-		{224 << 20, 32<<20 + 1, false},
-		{256 << 20, 1, false},
-		{-1, 1, false},
+		{512 << 20, 32 << 20, 16 << 20, true},
+		{512 << 20, 480 << 20, 32 << 20, true},
+		{512 << 20, 480 << 20, 32<<20 + 1, false},
+		{512 << 20, 512 << 20, 1, false},
+		{1024 << 20, 512 << 20, 1, true},
+		{0, 1024 << 20, 32 << 20, true},
+		{0, int64(^uint64(0) >> 1), 1, false},
+		{-1, 0, 1, false},
+		{512 << 20, -1, 1, false},
 	} {
-		if got := readOnlyVisiblePayloadFits(test.current, test.additional); got != test.want {
-			t.Errorf("visible payload current=%d additional=%d: got %t, want %t", test.current, test.additional, got, test.want)
+		if got := readOnlyVisiblePayloadFits(test.limit, test.current, test.additional); got != test.want {
+			t.Errorf("visible payload limit=%d current=%d additional=%d: got %t, want %t", test.limit, test.current, test.additional, got, test.want)
 		}
 	}
 }
 
-func TestReadOnlyVisibleFeatureBudgetAcceptsUpToThreeHundredThousand(t *testing.T) {
+func TestReadOnlyVisibleFeatureBudgetAcceptsUpToFiveHundredThousand(t *testing.T) {
 	for _, test := range []struct {
-		current, additional int
-		want                bool
+		limit, current, additional int
+		want                       bool
 	}{
-		{50_000, 1, true},
-		{80_000, 20_000, true},
-		{99_999, 1, true},
-		{100_000, 1, true},
-		{200_000, 20_000, true},
-		{280_000, 20_000, true},
-		{300_000, 1, false},
-		{280_000, 20_001, false},
-		{-1, 1, false},
+		{500_000, 50_000, 1, true},
+		{500_000, 80_000, 20_000, true},
+		{500_000, 99_999, 1, true},
+		{500_000, 100_000, 1, true},
+		{500_000, 200_000, 20_000, true},
+		{500_000, 280_000, 20_000, true},
+		{500_000, 300_000, 1, true},
+		{500_000, 480_000, 20_000, true},
+		{500_000, 500_000, 1, false},
+		{500_000, 480_000, 20_001, false},
+		{1_000_000, 500_000, 1, true},
+		{1_000_000, 980_000, 20_000, true},
+		{1_000_000, 980_000, 20_001, false},
+		{50_000, 49_999, 1, true},
+		{50_000, 50_000, 1, false},
+		{500_000, -1, 1, false},
+		{0, 1, 1, false},
 	} {
-		if got := readOnlyVisibleFeaturesFit(test.current, test.additional); got != test.want {
-			t.Errorf("visible features current=%d additional=%d: got %t, want %t", test.current, test.additional, got, test.want)
+		if got := readOnlyVisibleFeaturesFit(test.limit, test.current, test.additional); got != test.want {
+			t.Errorf("visible features limit=%d current=%d additional=%d: got %t, want %t", test.limit, test.current, test.additional, got, test.want)
 		}
 	}
 }
@@ -1250,6 +1259,33 @@ func TestReadOnlyWindowSubdivisionRecursivelyMergesAndDeduplicates(t *testing.T)
 	}
 	if window.Name != "roads" || len(window.Fields) != 1 || len(window.Features) != 5 {
 		t.Fatalf("merged subdivided window = layer %q, fields %d, features %d; want roads, 1, 5", window.Name, len(window.Fields), len(window.Features))
+	}
+}
+
+func TestReadOnlyWindowSubdivisionUsesViewportPayloadBudget(t *testing.T) {
+	open := func(bounds [4]float64) (core.Layer, error) {
+		if bounds[2]-bounds[0] > 0.5 {
+			return core.Layer{}, fmt.Errorf("payload limit of %d bytes exceeded", maxReadOnlyWindowBytes)
+		}
+		geometry := make([]byte, 9<<20)
+		geometry[0] = byte(1 + bounds[0]*2 + bounds[1]*4)
+		return core.Layer{Features: []core.Feature{{Geometry: core.WKBGeometry{WKB: geometry}}}}, nil
+	}
+	for _, limit := range []int64{maxReadOnlyVisibleBytes, 0} {
+		window, subdivided, err := openReadOnlyWindowWithSubdivisionWithLimits(
+			context.Background(), [4]float64{0, 0, 1, 1}, maxReadOnlyVisibleFeatures, limit, open)
+		if err != nil || !subdivided || len(window.Features) != 4 {
+			t.Fatalf("limit=%d: merged features=%d subdivided=%t err=%v", limit, len(window.Features), subdivided, err)
+		}
+		bytes, err := estimateReadOnlyChunkPayloadBytes(window, limit)
+		if err != nil || bytes <= maxReadOnlyWindowBytes {
+			t.Fatalf("limit=%d: chunk payload=%d err=%v", limit, bytes, err)
+		}
+	}
+	_, _, err := openReadOnlyWindowWithSubdivisionWithLimits(
+		context.Background(), [4]float64{0, 0, 1, 1}, maxReadOnlyVisibleFeatures, maxReadOnlyWindowBytes, open)
+	if err == nil || !strings.Contains(err.Error(), "32 MiB payload budget") {
+		t.Fatalf("32 MiB merged budget error = %v", err)
 	}
 }
 

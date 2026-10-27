@@ -127,7 +127,7 @@ $AppExe = Join-Path $PackageDir 'GoGIS.exe'
 Push-Location $RootDir
 try {
     & go build -trimpath -tags 'qt native' `
-        -ldflags "-s -w -X main.appVersion=$Version" `
+        -ldflags "-H=windowsgui -s -w -X main.appVersion=$Version" `
         -o $AppExe ./cmd/gis-desktop
     if ($LASTEXITCODE -ne 0) {
         throw "GoGIS $Arch build failed with exit code $LASTEXITCODE"

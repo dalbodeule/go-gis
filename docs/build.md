@@ -371,6 +371,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\build.ps1 clean
 ```
 
+`desktop`, `desktop-native`, `all`, `all-native`로 생성하는 데스크톱
+실행 파일은 Windows GUI 서브시스템(`-H=windowsgui`)으로 링크됩니다. 따라서
+탐색기에서 더블클릭해 실행할 때는 별도 콘솔 창이 열리지 않으며, `cmd` 또는
+PowerShell에서 직접 실행할 때는 부모 터미널의 stdout/stderr를 계속 사용할 수
+있습니다. CLI 실행 파일은 일반 콘솔 프로그램으로 유지됩니다.
+
 `native`, `desktop`, `desktop-native`, `all`, `all-native`는 CGO를 켜고 C/C++
 컴파일러 및 `pkg-config`를 검사합니다. 컴파일러가 PATH에 없으면
 `MSYS2_ROOT`(설정된 경우), `C:\tools\msys64`, `C:\msys64` 순서로 현재 Go

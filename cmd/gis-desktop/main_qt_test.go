@@ -503,6 +503,91 @@ func TestDesktopShapefileIndexThresholdReadsPreferencesAndValidates(t *testing.T
 	}
 }
 
+func TestDesktopVisibleFeatureLimitReadsPreferencesAndValidates(t *testing.T) {
+	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
+	defer settings.Delete()
+	key := qt.NewQAnyStringView3("preferences/visibleFeatureLimit")
+	defer key.Delete()
+	if got := desktopVisibleFeatureLimitFromSettings(settings); got != 500_000 {
+		t.Fatalf("default visible feature limit = %d, want 500000", got)
+	}
+	for _, test := range []struct {
+		value, want int
+	}{
+		{50_000, 50_000},
+		{750_000, 750_000},
+		{1_000_000, 1_000_000},
+		{0, 500_000},
+		{1_000_001, 500_000},
+	} {
+		value := qt.NewQVariant4(test.value)
+		settings.SetValue(*key, value)
+		value.Delete()
+		settings.Sync()
+		if got := desktopVisibleFeatureLimitFromSettings(settings); got != test.want {
+			t.Errorf("saved visible feature limit %d = %d, want %d", test.value, got, test.want)
+		}
+	}
+}
+
+func TestDesktopVisiblePayloadLimitReadsPreferencesAndValidates(t *testing.T) {
+	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
+	defer settings.Delete()
+	key := qt.NewQAnyStringView3("preferences/visiblePayloadLimitMiB")
+	defer key.Delete()
+	if got := desktopVisiblePayloadLimitMiBFromSettings(settings); got != 512 {
+		t.Fatalf("default visible payload limit = %d MiB, want 512", got)
+	}
+	for _, test := range []struct {
+		value, want int
+	}{
+		{0, 0},
+		{256, 256},
+		{1024, 1024},
+		{4096, 4096},
+		{-1, 512},
+		{4097, 512},
+	} {
+		value := qt.NewQVariant4(test.value)
+		settings.SetValue(*key, value)
+		value.Delete()
+		settings.Sync()
+		if got := desktopVisiblePayloadLimitMiBFromSettings(settings); got != test.want {
+			t.Errorf("saved visible payload limit %d MiB = %d, want %d", test.value, got, test.want)
+		}
+	}
+}
+
+func TestChangingVisibleFeatureLimitDropsOldReadOnlyViewportState(t *testing.T) {
+	runtime := newEmptyProjectRuntime()
+	key := render.ChunkKey{Layer: "parcels"}
+	runtime.viewportReadOnly = true
+	runtime.windowVisibleKeys = map[render.ChunkKey]struct{}{key: {}}
+	runtime.windowFeatureCounts = map[render.ChunkKey]int{key: 10}
+	runtime.windowPayloadBytes = map[render.ChunkKey]int64{key: 1024}
+	runtime.windowVisibleFeatureCount = 10
+	runtime.windowVisiblePayloadBytes = 1024
+	runtime.hasCompleteFrame = true
+	runtime.setReadOnlyVisibleLimits(750_000, 1024<<20)
+	if runtime.readOnlyVisibleFeatureLimit != 750_000 || runtime.windowVisibleFeatureCount != 0 ||
+		runtime.readOnlyVisiblePayloadLimit != 1024<<20 || runtime.windowVisiblePayloadBytes != 0 ||
+		len(runtime.windowVisibleKeys) != 0 || runtime.hasCompleteFrame {
+		t.Fatalf("limit change retained old viewport state: limit=%d features=%d bytes=%d keys=%d complete=%t",
+			runtime.readOnlyVisibleFeatureLimit, runtime.windowVisibleFeatureCount,
+			runtime.windowVisiblePayloadBytes, len(runtime.windowVisibleKeys), runtime.hasCompleteFrame)
+	}
+	runtime.setReadOnlyVisibleLimits(2_000_000, -1)
+	if runtime.readOnlyVisibleFeatureLimit != defaultVisibleFeatureLimit ||
+		runtime.readOnlyVisiblePayloadLimit != int64(defaultVisiblePayloadMiB)<<20 {
+		t.Fatalf("invalid limits = %d features/%d bytes, want defaults",
+			runtime.readOnlyVisibleFeatureLimit, runtime.readOnlyVisiblePayloadLimit)
+	}
+	runtime.setReadOnlyVisibleLimits(500_000, 0)
+	if !runtime.visiblePayloadLimitConfigured || runtime.readOnlyVisiblePayloadLimit != 0 {
+		t.Fatal("unlimited payload setting was not retained")
+	}
+}
+
 func TestLoadEmptyProjectStartsWithoutLayersOrFeatures(t *testing.T) {
 	runtime := loadEmptyProject()
 	if runtime.service == nil {
