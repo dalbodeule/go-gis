@@ -1285,7 +1285,9 @@ TestCase {
         compare(optionsView.reuseItems, true);
         compare(optionsView.cacheBuffer, 0);
         var originalPayload = canvas.layerTreePayload;
+        var originalLanguage = appWindow.language;
         try {
+            appWindow.language = "en";
             canvas.layerTreePayload = JSON.stringify([
                 {name: "parcels", displayName: "0-연속지적도", geometryType: "Polygon", visible: true},
                 {name: "points", displayName: "0-지적도근점", geometryType: "Point", visible: true},
@@ -1294,6 +1296,22 @@ TestCase {
             tryCompare(layerModel, "count", 3);
             dialog.open();
             tryCompare(options, "count", 3);
+            tryVerify(function() { return optionsView.itemAtIndex(0) !== null; });
+            var firstRow = optionsView.itemAtIndex(0);
+            var firstInclude = findChild(firstRow, "dxfOptionInclude");
+            var firstCadName = findChild(firstRow, "dxfOptionCadName");
+            verify(firstInclude && firstCadName);
+            compare(firstInclude.text, "Project layer: parcels (Polygon)");
+            compare(firstCadName.text, "0-연속지적도");
+            compare(firstInclude.checked, true);
+            mouseClick(firstInclude);
+            compare(options.get(0).included, false);
+            mouseClick(firstInclude);
+            compare(options.get(0).included, true);
+            mouseClick(firstCadName);
+            firstCadName.text = "Parcel CAD";
+            compare(options.get(0).cadName, "Parcel CAD");
+            firstCadName.text = "0-연속지적도";
             compare(options.get(0).cadName, "0-연속지적도");
             verify(options.get(0).included);
             verify(options.get(0).geometryEnabled);
@@ -1318,6 +1336,38 @@ TestCase {
             tryCompare(options, "count", 1);
             dialog.close();
             compare(options.count, 0);
+        } finally {
+            dialog.close();
+            canvas.layerTreePayload = originalPayload;
+            appWindow.language = originalLanguage;
+        }
+    }
+
+    function test_dxfValidationKeepsLayerEdits() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var dialog = findChild(appWindow, "dxfEncodingDialog");
+        var options = findChild(appWindow, "dxfLayerOptionsModel");
+        var choice = findChild(appWindow, "dxfEncodingChoice");
+        var originalPayload = canvas.layerTreePayload;
+        try {
+            canvas.layerTreePayload = JSON.stringify([
+                {name: "parcels", displayName: "Parcels", geometryType: "Polygon"},
+                {name: "roads", displayName: "Roads", geometryType: "LineString"}
+            ]);
+            tryCompare(layerModel, "count", 2);
+            dialog.open();
+            tryCompare(options, "count", 2);
+            choice.currentIndex = 1;
+            options.setProperty(0, "cadName", "Roads");
+            options.setProperty(1, "geometryEnabled", false);
+            dialog.accept();
+            tryCompare(dialog, "visible", true);
+            tryCompare(options, "count", 2);
+            compare(options.get(0).cadName, "Roads");
+            compare(options.get(1).geometryEnabled, false);
+            compare(choice.currentIndex, 1);
+            verify(dialog.validationMessage.length > 0);
         } finally {
             dialog.close();
             canvas.layerTreePayload = originalPayload;

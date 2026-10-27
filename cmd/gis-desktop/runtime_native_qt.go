@@ -1289,7 +1289,8 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// Overview geometry can be simplified, but labels still need the source
 	// attributes. Keep geometry-only reads for unlabeled layers and for a
 	// forced dissolved boundary, which no longer has per-parcel anchors.
-	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview)
+	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview) ||
+		strings.TrimSpace(binding.layer.DisplayRule) != ""
 	profileStarted := time.Now()
 	setStage("wait-dataset")
 	windowSession := binding.session
@@ -1714,12 +1715,12 @@ const (
 	maxReadOnlyVisibleBytes = defaultVisiblePayloadMiB << 20
 	// Bounds all retained polygon fill meshes in a materialized desktop project
 	// (8M Go render.Vertex values, about 160 MiB before allocator overhead).
-	maxDesktopPolygonFillVertices  = 8 * 1024 * 1024
-	maxDesktopGeoJSONIndexFeatures = 2_000_000
-	maxDesktopMaterializedFeatures = 1_000_000
-	maxDesktopMaterializedBytes    = 256 << 20
-	maxDesktopDXFExportFeatures    = 1_000_000
-	maxDesktopDXFExportBytes       = 768 << 20
+	maxDesktopPolygonFillVertices    = 8 * 1024 * 1024
+	maxDesktopGeoJSONIndexFeatures   = 2_000_000
+	maxDesktopMaterializedFeatures   = 1_000_000
+	maxDesktopMaterializedBytes      = 256 << 20
+	maxDesktopDXFExportBatchFeatures = 5_000
+	maxDesktopDXFExportBatchBytes    = 32 << 20
 )
 
 func readOnlyVisiblePayloadFits(limit, current, additional int64) bool {
@@ -1754,7 +1755,7 @@ func sampleReadOnlyOverviewFeatures(layer core.Layer, stride int) core.Layer {
 	if stride <= 1 || len(layer.Features) <= 1 {
 		return layer
 	}
-	features := layer.Features[:0]
+	features := make([]core.Feature, 0, (len(layer.Features)+stride-1)/stride)
 	for index, feature := range layer.Features {
 		// Source FIDs may be sparse or clustered by import order. Sampling the
 		// returned window by ordinal gives a stable, even spread through the
@@ -3016,6 +3017,7 @@ func applyFeatureDisplayRule(ctx context.Context, layer *core.Layer) error {
 			visible = append(visible, feature)
 		}
 	}
+	clear(layer.Features[len(visible):])
 	layer.Features = visible
 	return nil
 }
@@ -3545,69 +3547,72 @@ func (r *demoRuntime) exportProjectLayersDXFWithOptions(destination, profile, op
 	if len(selected) == 0 {
 		return fmt.Errorf("select at least one layer for DXF export")
 	}
-	load := func(index int) (core.Layer, error) {
+	produce := func(index int, emit func(core.Layer) error) error {
 		property := selected[index]
 		layerName := property.Name
-		var layer core.Layer
+		prepareAndEmit := func(layer core.Layer) error {
+			layer.Name = property.Name
+			layer.DisplayName = property.DisplayName
+			layer.Labels = property.Labels
+			layer.DisplayRule = property.DisplayRule
+			if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
+				return fmt.Errorf("apply feature display filter: %w", err)
+			}
+			if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
+				return fmt.Errorf("prepare layer labels: %w", err)
+			}
+			return emit(layer)
+		}
 		if readOnly && property.SourcePath != "" {
 			var source *vectorSourceSpec
-			for index := range sources {
-				if sources[index].Name == layerName || (sources[index].Path == property.SourcePath &&
-					(sources[index].LayerName == "" || sources[index].LayerName == property.SourceLayerName)) {
-					source = &sources[index]
+			for sourceIndex := range sources {
+				if sources[sourceIndex].Name == layerName || (sources[sourceIndex].Path == property.SourcePath &&
+					(sources[sourceIndex].LayerName == "" || sources[sourceIndex].LayerName == property.SourceLayerName)) {
+					source = &sources[sourceIndex]
 					break
 				}
 			}
 			if source == nil {
-				return core.Layer{}, fmt.Errorf("source for layer %q is unavailable", layerName)
+				return fmt.Errorf("source for layer %q is unavailable", layerName)
 			}
 			sourceLayerName := property.SourceLayerName
 			if sourceLayerName == "" {
 				sourceLayerName = source.LayerName
 			}
-			loaded, err := (gdal.Reader{Encoding: source.Encoding}).OpenWithLimits(
-				context.Background(), source.Path, sourceLayerName, maxDesktopDXFExportFeatures, maxDesktopDXFExportBytes)
+			err := (gdal.Reader{Encoding: source.Encoding}).ReadBatches(context.Background(), source.Path,
+				sourceLayerName, maxDesktopDXFExportBatchFeatures, maxDesktopDXFExportBatchBytes, func(layer core.Layer) error {
+					if source.SourceCRS != "" {
+						layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
+					}
+					targetCRS := property.CRS.AuthorityCode
+					if targetCRS == "" {
+						targetCRS = displayCRS
+					}
+					if targetCRS != "" && layer.CRS.AuthorityCode != "" && !strings.EqualFold(targetCRS, layer.CRS.AuthorityCode) {
+						var transformErr error
+						layer, transformErr = (proj.Transformer{}).Transform(context.Background(), layer.CRS, core.CRS{AuthorityCode: targetCRS}, layer)
+						if transformErr != nil {
+							return fmt.Errorf("transform layer for export: %w", transformErr)
+						}
+					}
+					return prepareAndEmit(layer)
+				})
 			if err != nil {
-				return core.Layer{}, fmt.Errorf("read layer for export: %w", err)
+				return fmt.Errorf("read layer for export: %w", err)
 			}
-			layer = loaded
-			if source.SourceCRS != "" {
-				layer.CRS = core.CRS{AuthorityCode: source.SourceCRS}
-			}
-			targetCRS := property.CRS.AuthorityCode
-			if targetCRS == "" {
-				targetCRS = displayCRS
-			}
-			if targetCRS != "" && layer.CRS.AuthorityCode != "" && !strings.EqualFold(targetCRS, layer.CRS.AuthorityCode) {
-				layer, err = (proj.Transformer{}).Transform(context.Background(), layer.CRS, core.CRS{AuthorityCode: targetCRS}, layer)
-				if err != nil {
-					return core.Layer{}, fmt.Errorf("transform layer for export: %w", err)
-				}
-			}
-		} else {
-			var ok bool
-			layer, ok = service.ProjectLayerRenderSnapshot(layerName)
-			if !ok {
-				return core.Layer{}, fmt.Errorf("layer %q data was not found", layerName)
-			}
+			return nil
 		}
-		layer.Name = property.Name
-		layer.DisplayName = property.DisplayName
-		layer.Labels = property.Labels
-		layer.DisplayRule = property.DisplayRule
-		if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
-			return core.Layer{}, fmt.Errorf("apply feature display filter: %w", err)
+		layer, ok := service.ProjectLayerRenderSnapshot(layerName)
+		if !ok {
+			return fmt.Errorf("layer %q data was not found", layerName)
 		}
-		if err := prepareLayerLabels(context.Background(), []core.Layer{layer}); err != nil {
-			return core.Layer{}, fmt.Errorf("prepare layer labels: %w", err)
-		}
-		return layer, nil
+		return prepareAndEmit(layer)
 	}
 	if profile == "" {
 		profile = "ares-utf8"
 	}
 	triangulator := geosdriver.NewOperator()
-	if err := (dxf.Exporter{Triangulate: triangulator.ConstrainedTriangles}).ExportProject(context.Background(), destination, specs, load, profile); err != nil {
+	if err := (dxf.Exporter{Triangulate: triangulator.ConstrainedTriangles}).ExportProjectBatches(context.Background(), destination, specs, produce, profile); err != nil {
 		return err
 	}
 	return nil

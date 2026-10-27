@@ -66,6 +66,45 @@ func TestExportProjectWritesEachLayerAndPreservesDestinationOnFailure(t *testing
 	}
 }
 
+func TestExportProjectBatchesWritesAllFeaturesAndKeepsPreviousFileOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batches.dxf")
+	specs := []LayerSpec{{Name: "buildings"}}
+	produce := func(_ int, emit func(core.Layer) error) error {
+		for i := 0; i < 5; i++ {
+			layer := core.Layer{Features: []core.Feature{{ID: uint64(i + 1),
+				Geometry: core.WKTGeometry{WKT: fmt.Sprintf("POINT (%d %d)", i, i)}}}}
+			if err := emit(layer); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := (Exporter{}).ExportProjectBatches(context.Background(), path, specs, produce, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Count(previous, []byte("\n0\nPOINT\n")); got != 5 {
+		t.Fatalf("DXF contains %d points, want 5", got)
+	}
+	err = (Exporter{}).ExportProjectBatches(context.Background(), path, specs,
+		func(_ int, emit func(core.Layer) error) error {
+			if err := emit(core.Layer{Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (9 9)"}}}}); err != nil {
+				return err
+			}
+			return fmt.Errorf("source read failed")
+		}, "ares-utf8")
+	if err == nil {
+		t.Fatal("expected source read error")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, previous) {
+		t.Fatalf("failed batch export changed previous DXF: %v", err)
+	}
+}
+
 func TestExportProjectWritesOpeningViewCenteredOnNonPointLayers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "project-view.dxf")
 	specs := []LayerSpec{

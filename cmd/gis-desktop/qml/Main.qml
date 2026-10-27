@@ -4457,21 +4457,38 @@ ApplicationWindow {
         width: Math.min(640, rootWindow.width - 48)
         anchors.centerIn: Overlay.overlay
         property string validationMessage: ""
+        property var pendingOptions: null
         ListModel { id: dxfLayerOptions; objectName: "dxfLayerOptionsModel" }
-        onOpened: {
-            dxfEncodingChoice.currentIndex = 0;
-            // Rebuild from the current layer tree on every open. Keeping the
-            // first snapshot caused removed layers and old export settings to
-            // survive subsequent layer edits.
-            dxfLayerOptions.clear();
-            for (var i = 0; i < layerModel.count; ++i) {
-                var layer = layerModel.get(i);
-                dxfLayerOptions.append({name: layer.name,
-                    cadName: layer.displayName || layer.name,
-                    included: true, geometryEnabled: true, labelsEnabled: true,
-                    geometryType: layer.geometryType || ""});
+        function reopenWithValidation(message) {
+            var snapshot = [];
+            for (var i = 0; i < dxfLayerOptions.count; ++i) {
+                var option = dxfLayerOptions.get(i);
+                snapshot.push({name: option.name, cadName: option.cadName,
+                    included: option.included, geometryEnabled: option.geometryEnabled,
+                    labelsEnabled: option.labelsEnabled, geometryType: option.geometryType});
             }
-            validationMessage = "";
+            pendingOptions = snapshot;
+            validationMessage = message;
+            Qt.callLater(function() { dxfEncodingDialog.open(); });
+        }
+        onOpened: {
+            dxfLayerOptions.clear();
+            if (pendingOptions !== null) {
+                for (var i = 0; i < pendingOptions.length; ++i)
+                    dxfLayerOptions.append(pendingOptions[i]);
+                pendingOptions = null;
+            } else {
+                dxfEncodingChoice.currentIndex = 0;
+                // Rebuild from the current layer tree on each fresh open.
+                for (var j = 0; j < layerModel.count; ++j) {
+                    var layer = layerModel.get(j);
+                    dxfLayerOptions.append({name: layer.name,
+                        cadName: layer.displayName || layer.name,
+                        included: true, geometryEnabled: true, labelsEnabled: true,
+                        geometryType: layer.geometryType || ""});
+                }
+                validationMessage = "";
+            }
         }
         onClosed: dxfLayerOptions.clear()
         onAccepted: {
@@ -4484,19 +4501,16 @@ ApplicationWindow {
                 if (option.included) {
                     included++;
                     if (cadName === "" || (!option.geometryEnabled && !option.labelsEnabled)) {
-                        validationMessage = rootWindow.language === "ko" ? "선택한 레이어에는 CAD 이름과 도형/레이블 중 하나가 필요합니다." : "Selected layers need a CAD name and geometry or labels.";
-                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        reopenWithValidation(rootWindow.language === "ko" ? "선택한 레이어에는 CAD 이름과 도형/레이블 중 하나가 필요합니다." : "Selected layers need a CAD name and geometry or labels.");
                         return;
                     }
                     if (cadName.length > 255 || /[<>\/\\\":;?*|=,']/.test(cadName)) {
-                        validationMessage = rootWindow.language === "ko" ? "CAD 레이어 이름에 허용되지 않는 문자 또는 길이가 있습니다: " + cadName : "Invalid CAD layer name: " + cadName;
-                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        reopenWithValidation(rootWindow.language === "ko" ? "CAD 레이어 이름에 허용되지 않는 문자 또는 길이가 있습니다: " + cadName : "Invalid CAD layer name: " + cadName);
                         return;
                     }
                     var key = cadName.toUpperCase();
                     if (seen[key]) {
-                        validationMessage = rootWindow.language === "ko" ? "CAD 레이어 이름이 중복됩니다: " + cadName : "Duplicate CAD layer name: " + cadName;
-                        Qt.callLater(function() { dxfEncodingDialog.open(); });
+                        reopenWithValidation(rootWindow.language === "ko" ? "CAD 레이어 이름이 중복됩니다: " + cadName : "Duplicate CAD layer name: " + cadName);
                         return;
                     }
                     seen[key] = true;
@@ -4505,8 +4519,7 @@ ApplicationWindow {
                     geometry: option.geometryEnabled, labels: option.labelsEnabled});
             }
             if (included === 0) {
-                validationMessage = rootWindow.language === "ko" ? "내보낼 레이어를 하나 이상 선택하세요." : "Select at least one layer.";
-                Qt.callLater(function() { dxfEncodingDialog.open(); });
+                reopenWithValidation(rootWindow.language === "ko" ? "내보낼 레이어를 하나 이상 선택하세요." : "Select at least one layer.");
                 return;
             }
             dxfExportDialog.selectedProfile = dxfEncodingChoice.currentValue;
@@ -4545,6 +4558,11 @@ ApplicationWindow {
                 text: rootWindow.language === "ko" ? "2D 도형: 점→POINT(원형 십자 표시), 선·폴리곤 경계→LWPOLYLINE. 채우기가 설정된 폴리곤은 SOLID 삼각형으로 채웁니다. Z 좌표는 제외하며 레이블은 같은 CAD 레이어의 TEXT입니다." : rootWindow.language === "jp" ? "2D図形: 点→POINT（円と十字の記号）、線・ポリゴン境界→LWPOLYLINE。塗り設定のあるポリゴンはSOLID三角形で塗ります。Z座標は除外し、ラベルは同じCADレイヤーのTEXTです。" : "2D geometry: points → POINT with a circle-and-cross marker; lines and polygon outlines → LWPOLYLINE. Filled polygons use SOLID triangles. Z coordinates are omitted; labels become TEXT on the same CAD layer."
                 wrapMode: Text.WordWrap
             }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "내보낼 프로젝트 레이어를 선택하고, 각 레이어의 출력 CAD 이름과 도형·레이블 포함 여부를 정하세요." : rootWindow.language === "jp" ? "書き出すプロジェクトレイヤーを選び、CADレイヤー名と図形・ラベルの出力を設定してください。" : "Choose project layers to export, then set each CAD layer name and whether to include geometry and labels."
+                wrapMode: Text.WordWrap
+            }
             ListView {
                 id: dxfLayerOptionsView
                 objectName: "dxfLayerOptionsView"
@@ -4555,45 +4573,56 @@ ApplicationWindow {
                 cacheBuffer: 0
                 model: dxfLayerOptions
                 delegate: ColumnLayout {
+                    id: dxfOptionRow
+                    objectName: "dxfOptionRow"
+                    required property int index
+                    required property string name
+                    required property string cadName
+                    required property string geometryType
+                    required property bool included
+                    required property bool geometryEnabled
+                    required property bool labelsEnabled
                     width: dxfLayerOptionsView.width
                     CheckBox {
-                        text: model.cadName + " (" + model.geometryType + ")"
-                        checked: model.included
-                        onClicked: dxfLayerOptions.setProperty(index, "included", checked)
+                        objectName: "dxfOptionInclude"
+                        text: (rootWindow.language === "ko" ? "프로젝트 레이어: " : rootWindow.language === "jp" ? "プロジェクトレイヤー: " : "Project layer: ") + dxfOptionRow.name + " (" + (dxfOptionRow.geometryType || "?") + ")"
+                        checked: dxfOptionRow.included
+                        onClicked: dxfLayerOptions.setProperty(dxfOptionRow.index, "included", checked)
                     }
                     Label {
                         Layout.fillWidth: true
                         leftPadding: 20
                         color: "#526578"
                         text: rootWindow.language === "ko"
-                            ? "도형 해석: " + (/point/i.test(model.geometryType) ? "점 → POINT" : /polygon/i.test(model.geometryType) ? "폴리곤 경계 → LWPOLYLINE" : /line/i.test(model.geometryType) ? "선 → LWPOLYLINE" : "원본 형상에 따라 POINT/LWPOLYLINE")
-                            : "Geometry mapping: " + (/point/i.test(model.geometryType) ? "points → POINT" : /polygon/i.test(model.geometryType) ? "polygon outlines → LWPOLYLINE" : /line/i.test(model.geometryType) ? "lines → LWPOLYLINE" : "POINT/LWPOLYLINE by source shape")
+                            ? "도형 해석: " + (/point/i.test(dxfOptionRow.geometryType) ? "점 → POINT" : /polygon/i.test(dxfOptionRow.geometryType) ? "폴리곤 경계 → LWPOLYLINE" : /line/i.test(dxfOptionRow.geometryType) ? "선 → LWPOLYLINE" : "원본 형상에 따라 POINT/LWPOLYLINE")
+                            : "Geometry mapping: " + (/point/i.test(dxfOptionRow.geometryType) ? "points → POINT" : /polygon/i.test(dxfOptionRow.geometryType) ? "polygon outlines → LWPOLYLINE" : /line/i.test(dxfOptionRow.geometryType) ? "lines → LWPOLYLINE" : "POINT/LWPOLYLINE by source shape")
                     }
                     RowLayout {
                         Layout.fillWidth: true
-                        enabled: model.included
+                        enabled: dxfOptionRow.included
                         Label { text: rootWindow.language === "ko" ? "CAD 이름" : "CAD name" }
                         TextField {
+                            objectName: "dxfOptionCadName"
                             Layout.fillWidth: true
-                            text: model.cadName
+                            text: dxfOptionRow.cadName
                             // Do not write the initial binding value back to
                             // the ListModel. On macOS the native control can
                             // emit textChanged while the delegate is being
                             // constructed, which used to erase CAD names.
-                            onTextChanged: if (activeFocus) dxfLayerOptions.setProperty(index, "cadName", text)
+                            onTextChanged: if (activeFocus) dxfLayerOptions.setProperty(dxfOptionRow.index, "cadName", text)
                         }
                     }
                     RowLayout {
-                        enabled: model.included
+                        enabled: dxfOptionRow.included
                         CheckBox {
                             text: rootWindow.language === "ko" ? "도형" : "Geometry"
-                            checked: model.geometryEnabled
-                            onClicked: dxfLayerOptions.setProperty(index, "geometryEnabled", checked)
+                            checked: dxfOptionRow.geometryEnabled
+                            onClicked: dxfLayerOptions.setProperty(dxfOptionRow.index, "geometryEnabled", checked)
                         }
                         CheckBox {
                             text: rootWindow.language === "ko" ? "레이블" : "Labels"
-                            checked: model.labelsEnabled
-                            onClicked: dxfLayerOptions.setProperty(index, "labelsEnabled", checked)
+                            checked: dxfOptionRow.labelsEnabled
+                            onClicked: dxfLayerOptions.setProperty(dxfOptionRow.index, "labelsEnabled", checked)
                         }
                     }
                 }

@@ -987,6 +987,9 @@ func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
 	if len(layer.Features) != 16 {
 		t.Fatalf("source layer was mutated to %d features", len(layer.Features))
 	}
+	if layer.Features[0].ID != 1 || layer.Features[3].ID != 4 || cap(sampled.Features) >= len(layer.Features) {
+		t.Fatal("overview sample mutated or retained the unsampled source backing slice")
+	}
 	sparseIDs := core.Layer{Features: make([]core.Feature, 12)}
 	for index := range sparseIDs.Features {
 		sparseIDs.Features[index] = core.Feature{ID: uint64(101 + index*17)}
@@ -2277,6 +2280,125 @@ func TestFeatureDisplayRuleFiltersRenderSnapshotAndKeepsProjectData(t *testing.T
 	}
 }
 
+func TestFeatureDisplayRuleClearsDiscardedFeatureReferences(t *testing.T) {
+	layer := core.Layer{DisplayRule: `return feature.keep == true`, Features: []core.Feature{
+		{ID: 1, Properties: map[string]any{"keep": true}},
+		{ID: 2, Geometry: core.WKBGeometry{WKB: make([]byte, 1024)}, Properties: map[string]any{"keep": false}},
+		{ID: 3, Geometry: core.WKBGeometry{WKB: make([]byte, 1024)}, Properties: map[string]any{"keep": false}},
+	}}
+	if err := applyFeatureDisplayRule(context.Background(), &layer); err != nil {
+		t.Fatal(err)
+	}
+	if len(layer.Features) != 1 || layer.Features[0].ID != 1 {
+		t.Fatalf("visible features = %+v", layer.Features)
+	}
+	for _, discarded := range layer.Features[len(layer.Features):cap(layer.Features)] {
+		if discarded.ID != 0 || discarded.Geometry != nil || discarded.Properties != nil {
+			t.Fatal("filtered feature still retained geometry or properties in backing slice")
+		}
+	}
+}
+
+func TestReadOnlySHPDisplayRuleAppliesAtOverviewAndDetail(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "filtered.shp")
+	features := []core.Feature{
+		{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (200005.1 400005.1)"}, Properties: map[string]any{"keep": "yes"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200005.1 400005.1)"}, Properties: map[string]any{"keep": "no"}},
+		{ID: 3, Geometry: core.WKTGeometry{WKT: "POINT (200000 400000)"}, Properties: map[string]any{"keep": "no"}},
+		{ID: 4, Geometry: core.WKTGeometry{WKT: "POINT (200010 400010)"}, Properties: map[string]any{"keep": "no"}},
+	}
+	if err := (gdal.Writer{}).Write(ctx, path, core.Layer{Name: "filtered", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "keep", Type: core.FieldTypeText}}, Features: features}); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	overviewKey := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(0), name,
+		render.Point{X: 200005.1, Y: 400005.1})
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{overviewKey})
+	runtime.mu.Unlock()
+	unfiltered, err := runtime.builder(ctx, overviewKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := runtime.readOnlyBindings[name]
+	binding.layer.DisplayRule = `return feature.keep == "yes"`
+	runtime.readOnlyBindings[name] = binding
+	for _, zoomBucket := range []int{0, 2} {
+		key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(zoomBucket), name,
+			render.Point{X: 200005.1, Y: 400005.1})
+		key.ZoomBucket = zoomBucket
+		runtime.mu.Lock()
+		runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{key})
+		runtime.mu.Unlock()
+		chunk, err := runtime.builder(ctx, key)
+		if err != nil {
+			t.Fatalf("zoom bucket %d: %v", zoomBucket, err)
+		}
+		if len(chunk.Vertices) == 0 {
+			t.Fatalf("zoom bucket %d filtered the visible SHP point: extent=%v key=%v source=%s rule=%q", zoomBucket,
+				runtime.mapExtent, key, binding.sourceName, binding.layer.DisplayRule)
+		}
+		if zoomBucket == 0 && len(chunk.Vertices) >= len(unfiltered.Vertices) {
+			t.Fatalf("overview kept hidden SHP geometry: filtered=%d unfiltered=%d vertices", len(chunk.Vertices), len(unfiltered.Vertices))
+		}
+		if zoomBucket == 2 {
+			runtime.mu.Lock()
+			visible := runtime.windowVisibleFeatureCount
+			hits := len(runtime.windowHits[key])
+			runtime.mu.Unlock()
+			if visible != 1 || hits != 1 {
+				t.Fatalf("filtered detail retained %d features and %d hit targets, want one", visible, hits)
+			}
+		}
+	}
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked(nil)
+	retained := runtime.windowVisibleFeatureCount
+	hits := len(runtime.windowHits)
+	names := len(runtime.windowFeatureNames)
+	runtime.mu.Unlock()
+	if retained != 0 || hits != 0 || names != 0 {
+		t.Fatalf("offscreen filtered SHP data retained: features=%d hits=%d names=%d", retained, hits, names)
+	}
+}
+
+func TestReadOnlySHPDXFExportExcludesFilteredFeatures(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "filtered-export.shp")
+	layer := core.Layer{Name: "filtered-export", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "keep", Type: core.FieldTypeText}}, Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (200000 400000)"}, Properties: map[string]any{"keep": "yes"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200010 400010)"}, Properties: map[string]any{"keep": "no"}},
+		}}
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path,
+		DisplayRule: `return feature.keep == "yes"`}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	destination := filepath.Join(t.TempDir(), "filtered.dxf")
+	if err := runtime.exportProjectLayersDXF(destination, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "\n0\nPOINT\n"); got != 1 {
+		t.Fatalf("filtered SHP DXF contains %d points, want one", got)
+	}
+}
+
 func TestReadOnlyMaterializedLayerRebuildsLabelsAfterSettingsChange(t *testing.T) {
 	runtime, err := buildDataRuntime(context.Background(), []core.Layer{{
 		Name: "parcels", DisplayName: "Parcels", SourcePath: "parcels.gpkg", SourceLayerName: "parcels",
@@ -2467,6 +2589,35 @@ func TestDesktopReadOnlyDXFExportIncludesEverySource(t *testing.T) {
 	}
 	if !strings.Contains(content, "\n0\nPOINT\n") || !strings.Contains(content, "\n0\nLWPOLYLINE\n") {
 		t.Fatal("read-only source geometry missing from project DXF")
+	}
+}
+
+func TestDesktopReadOnlyDXFExportCrossesBatchBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "many-points.shp")
+	features := make([]core.Feature, maxDesktopDXFExportBatchFeatures+1)
+	for i := range features {
+		features[i] = core.Feature{ID: uint64(i + 1), Geometry: core.WKTGeometry{
+			WKT: fmt.Sprintf("POINT (%d %d)", i, i)}}
+	}
+	if err := (gdal.Writer{}).Write(context.Background(), path, core.Layer{
+		Name: "many-points", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Features: features}); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	destination := filepath.Join(t.TempDir(), "many-points.dxf")
+	if err := runtime.exportProjectLayersDXF(destination, "ares-utf8"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(data), "\n0\nPOINT\n"); got != len(features) {
+		t.Fatalf("DXF points = %d, want %d across two batches", got, len(features))
 	}
 }
 

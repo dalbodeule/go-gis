@@ -173,6 +173,73 @@ func (reader Reader) OpenWithLimits(ctx context.Context, source, layerName strin
 	return readLayerOptionsLimited(ctx, layer, true, maxFeatures, maxBytes)
 }
 
+// ReadBatches scans a source once and passes bounded detached feature batches
+// to consume. The callback must not retain a batch after it returns. GDAL
+// features and the dataset are closed on success, cancellation, or error.
+func (reader Reader) ReadBatches(ctx context.Context, source, layerName string, batchFeatures int, batchBytes int64, consume func(core.Layer) error) error {
+	if batchFeatures <= 0 || batchBytes <= 0 || consume == nil {
+		return fmt.Errorf("batch feature and byte limits and a consumer are required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	registerDrivers()
+	dataset, err := openDataset(source, reader.Encoding)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", source, err)
+	}
+	defer dataset.Close()
+	layer, err := selectLayer(dataset, source, layerName)
+	if err != nil {
+		return err
+	}
+	header := readLayerHeader(layer)
+	batch := header
+	batch.Features = make([]core.Feature, 0, min(batchFeatures, 1024))
+	var usedBytes int64
+	flush := func() error {
+		if len(batch.Features) == 0 {
+			return nil
+		}
+		if err := consume(batch); err != nil {
+			return err
+		}
+		batch = header
+		batch.Features = make([]core.Feature, 0, min(batchFeatures, 1024))
+		usedBytes = 0
+		return nil
+	}
+	layer.ResetReading()
+	var nextID uint64 = 1
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			break
+		}
+		loaded, readErr := readFeature(feature, nextID, true)
+		feature.Close()
+		if readErr != nil {
+			return fmt.Errorf("read feature %d: %w", nextID, readErr)
+		}
+		featureBytes := estimateFeaturePayloadBytes(loaded)
+		if featureBytes > batchBytes {
+			return fmt.Errorf("feature %d exceeds the %d-byte batch limit", nextID, batchBytes)
+		}
+		if len(batch.Features) >= batchFeatures || featureBytes > batchBytes-usedBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		batch.Features = append(batch.Features, loaded)
+		usedBytes += featureBytes
+		nextID++
+	}
+	return flush()
+}
+
 // OpenGeometryOnly reads layer identity, CRS, feature IDs, and geometry while
 // skipping attribute maps. Render pipelines can use this path when properties
 // are fetched separately on demand.

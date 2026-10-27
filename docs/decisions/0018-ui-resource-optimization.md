@@ -372,3 +372,12 @@ visible features 64, visible payload 4.25KiB였다. 단일 실행 수치이므�
 visible features 64, visible payload 4.25KiB, 192,467,952 B/op 및 3,001,851
 allocs/op였다. 실행 간 시간 편차가 있으므로 캐시 생략의 시간 개선으로 해석하지 않고,
 메모리 상한과 기능 결과가 유지된 근거로만 사용한다.
+
+SHP를 포함한 read-only viewport에서 Lua 표시 필터가 설정되면 축소 지도에서도
+속성 필드를 읽는다. 필터 판정은 도형·레이블·hit target 생성보다 먼저 수행한다.
+필터에서 제외된 피처의 feature slice 꼬리를 비워 임시 window가 보유하던 WKB와
+속성 map 참조를 해제한다. 축소 지도 샘플도 별도 작은 slice에 복사해 선택되지 않은
+원본 window 전체를 붙잡지 않는다. 원본 파일과 프로젝트 데이터는 필터로 변경되지
+않으며, 화면을 벗어난 chunk의 hit/label/name 캐시는 기존 viewport 수명 규칙에 따라
+제거한다. 필터 평가는 현재 창 조회 뒤에 수행되므로 일시적인 읽기 한도는 원본 창의
+피처 수와 크기를 기준으로 적용된다.

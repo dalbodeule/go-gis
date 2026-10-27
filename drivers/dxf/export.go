@@ -145,11 +145,32 @@ func (e Exporter) ExportProject(ctx context.Context, destination string, layers 
 }
 
 func (e Exporter) export(ctx context.Context, destination string, specs []LayerSpec, load func(int) (core.Layer, error), profile string, separateLabels bool) error {
+	if load == nil {
+		return fmt.Errorf("DXF export requires a loader")
+	}
+	return e.exportBatches(ctx, destination, specs, func(index int, emit func(core.Layer) error) error {
+		layer, err := load(index)
+		if err != nil {
+			return err
+		}
+		return emit(layer)
+	}, profile, separateLabels)
+}
+
+// ExportProjectBatches writes each layer from bounded batches. A producer must
+// call emit in source order and release each batch after emit returns.
+func (e Exporter) ExportProjectBatches(ctx context.Context, destination string, layers []LayerSpec,
+	produce func(int, func(core.Layer) error) error, profile string) error {
+	return e.exportBatches(ctx, destination, layers, produce, profile, false)
+}
+
+func (e Exporter) exportBatches(ctx context.Context, destination string, specs []LayerSpec,
+	produce func(int, func(core.Layer) error) error, profile string, separateLabels bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(specs) == 0 || load == nil {
-		return fmt.Errorf("DXF export requires at least one layer and a loader")
+	if len(specs) == 0 || produce == nil {
+		return fmt.Errorf("DXF export requires at least one layer and a producer")
 	}
 	seenLayers := make(map[string]bool, len(specs))
 	for _, spec := range specs {
@@ -275,34 +296,40 @@ func (e Exporter) export(ctx context.Context, destination string, specs []LayerS
 		return err
 	}
 	for index, spec := range specs {
-		layer, loadErr := load(index)
-		if loadErr != nil {
-			return fmt.Errorf("load DXF layer %q: %w", spec.Name, loadErr)
-		}
-		for _, feature := range layer.Features {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !spec.SkipGeometry {
-				if spec.FillPolygons {
-					if e.Triangulate != nil {
-						triangles, err := e.Triangulate(ctx, feature.Geometry)
-						if err != nil {
-							return fmt.Errorf("feature %d fill triangulation: %w", feature.ID, err)
-						}
-						if err := writeSolidTrianglesWithFloat(write, writeFloat, spec.Name, triangles); err != nil {
-							return fmt.Errorf("feature %d triangle fill: %w", feature.ID, err)
-						}
-					} else if err := writeGeometrySolidFillWithFloat(write, writeFloat, feature.Geometry, spec.Name); err != nil {
-						return fmt.Errorf("feature %d fill: %w", feature.ID, err)
-					}
+		loadErr := produce(index, func(layer core.Layer) error {
+			for _, feature := range layer.Features {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-				if wkb, ok := feature.Geometry.(core.WKBGeometry); ok {
-					handled, err := writeWKBGeometryWithFloat(write, writeFloat, wkb, spec.Name)
-					if err != nil {
-						return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+				if !spec.SkipGeometry {
+					if spec.FillPolygons {
+						if e.Triangulate != nil {
+							triangles, err := e.Triangulate(ctx, feature.Geometry)
+							if err != nil {
+								return fmt.Errorf("feature %d fill triangulation: %w", feature.ID, err)
+							}
+							if err := writeSolidTrianglesWithFloat(write, writeFloat, spec.Name, triangles); err != nil {
+								return fmt.Errorf("feature %d triangle fill: %w", feature.ID, err)
+							}
+						} else if err := writeGeometrySolidFillWithFloat(write, writeFloat, feature.Geometry, spec.Name); err != nil {
+							return fmt.Errorf("feature %d fill: %w", feature.ID, err)
+						}
 					}
-					if !handled {
+					if wkb, ok := feature.Geometry.(core.WKBGeometry); ok {
+						handled, err := writeWKBGeometryWithFloat(write, writeFloat, wkb, spec.Name)
+						if err != nil {
+							return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+						}
+						if !handled {
+							geometry, err := core.ToWKT(feature.Geometry)
+							if err != nil {
+								return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+							}
+							if err := writeWKTWithFloat(write, writeFloat, geometry.WKT, spec.Name); err != nil {
+								return fmt.Errorf("feature %d: %w", feature.ID, err)
+							}
+						}
+					} else {
 						geometry, err := core.ToWKT(feature.Geometry)
 						if err != nil {
 							return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
@@ -311,41 +338,37 @@ func (e Exporter) export(ctx context.Context, destination string, specs []LayerS
 							return fmt.Errorf("feature %d: %w", feature.ID, err)
 						}
 					}
-				} else {
-					geometry, err := core.ToWKT(feature.Geometry)
-					if err != nil {
-						return fmt.Errorf("feature %d geometry: %w", feature.ID, err)
+				}
+				if spec.SkipLabels {
+					continue
+				}
+				if feature.Label != nil && feature.Label.Text != "" {
+					label := *feature.Label
+					if label.Height <= 0 {
+						label.Height = configuration.TextHeight
 					}
-					if err := writeWKTWithFloat(write, writeFloat, geometry.WKT, spec.Name); err != nil {
-						return fmt.Errorf("feature %d: %w", feature.ID, err)
+					labelLayer := spec.Name
+					if separateLabels {
+						labelLayer = "LABEL"
+					}
+					alignment, aligned := pointTextAlignment(label, feature.Geometry, spec)
+					if err := writeTextOnLayerAlignedWithFloat(write, writeFloat, label, labelLayer, alignment, aligned); err != nil {
+						return err
+					}
+				} else if label, ok := feature.Properties["label"].(string); ok && label != "" {
+					labelLayer := spec.Name
+					if separateLabels {
+						labelLayer = "LABEL"
+					}
+					if err := writeTextOnLayerWithFloat(write, writeFloat, core.Label{Text: label, Height: configuration.TextHeight}, labelLayer); err != nil {
+						return err
 					}
 				}
 			}
-			if spec.SkipLabels {
-				continue
-			}
-			if feature.Label != nil && feature.Label.Text != "" {
-				label := *feature.Label
-				if label.Height <= 0 {
-					label.Height = configuration.TextHeight
-				}
-				labelLayer := spec.Name
-				if separateLabels {
-					labelLayer = "LABEL"
-				}
-				alignment, aligned := pointTextAlignment(label, feature.Geometry, spec)
-				if err := writeTextOnLayerAlignedWithFloat(write, writeFloat, label, labelLayer, alignment, aligned); err != nil {
-					return err
-				}
-			} else if label, ok := feature.Properties["label"].(string); ok && label != "" {
-				labelLayer := spec.Name
-				if separateLabels {
-					labelLayer = "LABEL"
-				}
-				if err := writeTextOnLayerWithFloat(write, writeFloat, core.Label{Text: label, Height: configuration.TextHeight}, labelLayer); err != nil {
-					return err
-				}
-			}
+			return nil
+		})
+		if loadErr != nil {
+			return fmt.Errorf("load DXF layer %q: %w", spec.Name, loadErr)
 		}
 	}
 	if err := write(0, "ENDSEC"); err != nil {

@@ -50,6 +50,41 @@ func TestReaderImportsDXFThroughOGR(t *testing.T) {
 	}
 }
 
+func TestReaderReadBatchesPreservesFeatureOrderAcrossByteLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch.shp")
+	features := make([]core.Feature, 7)
+	for i := range features {
+		features[i] = core.Feature{ID: uint64(i + 1), Geometry: core.WKTGeometry{WKT: fmt.Sprintf("POINT (%d %d)", i, i)},
+			Properties: map[string]any{"name": fmt.Sprintf("building-%d", i)}}
+	}
+	if err := (Writer{}).Write(context.Background(), path, core.Layer{Name: "batch", Features: features}); err != nil {
+		t.Fatal(err)
+	}
+	var ids []uint64
+	batches := 0
+	err := (Reader{}).ReadBatches(context.Background(), path, "", 3, 512, func(batch core.Layer) error {
+		batches++
+		if len(batch.Features) > 3 {
+			t.Fatalf("batch contains %d features", len(batch.Features))
+		}
+		for _, feature := range batch.Features {
+			ids = append(ids, feature.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches < 3 || len(ids) != len(features) {
+		t.Fatalf("batches=%d ids=%v", batches, ids)
+	}
+	for i, id := range ids {
+		if id != uint64(i+1) {
+			t.Fatalf("feature IDs = %v", ids)
+		}
+	}
+}
+
 func TestValidateSpatialWindowRejectsNonFiniteAndReversedBounds(t *testing.T) {
 	for _, bounds := range [][4]float64{
 		{math.NaN(), 0, 1, 1},
