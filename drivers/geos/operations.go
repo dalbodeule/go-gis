@@ -20,6 +20,10 @@ type Operator struct {
 	context *geoslib.Context
 }
 
+// BorrowsSpatialInputs marks GEOS operations as read-only on their input
+// snapshots. Operation results clone mutable properties and replace geometry.
+func (*Operator) BorrowsSpatialInputs() {}
+
 const minDisplaySimplificationPoints = 32
 
 // overviewUnionGrid suppresses sub-decimeter seams between separately digitized

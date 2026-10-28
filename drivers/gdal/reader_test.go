@@ -1414,6 +1414,44 @@ func TestAttributeSessionOpenWindowWithLimitsBoundsDecodedPayload(t *testing.T) 
 	}
 }
 
+func TestAttributeSessionFilteredShapefileWindowBudgetsOnlyVisibleFeatures(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "filtered.shp")
+	layer := core.Layer{Name: "filtered", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "keep", Type: core.FieldTypeText}}, Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 1)"}, Properties: map[string]any{"keep": "no"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (2 2)"}, Properties: map[string]any{"keep": "yes"}},
+			{ID: 3, Geometry: core.WKTGeometry{WKT: "POINT (3 3)"}, Properties: map[string]any{"keep": "no"}},
+		}}
+	if err := (Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if _, err := session.OpenWindowWithLimits(ctx, "", [4]float64{0, 0, 4, 4}, true, 1, 1024); err == nil {
+		t.Fatal("unfiltered window unexpectedly fit the one-feature budget")
+	}
+	filtered, err := session.OpenShapefileWindowWithLimitsFiltered(ctx, "", [4]float64{0, 0, 4, 4}, 1, 1024,
+		func(properties map[string]any) (bool, error) { return properties["keep"] == "yes", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Features) != 1 || filtered.Features[0].ID != 2 ||
+		filtered.Features[0].Properties["keep"] != "yes" || filtered.Features[0].Geometry == nil {
+		t.Fatalf("filtered window = %+v", filtered.Features)
+	}
+	if _, err := session.OpenWindowWithLimits(ctx, "", [4]float64{0, 0, 4, 4}, true, 0, 160); err == nil {
+		t.Fatal("unfiltered window unexpectedly fit the visible byte budget")
+	}
+	if _, err := session.OpenShapefileWindowWithLimitsFiltered(ctx, "", [4]float64{0, 0, 4, 4}, 0, 160,
+		func(properties map[string]any) (bool, error) { return properties["keep"] == "yes", nil }); err != nil {
+		t.Fatalf("filtered window exceeded the visible byte budget: %v", err)
+	}
+}
+
 func TestReaderOpenGeometryOnlySkipsProperties(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}}]}`

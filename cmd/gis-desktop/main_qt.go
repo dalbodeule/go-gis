@@ -1395,6 +1395,14 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	forceOverview := r.forceOverviewNext
 	r.forceOverviewNext = false
 	visibleLayerNames := visibility.VisibleLayers()
+	filteredLayerNames := make([]string, 0)
+	if viewportReadOnly {
+		for _, name := range visibleLayerNames {
+			if binding, ok := r.readOnlyBindings[name]; ok && strings.TrimSpace(binding.layer.DisplayRule) != "" {
+				filteredLayerNames = append(filteredLayerNames, name)
+			}
+		}
+	}
 	layerSignature := strings.Join(visibleLayerNames, "\x00")
 	keepCompleteFrame := r.hasCompleteFrame && r.completeFrameLayers == layerSignature && viewportReadOnly
 	maxVisibleLayerFeatureCount := 0
@@ -1588,8 +1596,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		windowWorkerLimit = min(windowWorkerLimit, maxReadOnlyDetailWorkers)
 	}
 	native.RecordDiagnostic("render", fmt.Sprintf(
-		"request generation=%d layers=%d chunks=%d pruned=%d zoom=%g lod=%d workers=%d window_limit=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
-		requestGeneration, len(visibleLayerNames), len(keys), prunedReadOnlyKeys, viewport.Zoom, lodBucket,
+		"request generation=%d layers=%d display_rule_layers=%v chunks=%d pruned=%d zoom=%g lod=%d workers=%d window_limit=%d forced_overview=%t center=(%.6f,%.6f) screen=%.0fx%.0f canvas=%.0fx%.0f extent=[%.3f,%.3f,%.3f,%.3f] fit=[%.3f,%.3f,%.3f,%.3f]",
+		requestGeneration, len(visibleLayerNames), filteredLayerNames, len(keys), prunedReadOnlyKeys, viewport.Zoom, lodBucket,
 		scheduler.MaxWorkers(), windowWorkerLimit, forceOverview,
 		viewport.Center.X, viewport.Center.Y, viewport.ScreenWidth, viewport.ScreenHeight,
 		viewport.CanvasWidth, viewport.CanvasHeight, mapExtent[0], mapExtent[1], mapExtent[2], mapExtent[3],
@@ -1643,6 +1651,12 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		completed := 0
 		renderedVertices := 0
 		nonemptyChunks := 0
+		nonemptyByLayer := make(map[string]int, len(visibleLayerNames))
+		verticesByLayer := make(map[string]int, len(visibleLayerNames))
+		for _, name := range visibleLayerNames {
+			nonemptyByLayer[name] = 0
+			verticesByLayer[name] = 0
+		}
 		emptyChunkKeys := make([]render.ChunkKey, 0)
 		fillVerticesByLayer := make(map[string]int, len(visibleLayerNames))
 		zeroAlphaFillVertices := 0
@@ -1684,7 +1698,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			// A citywide layer can grow to millions of source vertices. Repeatedly
 			// flattening, copying, and rebuilding every intermediate frame makes
 			// the render thread fall behind the worker; publish the final batch once.
-			if viewportReadOnly && !final &&
+			if viewportReadOnly && !final && firstPublish &&
 				(renderedVertices > maxProgressiveReadOnlyVertices || progressivePublishes >= maxProgressiveReadOnlyPublishes) {
 				return
 			}
@@ -1711,7 +1725,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				r.publishedRevision = revision
 				dirty = false
 				lastPublish = time.Now()
-				if viewportReadOnly && !final {
+				if viewportReadOnly && !final && len(publishScratch) > 0 {
 					progressivePublishes++
 				}
 			}
@@ -1739,6 +1753,8 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 			renderedVertices += len(result.Chunk.Vertices)
 			if len(result.Chunk.Vertices) > 0 {
 				nonemptyChunks++
+				nonemptyByLayer[result.Key.Layer]++
+				verticesByLayer[result.Key.Layer] += len(result.Chunk.Vertices)
 			} else {
 				emptyChunkKeys = append(emptyChunkKeys, result.Key)
 			}
@@ -1868,9 +1884,11 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 				emptySample[index] = fmt.Sprintf("%s:%d,%d", key.Layer, key.X, key.Y)
 			}
 			fillSummary, _ := json.Marshal(fillVerticesByLayer)
+			nonemptySummary, _ := json.Marshal(nonemptyByLayer)
+			vertexSummary, _ := json.Marshal(verticesByLayer)
 			native.RecordDiagnostic("render", fmt.Sprintf(
-				"ready generation=%d chunks=%d nonempty=%d empty=%d empty_sample=%v vertices=%d fill_vertices_by_layer=%s zero_alpha_fills=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] center_vertices=%d/%d occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
-				requestGeneration, completed, nonemptyChunks, completed-nonemptyChunks, emptySample, renderedVertices, string(fillSummary), zeroAlphaFillVertices,
+				"ready generation=%d chunks=%d nonempty=%d nonempty_by_layer=%s empty=%d empty_sample=%v vertices=%d vertices_by_layer=%s fill_vertices_by_layer=%s zero_alpha_fills=%d vertex_bounds=[%.6f,%.6f,%.6f,%.6f] world_center_vertices=%d/%d world_occupied_cells=%d/256 elapsed_ms=%d cache_hits=%d chunks_built=%d",
+				requestGeneration, completed, nonemptyChunks, string(nonemptySummary), completed-nonemptyChunks, emptySample, renderedVertices, string(vertexSummary), string(fillSummary), zeroAlphaFillVertices,
 				vertexMinX, vertexMinY, vertexMaxX, vertexMaxY, centerVertices, validVertices, occupiedCount,
 				time.Since(renderStartedAt).Milliseconds(),
 				stats.CacheHits-renderStatsBefore.CacheHits, stats.ChunksBuilt-renderStatsBefore.ChunksBuilt,
@@ -2522,6 +2540,10 @@ func startViewportSync(runtime *demoRuntime) {
 	go func() {
 		var viewportChangedAt time.Time
 		pendingViewportRefresh := false
+		var lastRequestedViewport native.Viewport
+		var lastRequestedScheduler *render.Scheduler
+		lastRequestedFeatureLimit := -1
+		lastRequestedPayloadLimit := int64(-1)
 		// QML payloads are generation-based and viewport redraws are already
 		// debounced below. A 30 Hz bridge poll keeps visible interaction
 		// responsive; hidden windows use the slower cadence used by the native
@@ -2639,31 +2661,49 @@ func startViewportSync(runtime *demoRuntime) {
 				// viewport once after restoration. Do not let a pre-hide debounce
 				// or layer toggle start a background render here.
 				pendingViewportRefresh = false
+			} else if !canvasViewportReady(viewport) {
+				// Wait for QML's first layout instead of querying provisional
+				// 0x0 windows. Keep the request pending until dimensions arrive.
+				if !pendingViewportRefresh {
+					viewportChangedAt = time.Now()
+				}
+				pendingViewportRefresh = true
 			} else if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
 				pendingViewportRefresh = false
-				runtime.advanceRenderGeneration()
+				runtime.mu.Lock()
+				currentScheduler := runtime.scheduler
+				runtime.mu.Unlock()
 				featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
-				runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
-				width, height := viewport.Width, viewport.Height
-				if width <= 0 {
-					width = 1
+				if visibilityChanged || currentScheduler != lastRequestedScheduler ||
+					featureLimit != lastRequestedFeatureLimit || payloadLimit != lastRequestedPayloadLimit ||
+					!sameViewportForRendering(lastRequestedViewport, viewport) {
+					runtime.advanceRenderGeneration()
+					runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
+					width, height := viewport.Width, viewport.Height
+					if width <= 0 {
+						width = 1
+					}
+					if height <= 0 {
+						height = 1
+					}
+					zoom := viewport.Zoom
+					if zoom <= 0 {
+						zoom = 1
+					}
+					runtime.refresh(context.Background(), render.Viewport{
+						Center: render.Point{
+							X: 0.5 - viewport.PanX/(width*zoom),
+							Y: 0.5 + viewport.PanY/(height*zoom),
+						},
+						Zoom:        zoom,
+						ScreenWidth: viewport.ViewportWidth, ScreenHeight: viewport.ViewportHeight,
+						CanvasWidth: width, CanvasHeight: height,
+					})
+					lastRequestedViewport = viewport
+					lastRequestedScheduler = currentScheduler
+					lastRequestedFeatureLimit = featureLimit
+					lastRequestedPayloadLimit = payloadLimit
 				}
-				if height <= 0 {
-					height = 1
-				}
-				zoom := viewport.Zoom
-				if zoom <= 0 {
-					zoom = 1
-				}
-				runtime.refresh(context.Background(), render.Viewport{
-					Center: render.Point{
-						X: 0.5 - viewport.PanX/(width*zoom),
-						Y: 0.5 + viewport.PanY/(height*zoom),
-					},
-					Zoom:        zoom,
-					ScreenWidth: viewport.ViewportWidth, ScreenHeight: viewport.ViewportHeight,
-					CanvasWidth: width, CanvasHeight: height,
-				})
 			}
 			clickGeneration := native.ClickGeneration()
 			if clickGeneration != lastClickGeneration {
@@ -2705,6 +2745,28 @@ func startViewportSync(runtime *demoRuntime) {
 			syncTimer.Reset(viewportSyncInterval(native.CanvasVisible()))
 		}
 	}()
+}
+
+// Ignore QML layout noise smaller than a quarter of a pixel. A real pan,
+// zoom, canvas resize, layer toggle, or new scheduler still refreshes.
+func sameViewportForRendering(left, right native.Viewport) bool {
+	if left.Width <= 0 || left.Height <= 0 || left.Zoom <= 0 ||
+		right.Width <= 0 || right.Height <= 0 || right.Zoom <= 0 {
+		return false
+	}
+	const pixelTolerance = 0.25
+	return math.Abs(left.Width-right.Width) <= pixelTolerance &&
+		math.Abs(left.Height-right.Height) <= pixelTolerance &&
+		math.Abs(left.ViewportWidth-right.ViewportWidth) <= pixelTolerance &&
+		math.Abs(left.ViewportHeight-right.ViewportHeight) <= pixelTolerance &&
+		math.Abs(left.PanX-right.PanX) <= pixelTolerance &&
+		math.Abs(left.PanY-right.PanY) <= pixelTolerance &&
+		math.Abs(left.Zoom-right.Zoom) <= 1e-9*right.Zoom
+}
+
+func canvasViewportReady(viewport native.Viewport) bool {
+	return viewport.Width > 0 && viewport.Height > 0 &&
+		viewport.ViewportWidth > 0 && viewport.ViewportHeight > 0 && viewport.Zoom > 0
 }
 
 func viewportSyncInterval(visible bool) time.Duration {
@@ -3631,6 +3693,17 @@ func (r *demoRuntime) advanceRenderGeneration() {
 
 func (r *demoRuntime) refreshCurrentViewport() {
 	viewport := native.CurrentViewport()
+	r.mu.Lock()
+	viewportReadOnly := r.viewportReadOnly
+	r.mu.Unlock()
+	// QML publishes the workspace and source metadata before its map item has
+	// a size. A read-only window query at 0x0 plans hundreds of provisional
+	// tiles, only to be canceled when the first real viewport arrives.
+	// The geometry change increments ViewportGeneration and triggers that
+	// real refresh through startViewportSync.
+	if viewportReadOnly && !canvasViewportReady(viewport) {
+		return
+	}
 	width, height := viewport.Width, viewport.Height
 	if width <= 0 {
 		width = 1

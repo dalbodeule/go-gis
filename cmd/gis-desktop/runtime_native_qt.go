@@ -1321,6 +1321,20 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// forced dissolved boundary, which no longer has per-parcel anchors.
 	includeProperties := readOnlyWindowNeedsProperties(binding.layer.Labels, overview, polygonOverview) ||
 		strings.TrimSpace(binding.layer.DisplayRule) != ""
+	var displayRuleProgram *scripting.LabelProgram
+	if strings.TrimSpace(binding.layer.DisplayRule) != "" {
+		displayRuleProgram, err = scripting.CompileLabelProgram(binding.layer.DisplayRule)
+		if err != nil {
+			return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
+		}
+		defer displayRuleProgram.Close()
+	}
+	var acceptsFeature func(core.Feature) (bool, error)
+	if displayRuleProgram != nil {
+		acceptsFeature = func(feature core.Feature) (bool, error) {
+			return displayRuleProgram.EvaluateRule(ctx, feature.Properties)
+		}
+	}
 	profileStarted := time.Now()
 	setStage("wait-dataset")
 	windowSession := binding.session
@@ -1332,11 +1346,44 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		}
 	}
 	setStage("query-window")
-	window, subdivided, err := openReadOnlyWindowWithSubdivisionWithLimits(ctx, queryBounds,
-		visibleFeatureLimit, visiblePayloadLimit, func(bounds [4]float64) (core.Layer, error) {
-			return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
-				maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
-		})
+	var window core.Layer
+	var subdivided bool
+	filteredAtSource := false
+	// The common SHP case can test attributes before copying hidden geometry
+	// to WKB. Keep the existing deduplicating subdivision path for an overfull
+	// root window; it evaluates each source feature only once across children.
+	if acceptsFeature != nil && strings.EqualFold(filepath.Ext(binding.layer.SourcePath), ".shp") {
+		if filteredSession, ok := windowSession.(interface {
+			OpenShapefileWindowWithLimitsFiltered(context.Context, string, [4]float64, int, int64, func(map[string]any) (bool, error)) (core.Layer, error)
+		}); ok {
+			window, err = filteredSession.OpenShapefileWindowWithLimitsFiltered(ctx, binding.sourceName,
+				queryBounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes,
+				func(properties map[string]any) (bool, error) {
+					return displayRuleProgram.EvaluateRule(ctx, properties)
+				})
+			if err == nil {
+				filteredAtSource = true
+			} else if isReadOnlyWindowSubdivisionError(err) {
+				// A failed trial may have advanced a stateful Lua program. Restart
+				// it before applying the original subdivision semantics.
+				displayRuleProgram, err = scripting.CompileLabelProgram(binding.layer.DisplayRule)
+				if err == nil {
+					defer displayRuleProgram.Close()
+				} else {
+					err = fmt.Errorf("recompile layer %q display rule: %w", binding.layer.Name, err)
+				}
+			} else {
+				filteredAtSource = true // Return the source error without a second query.
+			}
+		}
+	}
+	if !filteredAtSource && err == nil {
+		window, subdivided, err = openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx, queryBounds,
+			visibleFeatureLimit, visiblePayloadLimit, func(bounds [4]float64) (core.Layer, error) {
+				return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
+					maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+			}, acceptsFeature)
+	}
 	if binding.windowPool != nil {
 		binding.windowPool <- windowSession
 	}
@@ -1347,9 +1394,12 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	queryFeatures := len(window.Features)
 	var unionElapsed, simplifyElapsed, fillElapsed time.Duration
 	window.DisplayRule = binding.layer.DisplayRule
-	setStage("apply-display-rule")
-	if err := applyFeatureDisplayRule(ctx, &window); err != nil {
-		return render.Chunk{}, fmt.Errorf("layer %q display rule: %w", binding.layer.Name, err)
+	var displayOperator *geosdriver.Operator
+	getDisplayOperator := func() *geosdriver.Operator {
+		if displayOperator == nil {
+			displayOperator = geosdriver.NewOperator()
+		}
+		return displayOperator
 	}
 	if overview {
 		setStage("sample-overview")
@@ -1357,8 +1407,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		if polygonOverview && !denseParcelOverview {
 			setStage("dissolve-overview")
 			started := time.Now()
-			operator := geosdriver.NewOperator()
-			window, err = operator.DissolvePolygonBoundariesForDisplay(ctx, window)
+			window, err = getDisplayOperator().DissolvePolygonBoundariesForDisplay(ctx, window)
 			if err != nil {
 				return render.Chunk{}, fmt.Errorf("dissolve coarse-scale polygon coverage for %s: %w", key.Layer, err)
 			}
@@ -1455,10 +1504,11 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			tolerance *= 4
 		}
 		displayTolerance = tolerance
-		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) {
+		if tolerance > 0 && !math.IsInf(tolerance, 0) && !math.IsNaN(tolerance) &&
+			!isPointGeometryType(runtime.layerGeometryTypes[binding.layer.Name]) {
 			setStage("simplify-geometry")
 			started := time.Now()
-			displayWindow, err = geosdriver.NewOperator().SimplifyForDisplay(ctx, window, tolerance)
+			displayWindow, err = getDisplayOperator().SimplifyForDisplay(ctx, window, tolerance)
 			if err != nil {
 				return render.Chunk{}, fmt.Errorf("simplify coarse-scale geometry for %s: %w", key.Layer, err)
 			}
@@ -1949,6 +1999,7 @@ func estimateReadOnlyChunkPayloadBytes(layer core.Layer, limit int64) (int64, er
 const (
 	maxReadOnlyWindowSubdivisionDepth = 8
 	maxReadOnlyWindowSubdivisionCalls = 256
+	maxReadOnlyWindowFingerprints     = 1_000_000
 	readOnlyWindowFeatureHeaderBudget = 64
 	maxReadOnlyOutlinePolygonVertices = 1_000_000
 )
@@ -1964,8 +2015,26 @@ func openReadOnlyWindowWithSubdivision(ctx context.Context, bounds [4]float64,
 func openReadOnlyWindowWithSubdivisionWithLimits(ctx context.Context, bounds [4]float64,
 	featureLimit int, payloadLimit int64,
 	open func([4]float64) (core.Layer, error)) (core.Layer, bool, error) {
+	return openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx, bounds, featureLimit, payloadLimit, open, nil)
+}
+
+// The optional predicate runs once per unique source feature before it enters
+// the merged geometry payload. Fingerprinting still precedes evaluation so
+// overlapping child windows preserve the original display-rule semantics.
+func openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx context.Context, bounds [4]float64,
+	featureLimit int, payloadLimit int64,
+	open func([4]float64) (core.Layer, error),
+	accept func(core.Feature) (bool, error)) (core.Layer, bool, error) {
 	root, err := open(bounds)
-	if err == nil || !isReadOnlyWindowSubdivisionError(err) {
+	if err == nil {
+		if accept != nil {
+			if filterErr := filterWindowFeatures(ctx, &root, accept); filterErr != nil {
+				return core.Layer{}, false, fmt.Errorf("display rule: %w", filterErr)
+			}
+		}
+		return root, false, nil
+	}
+	if !isReadOnlyWindowSubdivisionError(err) {
 		return root, false, err
 	}
 	children := splitReadOnlyWindowBounds(bounds)
@@ -2013,6 +2082,19 @@ func openReadOnlyWindowWithSubdivisionWithLimits(ctx context.Context, bounds [4]
 			if _, duplicate := seen[fingerprint]; duplicate {
 				continue
 			}
+			if len(seen) >= maxReadOnlyWindowFingerprints {
+				return fmt.Errorf("subdivided spatial window exceeds the %d-feature deduplication budget", maxReadOnlyWindowFingerprints)
+			}
+			seen[fingerprint] = struct{}{}
+			if accept != nil {
+				show, filterErr := accept(feature)
+				if filterErr != nil {
+					return fmt.Errorf("display rule feature %d: %w", feature.ID, filterErr)
+				}
+				if !show {
+					continue
+				}
+			}
 			if len(merged.Features) >= featureLimit {
 				return fmt.Errorf("subdivided spatial window exceeds the %d-feature safety limit", featureLimit)
 			}
@@ -2025,7 +2107,6 @@ func openReadOnlyWindowWithSubdivisionWithLimits(ctx context.Context, bounds [4]
 				return fmt.Errorf("subdivided spatial window exceeds the %d MiB payload budget", payloadLimit>>20)
 			}
 			payloadBytes += featureBytes
-			seen[fingerprint] = struct{}{}
 			merged.Features = append(merged.Features, feature)
 		}
 		return nil
@@ -3037,12 +3118,28 @@ func applyFeatureDisplayRule(ctx context.Context, layer *core.Layer) error {
 		return err
 	}
 	defer program.Close()
+	return applyFeatureDisplayRuleWithProgram(ctx, layer, program)
+}
+
+func applyFeatureDisplayRuleWithProgram(ctx context.Context, layer *core.Layer, program *scripting.LabelProgram) error {
+	if program == nil {
+		return nil
+	}
+	return filterWindowFeatures(ctx, layer, func(feature core.Feature) (bool, error) {
+		return program.EvaluateRule(ctx, feature.Properties)
+	})
+}
+
+func filterWindowFeatures(ctx context.Context, layer *core.Layer, accept func(core.Feature) (bool, error)) error {
+	if layer == nil || accept == nil || len(layer.Features) == 0 {
+		return nil
+	}
 	visible := layer.Features[:0]
 	for _, feature := range layer.Features {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		show, err := program.EvaluateRule(ctx, feature.Properties)
+		show, err := accept(feature)
 		if err != nil {
 			return fmt.Errorf("feature %d: %w", feature.ID, err)
 		}
@@ -3051,7 +3148,16 @@ func applyFeatureDisplayRule(ctx context.Context, layer *core.Layer) error {
 		}
 	}
 	clear(layer.Features[len(visible):])
-	layer.Features = visible
+	// A sparse display rule can leave a large window allocation behind a tiny
+	// visible slice. Release that backing array before geometry preparation;
+	// otherwise every later render stage keeps the discarded feature slots live.
+	if len(visible) == 0 {
+		layer.Features = nil
+	} else if cap(visible) >= 1024 && len(visible) <= cap(visible)/4 {
+		layer.Features = append([]core.Feature(nil), visible...)
+	} else {
+		layer.Features = visible
+	}
 	return nil
 }
 

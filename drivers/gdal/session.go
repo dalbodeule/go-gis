@@ -285,6 +285,36 @@ func (s *AttributeSession) OpenWindowWithLimits(ctx context.Context, layerName s
 	return openWindowLayerLimited(ctx, s.dataset, s.source, layer, resolvedLayerName, bounds, includeProperties, maxFeatures, maxBytes)
 }
 
+// OpenShapefileWindowWithLimitsFiltered evaluates an attribute predicate while
+// reading a spatial SHP window. Rejected features never copy geometry to WKB
+// and do not consume the decoded window budgets. Callers must use a fresh
+// predicate if they retry a failed query because a script may keep state.
+func (s *AttributeSession) OpenShapefileWindowWithLimitsFiltered(ctx context.Context, layerName string, bounds [4]float64, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	if accept == nil {
+		return core.Layer{}, fmt.Errorf("filtered shapefile window requires a predicate")
+	}
+	if err := validateSpatialWindow(bounds); err != nil {
+		return core.Layer{}, err
+	}
+	if maxFeatures < 0 || maxBytes < 0 {
+		return core.Layer{}, fmt.Errorf("filtered window budgets must not be negative")
+	}
+	if err := s.lockContext(ctx); err != nil {
+		return core.Layer{}, err
+	}
+	defer s.mu.Unlock()
+	if s.streamGeoJSON || s.dataset == nil {
+		return core.Layer{}, fmt.Errorf("filtered shapefile source is unavailable")
+	}
+	s.featureCursorReady = false
+	s.attributeCursorReady = false
+	layer, resolvedLayerName, err := s.layerForName(layerName)
+	if err != nil {
+		return core.Layer{}, err
+	}
+	return openWindowSpatialFilterLimitedWithPredicate(ctx, s.dataset, layer, resolvedLayerName, bounds, true, maxFeatures, maxBytes, accept)
+}
+
 // OpenAttributePage reads one property page using the retained dataset.
 func (s *AttributeSession) OpenAttributePage(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
 	if err := validateAttributePage(offset, limit); err != nil {

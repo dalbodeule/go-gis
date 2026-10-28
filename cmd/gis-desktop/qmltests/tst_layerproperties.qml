@@ -525,6 +525,37 @@ TestCase {
         appWindow.language = "en";
     }
 
+    function test_diagnosticLogOpensAtLeftOfNewestLine() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var button = findChild(appWindow, "openDiagnosticLogsButton");
+        var dialog = findChild(appWindow, "diagnosticLogDialog");
+        var scroll = findChild(appWindow, "diagnosticLogScrollView");
+        verify(canvas !== null && button !== null && dialog !== null && scroll !== null);
+        var entries = [];
+        for (var i = 0; i < 80; ++i)
+            entries.push({time: "12:34:56.789", stream: "render", message: i + " " + "x".repeat(400)});
+        button.clicked();
+        tryCompare(dialog, "visible", true);
+        canvas.diagnosticLogPayload = JSON.stringify(entries);
+        var flickable = scroll.contentItem;
+        tryVerify(function() {
+            return flickable.contentHeight > flickable.height && flickable.contentWidth > flickable.width;
+        });
+        tryVerify(function() {
+            return Math.abs(flickable.contentY - Math.max(0, flickable.contentHeight - flickable.height)) < 2 &&
+                   flickable.contentX === 0;
+        });
+        flickable.contentX = 100;
+        flickable.contentY = 0;
+        entries.push({time: "12:34:57.000", stream: "render", message: "latest " + "y".repeat(400)});
+        canvas.diagnosticLogPayload = JSON.stringify(entries);
+        tryVerify(function() {
+            return flickable.contentX === 0 &&
+                   Math.abs(flickable.contentY - Math.max(0, flickable.contentHeight - flickable.height)) < 2;
+        });
+        dialog.close();
+    }
+
     function test_layerVisibilityToggleRequestsViewportRefresh() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var layerModel = findChild(appWindow, "layerModel");

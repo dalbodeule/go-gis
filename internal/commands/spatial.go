@@ -19,6 +19,14 @@ type SpatialOperator interface {
 	Buffer(ctx context.Context, layer core.Layer, distance float64) (core.Layer, error)
 }
 
+// BorrowedSpatialInputOperator promises not to mutate or retain input geometry,
+// labels, or property maps. ProjectService may share those immutable payloads
+// while detaching feature headers. Other operators receive full clones.
+type BorrowedSpatialInputOperator interface {
+	SpatialOperator
+	BorrowsSpatialInputs()
+}
+
 var (
 	ErrSpatialOperatorMissing  = errors.New("spatial operator is required")
 	ErrUnknownSpatialOperation = errors.New("unknown spatial operation")
@@ -61,7 +69,11 @@ func (s *ProjectService) ApplySpatialOperation(ctx context.Context, operator Spa
 	if resultName == "" {
 		return errors.New("result layer name is required")
 	}
-	left, foundLeft := s.Layer(leftName)
+	readLayer := s.Layer
+	if _, ok := operator.(BorrowedSpatialInputOperator); ok {
+		readLayer = s.ProjectLayerRenderSnapshot
+	}
+	left, foundLeft := readLayer(leftName)
 	if !foundLeft {
 		return fmt.Errorf("%w: %s", ErrLayerMissing, leftName)
 	}
@@ -71,7 +83,7 @@ func (s *ProjectService) ApplySpatialOperation(ctx context.Context, operator Spa
 			right = left
 		} else {
 			var foundRight bool
-			right, foundRight = s.Layer(rightName)
+			right, foundRight = readLayer(rightName)
 			if !foundRight {
 				return fmt.Errorf("%w: %s", ErrLayerMissing, rightName)
 			}

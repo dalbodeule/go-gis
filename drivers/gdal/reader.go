@@ -173,9 +173,10 @@ func (reader Reader) OpenWithLimits(ctx context.Context, source, layerName strin
 	return readLayerOptionsLimited(ctx, layer, true, maxFeatures, maxBytes)
 }
 
-// ReadBatches scans a source once and passes bounded detached feature batches
-// to consume. The callback must not retain a batch after it returns. GDAL
-// features and the dataset are closed on success, cancellation, or error.
+// ReadBatches scans a source once and passes bounded feature batches detached
+// from GDAL to consume. A batch is valid only during its callback; its feature
+// storage is cleared and reused afterward. GDAL features and the dataset are
+// closed on success, cancellation, or error.
 func (reader Reader) ReadBatches(ctx context.Context, source, layerName string, batchFeatures int, batchBytes int64, consume func(core.Layer) error) error {
 	if batchFeatures <= 0 || batchBytes <= 0 || consume == nil {
 		return fmt.Errorf("batch feature and byte limits and a consumer are required")
@@ -201,11 +202,16 @@ func (reader Reader) ReadBatches(ctx context.Context, source, layerName string, 
 		if len(batch.Features) == 0 {
 			return nil
 		}
+		features := batch.Features
 		if err := consume(batch); err != nil {
 			return err
 		}
+		// The consumer may compact or reorder its layer copy. Clear the full
+		// backing array before reuse so discarded WKB and attribute maps do not
+		// stay reachable while the next batch is decoded.
+		clear(features[:cap(features)])
 		batch = header
-		batch.Features = make([]core.Feature, 0, min(batchFeatures, 1024))
+		batch.Features = features[:0]
 		usedBytes = 0
 		return nil
 	}
@@ -605,6 +611,12 @@ func openWindowLayerLimited(ctx context.Context, dataset *godal.Dataset, source 
 }
 
 func openWindowSpatialFilterLimited(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	return openWindowSpatialFilterLimitedWithPredicate(ctx, dataset, layer, layerName, bounds, includeProperties, maxFeatures, maxBytes, nil)
+}
+
+// The predicate sees decoded attributes before geometry is copied to WKB.
+// Only accepted features consume the window's feature and payload budgets.
+func openWindowSpatialFilterLimitedWithPredicate(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
 	if layerName == "" {
 		layerName = layer.Name()
 	}
@@ -622,7 +634,7 @@ func openWindowSpatialFilterLimited(ctx context.Context, dataset *godal.Dataset,
 		return core.Layer{Name: layerName, Editable: true}, nil
 	}
 	defer resultSet.Close()
-	result, err := readLayerOptionsLimited(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes)
+	result, err := readLayerOptionsLimitedWithPredicate(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes, accept)
 	if err != nil {
 		return core.Layer{}, err
 	}
@@ -834,6 +846,10 @@ func layerPayloadBytes(layer core.Layer) int64 {
 }
 
 func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	return readLayerOptionsLimitedWithPredicate(ctx, layer, includeProperties, maxFeatures, maxBytes, nil)
+}
+
+func readLayerOptionsLimitedWithPredicate(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
 	result := readLayerHeader(layer)
 	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
 	// feature slice up front. Driver counts are not always trustworthy, however,
@@ -843,6 +859,11 @@ func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProp
 		capacity := initialFeatureCapacity(count)
 		if maxFeatures > 0 && capacity > maxFeatures {
 			capacity = maxFeatures
+		}
+		if accept != nil {
+			// The source count includes hidden features. Reserve a modest
+			// visible slice until selectivity is known from the scan.
+			capacity = min(capacity, 256)
 		}
 		result.Features = make([]core.Feature, 0, capacity)
 	}
@@ -858,7 +879,7 @@ func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProp
 		if feature == nil {
 			break
 		}
-		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+		if accept == nil && maxFeatures > 0 && len(result.Features) >= maxFeatures {
 			feature.Close()
 			return core.Layer{}, fmt.Errorf("feature limit of %d features exceeded", maxFeatures)
 		}
@@ -877,10 +898,34 @@ func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProp
 					result.Fields = fieldSchema(fields)
 				}
 			}
-			loaded, err := readFeatureFields(feature, nextID, fields)
+			var properties map[string]any
+			if accept != nil {
+				properties = featureFieldValues(fields)
+				show, predicateErr := accept(properties)
+				if predicateErr != nil {
+					featureErr = fmt.Errorf("display filter feature %d: %w", nextID, predicateErr)
+					return
+				}
+				if !show {
+					nextID++
+					return
+				}
+				if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+					featureErr = fmt.Errorf("feature limit of %d features exceeded", maxFeatures)
+					return
+				}
+			}
+			readFields := fields
+			if accept != nil {
+				readFields = nil // Properties were decoded for the predicate above.
+			}
+			loaded, err := readFeatureFields(feature, nextID, readFields)
 			if err != nil {
 				featureErr = err
 				return
+			}
+			if accept != nil {
+				loaded.Properties = properties
 			}
 			featureBytes := estimateFeaturePayloadBytes(loaded)
 			if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
@@ -1048,13 +1093,7 @@ func readFeatureFields(feature *godal.Feature, id uint64, fields map[string]goda
 }
 
 func readFeatureFieldsWithGeometry(feature *godal.Feature, id uint64, fields map[string]godal.Field, geometry *godal.Geometry) (core.Feature, error) {
-	var properties map[string]any
-	if fields != nil {
-		properties = make(map[string]any, len(fields))
-		for name, field := range fields {
-			properties[name] = fieldValue(field)
-		}
-	}
+	properties := featureFieldValues(fields)
 	if geometry == nil {
 		return core.Feature{ID: id, Properties: properties}, nil
 	}
@@ -1063,6 +1102,17 @@ func readFeatureFieldsWithGeometry(feature *godal.Feature, id uint64, fields map
 		return core.Feature{}, err
 	}
 	return core.Feature{ID: id, Geometry: core.WKBGeometry{WKB: wkb}, Properties: properties}, nil
+}
+
+func featureFieldValues(fields map[string]godal.Field) map[string]any {
+	if fields == nil {
+		return nil
+	}
+	properties := make(map[string]any, len(fields))
+	for name, field := range fields {
+		properties[name] = fieldValue(field)
+	}
+	return properties
 }
 
 func fieldSchema(fields map[string]godal.Field) []core.Field {

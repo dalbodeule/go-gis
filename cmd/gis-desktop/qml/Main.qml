@@ -4401,6 +4401,16 @@ ApplicationWindow {
         height: Math.min(680, rootWindow.height - 48)
         anchors.centerIn: Overlay.overlay
         standardButtons: Dialog.Close
+        function scrollToLatest() {
+            Qt.callLater(function() {
+                if (!diagnosticLogDialog.visible)
+                    return;
+                var flickable = diagnosticLogScrollView.contentItem;
+                flickable.contentY = Math.max(0, flickable.contentHeight - flickable.height);
+                flickable.contentX = 0;
+            });
+        }
+        onOpened: scrollToLatest()
         contentItem: ColumnLayout {
             spacing: 8
             Label {
@@ -4410,10 +4420,18 @@ ApplicationWindow {
                 wrapMode: Text.Wrap
             }
             ScrollView {
+                id: diagnosticLogScrollView
+                objectName: "diagnosticLogScrollView"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
+                onHeightChanged: diagnosticLogDialog.scrollToLatest()
+                Connections {
+                    target: diagnosticLogScrollView.contentItem
+                    function onContentHeightChanged() { diagnosticLogDialog.scrollToLatest(); }
+                }
                 TextArea {
+                    id: diagnosticLogTextArea
                     objectName: "diagnosticLogTextArea"
                     readOnly: true
                     selectByMouse: true
@@ -4431,7 +4449,7 @@ ApplicationWindow {
                             return String(mapCanvas.diagnosticLogPayload || "");
                         }
                     }
-                    onTextChanged: cursorPosition = length
+                    onTextChanged: diagnosticLogDialog.scrollToLatest()
                 }
             }
         }

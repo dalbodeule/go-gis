@@ -19,6 +19,61 @@ func BenchmarkGDALGeoJSONWindowEnvelope1M(b *testing.B) {
 	benchmarkGDALGeoJSONWindow1M(b, false)
 }
 
+func BenchmarkShapefileSparseDisplayFilter10K(b *testing.B) {
+	ctx := context.Background()
+	path := filepath.Join(b.TempDir(), "filtered.shp")
+	layer := core.Layer{Name: "filtered", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields:   []core.Field{{Name: "keep", Type: core.FieldTypeText}},
+		Features: make([]core.Feature, 10_000)}
+	for index := range layer.Features {
+		layer.Features[index] = core.Feature{ID: uint64(index + 1),
+			Geometry:   core.WKTGeometry{WKT: fmt.Sprintf("POINT (%d %d)", index%100, index/100)},
+			Properties: map[string]any{"keep": map[bool]string{true: "yes", false: "no"}[index%100 == 0]}}
+	}
+	if err := (Writer{}).Write(ctx, path, layer); err != nil {
+		b.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer session.Close()
+	bounds := [4]float64{-1, -1, 100, 100}
+	b.Run("after-read", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			window, err := session.OpenWindowWithLimits(ctx, "", bounds, true, 20_000, 32<<20)
+			if err != nil {
+				b.Fatal(err)
+			}
+			visible := window.Features[:0]
+			for _, feature := range window.Features {
+				if feature.Properties["keep"] == "yes" {
+					visible = append(visible, feature)
+				}
+			}
+			if len(visible) != 100 {
+				b.Fatalf("visible features = %d", len(visible))
+			}
+		}
+	})
+	b.Run("during-read", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			window, err := session.OpenShapefileWindowWithLimitsFiltered(ctx, "", bounds, 20_000, 32<<20,
+				func(properties map[string]any) (bool, error) { return properties["keep"] == "yes", nil })
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(window.Features) != 100 {
+				b.Fatalf("visible features = %d", len(window.Features))
+			}
+		}
+	})
+}
+
 func BenchmarkGDALGeoJSONWindowSpatialFilter1M(b *testing.B) {
 	benchmarkGDALGeoJSONWindow1M(b, true)
 }

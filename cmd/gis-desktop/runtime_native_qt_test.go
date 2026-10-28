@@ -26,6 +26,7 @@ import (
 	"gogis/internal/commands"
 	"gogis/internal/core"
 	"gogis/internal/render"
+	"gogis/internal/scripting"
 	"gogis/internal/workspace"
 	"gogis/ui/qt/native"
 
@@ -800,6 +801,39 @@ func TestReadOnlyDetailWorkspaceTransparentFillRealSource(t *testing.T) {
 	}
 }
 
+func TestReadOnlyWorkspacePublishesBeforeReadyRealSource(t *testing.T) {
+	path := os.Getenv("GOGIS_TEST_DETAIL_WORKSPACE")
+	if path == "" {
+		t.Skip("set GOGIS_TEST_DETAIL_WORKSPACE to a local multi-layer workspace")
+	}
+	previousIndexPolicy := activeShapefileIndexPolicy
+	configureShapefileIndexPolicy(nil)
+	defer func() { activeShapefileIndexPolicy = previousIndexPolicy }()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	runtime, err := loadWorkspaceRuntime(ctx, path, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.workspaceView == nil {
+		t.Fatal("workspace has no saved viewport")
+	}
+	view := runtime.workspaceView
+	viewport := render.Viewport{Center: render.Point{X: view.CenterX, Y: view.CenterY}, Zoom: view.Zoom,
+		ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 640, CanvasHeight: 732}
+	start := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(ctx, viewport)
+	first := waitForRenderMessage(t, start, "first-publish generation=", 90*time.Second)
+	terminal := waitForRenderTerminalDiagnostic(t, start, 120*time.Second)
+	t.Logf("saved workspace first visible batch: %s", first)
+	t.Logf("saved workspace terminal render: %s", terminal)
+	if !strings.Contains(terminal, "ready generation=") ||
+		metricValue(t, first, "elapsed_ms") >= metricValue(t, terminal, "elapsed_ms") {
+		t.Fatalf("saved workspace did not publish visible geometry before completion: first=%s terminal=%s", first, terminal)
+	}
+}
+
 func TestDenseReadOnlyParcelOutlineFeasibility(t *testing.T) {
 	if os.Getenv("GOGIS_TEST_PARCEL_OUTLINES") != "1" {
 		t.Skip("set GOGIS_TEST_PARCEL_OUTLINES=1 with GOGIS_TEST_DENSE_POLYGON_SOURCE")
@@ -1269,6 +1303,41 @@ func TestReadOnlyWindowSubdivisionRecursivelyMergesAndDeduplicates(t *testing.T)
 	}
 	if window.Name != "roads" || len(window.Fields) != 1 || len(window.Features) != 5 {
 		t.Fatalf("merged subdivided window = layer %q, fields %d, features %d; want roads, 1, 5", window.Name, len(window.Fields), len(window.Features))
+	}
+}
+
+func TestReadOnlyWindowSubdivisionFiltersHiddenFeaturesBeforeMergeBudget(t *testing.T) {
+	ctx := context.Background()
+	program, err := scripting.CompileLabelProgram(`return feature.show == true`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+	hiddenEvaluations := 0
+	window, subdivided, err := openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx,
+		[4]float64{0, 0, 1, 1}, 1, 1024, func(bounds [4]float64) (core.Layer, error) {
+			if bounds[2]-bounds[0] > 0.5 {
+				return core.Layer{}, fmt.Errorf("feature limit of %d features exceeded", maxReadOnlyWindowFeatures)
+			}
+			cell := int(bounds[0]*2) + 2*int(bounds[1]*2)
+			part := core.Layer{DisplayRule: `return feature.show == true`}
+			part.Features = append(part.Features, core.Feature{ID: 100,
+				Geometry: core.WKTGeometry{WKT: "POINT (10 10)"}, Properties: map[string]any{"show": false}})
+			for index := 0; index < 2; index++ {
+				part.Features = append(part.Features, core.Feature{ID: uint64(cell*2 + index + 1),
+					Geometry:   core.WKTGeometry{WKT: fmt.Sprintf("POINT (%d %d)", cell, index)},
+					Properties: map[string]any{"show": cell == 0 && index == 0}})
+			}
+			return part, nil
+		}, func(feature core.Feature) (bool, error) {
+			if feature.ID == 100 {
+				hiddenEvaluations++
+			}
+			return program.EvaluateRule(ctx, feature.Properties)
+		})
+	if err != nil || !subdivided || len(window.Features) != 1 || window.Features[0].ID != 1 || hiddenEvaluations != 1 {
+		t.Fatalf("filtered subdivision = features=%v subdivided=%t hidden evaluations=%d err=%v",
+			window.Features, subdivided, hiddenEvaluations, err)
 	}
 }
 
@@ -2330,6 +2399,30 @@ func TestFeatureDisplayRuleClearsDiscardedFeatureReferences(t *testing.T) {
 		if discarded.ID != 0 || discarded.Geometry != nil || discarded.Properties != nil {
 			t.Fatal("filtered feature still retained geometry or properties in backing slice")
 		}
+	}
+}
+
+func TestFeatureDisplayRuleReleasesSparseWindowBackingArray(t *testing.T) {
+	const total = 20_000
+	layer := core.Layer{Features: make([]core.Feature, total)}
+	for index := range layer.Features {
+		layer.Features[index] = core.Feature{ID: uint64(index + 1)}
+	}
+	if err := filterWindowFeatures(context.Background(), &layer, func(feature core.Feature) (bool, error) {
+		return feature.ID == 1, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(layer.Features) != 1 || layer.Features[0].ID != 1 || cap(layer.Features) > 4 {
+		t.Fatalf("sparse window retained %d features in %d slots", len(layer.Features), cap(layer.Features))
+	}
+	if err := filterWindowFeatures(context.Background(), &layer, func(core.Feature) (bool, error) {
+		return false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if layer.Features != nil {
+		t.Fatalf("empty filtered window retained %d slots", cap(layer.Features))
 	}
 }
 

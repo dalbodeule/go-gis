@@ -927,6 +927,72 @@ func TestRefreshVisibleLayerPublishesVerticesAndReusesCacheAfterToggle(t *testin
 	}
 }
 
+func TestReadOnlyRefreshPublishesFirstLargeChunkBeforeOtherChunksFinish(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var first sync.Once
+	runtime := &demoRuntime{
+		scheduler:  render.NewSchedulerWithMaxWorkers(2),
+		batchStore: render.NewBatchStore(),
+		planner: render.ChunkPlanner{ChunkSize: 0.5, Margin: 0,
+			Domain: [4]float64{0, 0, 1, 1}, HasDomain: true},
+		visibility:    render.NewLayerVisibility("roads"),
+		visibleLayers: map[string]bool{"roads": true},
+		readOnlyBindings: map[string]readOnlyLayerBinding{
+			"roads": {layer: core.Layer{DisplayRule: "return feature.keep == true"}},
+		},
+		layerBounds:  map[string][4]float64{"roads": {0, 0, 1, 1}},
+		mapExtent:    [4]float64{0, 0, 1, 1},
+		mapFitExtent: [4]float64{0, 0, 1, 1},
+		dataMode:     true, viewportReadOnly: true,
+		builder: func(ctx context.Context, key render.ChunkKey) (render.Chunk, error) {
+			isFirst := false
+			first.Do(func() { isFirst = true })
+			if isFirst {
+				time.Sleep(70 * time.Millisecond)
+				return render.Chunk{Key: key, Vertices: make([]render.Vertex, 30_001)}, nil
+			}
+			select {
+			case <-release:
+				return render.Chunk{Key: key}, nil
+			case <-ctx.Done():
+				return render.Chunk{}, ctx.Err()
+			}
+		},
+	}
+	runtime.advanceRenderGeneration()
+	start := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(context.Background(), render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 8})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var entries []renderDiagnostic
+		if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &entries); err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries[min(start, len(entries)):] {
+			if entry.Stream == "render" && strings.Contains(entry.Message, "request generation=1") &&
+				!strings.Contains(entry.Message, "display_rule_layers=[roads]") {
+				t.Fatalf("request did not identify the filtered layer: %s", entry.Message)
+			}
+			if entry.Stream == "render" && strings.Contains(entry.Message, "first-publish generation=1") {
+				if !strings.Contains(entry.Message, "vertices=30001") {
+					t.Fatalf("first publication = %s", entry.Message)
+				}
+				releaseOnce.Do(func() { close(release) })
+				ready := waitForRenderDiagnostic(t, start, "ready generation=1")
+				if !strings.Contains(ready, `nonempty_by_layer={"roads":1}`) ||
+					!strings.Contains(ready, `vertices_by_layer={"roads":30001}`) {
+					t.Fatalf("ready diagnostic omitted layer counts: %s", ready)
+				}
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("first large visible chunk was not published before the remaining chunks")
+}
+
 type renderDiagnostic struct {
 	Stream  string `json:"stream"`
 	Message string `json:"message"`

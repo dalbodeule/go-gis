@@ -14,6 +14,26 @@ type fakeSpatialOperator struct {
 	err       error
 }
 
+type borrowedInspectingSpatialOperator struct {
+	fakeSpatialOperator
+	input core.Layer
+}
+
+func (*borrowedInspectingSpatialOperator) BorrowsSpatialInputs() {}
+
+func (o *borrowedInspectingSpatialOperator) Buffer(_ context.Context, layer core.Layer, _ float64) (core.Layer, error) {
+	o.input = layer
+	layer.Features[0].ID = 99
+	return core.Layer{Features: []core.Feature{{ID: 2}}}, nil
+}
+
+type mutatingSpatialOperator struct{ fakeSpatialOperator }
+
+func (*mutatingSpatialOperator) Buffer(_ context.Context, layer core.Layer, _ float64) (core.Layer, error) {
+	layer.Features[0].Properties["name"] = "mutated"
+	return core.Layer{Features: []core.Feature{{ID: 2}}}, nil
+}
+
 func (f *fakeSpatialOperator) Intersect(context.Context, core.Layer, core.Layer) (core.Layer, error) {
 	f.operation = "intersect"
 	return f.result, f.err
@@ -108,5 +128,37 @@ func TestProjectServiceSpatialFailureLeavesProjectUnchanged(t *testing.T) {
 	}
 	if len(service.Project().Layers) != 1 {
 		t.Fatal("failed spatial operation changed project")
+	}
+}
+
+func TestProjectServiceBorrowsOnlyOptedInSpatialInputs(t *testing.T) {
+	service := NewProjectService("demo", core.CRS{})
+	if err := service.BeginEdit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AddLayer(core.Layer{Name: "source", Features: []core.Feature{{ID: 1,
+		Geometry: core.WKBGeometry{WKB: []byte{1, 2, 3}}, Properties: map[string]any{"name": "original"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	borrowed := &borrowedInspectingSpatialOperator{}
+	if err := service.ApplySpatialOperation(context.Background(), borrowed, "buffer", "source", "", "borrowed", 1); err != nil {
+		t.Fatal(err)
+	}
+	source, _ := service.ProjectLayerRenderSnapshot("source")
+	inputWKB := borrowed.input.Features[0].Geometry.(core.WKBGeometry).WKB
+	sourceWKB := source.Features[0].Geometry.(core.WKBGeometry).WKB
+	if &inputWKB[0] != &sourceWKB[0] || source.Features[0].ID != 1 {
+		t.Fatal("borrowed spatial input cloned payload or changed committed feature header")
+	}
+	legacy := &mutatingSpatialOperator{}
+	if err := service.ApplySpatialOperation(context.Background(), legacy, "buffer", "source", "", "legacy", 1); err != nil {
+		t.Fatal(err)
+	}
+	source, _ = service.ProjectLayerRenderSnapshot("source")
+	if got := source.Features[0].Properties["name"]; got != "original" {
+		t.Fatalf("legacy operator changed committed properties: %v", got)
 	}
 }

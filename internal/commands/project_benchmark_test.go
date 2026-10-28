@@ -354,6 +354,19 @@ func BenchmarkSpatialInputSnapshot10KFeatures(b *testing.B) {
 	}
 }
 
+func BenchmarkSpatialInputBorrowedSnapshot10KFeatures(b *testing.B) {
+	service := benchmarkProjectService10K(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		layer, ok := service.ProjectLayerRenderSnapshot("roads")
+		if !ok {
+			b.Fatal("benchmark layer missing")
+		}
+		benchmarkProjectSink = layer
+	}
+}
+
 func BenchmarkSpatialInputProjectCloneBaseline10KFeatures(b *testing.B) {
 	service := benchmarkProjectService10K(b)
 	b.ReportAllocs()
