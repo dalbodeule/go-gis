@@ -148,13 +148,10 @@ func desktopShapefileIndexThreshold() int {
 
 func desktopShapefileIndexThresholdFromSettings(settings *qt.QSettings) int {
 	const defaultThreshold = 10_000
-	key := qt.NewQAnyStringView3("preferences/shapefileIndexThreshold")
-	defer key.Delete()
-	if !settings.Contains(*key) {
+	threshold, present := settingsInt(settings, "preferences/shapefileIndexThreshold")
+	if !present {
 		return defaultThreshold
 	}
-	value := settings.ValueWithKey(*key)
-	threshold := value.ToInt()
 	if threshold < 0 || threshold > 1_000_000 {
 		return defaultThreshold
 	}
@@ -178,12 +175,10 @@ func desktopReadOnlyViewportLimits() (int, int64) {
 }
 
 func desktopVisibleFeatureLimitFromSettings(settings *qt.QSettings) int {
-	key := qt.NewQAnyStringView3("preferences/visibleFeatureLimit")
-	defer key.Delete()
-	if !settings.Contains(*key) {
+	limit, present := settingsInt(settings, "preferences/visibleFeatureLimit")
+	if !present {
 		return defaultVisibleFeatureLimit
 	}
-	limit := settings.ValueWithKey(*key).ToInt()
 	if limit < minVisibleFeatureLimit || limit > maxVisibleFeatureLimit {
 		return defaultVisibleFeatureLimit
 	}
@@ -191,12 +186,10 @@ func desktopVisibleFeatureLimitFromSettings(settings *qt.QSettings) int {
 }
 
 func desktopVisiblePayloadLimitMiBFromSettings(settings *qt.QSettings) int {
-	key := qt.NewQAnyStringView3("preferences/visiblePayloadLimitMiB")
-	defer key.Delete()
-	if !settings.Contains(*key) {
+	limit, present := settingsInt(settings, "preferences/visiblePayloadLimitMiB")
+	if !present {
 		return defaultVisiblePayloadMiB
 	}
-	limit := settings.ValueWithKey(*key).ToInt()
 	if limit < 0 || limit > maxVisiblePayloadMiB {
 		return defaultVisiblePayloadMiB
 	}

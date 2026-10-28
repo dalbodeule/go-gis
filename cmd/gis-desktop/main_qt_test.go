@@ -29,6 +29,44 @@ func TestViewportSyncIntervalMatchesCanvasVisibility(t *testing.T) {
 	}
 }
 
+func TestCanvasViewportReadyRequiresLayoutAndZoom(t *testing.T) {
+	ready := native.Viewport{Width: 640, Height: 732, ViewportWidth: 1172, ViewportHeight: 732, Zoom: 65.78}
+	if !canvasViewportReady(ready) {
+		t.Fatal("laid-out map viewport was rejected")
+	}
+	for _, invalid := range []native.Viewport{
+		{Width: 0, Height: 732, ViewportWidth: 0, ViewportHeight: 732, Zoom: 65.78},
+		{Width: 640, Height: 732, ViewportWidth: 0, ViewportHeight: 732, Zoom: 65.78},
+		{Width: 640, Height: 732, ViewportWidth: 1172, ViewportHeight: 0, Zoom: 65.78},
+		{Width: 640, Height: 732, ViewportWidth: 1172, ViewportHeight: 732, Zoom: 0},
+	} {
+		if canvasViewportReady(invalid) {
+			t.Fatalf("provisional viewport was accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestSameViewportForRenderingIgnoresSubpixelLayoutNoise(t *testing.T) {
+	base := native.Viewport{PanX: 1200, PanY: -500, Zoom: 65.78,
+		Width: 640, Height: 732, ViewportWidth: 1172, ViewportHeight: 732}
+	noise := base
+	noise.PanX += 0.12
+	noise.PanY -= 0.12
+	if !sameViewportForRendering(base, noise) {
+		t.Fatal("subpixel layout adjustment caused a new render")
+	}
+	for _, changed := range []native.Viewport{
+		func() native.Viewport { value := base; value.PanX += 1; return value }(),
+		func() native.Viewport { value := base; value.Zoom *= 1.01; return value }(),
+		func() native.Viewport { value := base; value.ViewportWidth += 1; return value }(),
+		func() native.Viewport { value := base; value.Width = 0; return value }(),
+	} {
+		if sameViewportForRendering(base, changed) {
+			t.Fatalf("changed map viewport was treated as identical: %+v", changed)
+		}
+	}
+}
+
 func TestMemoryMonitorIntervalMatchesCanvasVisibility(t *testing.T) {
 	if got := memoryMonitorInterval(true); got != time.Second {
 		t.Fatalf("visible memory monitor interval = %s, want 1s", got)
@@ -480,23 +518,18 @@ func TestDesktopLanguageArgs(t *testing.T) {
 func TestDesktopShapefileIndexThresholdReadsPreferencesAndValidates(t *testing.T) {
 	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
 	defer settings.Delete()
-	key := qt.NewQAnyStringView3("preferences/shapefileIndexThreshold")
-	defer key.Delete()
-	value := qt.NewQVariant4(50_000)
-	defer value.Delete()
-	settings.SetValue(*key, value)
+	key := "preferences/shapefileIndexThreshold"
+	settingsSetInt(settings, key, 50_000)
 	settings.Sync()
 	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 50_000 {
 		t.Fatalf("saved SHP index threshold = %d, want 50000", got)
 	}
-	settings.Remove(*key)
+	settingsRemove(settings, key)
 	settings.Sync()
 	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 10_000 {
 		t.Fatalf("default SHP index threshold = %d, want 10000", got)
 	}
-	invalidValue := qt.NewQVariant4(-1)
-	defer invalidValue.Delete()
-	settings.SetValue(*key, invalidValue)
+	settingsSetInt(settings, key, -1)
 	settings.Sync()
 	if got := desktopShapefileIndexThresholdFromSettings(settings); got != 10_000 {
 		t.Fatalf("invalid SHP index threshold fallback = %d, want 10000", got)
@@ -506,8 +539,7 @@ func TestDesktopShapefileIndexThresholdReadsPreferencesAndValidates(t *testing.T
 func TestDesktopVisibleFeatureLimitReadsPreferencesAndValidates(t *testing.T) {
 	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
 	defer settings.Delete()
-	key := qt.NewQAnyStringView3("preferences/visibleFeatureLimit")
-	defer key.Delete()
+	key := "preferences/visibleFeatureLimit"
 	if got := desktopVisibleFeatureLimitFromSettings(settings); got != 500_000 {
 		t.Fatalf("default visible feature limit = %d, want 500000", got)
 	}
@@ -520,9 +552,7 @@ func TestDesktopVisibleFeatureLimitReadsPreferencesAndValidates(t *testing.T) {
 		{0, 500_000},
 		{1_000_001, 500_000},
 	} {
-		value := qt.NewQVariant4(test.value)
-		settings.SetValue(*key, value)
-		value.Delete()
+		settingsSetInt(settings, key, test.value)
 		settings.Sync()
 		if got := desktopVisibleFeatureLimitFromSettings(settings); got != test.want {
 			t.Errorf("saved visible feature limit %d = %d, want %d", test.value, got, test.want)
@@ -533,8 +563,7 @@ func TestDesktopVisibleFeatureLimitReadsPreferencesAndValidates(t *testing.T) {
 func TestDesktopVisiblePayloadLimitReadsPreferencesAndValidates(t *testing.T) {
 	settings := qt.NewQSettings4(t.TempDir()+"/settings.ini", qt.QSettings__IniFormat)
 	defer settings.Delete()
-	key := qt.NewQAnyStringView3("preferences/visiblePayloadLimitMiB")
-	defer key.Delete()
+	key := "preferences/visiblePayloadLimitMiB"
 	if got := desktopVisiblePayloadLimitMiBFromSettings(settings); got != 512 {
 		t.Fatalf("default visible payload limit = %d MiB, want 512", got)
 	}
@@ -548,9 +577,7 @@ func TestDesktopVisiblePayloadLimitReadsPreferencesAndValidates(t *testing.T) {
 		{-1, 512},
 		{4097, 512},
 	} {
-		value := qt.NewQVariant4(test.value)
-		settings.SetValue(*key, value)
-		value.Delete()
+		settingsSetInt(settings, key, test.value)
 		settings.Sync()
 		if got := desktopVisiblePayloadLimitMiBFromSettings(settings); got != test.want {
 			t.Errorf("saved visible payload limit %d MiB = %d, want %d", test.value, got, test.want)
