@@ -2496,6 +2496,48 @@ func TestReadOnlySHPDisplayRuleAppliesAtOverviewAndDetail(t *testing.T) {
 	}
 }
 
+func TestChangingReadOnlySHPDisplayRuleInvalidatesAcceptedIDs(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "filter-index.shp")
+	layer := core.Layer{Name: "filter-index", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "code", Type: core.FieldTypeText}}, Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (200000 400000)"}, Properties: map[string]any{"code": "44150"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200010 400010)"}, Properties: map[string]any{"code": "44151"}},
+		}}
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path,
+		DisplayRule: "return feature.code == '44150'"}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	if set := runtime.readOnlyBindings[name].acceptedIDs; set == nil || set.Count() != 1 {
+		t.Fatalf("initial accepted FIDs = %+v", set)
+	}
+	properties, ok := runtime.service.LayerProperties(name)
+	if !ok {
+		t.Fatal("missing source layer properties")
+	}
+	request, err := json.Marshal(layerSettingsRequest{
+		Name: name, DisplayName: properties.DisplayName, SourcePath: properties.SourcePath,
+		SourceLayerName: properties.SourceLayerName, SourceEncoding: properties.SourceEncoding,
+		SourceCRS: properties.SourceCRS, Visible: properties.Visible, Style: properties.Style,
+		Labels: properties.Labels, DisplayRule: "return feature.code == '44151'",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLayerSettings(runtime, string(request)); err != nil {
+		t.Fatal(err)
+	}
+	if set := runtime.readOnlyBindings[name].acceptedIDs; set != nil {
+		t.Fatal("changed display rule retained the old feature-ID filter")
+	}
+}
+
 func TestReadOnlySHPDXFExportExcludesFilteredFeatures(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "filtered-export.shp")
@@ -3908,7 +3950,8 @@ func TestReplacedReadOnlyRuntimePublishesWindowLabelsToActiveRuntime(t *testing.
 	defer active.closeAttributeSource()
 	active.mu.Lock()
 	if active.cancel != nil {
-		active.cancel()
+		active.mu.Unlock()
+		t.Fatal("read-only replacement started a render before the QML viewport was ready")
 	}
 	active.scheduler.AdvanceGeneration()
 	key := chunkKeyForPoint(active.mapExtent, readOnlyWindowChunkSize(-7), "parcels", render.Point{X: 5, Y: 5})
@@ -3933,6 +3976,19 @@ func TestReplacedReadOnlyRuntimePublishesWindowLabelsToActiveRuntime(t *testing.
 	feature, err := active.attributeFeatureReader(ctx, "parcels", 123)
 	if err != nil || feature.Properties["name"] != "active parcel" {
 		t.Fatalf("active runtime feature lookup = %+v, %v", feature, err)
+	}
+}
+
+func TestSimpleStringFilterForLayerRequiresTextField(t *testing.T) {
+	layer := core.Layer{DisplayRule: "return string.sub(feature.A3, 1, 5) == '44150'",
+		Fields: []core.Field{{Name: "A3", Type: core.FieldTypeText}}}
+	filter, ok := simpleStringFilterForLayer(layer)
+	if !ok || filter.Field != "A3" || filter.Value != "44150" || !filter.Prefix {
+		t.Fatalf("building prefilter = %+v, %t", filter, ok)
+	}
+	layer.Fields[0].Type = core.FieldTypeNumber
+	if _, ok := simpleStringFilterForLayer(layer); ok {
+		t.Fatal("numeric field was pushed down as a string comparison")
 	}
 }
 

@@ -290,6 +290,43 @@ func (s *AttributeSession) OpenWindowWithLimits(ctx context.Context, layerName s
 // and do not consume the decoded window budgets. Callers must use a fresh
 // predicate if they retry a failed query because a script may keep state.
 func (s *AttributeSession) OpenShapefileWindowWithLimitsFiltered(ctx context.Context, layerName string, bounds [4]float64, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return s.openShapefileWindowWithLimitsFiltered(ctx, layerName, bounds, maxFeatures, maxBytes, nil, accept)
+}
+
+// StringAttributeFilter describes a one-time source FID scan. The caller
+// still evaluates its original predicate on every retained feature.
+type StringAttributeFilter struct {
+	Field  string
+	Value  string
+	Prefix bool
+}
+
+func validStringAttributeFilter(filter StringAttributeFilter) bool {
+	if filter.Field == "" || filter.Value == "" {
+		return false
+	}
+	for index, character := range filter.Field {
+		if character == '_' || character >= 'A' && character <= 'Z' ||
+			character >= 'a' && character <= 'z' || index > 0 && character >= '0' && character <= '9' {
+			continue
+		}
+		return false
+	}
+	for _, character := range filter.Value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// OpenShapefileWindowWithLimitsFilteredIDs keeps the QIX spatial query and
+// skips attributes for source FIDs absent from the precomputed filter set.
+func (s *AttributeSession) OpenShapefileWindowWithLimitsFilteredIDs(ctx context.Context, layerName string, bounds [4]float64, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return s.openShapefileWindowWithLimitsFiltered(ctx, layerName, bounds, maxFeatures, maxBytes, accepted, accept)
+}
+
+func (s *AttributeSession) openShapefileWindowWithLimitsFiltered(ctx context.Context, layerName string, bounds [4]float64, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
 	if accept == nil {
 		return core.Layer{}, fmt.Errorf("filtered shapefile window requires a predicate")
 	}
@@ -298,6 +335,12 @@ func (s *AttributeSession) OpenShapefileWindowWithLimitsFiltered(ctx context.Con
 	}
 	if maxFeatures < 0 || maxBytes < 0 {
 		return core.Layer{}, fmt.Errorf("filtered window budgets must not be negative")
+	}
+	if err := ctx.Err(); err != nil {
+		return core.Layer{}, err
+	}
+	if accepted != nil && !accepted.MayIntersect(bounds) {
+		return core.Layer{Name: layerName, Editable: true}, nil
 	}
 	if err := s.lockContext(ctx); err != nil {
 		return core.Layer{}, err
@@ -312,7 +355,7 @@ func (s *AttributeSession) OpenShapefileWindowWithLimitsFiltered(ctx context.Con
 	if err != nil {
 		return core.Layer{}, err
 	}
-	return openWindowSpatialFilterLimitedWithPredicate(ctx, s.dataset, layer, resolvedLayerName, bounds, true, maxFeatures, maxBytes, accept)
+	return openWindowSpatialFilterLimitedWithPredicateIDs(ctx, s.dataset, layer, resolvedLayerName, bounds, true, maxFeatures, maxBytes, accepted, accept)
 }
 
 // OpenAttributePage reads one property page using the retained dataset.

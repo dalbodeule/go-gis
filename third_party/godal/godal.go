@@ -3285,6 +3285,11 @@ func (g *Geometry) Empty() bool {
 	return ret != 0
 }
 
+// IsNull reports whether a feature has no geometry handle.
+func (g *Geometry) IsNull() bool {
+	return g == nil || g.handle == nil
+}
+
 // Valid returns true is the geometry is valid
 func (g *Geometry) Valid() bool {
 	ret := C.OGR_G_IsValid(g.handle)
@@ -3376,6 +3381,11 @@ func (f *Feature) SetGeometryColumnName(name string, opts ...SetGeometryColumnNa
 func (f *Feature) SetFID(fid int64) {
 	// OGR error returned is always none, so we don't handle it
 	C.OGR_F_SetFID(f.handle, C.GIntBig(fid))
+}
+
+// FID returns the source feature identifier, or OGRNullFID when unavailable.
+func (f *Feature) FID() int64 {
+	return int64(C.OGR_F_GetFID(f.handle))
 }
 
 // SetFieldValue set feature's field value

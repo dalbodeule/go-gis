@@ -13,6 +13,8 @@ type readOnlyLayerBinding struct {
 	layer core.Layer
 }
 
+func (*readOnlyLayerBinding) invalidateAcceptedIDs() {}
+
 func loadRuntime(_ []string) *demoRuntime {
 	return loadEmptyProject()
 }

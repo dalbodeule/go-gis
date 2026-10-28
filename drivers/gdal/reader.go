@@ -617,6 +617,10 @@ func openWindowSpatialFilterLimited(ctx context.Context, dataset *godal.Dataset,
 // The predicate sees decoded attributes before geometry is copied to WKB.
 // Only accepted features consume the window's feature and payload budgets.
 func openWindowSpatialFilterLimitedWithPredicate(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return openWindowSpatialFilterLimitedWithPredicateIDs(ctx, dataset, layer, layerName, bounds, includeProperties, maxFeatures, maxBytes, nil, accept)
+}
+
+func openWindowSpatialFilterLimitedWithPredicateIDs(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
 	if layerName == "" {
 		layerName = layer.Name()
 	}
@@ -634,7 +638,7 @@ func openWindowSpatialFilterLimitedWithPredicate(ctx context.Context, dataset *g
 		return core.Layer{Name: layerName, Editable: true}, nil
 	}
 	defer resultSet.Close()
-	result, err := readLayerOptionsLimitedWithPredicate(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes, accept)
+	result, err := readLayerOptionsLimitedWithPredicateIDs(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes, accepted, accept)
 	if err != nil {
 		return core.Layer{}, err
 	}
@@ -850,6 +854,10 @@ func readLayerOptionsLimited(ctx context.Context, layer godal.Layer, includeProp
 }
 
 func readLayerOptionsLimitedWithPredicate(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return readLayerOptionsLimitedWithPredicateIDs(ctx, layer, includeProperties, maxFeatures, maxBytes, nil, accept)
+}
+
+func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
 	result := readLayerHeader(layer)
 	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
 	// feature slice up front. Driver counts are not always trustworthy, however,
@@ -886,6 +894,10 @@ func readLayerOptionsLimitedWithPredicate(ctx context.Context, layer godal.Layer
 		var featureErr error
 		func() {
 			defer feature.Close()
+			if accepted != nil && !accepted.MayInclude(feature.FID()) {
+				nextID++
+				return
+			}
 			var fields map[string]godal.Field
 			if includeProperties {
 				var fieldsErr error

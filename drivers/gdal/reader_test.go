@@ -1452,6 +1452,73 @@ func TestAttributeSessionFilteredShapefileWindowBudgetsOnlyVisibleFeatures(t *te
 	}
 }
 
+func TestAttributeSessionStringPrefilterPreservesVisibleShapefileFeatures(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "buildings.shp")
+	layer := core.Layer{Name: "buildings", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Fields: []core.Field{{Name: "A3", Type: core.FieldTypeText}}, Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (1 1)"}, Properties: map[string]any{"A3": "44150001"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (2 2)"}, Properties: map[string]any{"A3": "44159001"}},
+			{ID: 3, Geometry: core.WKTGeometry{WKT: "POINT (3 3)"}, Properties: map[string]any{"A3": "44150002"}},
+			{ID: 4, Geometry: core.WKTGeometry{WKT: "POINT (10 10)"}, Properties: map[string]any{"A3": "44159002"}},
+		}}
+	if err := (Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	accept := func(properties map[string]any) (bool, error) {
+		return strings.HasPrefix(fmt.Sprint(properties["A3"]), "44150"), nil
+	}
+	accepted, err := session.BuildStringFilterIDSet(ctx, "", 4, StringAttributeFilter{Field: "A3", Value: "44150", Prefix: true})
+	if err != nil || accepted.Count() != 2 || accepted.MayInclude(1) || !accepted.MayInclude(0) ||
+		!accepted.MayInclude(2) || accepted.MayInclude(3) || !accepted.MayInclude(-1) || !accepted.MayInclude(4) ||
+		!accepted.MayIntersect([4]float64{0, 0, 4, 4}) || accepted.MayIntersect([4]float64{9, 9, 11, 11}) {
+		t.Fatalf("accepted FIDs = %+v, %v", accepted, err)
+	}
+	outside, err := session.OpenShapefileWindowWithLimitsFilteredIDs(ctx, "", [4]float64{9, 9, 11, 11}, 2, 1024,
+		accepted, accept)
+	if err != nil || len(outside.Features) != 0 {
+		t.Fatalf("window outside accepted bounds = %+v, %v", outside.Features, err)
+	}
+	for _, bounds := range [][4]float64{{0, 0, 4, 4}, {1.5, 1.5, 2.5, 2.5}} {
+		ordinary, err := session.OpenShapefileWindowWithLimitsFiltered(ctx, "", bounds, 2, 1024, accept)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pushdown, err := session.OpenShapefileWindowWithLimitsFilteredIDs(ctx, "", bounds, 2, 1024, accepted, accept)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pushdown.Features) != len(ordinary.Features) {
+			t.Fatalf("window %v: pushdown returned %d features, want %d", bounds, len(pushdown.Features), len(ordinary.Features))
+		}
+		for index := range pushdown.Features {
+			if pushdown.Features[index].Properties["A3"] != ordinary.Features[index].Properties["A3"] {
+				t.Fatalf("window %v: pushdown feature %d = %v, want %v", bounds, index,
+					pushdown.Features[index].Properties["A3"], ordinary.Features[index].Properties["A3"])
+			}
+		}
+	}
+	if validStringAttributeFilter(StringAttributeFilter{Field: "A3;DROP", Value: "44150"}) ||
+		validStringAttributeFilter(StringAttributeFilter{Field: "A3", Value: "44%'"}) {
+		t.Fatal("unsafe SQL filter was accepted")
+	}
+	exactIDs, err := session.BuildStringFilterIDSet(ctx, "", 4, StringAttributeFilter{Field: "A3", Value: "44150001"})
+	if err != nil || exactIDs.Count() != 1 {
+		t.Fatalf("exact FID set = %+v, %v", exactIDs, err)
+	}
+	exact, err := session.OpenShapefileWindowWithLimitsFilteredIDs(ctx, "", [4]float64{0, 0, 4, 4}, 1, 1024,
+		exactIDs,
+		func(properties map[string]any) (bool, error) { return properties["A3"] == "44150001", nil })
+	if err != nil || len(exact.Features) != 1 || exact.Features[0].Properties["A3"] != "44150001" {
+		t.Fatalf("exact string prefilter = %+v, %v", exact.Features, err)
+	}
+}
+
 func TestReaderOpenGeometryOnlySkipsProperties(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roads.geojson")
 	fixture := `{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[127.1,37.4]}}]}`

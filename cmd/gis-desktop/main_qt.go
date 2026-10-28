@@ -2554,7 +2554,11 @@ func startViewportSync(runtime *demoRuntime) {
 				if native.CanvasVisible() {
 					featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
 					runtime.setReadOnlyVisibleLimits(featureLimit, payloadLimit)
-					runtime.refreshCurrentViewport()
+					// Queue the refresh through the same debounce as layout and
+					// pan changes. A direct refresh here races the first viewport
+					// generation and builds the same tiles twice.
+					pendingViewportRefresh = true
+					viewportChangedAt = time.Now()
 				} else {
 					// Release viewport-derived native, scheduler, and window payload
 					// resources while hidden; file-picker requests remain on the bridge.
@@ -2635,6 +2639,15 @@ func startViewportSync(runtime *demoRuntime) {
 				}
 			}
 			viewport := native.CurrentViewport()
+			runtime.mu.Lock()
+			currentScheduler := runtime.scheduler
+			runtime.mu.Unlock()
+			if currentScheduler != lastRequestedScheduler && !pendingViewportRefresh {
+				// Loading a workspace replaces its scheduler. Its new map
+				// metadata can arrive before QML publishes a viewport generation.
+				pendingViewportRefresh = true
+				viewportChangedAt = time.Now()
+			}
 			if qtGeneration != lastQtGeneration {
 				lastQtGeneration = qtGeneration
 				viewportChangedAt = time.Now()
@@ -2663,9 +2676,6 @@ func startViewportSync(runtime *demoRuntime) {
 				pendingViewportRefresh = true
 			} else if visibilityChanged || (pendingViewportRefresh && time.Since(viewportChangedAt) >= 120*time.Millisecond) {
 				pendingViewportRefresh = false
-				runtime.mu.Lock()
-				currentScheduler := runtime.scheduler
-				runtime.mu.Unlock()
 				featureLimit, payloadLimit := desktopReadOnlyViewportLimits()
 				if visibilityChanged || currentScheduler != lastRequestedScheduler ||
 					featureLimit != lastRequestedFeatureLimit || payloadLimit != lastRequestedPayloadLimit ||
@@ -3030,6 +3040,9 @@ func applyLayerSettings(runtime *demoRuntime, payload string) error {
 			binding.layer.Style = updated.Style
 			binding.layer.Labels = updated.Labels
 			binding.layer.DisplayRule = updated.DisplayRule
+			if displayRuleChanged {
+				binding.invalidateAcceptedIDs() // Never reuse an old rule's FIDs.
+			}
 			runtime.readOnlyBindings[request.Name] = binding
 			for index := range runtime.readOnlySources {
 				source := &runtime.readOnlySources[index]

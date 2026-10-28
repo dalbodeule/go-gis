@@ -37,6 +37,11 @@ type readOnlyLayerBinding struct {
 	layer        core.Layer
 	sourceCRS    string
 	featureCount int
+	acceptedIDs  *gdal.FeatureIDSet
+}
+
+func (binding *readOnlyLayerBinding) invalidateAcceptedIDs() {
+	binding.acceptedIDs = nil
 }
 
 // readOnlyWindowSource is the bounded source contract shared by GDAL files
@@ -1083,9 +1088,23 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			}
 			layer = layer.WithDefaultPresentation()
 			layers = append(layers, layer)
+			var acceptedIDs *gdal.FeatureIDSet
+			if filter, ok := simpleStringFilterForLayer(layer); ok && strings.EqualFold(filepath.Ext(source.Path), ".shp") {
+				started := time.Now()
+				acceptedIDs, err = session.BuildStringFilterIDSet(ctx, overview.Name, overview.FeatureCount, filter)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil, true, ctx.Err()
+					}
+					native.RecordDiagnostic("render", fmt.Sprintf("attribute filter index unavailable layer=%s: %v", layer.Name, err))
+				} else {
+					native.RecordDiagnostic("render", fmt.Sprintf("attribute filter index layer=%s accepted=%d/%d elapsed_ms=%d",
+						layer.Name, acceptedIDs.Count(), overview.FeatureCount, time.Since(started).Milliseconds()))
+				}
+			}
 			bindings[layer.Name] = readOnlyLayerBinding{
 				session: session, windowPool: windowPool, sourceName: overview.Name, layer: layer,
-				sourceCRS: sourceCRS, featureCount: overview.FeatureCount,
+				sourceCRS: sourceCRS, featureCount: overview.FeatureCount, acceptedIDs: acceptedIDs,
 			}
 			layerBounds[layer.Name] = targetBounds
 			layerGeometryTypes[layer.Name] = overview.GeometryType
@@ -1356,11 +1375,23 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		if filteredSession, ok := windowSession.(interface {
 			OpenShapefileWindowWithLimitsFiltered(context.Context, string, [4]float64, int, int64, func(map[string]any) (bool, error)) (core.Layer, error)
 		}); ok {
-			window, err = filteredSession.OpenShapefileWindowWithLimitsFiltered(ctx, binding.sourceName,
-				queryBounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes,
-				func(properties map[string]any) (bool, error) {
-					return displayRuleProgram.EvaluateRule(ctx, properties)
-				})
+			predicate := func(properties map[string]any) (bool, error) {
+				return displayRuleProgram.EvaluateRule(ctx, properties)
+			}
+			if binding.acceptedIDs != nil && !overview {
+				if indexedSession, supportsIndex := windowSession.(interface {
+					OpenShapefileWindowWithLimitsFilteredIDs(context.Context, string, [4]float64, int, int64, *gdal.FeatureIDSet, func(map[string]any) (bool, error)) (core.Layer, error)
+				}); supportsIndex {
+					window, err = indexedSession.OpenShapefileWindowWithLimitsFilteredIDs(ctx, binding.sourceName,
+						queryBounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes, binding.acceptedIDs, predicate)
+				} else {
+					window, err = filteredSession.OpenShapefileWindowWithLimitsFiltered(ctx, binding.sourceName,
+						queryBounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes, predicate)
+				}
+			} else {
+				window, err = filteredSession.OpenShapefileWindowWithLimitsFiltered(ctx, binding.sourceName,
+					queryBounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes, predicate)
+			}
 			if err == nil {
 				filteredAtSource = true
 			} else if isReadOnlyWindowSubdivisionError(err) {
@@ -1418,7 +1449,11 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// mesh when it fits the bounded triangulation budget. Dense windows fall back
 	// to outlines below.
 	outlineOnly := false
-	if !outlineOnly {
+	// A transparent detail fill has no triangulation work or fill vertex
+	// budget to guard. Keep the overview path unchanged because it also uses
+	// outlineOnly to choose its coarse boundary presentation.
+	checkFillBudget := overview || render.ColorForPolygonFill(binding.layer.Style)&0xff != 0
+	if checkFillBudget {
 		polygonVertexLimit := maxReadOnlyOutlinePolygonVertices
 		polygonVertices, polygonErr := readOnlyWindowPolygonVertexCount(window, polygonVertexLimit)
 		if polygonErr != nil {
@@ -1538,7 +1573,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 		payloadBytes += bytes
 		labelBytes += bytes
 	}
-	if !outlineOnly {
+	if checkFillBudget && !outlineOnly {
 		setStage("build-fill")
 		started := time.Now()
 		if err := attachPolygonFillGeometryForChunk(ctx, []core.Layer{displayWindow}, newSources, &key); err != nil {
@@ -1629,6 +1664,19 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			time.Since(profileStarted), len(chunk.Vertices))
 	}
 	return chunk, err
+}
+
+func simpleStringFilterForLayer(layer core.Layer) (gdal.StringAttributeFilter, bool) {
+	filter, ok := scripting.SimpleStringFilter(layer.DisplayRule)
+	if !ok {
+		return gdal.StringAttributeFilter{}, false
+	}
+	for _, field := range layer.Fields {
+		if field.Name == filter.Field && field.Type == core.FieldTypeText {
+			return gdal.StringAttributeFilter{Field: filter.Field, Value: filter.Value, Prefix: filter.Prefix}, true
+		}
+	}
+	return gdal.StringAttributeFilter{}, false
 }
 
 func useDenseParcelOverview(lodBucket, featureCount int, geometryType string, forceOverview bool) bool {
@@ -4698,7 +4746,11 @@ func (r *demoRuntime) replaceWithLoadedMode(next *demoRuntime, expectedLoadGener
 	}
 	native.SetSelection("", "", "", "Loaded")
 	r.publishMapMetadata()
-	r.refresh(context.Background(), runtimeInitialViewport(next))
+	// Read-only windows need the laid-out QML viewport. The sync loop notices
+	// the replacement scheduler and requests the first render after layout.
+	if !next.viewportReadOnly {
+		r.refresh(context.Background(), runtimeInitialViewport(next))
+	}
 	r.publishLayerTree()
 	r.publishLayerLabels()
 	if preview {
