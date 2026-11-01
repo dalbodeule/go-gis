@@ -105,6 +105,7 @@ std::string g_vertex_handle_payload = "[]";
 std::atomic<unsigned long long> g_vertex_handle_generation{0};
 std::mutex g_postgis_catalog_mutex;
 std::string g_postgis_catalog_schema;
+std::string g_postgis_connection;
 std::atomic<unsigned long long> g_postgis_catalog_generation{0};
 std::mutex g_postgis_catalog_payload_mutex;
 std::string g_postgis_catalog_payload = "[]";
@@ -423,6 +424,7 @@ public:
             if (postgis_catalog_generation != g_postgis_catalog_generation.load(std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(g_postgis_catalog_mutex);
                 g_postgis_catalog_schema = property("postGISCatalogSchema").toString().toStdString();
+                g_postgis_connection = property("postGISConnectionPayload").toString().toStdString();
                 g_postgis_catalog_generation.store(postgis_catalog_generation, std::memory_order_relaxed);
             }
 
@@ -1211,6 +1213,16 @@ extern "C" void gogis_postgis_catalog_schema(char* buffer, int buffer_length) {
     std::lock_guard<std::mutex> lock(g_postgis_catalog_mutex);
     const auto copy_length = std::min<size_t>(g_postgis_catalog_schema.size(), static_cast<size_t>(buffer_length - 1));
     std::memcpy(buffer, g_postgis_catalog_schema.data(), copy_length);
+    buffer[copy_length] = '\0';
+}
+
+extern "C" void gogis_postgis_connection(char* buffer, int buffer_length) {
+    if (buffer == nullptr || buffer_length <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_postgis_catalog_mutex);
+    const auto copy_length = std::min<size_t>(g_postgis_connection.size(), static_cast<size_t>(buffer_length - 1));
+    std::memcpy(buffer, g_postgis_connection.data(), copy_length);
     buffer[copy_length] = '\0';
 }
 

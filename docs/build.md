@@ -177,6 +177,15 @@ PostGIS 테이블은 `GOGIS_POSTGIS_DSN`으로 연결 정보를 주고 `--postgi
 QGIS의 테이블 식별자와 같은 `schema.table` 이름을 지정합니다. 연결 문자열은
 워크스페이스에 저장하지 않습니다.
 
+데스크톱의 **PostGIS 테이블** 창에서는 호스트·포트·DB·사용자·암호·SSL 모드를
+입력하고 새로고침으로 연결 및 PostGIS 확장 버전을 확인할 수 있습니다. 빈 양식은
+`GOGIS_POSTGIS_DSN`을 사용합니다. 목록에는 현재 드라이버가 읽고 쓸 수 있는
+`id BIGINT`, `geom`, `properties JSONB` 구조의 공간 테이블만 표시됩니다.
+선택한 테이블을 레이어로 불러온 뒤 속성 창에서 레코드를 편집할 수 있습니다.
+**저장·내보내기 → PostGIS로 내보내기**는 완전히 로드된 단일 프로젝트 레이어를
+지정한 `schema.table`에 트랜잭션으로 저장하며 기존 데이터를 교체합니다.
+접속 정보는 실행 중 메모리에만 유지하고 프로젝트에는 저장하지 않습니다.
+
 ```sh
 GOGIS_POSTGIS_DSN='postgres://gogis:gogis@localhost:55432/gogis?sslmode=disable' \
   ./build/gogis-desktop-native --postgis-table public.roads

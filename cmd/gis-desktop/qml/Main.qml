@@ -200,6 +200,10 @@ ApplicationWindow {
             return (language === "ko" ? "DXF 내보내기 완료: " : language === "jp" ? "DXF書き出し完了: " : "DXF exported: ") + status.substring("DXF exported: ".length);
         if (status.indexOf("DXF export failed: ") === 0)
             return (language === "ko" ? "DXF 내보내기 실패: " : language === "jp" ? "DXF書き出し失敗: " : "DXF export failed: ") + status.substring("DXF export failed: ".length);
+        if (status.indexOf("PostGIS exported: ") === 0)
+            return (language === "ko" ? "PostGIS 내보내기 완료: " : language === "jp" ? "PostGIS書き出し完了: " : "PostGIS exported: ") + status.substring("PostGIS exported: ".length);
+        if (status.indexOf("PostGIS export failed: ") === 0)
+            return (language === "ko" ? "PostGIS 내보내기 실패: " : language === "jp" ? "PostGIS書き出し失敗: " : "PostGIS export failed: ") + status.substring("PostGIS export failed: ".length);
         var renderReady = /^Render ready: (\d+)\/(\d+) chunks contain geometry$/.exec(status);
         if (renderReady) {
             if (language === "ko") return "타일 렌더링 완료 · " + renderReady[1] + "/" + renderReady[2] + "개 청크에 도형 포함";
@@ -562,6 +566,12 @@ ApplicationWindow {
             text: rootWindow.tr("Save GeoPackage")
             enabled: layerModel.count > 0
             onTriggered: saveDialog.open()
+        }
+        MenuItem {
+            objectName: "exportPostGISAction"
+            text: rootWindow.language === "ko" ? "PostGIS로 내보내기…" : "Export layer to PostGIS…"
+            enabled: layerModel.count > 0
+            onTriggered: postGISExportDialog.open()
         }
         MenuItem {
             objectName: "exportDxfButton"
@@ -935,26 +945,72 @@ ApplicationWindow {
         height: Math.min(560, rootWindow.height - 80)
         standardButtons: Dialog.Close
         property string errorText: ""
+        property string connectionVersion: ""
         property bool catalogTruncated: false
+        function refreshCatalog() {
+            connectionVersion = "";
+            errorText = "";
+            mapViewport.postGISTables = [];
+            var host = postGISHostField.text.trim();
+            // An empty form uses the process environment connection, if set.
+            mapCanvas.postGISConnectionPayload = host === "" && postGISDatabaseField.text.trim() === "" && postGISUserField.text.trim() === "" && postGISPasswordField.text === "" ? "" : JSON.stringify({
+                host: host, port: postGISPortField.text.trim(), database: postGISDatabaseField.text.trim(),
+                user: postGISUserField.text.trim(), password: postGISPasswordField.text,
+                sslMode: postGISSSLMode.currentValue
+            });
+            mapCanvas.postGISCatalogSchema = postGISSchemaField.text.trim();
+            mapCanvas.postGISCatalogGeneration += 1;
+        }
         onOpened: {
             errorText = "";
+            connectionVersion = "";
             catalogTruncated = false;
             mapCanvas.postGISCatalogVisible = true;
             // Keep catalog rows lazy: the native payload remains the source
             // of truth while the QML ListView exists only when open.
             mapViewport.postGISCatalogPayloadSeen = -1;
-            mapCanvas.postGISCatalogSchema = postGISSchemaField.text.trim();
-            mapCanvas.postGISCatalogGeneration += 1;
+            refreshCatalog();
         }
         onClosed: {
             mapCanvas.postGISCatalogVisible = false;
             mapCanvas.postGISCatalogPayload = "[]";
             mapViewport.postGISTables = [];
             errorText = "";
+            connectionVersion = "";
             catalogTruncated = false;
         }
         contentItem: ColumnLayout {
             spacing: 8
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 4
+                Label { text: rootWindow.language === "ko" ? "호스트" : "Host" }
+                TextField { id: postGISHostField; objectName: "postGISHostField"; Layout.fillWidth: true; placeholderText: "localhost" }
+                Label { text: rootWindow.language === "ko" ? "포트" : "Port" }
+                TextField { id: postGISPortField; objectName: "postGISPortField"; text: "5432"; implicitWidth: 75 }
+                Label { text: rootWindow.language === "ko" ? "데이터베이스" : "Database" }
+                TextField { id: postGISDatabaseField; objectName: "postGISDatabaseField"; Layout.fillWidth: true }
+                Label { text: rootWindow.language === "ko" ? "사용자" : "User" }
+                TextField { id: postGISUserField; objectName: "postGISUserField"; Layout.fillWidth: true }
+                Label { text: rootWindow.language === "ko" ? "암호" : "Password" }
+                TextField { id: postGISPasswordField; objectName: "postGISPasswordField"; Layout.fillWidth: true; echoMode: TextInput.Password }
+                Label { text: "SSL" }
+                ComboBox {
+                    id: postGISSSLMode
+                    objectName: "postGISSSLMode"
+                    Layout.fillWidth: true
+                    textRole: "label"
+                    valueRole: "value"
+                    model: [{label: "prefer", value: "prefer"}, {label: "require", value: "require"},
+                            {label: "verify-full", value: "verify-full"}, {label: "disable", value: "disable"}]
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "빈 연결 양식은 GOGIS_POSTGIS_DSN 환경 변수를 사용합니다. 접속 정보는 작업공간에 저장하지 않습니다." : "An empty form uses GOGIS_POSTGIS_DSN. Connection details are not saved in the workspace."
+                wrapMode: Text.WordWrap
+                color: "#65717d"
+            }
             RowLayout {
                 Layout.fillWidth: true
                 Label { text: rootWindow.language === "ko" ? "스키마" : rootWindow.language === "jp" ? "スキーマ" : "Schema" }
@@ -967,11 +1023,15 @@ ApplicationWindow {
                 Button {
                     objectName: "refreshPostGISTablesButton"
                     text: rootWindow.language === "ko" ? "새로고침" : rootWindow.language === "jp" ? "更新" : "Refresh"
-                    onClicked: {
-                        mapCanvas.postGISCatalogSchema = postGISSchemaField.text.trim();
-                        mapCanvas.postGISCatalogGeneration += 1;
-                    }
+                    onClicked: postGISTableDialog.refreshCatalog()
                 }
+            }
+            Label {
+                objectName: "postGISConnectionStatus"
+                Layout.fillWidth: true
+                visible: postGISTableDialog.connectionVersion !== ""
+                text: rootWindow.language === "ko" ? "PostGIS 연결됨 · 확장 버전 " + postGISTableDialog.connectionVersion : "PostGIS connected · extension " + postGISTableDialog.connectionVersion
+                color: "#087443"
             }
             Label {
                 Layout.fillWidth: true
@@ -989,7 +1049,7 @@ ApplicationWindow {
             }
             Label {
                 Layout.fillWidth: true
-                text: rootWindow.language === "ko" ? "공간 테이블을 선택하면 레이어로 불러옵니다. 레코드 추가·삭제는 속성 테이블에서 수행합니다." : rootWindow.language === "jp" ? "空間テーブルを選択するとレイヤーとして読み込みます。レコードの追加・削除は属性テーブルで行います。" : "Select a spatial table to load it as a layer. Add or delete records from the attribute table."
+                text: rootWindow.language === "ko" ? "id(BIGINT)·geom·properties(JSONB) 구조의 테이블을 표시합니다. 선택하면 레이어로 불러오고, 레코드 추가·삭제는 속성 테이블에서 수행합니다." : rootWindow.language === "jp" ? "対応する空間テーブルをレイヤーとして読み込みます。" : "Compatible id/geom/properties spatial tables can be loaded as layers. Add or delete records from the attribute table."
                 wrapMode: Text.WordWrap
                 color: "#65717d"
             }
@@ -1001,6 +1061,7 @@ ApplicationWindow {
                 reuseItems: true
                 cacheBuffer: 0
                 model: mapViewport.postGISTables
+                enabled: postGISTableDialog.connectionVersion !== ""
                 delegate: ItemDelegate {
                     required property var modelData
                     width: ListView.view.width
@@ -1012,6 +1073,50 @@ ApplicationWindow {
                 }
             }
         }
+    }
+
+    Dialog {
+        id: postGISExportDialog
+        objectName: "postGISExportDialog"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        title: rootWindow.language === "ko" ? "PostGIS로 내보내기" : "Export to PostGIS"
+        width: Math.min(480, rootWindow.width - 48)
+        property string errorText: ""
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label { text: rootWindow.language === "ko" ? "프로젝트 레이어" : "Project layer" }
+            ComboBox { id: postGISExportLayer; objectName: "postGISExportLayer"; Layout.fillWidth: true; model: layerModel; textRole: "name" }
+            Label { text: rootWindow.language === "ko" ? "대상 테이블 (schema.table)" : "Destination table (schema.table)" }
+            TextField { id: postGISExportTable; objectName: "postGISExportTable"; Layout.fillWidth: true; placeholderText: "public.roads" }
+            Label {
+                Layout.fillWidth: true
+                text: rootWindow.language === "ko" ? "기존 테이블의 데이터는 트랜잭션 안에서 교체됩니다. 연결 정보는 PostGIS 테이블 창에서 입력하고 연결을 확인하세요." : "Existing table data is replaced in one transaction. Set and check the connection in PostGIS tables first."
+                wrapMode: Text.WordWrap
+                color: "#8a4b08"
+            }
+            Label { Layout.fillWidth: true; visible: postGISExportDialog.errorText !== ""; text: postGISExportDialog.errorText; color: "#b42318"; wrapMode: Text.WordWrap }
+        }
+        footer: RowLayout {
+            Button { text: rootWindow.tr("Cancel"); onClicked: postGISExportDialog.reject() }
+            Item { Layout.fillWidth: true }
+            Button {
+                objectName: "postGISExportConfirmButton"
+                text: rootWindow.language === "ko" ? "내보내기" : "Export"
+                onClicked: {
+                    var table = postGISExportTable.text.trim();
+                    if (!/^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$/.test(table) || postGISExportLayer.currentIndex < 0) {
+                        postGISExportDialog.errorText = rootWindow.language === "ko" ? "레이어와 schema.table을 지정하세요." : "Select a layer and enter schema.table.";
+                        return;
+                    }
+                    mapCanvas.saveProfile = layerModel.get(postGISExportLayer.currentIndex).name;
+                    mapCanvas.savePath = "postgis://" + table;
+                    mapCanvas.saveGeneration += 1;
+                    postGISExportDialog.accept();
+                }
+            }
+        }
+        onOpened: errorText = ""
     }
 
     Dialog {
@@ -2278,6 +2383,7 @@ ApplicationWindow {
                     property int loadGeneration: 0
                     property int loadCapturedGeneration: 0
                     property string postGISCatalogSchema: ""
+                    property string postGISConnectionPayload: ""
                     property int postGISCatalogGeneration: 0
                     property string postGISCatalogPayload: "[]"
                     property int postGISCatalogPayloadGeneration: 0
@@ -2549,6 +2655,7 @@ ApplicationWindow {
                                     catalog.tables = [];
                                 mapViewport.postGISTables = catalog.tables || [];
                                 postGISTableDialog.errorText = catalog.error || "";
+                                postGISTableDialog.connectionVersion = catalog.version || "";
                                 postGISTableDialog.catalogTruncated = catalog.truncated === true;
                             } else {
                                 mapViewport.postGISTables = [];

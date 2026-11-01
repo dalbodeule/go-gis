@@ -2191,7 +2191,7 @@ TestCase {
         verify(canvas !== null && viewport !== null && dialog !== null && list !== null && button !== null);
         compare(list.reuseItems, true);
         compare(list.cacheBuffer, 0);
-        canvas.postGISCatalogPayload = JSON.stringify({tables: [
+        canvas.postGISCatalogPayload = JSON.stringify({version: "3.6.1", tables: [
             {schema: "public", name: "roads", srid: 5179, geometryColumn: "geom"}
         ]});
         canvas.postGISCatalogPayloadGeneration += 1;
@@ -2203,7 +2203,7 @@ TestCase {
         compare(list.count, 0);
         // The desktop native bridge releases the catalog payload while the
         // dialog is closed; the fixture supplies the next catalog response.
-        canvas.postGISCatalogPayload = JSON.stringify({tables: [
+        canvas.postGISCatalogPayload = JSON.stringify({version: "3.6.1", tables: [
             {schema: "public", name: "roads", srid: 5179, geometryColumn: "geom"}
         ]});
         mouseClick(button);
@@ -2211,6 +2211,63 @@ TestCase {
         tryVerify(function() { return list.count === 1; });
         dialog.close();
         compare(JSON.parse(canvas.loadPath)[0], "postgis://public.roads");
+    }
+
+    function test_postGISConnectionFormStaysInSessionRequest() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var dialog = findChild(appWindow, "postGISTableDialog");
+        var host = findChild(appWindow, "postGISHostField");
+        var database = findChild(appWindow, "postGISDatabaseField");
+        var user = findChild(appWindow, "postGISUserField");
+        var password = findChild(appWindow, "postGISPasswordField");
+        var refresh = findChild(appWindow, "refreshPostGISTablesButton");
+        verify(canvas && dialog && host && database && user && password && refresh);
+        compare(password.echoMode, TextInput.Password);
+        dialog.open();
+        host.text = "localhost";
+        database.text = "sample";
+        user.text = "tester";
+        password.text = "temporary-secret";
+        mouseClick(refresh);
+        var connection = JSON.parse(canvas.postGISConnectionPayload);
+        compare(connection.host, "localhost");
+        compare(connection.database, "sample");
+        compare(connection.user, "tester");
+        compare(connection.password, "temporary-secret");
+        dialog.close();
+        host.text = "";
+        database.text = "";
+        user.text = "";
+        password.text = "";
+        dialog.open();
+        compare(canvas.postGISConnectionPayload, "");
+        dialog.close();
+    }
+
+    function test_postGISExportRequestsSelectedLayerAndTable() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var layerModel = findChild(appWindow, "layerModel");
+        var dialog = findChild(appWindow, "postGISExportDialog");
+        var layer = findChild(appWindow, "postGISExportLayer");
+        var table = findChild(appWindow, "postGISExportTable");
+        var confirm = findChild(appWindow, "postGISExportConfirmButton");
+        verify(canvas && layerModel && dialog && layer && table && confirm);
+        var originalPayload = canvas.layerTreePayload;
+        try {
+            canvas.layerTreePayload = JSON.stringify([{name: "synthetic", displayName: "Synthetic", geometryType: "Point", visible: true}]);
+            tryCompare(layerModel, "count", 1);
+            dialog.open();
+            table.text = "public.synthetic";
+            var generation = canvas.saveGeneration;
+            mouseClick(confirm);
+            compare(canvas.saveGeneration, generation + 1);
+            compare(canvas.savePath, "postgis://public.synthetic");
+            compare(canvas.saveProfile, "synthetic");
+            compare(dialog.visible, false);
+        } finally {
+            canvas.layerTreePayload = originalPayload;
+            dialog.close();
+        }
     }
 
     function test_largeReadOnlyLayerExplainsDisabledRecordEditing() {

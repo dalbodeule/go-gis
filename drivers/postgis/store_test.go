@@ -3,7 +3,9 @@ package postgis
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -94,6 +96,15 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 	}
 	table := "gogis_integration_" + hex.EncodeToString(suffix[:])
 	ctx := context.Background()
+	setupDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open integration database for extension setup: %v", err)
+	}
+	if _, err := setupDB.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS postgis"); err != nil {
+		_ = setupDB.Close()
+		t.Fatalf("enable PostGIS extension: %v", err)
+	}
+	_ = setupDB.Close()
 	store, err := Open(ctx, dsn, table)
 	if err != nil {
 		t.Fatalf("open integration PostGIS database: %v", err)
@@ -102,9 +113,6 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 		_, _ = store.DB.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+quoteIdentifier(table))
 		_ = store.Close()
 	})
-	if _, err := store.DB.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS postgis"); err != nil {
-		t.Fatalf("enable PostGIS extension: %v", err)
-	}
 
 	initial := core.Layer{
 		Name: "roads", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
@@ -346,5 +354,24 @@ func TestInferFieldsSortsNamesAndMapsJSONTypes(t *testing.T) {
 func TestTableNameUsesFinalIdentifierPart(t *testing.T) {
 	if got := tableName("gis.roads"); got != "roads" {
 		t.Fatalf("table name = %q", got)
+	}
+}
+
+func TestPostGISConnectionRequiresExplicitDatabase(t *testing.T) {
+	if _, err := CheckConnection(context.Background(), ""); err == nil {
+		t.Fatal("empty connection should fail before using a local default")
+	}
+	if _, err := Open(context.Background(), "", "public.roads"); err == nil {
+		t.Fatal("empty connection should fail before using a local default")
+	}
+}
+
+func TestPostGISTableCatalogJSONMatchesDesktop(t *testing.T) {
+	payload, err := json.Marshal(TableInfo{Schema: "public", Name: "roads", GeometryColumn: "geom", SRID: 5179})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != `{"schema":"public","name":"roads","geometryColumn":"geom","srid":5179}` {
+		t.Fatalf("desktop catalog row = %s", payload)
 	}
 }

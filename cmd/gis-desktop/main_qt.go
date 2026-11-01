@@ -2819,9 +2819,15 @@ func (r *demoRuntime) cancelPostGISCatalogRequest() {
 }
 
 func (r *demoRuntime) postGISTableCatalogPayload(ctx context.Context, schema string) string {
-	dsn := strings.TrimSpace(os.Getenv("GOGIS_POSTGIS_DSN"))
-	if dsn == "" {
-		return `{"error":"GOGIS_POSTGIS_DSN is not configured","tables":[]}`
+	dsn, err := currentDesktopPostGISDSN()
+	if err != nil {
+		payload, _ := json.Marshal(map[string]any{"error": err.Error(), "tables": []postgis.TableInfo{}})
+		return string(payload)
+	}
+	version, err := postgis.CheckConnection(ctx, dsn)
+	if err != nil {
+		payload, _ := json.Marshal(map[string]any{"error": postGISConnectionError(err, dsn).Error(), "tables": []postgis.TableInfo{}})
+		return string(payload)
 	}
 	const maxCatalogTables = 2048
 	tables, truncated, err := postgis.ListTablesLimited(ctx, dsn, schema, maxCatalogTables)
@@ -2830,13 +2836,14 @@ func (r *demoRuntime) postGISTableCatalogPayload(ctx context.Context, schema str
 			Error     string              `json:"error"`
 			Tables    []postgis.TableInfo `json:"tables"`
 			Truncated bool                `json:"truncated"`
-		}{Error: err.Error(), Tables: []postgis.TableInfo{}, Truncated: false})
+		}{Error: postGISConnectionError(err, dsn).Error(), Tables: []postgis.TableInfo{}, Truncated: false})
 		return string(payload)
 	}
 	payload, err := json.Marshal(struct {
 		Tables    []postgis.TableInfo `json:"tables"`
 		Truncated bool                `json:"truncated"`
-	}{Tables: tables, Truncated: truncated})
+		Version   string              `json:"version"`
+	}{Tables: tables, Truncated: truncated, Version: version})
 	if err != nil {
 		return `{"error":"failed to encode PostGIS table catalog","tables":[]}`
 	}

@@ -291,6 +291,14 @@ func CurrentPostGISCatalogSchema() string {
 	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
 }
 
+// CurrentPostGISConnection returns the session-only connection form payload.
+// Callers must never log it or persist it in a workspace.
+func CurrentPostGISConnection() string {
+	buffer := make([]C.char, 8192)
+	C.gogis_postgis_connection((*C.char)(unsafe.Pointer(&buffer[0])), C.int(len(buffer)))
+	return C.GoString((*C.char)(unsafe.Pointer(&buffer[0])))
+}
+
 // SetPostGISCatalogPayload publishes a bounded QGIS-style table catalog.
 func SetPostGISCatalogPayload(payload string) {
 	cPayload := C.CString(payload)

@@ -86,6 +86,7 @@ unsigned long long gogis_vertex_handle_generation(void);
 // bounded catalog result back to QML.
 unsigned long long gogis_postgis_catalog_generation(void);
 void gogis_postgis_catalog_schema(char* buffer, int buffer_length);
+void gogis_postgis_connection(char* buffer, int buffer_length);
 void gogis_set_postgis_catalog_payload(const char* payload);
 unsigned long long gogis_postgis_catalog_payload_generation(void);
 int gogis_postgis_catalog_visible(void);

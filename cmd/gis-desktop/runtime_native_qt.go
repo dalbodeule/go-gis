@@ -3599,6 +3599,15 @@ func (r *demoRuntime) saveDatasetWithOptions(destination, profile, options strin
 		native.SetRenderStatus("Save cancelled")
 		return
 	}
+	if strings.HasPrefix(strings.ToLower(destination), "postgis://") {
+		table := destination[len("postgis://"):]
+		if err := r.exportLayerToPostGIS(context.Background(), profile, table); err != nil {
+			native.SetRenderStatus("PostGIS export failed: " + err.Error())
+		} else {
+			native.SetRenderStatus("PostGIS exported: " + table)
+		}
+		return
+	}
 	if strings.EqualFold(filepath.Ext(destination), ".gogis") {
 		r.saveWorkspace(destination)
 		return

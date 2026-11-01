@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"gogis/drivers/postgis"
@@ -14,16 +13,43 @@ import (
 	"gogis/internal/render"
 )
 
-const postGISDSNEnvironment = "GOGIS_POSTGIS_DSN"
-
-func loadPostGISRuntime(ctx context.Context, table, targetCRS string, readOnly bool) (*demoRuntime, error) {
-	dsn := strings.TrimSpace(os.Getenv(postGISDSNEnvironment))
-	if dsn == "" {
-		return nil, fmt.Errorf("%s is required for PostGIS desktop loading", postGISDSNEnvironment)
+func (r *demoRuntime) exportLayerToPostGIS(ctx context.Context, layerName, table string) error {
+	if strings.TrimSpace(layerName) == "" {
+		return fmt.Errorf("select a project layer")
+	}
+	r.mu.Lock()
+	service, readOnly := r.service, r.readOnly
+	r.mu.Unlock()
+	if service == nil || readOnly {
+		return fmt.Errorf("the selected project layer is not fully loaded for export")
+	}
+	layer, ok := service.Layer(layerName)
+	if !ok {
+		return fmt.Errorf("project layer %q was not found", layerName)
+	}
+	if strings.TrimSpace(layer.CRS.AuthorityCode) == "" {
+		return fmt.Errorf("project layer %q has no declared CRS", layerName)
+	}
+	dsn, err := currentDesktopPostGISDSN()
+	if err != nil {
+		return err
 	}
 	store, err := postgis.Open(ctx, dsn, table)
 	if err != nil {
-		return nil, fmt.Errorf("open PostGIS table %q: %w", table, err)
+		return fmt.Errorf("open destination: %w", postGISConnectionError(err, dsn))
+	}
+	defer store.Close()
+	return store.SaveLayer(ctx, layer)
+}
+
+func loadPostGISRuntime(ctx context.Context, table, targetCRS string, readOnly bool) (*demoRuntime, error) {
+	dsn, err := currentDesktopPostGISDSN()
+	if err != nil {
+		return nil, err
+	}
+	store, err := postgis.Open(ctx, dsn, table)
+	if err != nil {
+		return nil, fmt.Errorf("open PostGIS table %q: %w", table, postGISConnectionError(err, dsn))
 	}
 	info, err := store.Describe(ctx)
 	if err != nil {

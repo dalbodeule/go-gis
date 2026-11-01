@@ -45,10 +45,10 @@ type Store struct {
 
 // TableInfo is the QGIS-style catalog entry exposed by ListTables.
 type TableInfo struct {
-	Schema         string
-	Name           string
-	GeometryColumn string
-	SRID           int
+	Schema         string `json:"schema"`
+	Name           string `json:"name"`
+	GeometryColumn string `json:"geometryColumn"`
+	SRID           int    `json:"srid"`
 }
 
 // LayerInfo contains the lightweight metadata needed to create a viewport
@@ -64,6 +64,9 @@ var _ drivers.TransactionalStore = (*Store)(nil)
 
 // Open opens a pgx-backed database/sql connection.
 func Open(ctx context.Context, dsn, table string) (*Store, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, fmt.Errorf("PostGIS database is not configured")
+	}
 	if !validTableIdentifier(table) {
 		return nil, fmt.Errorf("invalid PostGIS table identifier %q", table)
 	}
@@ -75,11 +78,43 @@ func Open(ctx context.Context, dsn, table string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if _, err := checkExtension(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{DB: db, Table: table}, nil
 }
 
-// ListTables returns all user tables visible to the connection. It reads
-// PostgreSQL metadata so the result can drive a table picker like QGIS.
+// CheckConnection verifies the database is reachable and PostGIS is enabled
+// in that database. It never installs an extension or changes the database.
+func CheckConnection(ctx context.Context, dsn string) (string, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return "", fmt.Errorf("PostGIS database is not configured")
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return "", fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	return checkExtension(ctx, db)
+}
+
+func checkExtension(ctx context.Context, db *sql.DB) (string, error) {
+	var version string
+	if err := db.QueryRowContext(ctx, `SELECT extversion FROM pg_extension WHERE extname = 'postgis'`).Scan(&version); err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("PostGIS extension is not installed in the selected database")
+		}
+		return "", fmt.Errorf("check PostGIS extension: %w", err)
+	}
+	return version, nil
+}
+
+// ListTables returns spatial tables compatible with this driver's
+// id/geom/properties read and write contract.
 func ListTables(ctx context.Context, dsn, schema string) ([]TableInfo, error) {
 	return listTables(ctx, dsn, schema, -1)
 }
@@ -114,6 +149,9 @@ func listTables(ctx context.Context, dsn, schema string, limit int) ([]TableInfo
 	if err := db.PingContext(ctx); err != nil {
 		return nil, err
 	}
+	if _, err := checkExtension(ctx, db); err != nil {
+		return nil, err
+	}
 	const query = `SELECT t.table_schema, t.table_name,
     COALESCE(g.f_geometry_column, ''), COALESCE(g.srid, 0)
 FROM information_schema.tables t
@@ -122,6 +160,13 @@ LEFT JOIN geometry_columns g
 WHERE t.table_type = 'BASE TABLE'
   AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
   AND g.f_geometry_column IS NOT NULL
+  AND g.f_geometry_column = 'geom'
+  AND EXISTS (SELECT 1 FROM information_schema.columns c
+              WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name
+                AND c.column_name = 'id' AND c.data_type = 'bigint')
+  AND EXISTS (SELECT 1 FROM information_schema.columns c
+              WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name
+                AND c.column_name = 'properties' AND c.udt_name = 'jsonb')
   AND ($1 = '' OR t.table_schema = $1)
 ORDER BY t.table_schema, t.table_name`
 	queryText := query

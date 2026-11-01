@@ -18,6 +18,7 @@ Item {
     property string attributePayload: "[]"
     property bool attributePayloadVisible: false
     property bool postGISCatalogVisible: false
+    property string postGISConnectionPayload: ""
     property int attributePage: 0
     property int attributePageGeneration: 0
     property string layerTreePayload: "[]"

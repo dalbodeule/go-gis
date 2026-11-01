@@ -5,13 +5,52 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 
 	"gogis/drivers/postgis"
 	"gogis/internal/core"
 )
+
+func ensureDesktopTestPostGIS(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS postgis"); err != nil {
+		t.Fatalf("enable PostGIS extension: %v", err)
+	}
+}
+
+func TestDesktopPostGISConnectionForm(t *testing.T) {
+	form := `{"host":"localhost","port":"5432","database":"gis","user":"user","password":"p@ss:word","sslMode":"require"}`
+	dsn, err := desktopPostGISDSN(form, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := parsed.User.Password()
+	if parsed.Host != "localhost:5432" || parsed.Path != "/gis" || password != "p@ss:word" || parsed.Query().Get("sslmode") != "require" {
+		t.Fatalf("incorrect connection form mapping")
+	}
+	if _, err := desktopPostGISDSN(`{"host":"localhost","database":"gis","user":"u","port":"0"}`, ""); err == nil {
+		t.Fatal("invalid port accepted")
+	}
+	message := postGISConnectionError(errors.New("failed: "+dsn+" password p@ss:word"), dsn).Error()
+	if strings.Contains(message, "p@ss:word") || strings.Contains(message, dsn) {
+		t.Fatal("connection error exposed a password")
+	}
+}
 
 func TestPostGISDesktopRuntimePersistsRecordAddAndDelete(t *testing.T) {
 	dsn := os.Getenv("GOGIS_TEST_POSTGIS_DSN")
@@ -26,6 +65,7 @@ func TestPostGISDesktopRuntimePersistsRecordAddAndDelete(t *testing.T) {
 	}
 	table := "public.gogis_desktop_" + hex.EncodeToString(suffix[:])
 	ctx := context.Background()
+	ensureDesktopTestPostGIS(t, ctx, dsn)
 	store, err := postgis.Open(ctx, dsn, table)
 	if err != nil {
 		t.Fatalf("open PostGIS table: %v", err)
@@ -113,6 +153,7 @@ func TestPostGISDesktopRuntimeUsesViewportForLargeTable(t *testing.T) {
 	}
 	table := "public.gogis_large_" + hex.EncodeToString(suffix[:])
 	ctx := context.Background()
+	ensureDesktopTestPostGIS(t, ctx, dsn)
 	store, err := postgis.Open(ctx, dsn, table)
 	if err != nil {
 		t.Fatalf("open PostGIS table: %v", err)
@@ -122,9 +163,6 @@ func TestPostGISDesktopRuntimeUsesViewportForLargeTable(t *testing.T) {
 		_ = store.Close()
 	})
 
-	if _, err := store.DB.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS postgis"); err != nil {
-		t.Fatalf("enable PostGIS extension: %v", err)
-	}
 	if _, err := store.DB.ExecContext(ctx, "CREATE TABLE "+quotePostGISTestTable(table)+" (id BIGINT PRIMARY KEY, geom geometry(Point, 4326) NOT NULL, properties JSONB NOT NULL DEFAULT '{}'::jsonb)"); err != nil {
 		t.Fatalf("create large PostGIS table: %v", err)
 	}
