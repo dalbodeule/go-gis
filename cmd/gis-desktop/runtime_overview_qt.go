@@ -11,6 +11,13 @@ import (
 const maxReadOnlyOverviewFeatures = 240_000
 const maxReadOnlyDetailWorkers = 2
 
+func readOnlyKeyChunkSize(key render.ChunkKey, defaultSize float64) float64 {
+	if key.Coarse {
+		return 1
+	}
+	return defaultSize
+}
+
 func readOnlyWindowChunkSize(zoomBucket int) float64 {
 	// Coarse overviews use 1/32 windows. Larger cells at high zoom reduce
 	// per-viewport GDAL query overhead while detail still increases with zoom.
@@ -46,7 +53,21 @@ func readOnlyOverviewZoomBucket(zoomBucket int, dataExtent, fitExtent [4]float64
 	if dataWidth <= 0 || dataHeight <= 0 || fitWidth <= 0 || fitHeight <= 0 {
 		return zoomBucket
 	}
-	fraction := math.Max(fitWidth/dataWidth, fitHeight/dataHeight)
+	xFraction, yFraction := fitWidth/dataWidth, fitHeight/dataHeight
+	fraction := math.Max(xFraction, yFraction)
+	if smaller := math.Min(xFraction, yFraction); smaller > 0 && fraction/smaller > 64 {
+		// A single-axis coordinate outlier can make one fraction nearly one
+		// while the preferred fit occupies a tiny fraction of the canvas.
+		// Estimate its on-screen width after the source and fit extents each
+		// receive their aspect-preserving Qt canvas. This keeps the initial
+		// view in overview LOD instead of treating it as an extreme detail zoom.
+		const viewportAspect = 16.0 / 9.0
+		dataCanvasWidth := math.Min(viewportAspect, dataWidth/dataHeight)
+		fitCanvasWidth := math.Min(viewportAspect, fitWidth/fitHeight)
+		if dataCanvasWidth > 0 && fitCanvasWidth > 0 {
+			fraction = xFraction * dataCanvasWidth / fitCanvasWidth
+		}
+	}
 	zoom := math.Ldexp(1, max(-10, min(20, zoomBucket))) * fraction
 	return readOnlyWindowZoomBucket(zoom)
 }
@@ -95,13 +116,14 @@ func filterReadOnlyKeysByLayerBounds(keys []render.ChunkKey, extent [4]float64, 
 	spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
 	retained := keys[:0]
 	for _, key := range keys {
+		keySize := readOnlyKeyChunkSize(key, size)
 		bounds, known := layerBounds[key.Layer]
 		if !known || bounds[0] > bounds[2] || bounds[1] > bounds[3] {
 			retained = append(retained, key)
 			continue
 		}
-		x0, y0 := math.Max(0, float64(key.X)*size), math.Max(0, float64(key.Y)*size)
-		x1, y1 := math.Min(1, float64(key.X+1)*size), math.Min(1, float64(key.Y+1)*size)
+		x0, y0 := math.Max(0, float64(key.X)*keySize), math.Max(0, float64(key.Y)*keySize)
+		x1, y1 := math.Min(1, float64(key.X+1)*keySize), math.Min(1, float64(key.Y+1)*keySize)
 		if x0 >= x1 || y0 >= y1 {
 			continue
 		}

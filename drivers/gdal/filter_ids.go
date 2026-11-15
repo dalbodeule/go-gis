@@ -30,6 +30,16 @@ func (set *FeatureIDSet) Count() int {
 	return set.count
 }
 
+// Bounds is the union of accepted source geometries only when every accepted
+// geometry supplied a valid envelope. An empty or uncertain set has no fit
+// extent; callers should retain their conservative source bounds instead.
+func (set *FeatureIDSet) Bounds() ([4]float64, bool) {
+	if set == nil || set.count == 0 || !set.allBounds || !set.hasBounds {
+		return [4]float64{}, false
+	}
+	return set.bounds, true
+}
+
 // MayInclude returns true for an unknown FID so an unusual driver result
 // still reaches the authoritative Lua predicate.
 func (set *FeatureIDSet) MayInclude(fid int64) bool {
@@ -81,7 +91,9 @@ func (s *AttributeSession) BuildStringFilterIDSet(ctx context.Context, layerName
 	}
 	field := quoteSQLIdentifier(filter.Field)
 	query := "SELECT FID AS gogis_fid FROM " + quoteSQLIdentifier(resolvedName)
-	if filter.Prefix {
+	if filter.Contains {
+		query += " WHERE (" + field + " LIKE '%" + filter.Value + "%' OR " + field + " IS NULL)"
+	} else if filter.Prefix {
 		query += " WHERE (" + field + " LIKE '" + filter.Value + "%' OR " + field + " IS NULL)"
 	} else {
 		query += " WHERE " + field + " = '" + filter.Value + "'"
@@ -105,7 +117,7 @@ func (s *AttributeSession) BuildStringFilterIDSet(ctx context.Context, layerName
 		}
 		fid := feature.FID()
 		geometry := feature.Geometry()
-		if geometry.IsNull() || geometry.Empty() {
+		if geometry == nil || geometry.IsNull() || geometry.Empty() {
 			set.allBounds = false
 		} else if envelope, boundsErr := geometry.Bounds(); boundsErr != nil ||
 			!validFilterEnvelope(envelope) {

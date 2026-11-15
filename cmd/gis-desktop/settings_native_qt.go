@@ -22,6 +22,7 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 	oldExtent := r.mapExtent
 	oldCRS := r.mapCRS
 	pendingView := r.workspaceView
+	allowLargeEditable := r.allowLargeEditable
 	baseLayers := []core.Layer(nil)
 	if !readOnly {
 		baseLayers = r.service.ProjectLayersExcept(request.Name)
@@ -31,7 +32,9 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 		unavailable[name] = source
 	}
 	found := false
+	var targetSource vectorSourceSpec
 	sources := make([]vectorSourceSpec, 0, len(layers))
+	allSources := make([]vectorSourceSpec, 0, len(layers))
 	newDisplayName := strings.TrimSpace(request.DisplayName)
 	if newDisplayName == "" {
 		r.mu.Unlock()
@@ -77,6 +80,10 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 		if readOnly || targetLayer {
 			sources = append(sources, source)
 		}
+		allSources = append(allSources, source)
+		if targetLayer {
+			targetSource = source
+		}
 	}
 	if !found {
 		r.mu.Unlock()
@@ -98,7 +105,26 @@ func (r *demoRuntime) reloadLayerWithSettings(request layerSettingsRequest, read
 		if readOnly {
 			next, err = loadReadOnlyDataRuntime(ctx, sources, displayCRS)
 		} else {
-			next, err = loadDataRuntimeSourcesWithCRS(ctx, sources, baseLayers, saveDestination, displayCRS)
+			count, unknown, inspectErr := inspectSourceFeatureCount(ctx, []vectorSourceSpec{targetSource})
+			if inspectErr != nil {
+				err = fmt.Errorf("inspect replacement source: %w", inspectErr)
+			} else if shouldOpenLargeDatasetReadOnly(count, unknown, allowLargeEditable) {
+				// The editable loader reads the whole replacement into one snapshot.
+				// A missing-source workspace can switch to windowed reads safely,
+				// but preserve any other resident or newly created layer instead of
+				// silently discarding its unsaved edits.
+				for _, layer := range baseLayers {
+					if _, missing := unavailable[layer.Name]; !missing || len(layer.Features) != 0 {
+						err = fmt.Errorf("save or export other editable layers before relinking a large source in read-only mode")
+						break
+					}
+				}
+				if err == nil {
+					next, err = loadReadOnlyDataRuntime(ctx, allSources, displayCRS)
+				}
+			} else {
+				next, err = loadDataRuntimeSourcesWithCRS(ctx, sources, baseLayers, saveDestination, displayCRS)
+			}
 			if err == nil {
 				next.unavailableSources = make(map[string]unavailableSource, len(unavailable))
 				for name, source := range unavailable {

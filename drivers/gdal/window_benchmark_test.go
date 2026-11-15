@@ -8,12 +8,137 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"gogis/internal/core"
 
 	"github.com/airbusgeo/godal"
 )
+
+// Run explicitly with -benchtime=1x. The fixture is generated in b.TempDir,
+// so no large or user-owned source is checked into the repository.
+func BenchmarkGeoJSONSeqAttributePage10MPlusOne(b *testing.B) {
+	const featureCount = 10_000_001
+	path := filepath.Join(b.TempDir(), "ten-million.geojsons")
+	file, err := os.Create(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	writer := bufio.NewWriterSize(file, 1<<20)
+	const record = "{\"type\":\"Feature\",\"properties\":{\"kind\":\"point\"},\"geometry\":{\"type\":\"Point\",\"coordinates\":[0,0]}}\n"
+	for i := 0; i < featureCount; i++ {
+		if _, err := writer.WriteString(record); err != nil {
+			_ = file.Close()
+			b.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		b.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer session.Close()
+	inspectStart := time.Now()
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != featureCount {
+		b.Fatalf("inspect 10M+1 source: overviews=%#v err=%v", overviews, err)
+	}
+	inspectTime := time.Since(inspectStart)
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		page, total, err := session.OpenAttributePage(context.Background(), "", featureCount-128, 128)
+		if err != nil || total != featureCount || len(page.Features) != 128 || page.Features[127].ID != featureCount {
+			b.Fatalf("last page: total=%d rows=%d err=%v", total, len(page.Features), err)
+		}
+	}
+	b.StopTimer()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	b.ReportMetric(float64(featureCount), "features/source")
+	b.ReportMetric(inspectTime.Seconds(), "inspect-s")
+	b.ReportMetric(float64(after.HeapAlloc), "retained-heap-bytes")
+	b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc)), "page-heap-delta-bytes")
+}
+
+// Run explicitly with -benchtime=1x. This uses a bounded streaming OGR
+// writer, then measures a random page at the end of an actual 10M+1 SHP.
+func BenchmarkShapefileLastAttributePage10MPlusOne(b *testing.B) {
+	const featureCount = 10_000_001
+	registerDrivers()
+	path := filepath.Join(b.TempDir(), "ten-million.shp")
+	dataset, err := godal.CreateVector(godal.Shapefile, path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	layer, err := dataset.CreateLayer("ten-million", nil, godal.GTPoint,
+		godal.NewFieldDefinition("ordinal", godal.FTInt))
+	if err != nil {
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	geometry, err := godal.NewGeometryFromWKT("POINT (0 0)", nil)
+	if err != nil {
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	for ordinal := 1; ordinal <= featureCount; ordinal++ {
+		feature, err := layer.NewFeature(geometry)
+		if err != nil {
+			geometry.Close()
+			_ = dataset.Close()
+			b.Fatal(err)
+		}
+		if err := feature.SetFieldValue(feature.Fields()["ordinal"], ordinal); err != nil {
+			feature.Close()
+			geometry.Close()
+			_ = dataset.Close()
+			b.Fatal(err)
+		}
+		if err := layer.UpdateFeature(feature); err != nil {
+			feature.Close()
+			geometry.Close()
+			_ = dataset.Close()
+			b.Fatal(err)
+		}
+		feature.Close()
+	}
+	geometry.Close()
+	if err := dataset.Close(); err != nil {
+		b.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer session.Close()
+	overviews, err := session.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != featureCount {
+		b.Fatalf("SHP 10M+1 overview=%#v err=%v", overviews, err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		page, total, err := session.OpenAttributePage(context.Background(), "", featureCount-128, 128)
+		if err != nil || total != featureCount || len(page.Features) != 128 ||
+			fmt.Sprint(page.Features[127].Properties["ordinal"]) != fmt.Sprint(featureCount) {
+			b.Fatalf("SHP last page: total=%d rows=%d err=%v", total, len(page.Features), err)
+		}
+	}
+	b.ReportMetric(featureCount, "features/source")
+}
 
 func BenchmarkGDALGeoJSONWindowEnvelope1M(b *testing.B) {
 	benchmarkGDALGeoJSONWindow1M(b, false)

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"gogis/internal/core"
+	"golang.org/x/text/unicode/norm"
 )
 
 func TestWorkspaceRoundTripPreservesLayerSettingsWithoutFeatures(t *testing.T) {
@@ -140,6 +141,117 @@ func TestWorkspaceLoadDoesNotRebaseForeignWindowsAbsolutePath(t *testing.T) {
 	}
 	if got := loaded.Layers[0].SourcePath; got != want {
 		t.Fatalf("resolved Windows absolute source = %q, want %q", got, want)
+	}
+}
+
+func TestWorkspaceKeepsUNCSourceForRelinkingOnOtherHosts(t *testing.T) {
+	workspacePath := filepath.Join(t.TempDir(), "map.gogis")
+	const source = `//server/share/roads.shp`
+	doc := Document{Version: CurrentVersion, Layers: []Layer{{Name: "roads", SourcePath: source, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}}}
+	if err := Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := source
+	if filepath.Separator == '\\' {
+		want = filepath.Clean(source)
+	}
+	if loaded.Layers[0].SourcePath != want {
+		t.Fatalf("UNC source = %q, want %q", loaded.Layers[0].SourcePath, want)
+	}
+}
+
+func TestWorkspaceLoadRelocatesUniqueNearbySources(t *testing.T) {
+	directory := t.TempDir()
+	workspacePath := filepath.Join(directory, "공주시.gogis")
+	building := filepath.Join(directory, "AL_D010", "AL_D010.shp")
+	point := filepath.Join(directory, "point-data", "point.shp")
+	for _, source := range []string{building, point} {
+		if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(source, []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doc := Document{Version: CurrentVersion, Layers: []Layer{
+		{Name: "building", SourcePath: "../AL_D010/AL_D010.shp", Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()},
+		{Name: "point", SourcePath: "point.shp", Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()},
+	}}
+	if err := Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Layers[0].SourcePath != building || loaded.Layers[1].SourcePath != point {
+		t.Fatalf("relocated paths = %q, %q; want %q, %q", loaded.Layers[0].SourcePath, loaded.Layers[1].SourcePath, building, point)
+	}
+}
+
+func TestWorkspaceLoadDoesNotGuessBetweenDuplicateSources(t *testing.T) {
+	directory := t.TempDir()
+	for _, folder := range []string{"first", "second"} {
+		path := filepath.Join(directory, folder, "roads.shp")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(folder), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspacePath := filepath.Join(directory, "map.gogis")
+	doc := Document{Version: CurrentVersion, Layers: []Layer{{Name: "roads", SourcePath: "old/roads.shp", Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}}}
+	if err := Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(directory, "old", "roads.shp"); loaded.Layers[0].SourcePath != want {
+		t.Fatalf("ambiguous source = %q, want missing path %q", loaded.Layers[0].SourcePath, want)
+	}
+}
+
+func TestWorkspaceLoadRelocatesForeignAbsolutePathAndNormalizesUnicode(t *testing.T) {
+	directory := t.TempDir()
+	filename := norm.NFD.String("건물정보") + ".shp"
+	actual := filepath.Join(directory, "data", filename)
+	if err := os.MkdirAll(filepath.Dir(actual), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(actual, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspacePath := filepath.Join(directory, "map.gogis")
+	doc := Document{Version: CurrentVersion, Layers: []Layer{{Name: "building", SourcePath: `C:\GIS\건물정보.shp`, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}}}
+	if err := Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Layers[0].SourcePath != actual {
+		t.Fatalf("foreign absolute path = %q, want %q", loaded.Layers[0].SourcePath, actual)
+	}
+}
+
+func TestWorkspaceSourceURIRoundTrip(t *testing.T) {
+	workspacePath := filepath.Join(t.TempDir(), "map.gogis")
+	const source = "postgis://host.example/database?table=roads"
+	doc := Document{Version: CurrentVersion, Layers: []Layer{{Name: "roads", SourcePath: source, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()}}}
+	if err := Save(workspacePath, doc); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(workspacePath)
+	if err != nil || loaded.Layers[0].SourcePath != source {
+		t.Fatalf("source URI = %q, err=%v", loaded.Layers[0].SourcePath, err)
 	}
 }
 

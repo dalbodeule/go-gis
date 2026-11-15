@@ -31,17 +31,21 @@ import (
 )
 
 type readOnlyLayerBinding struct {
-	session      readOnlyWindowSource
-	windowPool   chan readOnlyWindowSource
-	sourceName   string
-	layer        core.Layer
-	sourceCRS    string
-	featureCount int
-	acceptedIDs  *gdal.FeatureIDSet
+	session         readOnlyWindowSource
+	windowPool      chan readOnlyWindowSource
+	sourceName      string
+	layer           core.Layer
+	sourceCRS       string
+	featureCount    int
+	acceptedIDs     *gdal.FeatureIDSet
+	broadOverlap    bool
+	renderBounds    [4]float64
+	hasRenderBounds bool
 }
 
 func (binding *readOnlyLayerBinding) invalidateAcceptedIDs() {
 	binding.acceptedIDs = nil
+	binding.hasRenderBounds = false
 }
 
 // readOnlyWindowSource is the bounded source contract shared by GDAL files
@@ -479,6 +483,8 @@ func inspectSingleSourceFeatureCount(ctx context.Context, source vectorSourceSpe
 func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) (int, bool, error) {
 	total := 0
 	unknownCount := false
+	availableSources := 0
+	unavailableSources := 0
 	for _, source := range sources {
 		if err := ctx.Err(); err != nil {
 			return total, false, err
@@ -486,6 +492,7 @@ func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) 
 		session, err := gdal.OpenAttributeSession(source.Path, source.Encoding)
 		if err != nil {
 			if source.AllowUnavailable {
+				unavailableSources++
 				continue
 			}
 			return total, false, err
@@ -494,16 +501,19 @@ func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) 
 		closeErr := session.Close()
 		if inspectErr != nil {
 			if source.AllowUnavailable {
+				unavailableSources++
 				continue
 			}
 			return total, false, inspectErr
 		}
 		if closeErr != nil {
 			if source.AllowUnavailable {
+				unavailableSources++
 				continue
 			}
 			return total, false, closeErr
 		}
+		availableSources++
 		for _, overview := range overviews {
 			if source.LayerName != "" && overview.Name != source.LayerName {
 				continue
@@ -517,6 +527,12 @@ func inspectSourceFeatureCount(ctx context.Context, sources []vectorSourceSpec) 
 			}
 			total += overview.FeatureCount
 		}
+	}
+	// A workspace with no available sources has no evidence that its layers
+	// are small. Keep it windowed so relinking a large SHP does not materialize
+	// the entire dataset before the normal large-source preflight can run.
+	if availableSources == 0 && unavailableSources > 0 {
+		unknownCount = true
 	}
 	return total, unknownCount, nil
 }
@@ -871,8 +887,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	usedNames := make(map[string]bool, len(baseLayers))
 	var extent [4]float64
 	hasExtent := false
-	var preferredExtent [4]float64
-	hasPreferredExtent := false
+	var polygonFits, pointFits []layerFitContribution
 	targetCRS := strings.TrimSpace(displayCRS)
 	if baseExtent != nil {
 		extent, hasExtent = *baseExtent, true
@@ -924,10 +939,18 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			return nil, true, fmt.Errorf("open %q: %w", source.Path, err)
 		}
 		sessions = append(sessions, session)
-		indexLimit := min(remainingGeoJSONIndexFeatures, 1_000_000)
-		streamIndexApplied, err := session.SetGeoJSONStreamIndexFeatureLimit(indexLimit)
-		if err != nil {
-			return nil, true, fmt.Errorf("configure source index for %q: %w", source.Path, err)
+		// Reserve part of the runtime's per-feature index budget for each
+		// remaining file. Large early files must not consume the whole budget
+		// or cause later outlier-bearing files to lose all fine-grained bounds.
+		indexLimit := remainingGeoJSONIndexFeatures / (len(sources) - sourceIndex)
+		indexLimit = min(indexLimit, 1_000_000)
+		retainedIndexEntries, preindexed := session.GeoJSONStreamIndexState()
+		streamIndexApplied := preindexed
+		if !preindexed {
+			streamIndexApplied, err = session.SetGeoJSONStreamIndexFeatureLimit(indexLimit)
+			if err != nil {
+				return nil, true, fmt.Errorf("configure source index for %q: %w", source.Path, err)
+			}
 		}
 		overviews, err := session.Inspect(ctx)
 		if err != nil {
@@ -939,8 +962,12 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			}
 			return nil, true, fmt.Errorf("inspect %q: %w", source.Path, err)
 		}
-		if streamIndexApplied && len(overviews) == 1 && overviews[0].FeatureCount >= 0 && overviews[0].FeatureCount <= indexLimit {
-			remainingGeoJSONIndexFeatures -= overviews[0].FeatureCount
+		if streamIndexApplied && len(overviews) == 1 && overviews[0].FeatureCount >= 0 {
+			if preindexed {
+				remainingGeoJSONIndexFeatures = max(0, remainingGeoJSONIndexFeatures-retainedIndexEntries)
+			} else {
+				remainingGeoJSONIndexFeatures -= min(overviews[0].FeatureCount, indexLimit)
+			}
 		}
 		selected := overviews[:0]
 		for _, overview := range overviews {
@@ -1060,9 +1087,6 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				extent[2] = math.Max(extent[2], targetBounds[2])
 				extent[3] = math.Max(extent[3], targetBounds[3])
 			}
-			if !isPointGeometryType(overview.GeometryType) {
-				preferredExtent, hasPreferredExtent = mergeExtent(preferredExtent, hasPreferredExtent, targetBounds)
-			}
 			page, _, err := session.OpenAttributePage(ctx, overview.Name, 0, 1)
 			if err != nil {
 				return nil, true, fmt.Errorf("read schema for %q: %w", overview.Name, err)
@@ -1071,8 +1095,9 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 				Name: overview.Name, Fields: page.Fields, SourcePath: source.Path,
 				SourceLayerName: overview.Name, SourceEncoding: source.Encoding,
 				SourceCRS: sourceCRS, CRS: core.CRS{AuthorityCode: targetCRS},
-				Visible:     source.Visible == nil || *source.Visible,
-				DisplayName: source.DisplayName, Style: source.Style, Labels: source.Labels, DisplayRule: source.DisplayRule,
+				GeometryType: overview.GeometryType,
+				Visible:      source.Visible == nil || *source.Visible,
+				DisplayName:  source.DisplayName, Style: source.Style, Labels: source.Labels, DisplayRule: source.DisplayRule,
 			}
 			if source.Name != "" {
 				layer.Name = source.Name
@@ -1102,9 +1127,77 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 						layer.Name, acceptedIDs.Count(), overview.FeatureCount, time.Since(started).Milliseconds()))
 				}
 			}
+			overlapReferenceBounds := overview.Bounds
+			var acceptedRenderBounds [4]float64
+			hasAcceptedRenderBounds := false
+			var sourceEnvelopeSamples [][4]float64
+			if acceptedIDs == nil || acceptedIDs.Count() > 0 {
+				fitSourceBounds := overview.Bounds
+				if acceptedBounds, ok := acceptedIDs.Bounds(); ok {
+					fitSourceBounds = acceptedBounds
+				} else if samples, sampleErr := session.SampleGeometryEnvelopes(ctx, overview.Name, overview.FeatureCount, 256); sampleErr != nil {
+					if ctx.Err() != nil {
+						return nil, true, ctx.Err()
+					}
+					native.RecordDiagnostic("render", fmt.Sprintf("fit sample unavailable layer=%s: %v", layer.Name, sampleErr))
+				} else {
+					sourceEnvelopeSamples = samples
+					if robustBounds, ok := robustFitBoundsFromSamples(overview.Bounds, samples); ok {
+						fitSourceBounds = robustBounds
+					}
+				}
+				// The mean envelope is unfiltered. Use the robust source fit only
+				// when it was likewise derived from the unfiltered source; a
+				// distant feature must not disable coarse dense overviews.
+				if acceptedIDs == nil {
+					overlapReferenceBounds = fitSourceBounds
+				}
+				fitBounds := targetBounds
+				if fitSourceBounds != overview.Bounds {
+					if strings.EqualFold(sourceCRS, targetCRS) {
+						fitBounds = fitSourceBounds
+					} else if transformed, transformErr := (proj.Transformer{}).TransformBounds(ctx,
+						core.CRS{AuthorityCode: sourceCRS}, core.CRS{AuthorityCode: targetCRS}, fitSourceBounds); transformErr == nil {
+						fitBounds = transformed
+					} else {
+						native.RecordDiagnostic("render", fmt.Sprintf("sampled fit bounds unavailable layer=%s: %v", layer.Name, transformErr))
+					}
+				}
+				if acceptedIDs != nil && validMapExtent(fitBounds) {
+					acceptedRenderBounds, hasAcceptedRenderBounds = fitBounds, true
+				}
+				fitCount := overview.FeatureCount
+				if acceptedIDs != nil {
+					fitCount = acceptedIDs.Count()
+				}
+				contribution := layerFitContribution{bounds: fitBounds, count: fitCount}
+				if isPointGeometryType(overview.GeometryType) {
+					pointFits = append(pointFits, contribution)
+				} else {
+					polygonFits = append(polygonFits, contribution)
+				}
+			}
+			broadOverlap := false
+			if overview.FeatureCount >= 100_000 &&
+				overlapReferenceBounds[2] > overlapReferenceBounds[0] && overlapReferenceBounds[3] > overlapReferenceBounds[1] {
+				meanX, meanY, count, spanErr := session.MeanGeometryEnvelopeSpans(ctx, overview.Name)
+				if spanErr != nil {
+					if ctx.Err() != nil {
+						return nil, true, ctx.Err()
+					}
+					native.RecordDiagnostic("render", fmt.Sprintf("envelope spans unavailable layer=%s: %v", layer.Name, spanErr))
+				} else {
+					if count == 0 {
+						meanX, meanY, count = medianSampleEnvelopeSpans(sourceEnvelopeSamples)
+					}
+					broadOverlap = count >= 64 && meanX/(overlapReferenceBounds[2]-overlapReferenceBounds[0]) >= 0.5 &&
+						meanY/(overlapReferenceBounds[3]-overlapReferenceBounds[1]) >= 0.5
+				}
+			}
 			bindings[layer.Name] = readOnlyLayerBinding{
 				session: session, windowPool: windowPool, sourceName: overview.Name, layer: layer,
 				sourceCRS: sourceCRS, featureCount: overview.FeatureCount, acceptedIDs: acceptedIDs,
+				broadOverlap: broadOverlap, renderBounds: acceptedRenderBounds, hasRenderBounds: hasAcceptedRenderBounds,
 			}
 			layerBounds[layer.Name] = targetBounds
 			layerGeometryTypes[layer.Name] = overview.GeometryType
@@ -1140,10 +1233,14 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 			runtime.layerGeometryTypes[name] = geometryType
 		}
 	}
+	preferredExtent, hasPreferredExtent := dominantLayerFitExtent(polygonFits)
+	pointPreferredExtent, hasPointPreferredExtent := dominantLayerFitExtent(pointFits)
 	if hasPreferredExtent {
 		runtime.mapFitExtent = preferredExtent
 	} else if baseExtent != nil {
 		runtime.mapFitExtent = *baseExtent
+	} else if hasPointPreferredExtent {
+		runtime.mapFitExtent = pointPreferredExtent
 	} else {
 		runtime.mapFitExtent = extent
 	}
@@ -1159,7 +1256,7 @@ func tryLoadWindowedReadOnlyRuntimeWithBaseLayersAndSession(ctx context.Context,
 	// Feature names are only needed when the viewport assigns transient IDs.
 	// Sources that preserve IDs resolve attributes through their own reader.
 	if !runtime.preserveReadOnlyFeatureIDs {
-		runtime.windowFeatureNames = make(map[uint64]string)
+		runtime.windowFeatureNames = make(map[windowFeatureNameKey]string)
 	}
 	runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
 	runtime.readOnlyBindings = bindings
@@ -1220,7 +1317,7 @@ func (runtime *demoRuntime) readOnlyAttributeFeature(_ context.Context, layerNam
 		}
 	}
 	runtime.mu.Lock()
-	name, ok := runtime.windowFeatureNames[featureID]
+	name, ok := runtime.windowFeatureNames[windowFeatureNameKey{layer: layerName, id: featureID}]
 	runtime.mu.Unlock()
 	if !ok {
 		return core.Feature{}, fmt.Errorf("feature %d is outside the current render window", featureID)
@@ -1310,7 +1407,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	// Properties are needed for label expressions and for the selected
 	// feature's display name. The layer snapshot is chunk-scoped and dropped
 	// after vertex generation; the runtime retains only the small name map.
-	chunkSize := readOnlyWindowChunkSize(key.ZoomBucket)
+	chunkSize := readOnlyKeyChunkSize(key, readOnlyWindowChunkSize(key.ZoomBucket))
 	queryBounds, ok := renderChunkBounds(runtime.mapExtent, chunkSize, key)
 	if !ok {
 		return render.Chunk{Key: key}, nil
@@ -1368,17 +1465,63 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	var window core.Layer
 	var subdivided bool
 	filteredAtSource := false
+	sampledOverview := false
+	if forceOverview && isPostGISSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule) {
+		if sampler, ok := windowSession.(interface {
+			OpenOverviewWindowSampled(context.Context, string, [4]float64, bool, int, int64) (core.Layer, error)
+		}); ok {
+			window, err = sampler.OpenOverviewWindowSampled(ctx, binding.sourceName, queryBounds,
+				includeProperties, maxReadOnlySampledOverviewFeatures, maxReadOnlySampledOverviewBytes)
+			if err == nil {
+				sampledOverview = true
+				native.RecordDiagnostic("render", fmt.Sprintf("sampled overview layer=%s chunk=%v features=%d", key.Layer, key, len(window.Features)))
+			} else {
+				native.RecordDiagnostic("render", fmt.Sprintf("sampled overview unavailable layer=%s: %v", key.Layer, err))
+				err = nil
+			}
+		}
+	} else if forceOverview && supportsSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule) {
+		if sampler, ok := windowSession.(interface {
+			OpenOverviewWindowSampled(context.Context, string, [4]float64, bool, int, int64, *gdal.FeatureIDSet,
+				func(map[string]any) (bool, error)) (core.Layer, error)
+		}); ok {
+			var predicate func(map[string]any) (bool, error)
+			if displayRuleProgram != nil {
+				predicate = func(properties map[string]any) (bool, error) {
+					return displayRuleProgram.EvaluateRule(ctx, properties)
+				}
+			}
+			window, err = sampler.OpenOverviewWindowSampled(ctx, binding.sourceName, queryBounds,
+				includeProperties, maxReadOnlySampledOverviewFeatures, maxReadOnlySampledOverviewBytes,
+				binding.acceptedIDs, predicate)
+			if err == nil {
+				sampledOverview = true
+				native.RecordDiagnostic("render", fmt.Sprintf("sampled overview layer=%s chunk=%v features=%d", key.Layer, key, len(window.Features)))
+			} else {
+				native.RecordDiagnostic("render", fmt.Sprintf("sampled overview unavailable layer=%s: %v", key.Layer, err))
+				err = nil
+			}
+			if !sampledOverview && displayRuleProgram != nil {
+				// A failed sample may have advanced a stateful Lua rule. The exact
+				// fallback must start with a fresh program.
+				displayRuleProgram, err = scripting.CompileLabelProgram(binding.layer.DisplayRule)
+				if err == nil {
+					defer displayRuleProgram.Close()
+				}
+			}
+		}
+	}
 	// The common SHP case can test attributes before copying hidden geometry
 	// to WKB. Keep the existing deduplicating subdivision path for an overfull
 	// root window; it evaluates each source feature only once across children.
-	if acceptsFeature != nil && strings.EqualFold(filepath.Ext(binding.layer.SourcePath), ".shp") {
+	if !sampledOverview && acceptsFeature != nil && strings.EqualFold(filepath.Ext(binding.layer.SourcePath), ".shp") {
 		if filteredSession, ok := windowSession.(interface {
 			OpenShapefileWindowWithLimitsFiltered(context.Context, string, [4]float64, int, int64, func(map[string]any) (bool, error)) (core.Layer, error)
 		}); ok {
 			predicate := func(properties map[string]any) (bool, error) {
 				return displayRuleProgram.EvaluateRule(ctx, properties)
 			}
-			if binding.acceptedIDs != nil && !overview {
+			if binding.acceptedIDs != nil {
 				if indexedSession, supportsIndex := windowSession.(interface {
 					OpenShapefileWindowWithLimitsFilteredIDs(context.Context, string, [4]float64, int, int64, *gdal.FeatureIDSet, func(map[string]any) (bool, error)) (core.Layer, error)
 				}); supportsIndex {
@@ -1408,17 +1551,53 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			}
 		}
 	}
-	if !filteredAtSource && err == nil {
-		window, subdivided, err = openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx, queryBounds,
-			visibleFeatureLimit, visiblePayloadLimit, func(bounds [4]float64) (core.Layer, error) {
+	if !sampledOverview && !filteredAtSource && err == nil {
+		if overview && !forceOverview && binding.acceptedIDs == nil && binding.featureCount > defaultVisibleFeatureLimit && (supportsSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule) ||
+			isPostGISSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule)) {
+			// At overview scale a root window above the exact query budget
+			// already needs the approximate retry. Recursively probing many
+			// dense children before that retry duplicates geometry decoding.
+			window, err = windowSession.OpenWindowWithLimits(ctx, binding.sourceName, queryBounds,
+				includeProperties, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
+			if err == nil && acceptsFeature != nil {
+				if filterErr := filterWindowFeatures(ctx, &window, acceptsFeature); filterErr != nil {
+					err = fmt.Errorf("display rule: %w", filterErr)
+				}
+			}
+		} else {
+			openWindow := func(bounds [4]float64) (core.Layer, error) {
 				return windowSession.OpenWindowWithLimits(ctx, binding.sourceName, bounds, includeProperties,
 					maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes)
-			}, acceptsFeature)
+			}
+			remainingPredicate := acceptsFeature
+			if binding.acceptedIDs != nil && acceptsFeature != nil {
+				if indexedSession, ok := windowSession.(interface {
+					OpenShapefileWindowWithLimitsFilteredIDs(context.Context, string, [4]float64, int, int64, *gdal.FeatureIDSet, func(map[string]any) (bool, error)) (core.Layer, error)
+				}); ok {
+					openWindow = func(bounds [4]float64) (core.Layer, error) {
+						return indexedSession.OpenShapefileWindowWithLimitsFilteredIDs(ctx, binding.sourceName,
+							bounds, maxReadOnlyWindowFeatures, maxReadOnlyWindowBytes, binding.acceptedIDs,
+							func(properties map[string]any) (bool, error) {
+								return displayRuleProgram.EvaluateRule(ctx, properties)
+							})
+					}
+					remainingPredicate = nil
+				}
+			}
+			window, subdivided, err = openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx, queryBounds,
+				visibleFeatureLimit, visiblePayloadLimit, openWindow, remainingPredicate)
+		}
 	}
 	if binding.windowPool != nil {
 		binding.windowPool <- windowSession
 	}
 	if err != nil {
+		if !forceOverview && (supportsSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule) ||
+			isPostGISSampledOverviewSource(binding.layer.SourcePath, binding.layer.DisplayRule)) &&
+			(isReadOnlyWindowSubdivisionError(err) || strings.Contains(err.Error(), "spatial window subdivision exceeded") ||
+				strings.Contains(err.Error(), "subdivided spatial window exceeds")) {
+			err = fmt.Errorf("sampled overview retry available: %w", err)
+		}
 		return render.Chunk{}, fmt.Errorf("query %s window %v: %w", key.Layer, key, err)
 	}
 	queryElapsed := time.Since(profileStarted)
@@ -1434,7 +1613,16 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 	}
 	if overview {
 		setStage("sample-overview")
+		if sampledOverview {
+			overviewStride = 1
+		}
 		window = sampleReadOnlyOverviewFeatures(window, overviewStride)
+		if isPointGeometryType(runtime.layerGeometryTypes[binding.layer.Name]) && !binding.layer.Labels.Enabled {
+			// Identical points share one screen symbol at overview scale. A
+			// sampled 10M source can still return thousands of coincident rows
+			// per tile; drawing each one needlessly expands the Qt vertex batch.
+			window = deduplicateReadOnlyOverviewPoints(window)
+		}
 		if polygonOverview && !denseParcelOverview {
 			setStage("dissolve-overview")
 			started := time.Now()
@@ -1609,7 +1797,7 @@ func (runtime *demoRuntime) buildReadOnlyWindowChunk(ctx context.Context, key re
 			runtime.windowFeatureCounts[key] = len(window.Features)
 			runtime.windowPayloadBytes[key] = payloadBytes
 			for id, name := range featureNames {
-				runtime.windowFeatureNames[id] = name
+				runtime.windowFeatureNames[windowFeatureNameKey{layer: key.Layer, id: id}] = name
 			}
 			ids := make([]uint64, 0, len(featureNames))
 			for id := range featureNames {
@@ -1673,7 +1861,7 @@ func simpleStringFilterForLayer(layer core.Layer) (gdal.StringAttributeFilter, b
 	}
 	for _, field := range layer.Fields {
 		if field.Name == filter.Field && field.Type == core.FieldTypeText {
-			return gdal.StringAttributeFilter{Field: filter.Field, Value: filter.Value, Prefix: filter.Prefix}, true
+			return gdal.StringAttributeFilter{Field: filter.Field, Value: filter.Value, Prefix: filter.Prefix, Contains: filter.Contains}, true
 		}
 	}
 	return gdal.StringAttributeFilter{}, false
@@ -1831,6 +2019,11 @@ func validateReadOnlyWindowMetadata(layerName, sourceCRS string, hasBounds bool)
 const (
 	// Bounds the transient Go geometry/property snapshot for a single chunk.
 	maxReadOnlyWindowFeatures = 20_000
+	// A forced approximate overview should remain useful when every exact
+	// subdivision still intersects a dense source. Stop after a small bounded
+	// spatial prefix before WKB and geometry construction can grow with 10M+.
+	maxReadOnlySampledOverviewFeatures = 2_000
+	maxReadOnlySampledOverviewBytes    = 8 << 20
 	// Bounds polygon coordinate complexity before GEOS triangulation in a
 	// window-backed read-only render.
 	maxReadOnlyWindowPolygonVertices = 250_000
@@ -1899,6 +2092,32 @@ func sampleReadOnlyOverviewFeatures(layer core.Layer, stride int) core.Layer {
 		features = append(features, layer.Features[0])
 	}
 	layer.Features = features
+	return layer
+}
+
+// Only sampled point overviews call this. Exact detail and attribute pages
+// retain every source row, including coincident features with different data.
+func deduplicateReadOnlyOverviewPoints(layer core.Layer) core.Layer {
+	if len(layer.Features) < 2 {
+		return layer
+	}
+	seen := make(map[[32]byte]struct{}, min(len(layer.Features), 2048))
+	kept := layer.Features[:0]
+	for _, feature := range layer.Features {
+		geometry, ok := feature.Geometry.(core.WKBGeometry)
+		if !ok || len(geometry.WKB) == 0 {
+			kept = append(kept, feature)
+			continue
+		}
+		fingerprint := sha256.Sum256(geometry.WKB)
+		if _, duplicate := seen[fingerprint]; duplicate {
+			continue
+		}
+		seen[fingerprint] = struct{}{}
+		kept = append(kept, feature)
+	}
+	clear(layer.Features[len(kept):])
+	layer.Features = kept
 	return layer
 }
 
@@ -2167,6 +2386,23 @@ func openReadOnlyWindowWithSubdivisionFilteredWithLimits(ctx context.Context, bo
 	return merged, true, nil
 }
 
+func supportsSampledOverviewSource(path, displayRule string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".shp", ".gpkg":
+		return true
+	case ".geojson", ".json", ".geojsonl", ".geojsons":
+		// The stream sampler currently has no predicate hook. A Lua display
+		// rule must not be bypassed by an approximate viewport retry.
+		return strings.TrimSpace(displayRule) == ""
+	default:
+		return false
+	}
+}
+
+func isPostGISSampledOverviewSource(path, displayRule string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(path)), "postgis://") && strings.TrimSpace(displayRule) == ""
+}
+
 func isReadOnlyWindowSubdivisionError(err error) bool {
 	if err == nil {
 		return false
@@ -2174,7 +2410,9 @@ func isReadOnlyWindowSubdivisionError(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "feature limit of") ||
 		strings.Contains(message, "spatial window exceeds the limit of") ||
-		strings.Contains(message, "payload limit of")
+		strings.Contains(message, "payload limit of") ||
+		strings.Contains(message, "-feature limit; zoom in") ||
+		strings.Contains(message, "MiB byte limit; zoom in")
 }
 
 func splitReadOnlyWindowBounds(bounds [4]float64) [][4]float64 {
@@ -4477,6 +4715,122 @@ func preferredMapFitExtent(dataExtent [4]float64, layerBounds map[string][4]floa
 		return fitExtent
 	}
 	return dataExtent
+}
+
+// robustFitBoundsFromSamples changes the preferred initial view only when
+// source metadata is much wider than a distributed geometry sample. The
+// source bounds remain authoritative for queries, coordinates, and navigation.
+// Median spans keep a small number of broad or distant source features from
+// making a distributed SHP/GeoPackage layer look broadly overlapping.
+func medianSampleEnvelopeSpans(samples [][4]float64) (float64, float64, int) {
+	xs, ys := make([]float64, 0, len(samples)), make([]float64, 0, len(samples))
+	for _, bounds := range samples {
+		if !validMapExtent(bounds) {
+			continue
+		}
+		x, y := bounds[2]-bounds[0], bounds[3]-bounds[1]
+		if math.IsInf(x, 0) || math.IsInf(y, 0) {
+			continue
+		}
+		xs, ys = append(xs, x), append(ys, y)
+	}
+	if len(xs) == 0 {
+		return 0, 0, 0
+	}
+	sort.Float64s(xs)
+	sort.Float64s(ys)
+	return xs[len(xs)/2], ys[len(ys)/2], len(xs)
+}
+
+func robustFitBoundsFromSamples(source [4]float64, samples [][4]float64) ([4]float64, bool) {
+	if len(samples) < 64 || !validMapExtent(source) {
+		return [4]float64{}, false
+	}
+	minsX, minsY := make([]float64, 0, len(samples)), make([]float64, 0, len(samples))
+	maxsX, maxsY := make([]float64, 0, len(samples)), make([]float64, 0, len(samples))
+	for _, bounds := range samples {
+		if !validMapExtent(bounds) {
+			continue
+		}
+		minsX, minsY = append(minsX, bounds[0]), append(minsY, bounds[1])
+		maxsX, maxsY = append(maxsX, bounds[2]), append(maxsY, bounds[3])
+	}
+	if len(minsX) < 64 {
+		return [4]float64{}, false
+	}
+	sort.Float64s(minsX)
+	sort.Float64s(minsY)
+	sort.Float64s(maxsX)
+	sort.Float64s(maxsY)
+	trim := max(1, len(minsX)/100)
+	last := len(minsX) - 1 - trim
+	fit := [4]float64{minsX[trim], minsY[trim], maxsX[last], maxsY[last]}
+	spanX, spanY := source[2]-source[0], source[3]-source[1]
+	if fit[2] <= fit[0] {
+		fit[0] -= math.Max(spanX*1e-9, 1e-9) / 2
+		fit[2] += math.Max(spanX*1e-9, 1e-9) / 2
+	}
+	if fit[3] <= fit[1] {
+		fit[1] -= math.Max(spanY*1e-9, 1e-9) / 2
+		fit[3] += math.Max(spanY*1e-9, 1e-9) / 2
+	}
+	fitSpanX, fitSpanY := fit[2]-fit[0], fit[3]-fit[1]
+	if fitSpanX <= 0 || fitSpanY <= 0 || math.Max(spanX/fitSpanX, spanY/fitSpanY) < 64 {
+		return [4]float64{}, false
+	}
+	paddingX, paddingY := fitSpanX*0.05, fitSpanY*0.05
+	fit = [4]float64{
+		math.Max(source[0], fit[0]-paddingX), math.Max(source[1], fit[1]-paddingY),
+		math.Min(source[2], fit[2]+paddingX), math.Min(source[3], fit[3]+paddingY),
+	}
+	return fit, validMapExtent(fit)
+}
+
+type layerFitContribution struct {
+	bounds [4]float64
+	count  int
+}
+
+// A tiny, distant file should not make a much larger group of layers nearly
+// invisible on initial fit. It remains in the full extent and layer list.
+func dominantLayerFitExtent(contributions []layerFitContribution) ([4]float64, bool) {
+	anchor := -1
+	for i, contribution := range contributions {
+		if validMapExtent(contribution.bounds) && contribution.count > 0 &&
+			(anchor < 0 || contribution.count > contributions[anchor].count) {
+			anchor = i
+		}
+	}
+	if anchor < 0 {
+		return [4]float64{}, false
+	}
+	anchorBounds := contributions[anchor].bounds
+	anchorWidth, anchorHeight := anchorBounds[2]-anchorBounds[0], anchorBounds[3]-anchorBounds[1]
+	var fit [4]float64
+	hasFit := false
+	for i, contribution := range contributions {
+		if contribution.count <= 0 || !validMapExtent(contribution.bounds) {
+			continue
+		}
+		if i != anchor && contribution.count < max(1, contributions[anchor].count/100) {
+			union, _ := mergeExtent(anchorBounds, true, contribution.bounds)
+			if math.Max(extentGrowth(union[2]-union[0], anchorWidth), extentGrowth(union[3]-union[1], anchorHeight)) > 64 {
+				continue
+			}
+		}
+		fit, hasFit = mergeExtent(fit, hasFit, contribution.bounds)
+	}
+	return fit, hasFit
+}
+
+func extentGrowth(span, anchorSpan float64) float64 {
+	if anchorSpan == 0 {
+		if span == 0 {
+			return 1
+		}
+		return math.Inf(1)
+	}
+	return span / anchorSpan
 }
 
 func isPointGeometryType(geometryType string) bool {

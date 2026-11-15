@@ -225,7 +225,10 @@ func TestViewportBatchBudgetRetriesOnceWithGeneralizedOverview(t *testing.T) {
 		want             bool
 	}{
 		{name: "large read-only viewport", err: batchError, readOnly: true, want: true},
+		{name: "dense window", err: "query polygons window: sampled overview retry available: feature limit of 20000 features exceeded", readOnly: true, want: true},
+		{name: "unsupported dense source", err: "spatial window subdivision exceeded 256 queries", readOnly: true},
 		{name: "already retried", err: batchError, readOnly: true, forced: true},
+		{name: "dense already retried", err: "sampled overview retry available: feature limit of 20000 features exceeded", readOnly: true, forced: true},
 		{name: "editable project", err: batchError},
 		{name: "different render failure", err: "GEOS simplify failed", readOnly: true},
 	} {
@@ -305,8 +308,9 @@ func TestReleaseAttributePayloadCacheClearsRetainedPages(t *testing.T) {
 
 func TestEstimateAttributePayloadJSONBytesBoundsEscapedAndNestedValues(t *testing.T) {
 	payload := attributePayload{
-		Columns: []string{"name"},
-		Fields:  []attributeFieldHint{{Name: "name", Type: core.FieldTypeText}},
+		LayerName: "한글 레이어",
+		Columns:   []string{"name"},
+		Fields:    []attributeFieldHint{{Name: "name", Type: core.FieldTypeText}},
 		Rows: []attributePayloadRow{{FeatureID: 1, Values: map[string]any{
 			"name": "한글 <road>", "nested": []any{map[string]any{"ok": true, "count": float64(2)}},
 			"bytes": []byte{0, 1, 2}, "number": json.Number("1.234e+20"), "integer": int64(-42),
@@ -368,7 +372,7 @@ func TestRetainVisibleWindowChunksReleasesOffscreenGeometry(t *testing.T) {
 		windowVisibleFeatureCount: 3,
 		windowVisiblePayloadBytes: 30,
 		windowFeatureIDs:          map[render.ChunkKey][]uint64{oldKey: {101}, keepKey: {202, 203}},
-		windowFeatureNames:        map[uint64]string{101: "offscreen", 202: "visible", 203: "visible 2"},
+		windowFeatureNames:        map[windowFeatureNameKey]string{{layer: "parcels", id: 101}: "offscreen", {layer: "parcels", id: 202}: "visible", {layer: "parcels", id: 203}: "visible 2"},
 		windowHits: map[render.ChunkKey][]render.HitFeature{
 			oldKey:  {{Layer: "parcels", FeatureID: 101, Vertices: []render.Point{{X: 0.1, Y: 0.1}}}},
 			keepKey: {{Layer: "parcels", FeatureID: 202, Vertices: []render.Point{{X: 0.2, Y: 0.1}}}},
@@ -386,7 +390,7 @@ func TestRetainVisibleWindowChunksReleasesOffscreenGeometry(t *testing.T) {
 	if runtime.windowVisibleFeatureCount != 2 || runtime.windowVisiblePayloadBytes != 20 {
 		t.Fatalf("retained budgets = %d features/%d bytes, want 2/20", runtime.windowVisibleFeatureCount, runtime.windowVisiblePayloadBytes)
 	}
-	if _, ok := runtime.windowFeatureNames[101]; ok || len(runtime.windowHits[oldKey]) != 0 || len(runtime.windowLabels[oldKey]) != 0 {
+	if _, ok := runtime.windowFeatureNames[windowFeatureNameKey{layer: "parcels", id: 101}]; ok || len(runtime.windowHits[oldKey]) != 0 || len(runtime.windowLabels[oldKey]) != 0 {
 		t.Fatal("offscreen hit geometry, labels, or name remained cached")
 	}
 	if len(runtime.features) != 1 || runtime.features[0].FeatureID != 202 || len(runtime.mapLabels) != 1 || runtime.mapLabels[0].Text != "visible" {
@@ -452,7 +456,7 @@ func TestReleaseHiddenRenderResourcesDropsViewportState(t *testing.T) {
 		windowVisibleFeatureCount: 1,
 		windowVisiblePayloadBytes: 12,
 		windowFeatureIDs:          map[render.ChunkKey][]uint64{key: {9}},
-		windowFeatureNames:        map[uint64]string{9: "window"},
+		windowFeatureNames:        map[windowFeatureNameKey]string{{layer: "parcels", id: 9}: "window"},
 		windowHits:                map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 9}}},
 		windowLabels:              map[render.ChunkKey][]render.LayerLabel{key: {{Text: "window"}}},
 		hasCompleteFrame:          true,

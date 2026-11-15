@@ -10,6 +10,11 @@ func TestSimpleStringFilter(t *testing.T) {
 	}{
 		{"return feature.COL_ADM_SE == '44150'", StringFilter{Field: "COL_ADM_SE", Value: "44150"}, true},
 		{"return string.sub(feature.A3, 1, 5) == '44150'", StringFilter{Field: "A3", Value: "44150", Prefix: true}, true},
+		{"return gogis.contains(feature.A3, '44150')", StringFilter{Field: "A3", Value: "44150", Contains: true}, true},
+		{"return gogis.contains ( feature.COL_ADM_SE , \"44150\" )", StringFilter{Field: "COL_ADM_SE", Value: "44150", Contains: true}, true},
+		{"return gogis.contains(feature.A3, '44%')", StringFilter{}, false},
+		{"return gogis.contains(feature.A3, '44150', true)", StringFilter{}, false},
+		{"return gogis.contains(feature.A3, '44150') or true", StringFilter{}, false},
 		{"return string.sub(feature.A3, 1, 4) == '44150'", StringFilter{}, false},
 		{"return feature.A3 == '44150' or feature.B3 == '44150'", StringFilter{}, false},
 		{"return feature.A3 == '44%'", StringFilter{}, false},

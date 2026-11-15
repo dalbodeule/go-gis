@@ -149,6 +149,10 @@ func TestPostGISIntegrationSaveLayerRollbackPreservesSnapshot(t *testing.T) {
 	if err != nil || len(window.Features) != 1 || window.Features[0].ID != 1 {
 		t.Fatalf("read PostGIS window: features=%d err=%v", len(window.Features), err)
 	}
+	sampled, err := store.OpenOverviewWindowSampled(ctx, table, [4]float64{126, 36, 128, 38}, true, 1, 1<<20)
+	if err != nil || len(sampled.Features) != 1 || sampled.Features[0].ID != 1 {
+		t.Fatalf("sample PostGIS overview: features=%d err=%v", len(sampled.Features), err)
+	}
 
 	// The first replacement insert succeeds, then malformed WKT makes the next
 	// PostGIS insert fail after the previous snapshot has been deleted. The

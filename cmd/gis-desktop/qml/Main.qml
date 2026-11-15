@@ -1116,7 +1116,10 @@ ApplicationWindow {
                 }
             }
         }
-        onOpened: errorText = ""
+        onOpened: {
+            errorText = "";
+            postGISExportLayer.currentIndex = layerModel.count > 0 ? 0 : -1;
+        }
     }
 
     Dialog {
@@ -1965,8 +1968,10 @@ ApplicationWindow {
 
                 function selectLayer(name) {
                     var layerChanged = activeLayer !== name || mapCanvas.activeLayer !== name;
-                    if (layerChanged)
+                    if (layerChanged) {
                         attributeFieldHints = [];
+                        attributeModel.rows = [];
+                    }
                     activeLayer = name;
                     if (mapCanvas.activeLayer !== name) {
                         mapCanvas.activeLayer = name;
@@ -2628,20 +2633,25 @@ ApplicationWindow {
                             var fieldHintsVisible = attributeDialog.visible || layerSettingsDialog.visible;
                             if (fieldHintsVisible) {
                                 var table = mapViewport.parseJSONObject(mapCanvas.attributePayload);
-                                var columns = Array.isArray(table.columns) ? table.columns.slice(0, mapViewport.maxAttributeColumns) : [];
-                                mapViewport.attributeColumns = columns;
-                                var fields = Array.isArray(table.fields) ? table.fields.slice(0, mapViewport.maxAttributeColumns) : columns.map(function(name) { return {name: name, type: "unknown"}; });
-                                mapViewport.attributeFieldHints = fields;
-                                var pageNumber = Number(table.page);
-                                var pageSize = Number(table.pageSize);
-                                var totalRecords = Number(table.total);
-                                mapViewport.attributePage = isFinite(pageNumber) && pageNumber >= 0 ? Math.floor(pageNumber) : 0;
-                                mapViewport.attributePageSize = isFinite(pageSize) && pageSize > 0 ? Math.min(mapViewport.maxAttributeRows, Math.floor(pageSize)) : 0;
-                                mapViewport.attributeTotal = isFinite(totalRecords) && totalRecords >= 0 ? Math.floor(totalRecords) : 0;
-                                var rows = Array.isArray(table.rows) ? table.rows.slice(0, mapViewport.maxAttributeRows) : [];
-                                // Replace one bounded page at once instead of
-                                // emitting one ListModel change per record.
-                                attributeModel.rows = attributeDialog.visible ? rows : [];
+                                // Attribute page requests complete asynchronously. An older
+                                // layer's page must never populate the current layer's editor.
+                                var expectedLayer = layerSettingsDialog.visible ? layerSettingsDialog.targetLayerName : mapViewport.activeLayer;
+                                if (table.layerName === expectedLayer) {
+                                    var columns = Array.isArray(table.columns) ? table.columns.slice(0, mapViewport.maxAttributeColumns) : [];
+                                    mapViewport.attributeColumns = columns;
+                                    var fields = Array.isArray(table.fields) ? table.fields.slice(0, mapViewport.maxAttributeColumns) : columns.map(function(name) { return {name: name, type: "unknown"}; });
+                                    mapViewport.attributeFieldHints = fields;
+                                    var pageNumber = Number(table.page);
+                                    var pageSize = Number(table.pageSize);
+                                    var totalRecords = Number(table.total);
+                                    mapViewport.attributePage = isFinite(pageNumber) && pageNumber >= 0 ? Math.floor(pageNumber) : 0;
+                                    mapViewport.attributePageSize = isFinite(pageSize) && pageSize > 0 ? Math.min(mapViewport.maxAttributeRows, Math.floor(pageSize)) : 0;
+                                    mapViewport.attributeTotal = isFinite(totalRecords) && totalRecords >= 0 ? Math.floor(totalRecords) : 0;
+                                    var rows = Array.isArray(table.rows) ? table.rows.slice(0, mapViewport.maxAttributeRows) : [];
+                                    // Replace one bounded page at once instead of
+                                    // emitting one ListModel change per record.
+                                    attributeModel.rows = attributeDialog.visible ? rows : [];
+                                }
                             } else {
                                 attributeModel.rows = [];
                                 mapViewport.attributeFieldHints = [];
@@ -3240,7 +3250,19 @@ ApplicationWindow {
                         onClicked: mapViewport.requestAttributePage(mapViewport.attributePage - 1)
                     }
                     Label {
-                        text: rootWindow.tr("Page") + " " + (mapViewport.attributePage + 1) + " / " + Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
+                        text: rootWindow.tr("Page")
+                    }
+                    SpinBox {
+                        objectName: "attributePageJumpSpinBox"
+                        Layout.preferredWidth: 110
+                        from: 1
+                        to: Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
+                        value: mapViewport.attributePage + 1
+                        editable: true
+                        onValueModified: mapViewport.requestAttributePage(value - 1)
+                    }
+                    Label {
+                        text: "/ " + Math.max(1, Math.ceil(mapViewport.attributeTotal / mapViewport.attributePageSize))
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
                     }
@@ -3667,6 +3689,7 @@ ApplicationWindow {
 
         onOpened: {
             loadLayer();
+            mapViewport.attributeFieldHints = [];
             // Labels and expressions use the same bounded schema payload as
             // the attribute table. Request it while layer properties is open
             // so field hints are available without opening another dialog.

@@ -41,7 +41,8 @@ type forceReadOnlyOverviewContextKey struct{}
 const maxPreservedCompleteFrameChunkKeys = 128
 
 func shouldRetryViewportWithOverview(viewportReadOnly, alreadyForced bool, err string) bool {
-	return viewportReadOnly && !alreadyForced && strings.Contains(err, "viewport render batch exceeds the")
+	return viewportReadOnly && !alreadyForced && (strings.Contains(err, "viewport render batch exceeds the") ||
+		strings.Contains(err, "sampled overview retry available"))
 }
 
 // Main.qml is embedded so the prototype can be launched from a checkout
@@ -400,7 +401,7 @@ type demoRuntime struct {
 	windowPayloadBytes            map[render.ChunkKey]int64
 	windowVisiblePayloadBytes     int64
 	windowVisibleKeys             map[render.ChunkKey]struct{}
-	windowFeatureNames            map[uint64]string
+	windowFeatureNames            map[windowFeatureNameKey]string
 	windowLabels                  map[render.ChunkKey][]render.LayerLabel
 	nextWindowFeatureID           uint64
 	sources                       map[string]render.LayerSource
@@ -451,6 +452,11 @@ type demoRuntime struct {
 	selectionGeneration           uint64
 	selectionCancel               context.CancelFunc
 	allowLargeEditable            bool
+}
+
+type windowFeatureNameKey struct {
+	layer string
+	id    uint64
 }
 
 type vectorSourceSpec struct {
@@ -599,12 +605,13 @@ func (r *demoRuntime) readOnlyPayloadLimitLocked() int64 {
 }
 
 type attributePayload struct {
-	Columns  []string              `json:"columns"`
-	Fields   []attributeFieldHint  `json:"fields"`
-	Rows     []attributePayloadRow `json:"rows"`
-	Page     int                   `json:"page"`
-	PageSize int                   `json:"pageSize"`
-	Total    int                   `json:"total"`
+	LayerName string                `json:"layerName"`
+	Columns   []string              `json:"columns"`
+	Fields    []attributeFieldHint  `json:"fields"`
+	Rows      []attributePayloadRow `json:"rows"`
+	Page      int                   `json:"page"`
+	PageSize  int                   `json:"pageSize"`
+	Total     int                   `json:"total"`
 }
 
 type attributeFieldHint struct {
@@ -1071,7 +1078,7 @@ func (r *demoRuntime) publishAttributesPageDispatched(layerName string, page int
 	r.attributeCancel = cancel
 	r.mu.Unlock()
 	defer cancel()
-	payloadModel := attributePayload{}
+	payloadModel := attributePayload{LayerName: layerName}
 	var layer core.Layer
 	var total int
 	var ok bool
@@ -1310,6 +1317,9 @@ func estimateAttributePayloadJSONBytes(payload attributePayload) int64 {
 	if !add(256) { // top-level object keys, page metadata, and punctuation
 		return limit + 1
 	}
+	if !writeString(payload.LayerName) {
+		return limit + 1
+	}
 	for index, column := range payload.Columns {
 		if index > 0 && !add(1) {
 			return limit + 1
@@ -1384,10 +1394,23 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 		for name, bounds := range r.layerBounds {
 			layerBoundsForKeys[name] = bounds
 		}
+		for name, binding := range r.readOnlyBindings {
+			if binding.hasRenderBounds {
+				layerBoundsForKeys[name] = binding.renderBounds
+			}
+		}
 	}
 	forceOverview := r.forceOverviewNext
 	r.forceOverviewNext = false
 	visibleLayerNames := visibility.VisibleLayers()
+	coarseOverviewLayers := make(map[string]bool)
+	if viewportReadOnly && readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom), r.mapExtent, r.mapFitExtent) <= 1 {
+		for name, binding := range r.readOnlyBindings {
+			if binding.broadOverlap {
+				coarseOverviewLayers[name] = true
+			}
+		}
+	}
 	filteredLayerNames := make([]string, 0)
 	if viewportReadOnly {
 		for _, name := range visibleLayerNames {
@@ -1431,8 +1454,21 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	chunkPlanExceeded := false
 	prunedReadOnlyKeys := 0
 	for _, layer := range visibleLayerNames {
+		if binding, ok := r.readOnlyBindings[layer]; ok && binding.acceptedIDs != nil && binding.acceptedIDs.Count() == 0 {
+			continue
+		}
 		var withinLimit bool
-		keys, withinLimit = planner.VisibleKeysIntoLimit(keys, viewport, layer, render.MaxViewportChunkKeys)
+		layerPlanner := planner
+		if coarseOverviewLayers[layer] {
+			layerPlanner.ChunkSize = 1
+		}
+		start := len(keys)
+		keys, withinLimit = layerPlanner.VisibleKeysIntoLimit(keys, viewport, layer, render.MaxViewportChunkKeys)
+		if coarseOverviewLayers[layer] {
+			for i := start; i < len(keys); i++ {
+				keys[i].Coarse = true
+			}
+		}
 		if !withinLimit {
 			chunkPlanExceeded = true
 			break
@@ -1459,9 +1495,22 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 	hiddenKeys := make([]render.ChunkKey, 0)
 	if !chunkPlanExceeded && len(keys) < render.MaxViewportChunkKeys {
 		for _, layer := range hiddenLayerNames {
+			if binding, ok := r.readOnlyBindings[layer]; ok && binding.acceptedIDs != nil && binding.acceptedIDs.Count() == 0 {
+				continue
+			}
 			var withinLimit bool
-			hiddenKeys, withinLimit = planner.VisibleKeysIntoLimit(hiddenKeys, viewport, layer,
+			layerPlanner := planner
+			if coarseOverviewLayers[layer] {
+				layerPlanner.ChunkSize = 1
+			}
+			start := len(hiddenKeys)
+			hiddenKeys, withinLimit = layerPlanner.VisibleKeysIntoLimit(hiddenKeys, viewport, layer,
 				render.MaxViewportChunkKeys-len(keys))
+			if coarseOverviewLayers[layer] {
+				for i := start; i < len(hiddenKeys); i++ {
+					hiddenKeys[i].Coarse = true
+				}
+			}
 			if !withinLimit {
 				// Drop the optional hidden-layer cache as a whole if its key plan
 				// would exceed the viewport cap; visible rendering takes priority.
@@ -1819,7 +1868,7 @@ func (r *demoRuntime) refresh(ctx context.Context, viewport render.Viewport) {
 					canRetry = r.scheduler == scheduler && scheduler.Generation() == requestGeneration && r.forceOverviewNext
 					r.mu.Unlock()
 					if canRetry {
-						native.RecordDiagnostic("render", fmt.Sprintf("retry generation=%d using generalized polygon boundaries after viewport batch budget", requestGeneration))
+						native.RecordDiagnostic("render", fmt.Sprintf("retry generation=%d using generalized polygon boundaries after viewport batch budget vertices=%d reason=%s", requestGeneration, renderedVertices, renderErr))
 						r.refresh(context.Background(), viewport)
 						return
 					}
@@ -1907,10 +1956,12 @@ func prioritizeViewportChunks(keys []render.ChunkKey, viewport render.Viewport, 
 		}
 		group := keys[start:end]
 		sort.SliceStable(group, func(left, right int) bool {
-			leftX := (float64(group[left].X)+0.5)*chunkSize - viewport.Center.X
-			leftY := (float64(group[left].Y)+0.5)*chunkSize - viewport.Center.Y
-			rightX := (float64(group[right].X)+0.5)*chunkSize - viewport.Center.X
-			rightY := (float64(group[right].Y)+0.5)*chunkSize - viewport.Center.Y
+			leftSize := readOnlyKeyChunkSize(group[left], chunkSize)
+			rightSize := readOnlyKeyChunkSize(group[right], chunkSize)
+			leftX := (float64(group[left].X)+0.5)*leftSize - viewport.Center.X
+			leftY := (float64(group[left].Y)+0.5)*leftSize - viewport.Center.Y
+			rightX := (float64(group[right].X)+0.5)*rightSize - viewport.Center.X
+			rightY := (float64(group[right].Y)+0.5)*rightSize - viewport.Center.Y
 			return leftX*leftX+leftY*leftY < rightX*rightX+rightY*rightY
 		})
 		start = end
@@ -2011,7 +2062,7 @@ func (r *demoRuntime) rebuildWindowFeaturesLocked() {
 
 func (r *demoRuntime) removeWindowChunkLocked(key render.ChunkKey) {
 	for _, id := range r.windowFeatureIDs[key] {
-		delete(r.windowFeatureNames, id)
+		delete(r.windowFeatureNames, windowFeatureNameKey{layer: key.Layer, id: id})
 	}
 	r.windowVisibleFeatureCount -= r.windowFeatureCounts[key]
 	r.windowVisiblePayloadBytes -= r.windowPayloadBytes[key]

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gogis/internal/core"
@@ -92,6 +93,9 @@ type geoJSONTailBlock struct {
 	featureCount int
 	bounds       [4]float64
 	hasBounds    bool
+	spanXSum     float64
+	spanYSum     float64
+	boundedCount int
 }
 
 const (
@@ -291,6 +295,13 @@ func (builder *geoJSONTailIndexBuilder) add(ordinal int, feature *streamedGeoJSO
 	if feature.hasBounds {
 		builder.current.bounds, builder.current.hasBounds = mergeGeoJSONBounds(
 			builder.current.bounds, builder.current.hasBounds, feature.featureBounds)
+		spanX := feature.featureBounds[2] - feature.featureBounds[0]
+		spanY := feature.featureBounds[3] - feature.featureBounds[1]
+		if !math.IsInf(spanX, 0) && !math.IsInf(spanY, 0) && spanX >= 0 && spanY >= 0 {
+			builder.current.spanXSum += spanX
+			builder.current.spanYSum += spanY
+			builder.current.boundedCount++
+		}
 	}
 	if builder.current.featureCount >= geoJSONTailBlockFeatureCount {
 		builder.flush()
@@ -314,6 +325,9 @@ func (builder *geoJSONTailIndexBuilder) flush() {
 			block.endOffset = next.endOffset
 			block.featureCount += next.featureCount
 			block.bounds, block.hasBounds = mergeGeoJSONBounds(block.bounds, block.hasBounds, next.bounds)
+			block.spanXSum += next.spanXSum
+			block.spanYSum += next.spanYSum
+			block.boundedCount += next.boundedCount
 		}
 		merged = append(merged, block)
 	}
@@ -1124,7 +1138,7 @@ func inspectGeoJSONCollectionWithIndexLimitAndTailBlocks(ctx context.Context, pa
 				valid:  feature.hasBounds,
 			}, indexLimit)
 		}
-		if !indexAvailable && indexLimit > 0 {
+		if !indexAvailable {
 			tailBuilder.add(ordinal, feature)
 		}
 		return nil
@@ -1173,7 +1187,7 @@ func inspectGeoJSONSourceWithIndexLimitAndTailBlocks(ctx context.Context, path s
 				valid:  feature.hasBounds,
 			}, indexLimit)
 		}
-		if !indexAvailable && indexLimit > 0 {
+		if !indexAvailable {
 			tailBuilder.add(ordinal, feature)
 		}
 		return nil
@@ -1206,6 +1220,17 @@ func readGeoJSONIndexedWindowWithTailBlocks(ctx context.Context, path string, ov
 func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, overview LayerOverview,
 	index []geoJSONFeatureIndex, tailBlocks []geoJSONTailBlock, spatialIndex *geoJSONSpatialCandidateIndex,
 	bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	return readGeoJSONIndexedWindowMode(ctx, path, overview, index, tailBlocks, spatialIndex,
+		bounds, includeProperties, maxFeatures, maxBytes, false)
+}
+
+// errGeoJSONSampleFull is internal control flow: only an explicitly sampled
+// overview may return the accumulated prefix when a payload budget is reached.
+var errGeoJSONSampleFull = errors.New("GeoJSON overview sample is full")
+
+func readGeoJSONIndexedWindowMode(ctx context.Context, path string, overview LayerOverview,
+	index []geoJSONFeatureIndex, tailBlocks []geoJSONTailBlock, spatialIndex *geoJSONSpatialCandidateIndex,
+	bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, sampled bool) (core.Layer, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return core.Layer{}, fmt.Errorf("open GeoJSON %q: %w", path, err)
@@ -1233,6 +1258,9 @@ func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, 
 			return nil
 		}
 		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
 		}
 		feature, err := readIndexedGeoJSONFeature(file, entry, ordinal+1, &rawBuffer)
@@ -1248,6 +1276,9 @@ func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, 
 		}
 		featureBytes := estimateFeaturePayloadBytes(loaded)
 		if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
 		}
 		payloadBytes += featureBytes
@@ -1257,22 +1288,34 @@ func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, 
 	if useSpatialIndex {
 		for _, ordinal := range candidateOrdinals {
 			if err := readOrdinal(int(ordinal)); err != nil {
+				if sampled && errors.Is(err, errGeoJSONSampleFull) {
+					return result, nil
+				}
 				return core.Layer{}, err
 			}
 		}
 	} else {
 		for ordinal := range index {
 			if err := readOrdinal(ordinal); err != nil {
+				if sampled && errors.Is(err, errGeoJSONSampleFull) {
+					return result, nil
+				}
 				return core.Layer{}, err
 			}
 		}
 	}
-	if overview.FeatureCount > len(index) && len(index) > 0 {
-		last := index[len(index)-1]
+	if overview.FeatureCount > len(index) {
 		if len(tailBlocks) == 0 {
+			if len(index) == 0 {
+				return core.Layer{}, fmt.Errorf("GeoJSON spatial window has no feature or block index")
+			}
+			last := index[len(index)-1]
 			if err := appendGeoJSONTailWindow(ctx, file, last.offset+int64(last.length), 0,
 				len(index)+1, overview.FeatureCount, bounds, includeProperties, maxFeatures, maxBytes,
-				&result, &payloadBytes, isGeoJSONSequence(path)); err != nil {
+				&result, &payloadBytes, isGeoJSONSequence(path), sampled); err != nil {
+				if sampled && errors.Is(err, errGeoJSONSampleFull) {
+					return result, nil
+				}
 				return core.Layer{}, err
 			}
 		} else {
@@ -1286,7 +1329,10 @@ func readGeoJSONIndexedWindowWithSpatialIndex(ctx context.Context, path string, 
 				lastOrdinal := block.firstOrdinal + block.featureCount - 1
 				if err := appendGeoJSONTailWindow(ctx, file, block.startOffset, block.endOffset,
 					block.firstOrdinal, lastOrdinal, bounds, includeProperties, maxFeatures, maxBytes,
-					&result, &payloadBytes, isGeoJSONSequence(path)); err != nil {
+					&result, &payloadBytes, isGeoJSONSequence(path), sampled); err != nil {
+					if sampled && errors.Is(err, errGeoJSONSampleFull) {
+						return result, nil
+					}
 					return core.Layer{}, err
 				}
 			}
@@ -1301,18 +1347,18 @@ func geoJSONBoundsIntersect(first, second [4]float64) bool {
 
 func appendGeoJSONTailWindow(ctx context.Context, file *os.File, startOffset, expectedEndOffset int64,
 	firstOrdinal, lastOrdinal int, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64,
-	result *core.Layer, payloadBytes *int64, sequence bool) error {
+	result *core.Layer, payloadBytes *int64, sequence, sampled bool) error {
 	if sequence {
 		return appendGeoJSONSequenceIndexedTailWindow(ctx, file, startOffset, expectedEndOffset,
-			firstOrdinal, lastOrdinal, bounds, includeProperties, maxFeatures, maxBytes, result, payloadBytes)
+			firstOrdinal, lastOrdinal, bounds, includeProperties, maxFeatures, maxBytes, result, payloadBytes, sampled)
 	}
 	return appendGeoJSONIndexedTailWindow(ctx, file, startOffset, expectedEndOffset,
-		firstOrdinal, lastOrdinal, bounds, includeProperties, maxFeatures, maxBytes, result, payloadBytes)
+		firstOrdinal, lastOrdinal, bounds, includeProperties, maxFeatures, maxBytes, result, payloadBytes, sampled)
 }
 
 func appendGeoJSONSequenceIndexedTailWindow(ctx context.Context, file *os.File, offset, expectedEndOffset int64,
 	firstOrdinal, lastOrdinal int, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64,
-	result *core.Layer, payloadBytes *int64) error {
+	result *core.Layer, payloadBytes *int64, sampled bool) error {
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek GeoJSONSeq tail at byte %d: %w", offset, err)
 	}
@@ -1381,6 +1427,9 @@ func appendGeoJSONSequenceIndexedTailWindow(ctx context.Context, file *os.File, 
 			continue
 		}
 		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
 		}
 		feature.featureBounds, feature.hasBounds = featureBounds, true
@@ -1393,6 +1442,9 @@ func appendGeoJSONSequenceIndexedTailWindow(ctx context.Context, file *os.File, 
 		}
 		featureBytes := estimateFeaturePayloadBytes(loaded)
 		if maxBytes > 0 && featureBytes > maxBytes-*payloadBytes {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
 		}
 		*payloadBytes += featureBytes
@@ -1409,7 +1461,7 @@ func appendGeoJSONSequenceIndexedTailWindow(ctx context.Context, file *os.File, 
 // than the in-memory index cap.
 func appendGeoJSONIndexedTailWindow(ctx context.Context, file *os.File, offset, expectedEndOffset int64,
 	firstOrdinal, lastOrdinal int, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64,
-	result *core.Layer, payloadBytes *int64) error {
+	result *core.Layer, payloadBytes *int64, sampled bool) error {
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek GeoJSON tail at byte %d: %w", offset, err)
 	}
@@ -1457,6 +1509,9 @@ func appendGeoJSONIndexedTailWindow(ctx context.Context, file *os.File, offset, 
 			continue
 		}
 		if maxFeatures > 0 && len(result.Features) >= maxFeatures {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d features", maxFeatures)
 		}
 		feature.featureBounds, feature.hasBounds = featureBounds, true
@@ -1469,6 +1524,9 @@ func appendGeoJSONIndexedTailWindow(ctx context.Context, file *os.File, offset, 
 		}
 		featureBytes := estimateFeaturePayloadBytes(loaded)
 		if maxBytes > 0 && featureBytes > maxBytes-*payloadBytes {
+			if sampled {
+				return errGeoJSONSampleFull
+			}
 			return fmt.Errorf("spatial window exceeds the limit of %d bytes", maxBytes)
 		}
 		*payloadBytes += featureBytes
@@ -1642,6 +1700,11 @@ func readGeoJSONIndexedFeature(ctx context.Context, path, layerName string, feat
 }
 
 func readGeoJSONIndexedAttributePage(ctx context.Context, path, layerName string, offset, limit int, index []geoJSONFeatureIndex, overview LayerOverview) (core.Layer, int, error) {
+	return readGeoJSONIndexedAttributePageWithTailBlocks(ctx, path, layerName, offset, limit, index, nil, overview)
+}
+
+func readGeoJSONIndexedAttributePageWithTailBlocks(ctx context.Context, path, layerName string, offset, limit int,
+	index []geoJSONFeatureIndex, blocks []geoJSONTailBlock, overview LayerOverview) (core.Layer, int, error) {
 	if err := validateAttributePage(offset, limit); err != nil {
 		return core.Layer{}, 0, err
 	}
@@ -1652,6 +1715,34 @@ func readGeoJSONIndexedAttributePage(ctx context.Context, path, layerName string
 		return core.Layer{}, 0, err
 	}
 	if offset >= len(index) || offset+limit > len(index) {
+		if len(blocks) > 0 {
+			if offset >= len(index) {
+				return readGeoJSONTailAttributePage(ctx, path, layerName, offset, limit, blocks, overview)
+			}
+			prefix, _, err := readGeoJSONIndexedAttributePageWithTailBlocks(ctx, path, layerName,
+				offset, len(index)-offset, index, blocks, overview)
+			if err != nil {
+				return core.Layer{}, 0, err
+			}
+			tail, total, err := readGeoJSONTailAttributePage(ctx, path, layerName, len(index),
+				limit-len(prefix.Features), blocks, overview)
+			if err != nil {
+				return core.Layer{}, 0, err
+			}
+			if len(prefix.Fields) == 0 {
+				prefix.Fields = tail.Fields
+			}
+			var payloadBytes int64
+			for _, feature := range prefix.Features {
+				payloadBytes += estimateFeaturePayloadBytes(feature)
+			}
+			for _, feature := range tail.Features {
+				if err := appendAttributePageFeature(&prefix, feature, &payloadBytes); err != nil {
+					return core.Layer{}, 0, err
+				}
+			}
+			return prefix, total, nil
+		}
 		page, total, err := readGeoJSONSourceAttributePage(ctx, path, layerName, offset, limit)
 		if err != nil {
 			return core.Layer{}, 0, err
@@ -1698,6 +1789,132 @@ func readGeoJSONIndexedAttributePage(ctx context.Context, path, layerName string
 		total = overview.FeatureCount
 	}
 	return result, total, nil
+}
+
+// readGeoJSONTailAttributePage starts at the coarse tail block containing the
+// requested row. A page near the end of a multi-million-feature source thus
+// scans at most the containing block plus one adjacent block.
+func readGeoJSONTailAttributePage(ctx context.Context, path, layerName string, offset, limit int,
+	blocks []geoJSONTailBlock, overview LayerOverview) (core.Layer, int, error) {
+	if err := validateAttributePage(offset, limit); err != nil {
+		return core.Layer{}, 0, err
+	}
+	if layerName != "" && layerName != overview.Name {
+		return core.Layer{}, 0, fmt.Errorf("layer %q not found in %q", layerName, path)
+	}
+	result := core.Layer{Name: overview.Name, CRS: overview.CRS, Editable: true,
+		Features: make([]core.Feature, 0, limit)}
+	if offset >= overview.FeatureCount {
+		return result, overview.FeatureCount, nil
+	}
+	first := offset + 1
+	blockIndex := sort.Search(len(blocks), func(i int) bool {
+		return blocks[i].firstOrdinal+blocks[i].featureCount > first
+	})
+	if blockIndex == len(blocks) || first < blocks[blockIndex].firstOrdinal {
+		return core.Layer{}, 0, fmt.Errorf("attribute page at feature %d is not covered by the GeoJSON tail index", first)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return core.Layer{}, 0, fmt.Errorf("open GeoJSON %q: %w", path, err)
+	}
+	defer file.Close()
+	var payloadBytes int64
+	last := min(overview.FeatureCount, offset+limit)
+	sequence := isGeoJSONSequence(path)
+	for ; blockIndex < len(blocks) && len(result.Features) < last-offset; blockIndex++ {
+		block := blocks[blockIndex]
+		if _, err := file.Seek(block.startOffset, io.SeekStart); err != nil {
+			return core.Layer{}, 0, fmt.Errorf("seek GeoJSON tail at byte %d: %w", block.startOffset, err)
+		}
+		readerSize := 1 << 20
+		if sequence {
+			readerSize = 64 << 10
+		}
+		reader := bufio.NewReaderSize(file, readerSize)
+		streamOffset := block.startOffset
+		var rawBuffer []byte
+		ordinal := block.firstOrdinal - 1
+		blockLast := block.firstOrdinal + block.featureCount - 1
+		for ordinal < blockLast && ordinal < last {
+			if err := ctx.Err(); err != nil {
+				return core.Layer{}, 0, err
+			}
+			var raw []byte
+			var endOffset int64
+			if sequence {
+				for {
+					recordStart := streamOffset
+					var bytesRead int
+					var eof bool
+					raw, bytesRead, eof, err = readGeoJSONSequenceRecord(reader, &rawBuffer, maxGeoJSONFeatureMiB<<20)
+					streamOffset += int64(bytesRead)
+					if err != nil {
+						return core.Layer{}, 0, fmt.Errorf("read GeoJSONSeq tail record %d: %w", ordinal+1, err)
+					}
+					if eof {
+						return core.Layer{}, 0, fmt.Errorf("GeoJSONSeq tail block ended before feature %d", ordinal+1)
+					}
+					start, end := 0, len(raw)
+					for start < end && (raw[start] == ' ' || raw[start] == '\t' || raw[start] == '\r' || raw[start] == '\n') {
+						start++
+					}
+					if start < end && raw[start] == 0x1e {
+						start++
+					}
+					for start < end && (raw[start] == ' ' || raw[start] == '\t' || raw[start] == '\r' || raw[start] == '\n') {
+						start++
+					}
+					for end > start && (raw[end-1] == ' ' || raw[end-1] == '\t' || raw[end-1] == '\r' || raw[end-1] == '\n') {
+						end--
+					}
+					if start == end {
+						continue
+					}
+					raw = raw[start:end]
+					endOffset = recordStart + int64(start+len(raw))
+					break
+				}
+			} else {
+				var atEnd bool
+				raw, atEnd, _, endOffset, err = readJSONFeatureObject(reader, &rawBuffer, &streamOffset, maxGeoJSONFeatureMiB<<20)
+				if err != nil {
+					return core.Layer{}, 0, fmt.Errorf("read GeoJSON tail feature %d: %w", ordinal+1, err)
+				}
+				if atEnd {
+					return core.Layer{}, 0, fmt.Errorf("GeoJSON tail block ended before feature %d", ordinal+1)
+				}
+			}
+			ordinal++
+			if endOffset > block.endOffset {
+				return core.Layer{}, 0, fmt.Errorf("GeoJSON tail block offsets do not cover feature %d", ordinal)
+			}
+			if ordinal < first {
+				continue
+			}
+			var feature streamedGeoJSONFeature
+			if err := json.Unmarshal(raw, &feature); err != nil {
+				return core.Layer{}, 0, fmt.Errorf("decode GeoJSON tail feature %d: %w", ordinal, err)
+			}
+			if feature.Type != "Feature" {
+				return core.Layer{}, 0, fmt.Errorf("GeoJSON tail feature %d has type %q", ordinal, feature.Type)
+			}
+			properties, err := decodeGeoJSONProperties(feature.Properties, ordinal)
+			if err != nil {
+				return core.Layer{}, 0, err
+			}
+			if len(properties) > 0 && len(result.Fields) == 0 {
+				result.Fields = geoJSONFieldSchema(properties)
+			}
+			if err := appendAttributePageFeature(&result, core.Feature{ID: uint64(ordinal), Properties: properties}, &payloadBytes); err != nil {
+				return core.Layer{}, 0, fmt.Errorf("read feature %d: %w", ordinal, err)
+			}
+		}
+		if ordinal == blockLast && streamOffset != block.endOffset && !sequence {
+			return core.Layer{}, 0, fmt.Errorf("GeoJSON tail block ended at byte %d; expected %d", streamOffset, block.endOffset)
+		}
+	}
+	return result, overview.FeatureCount, nil
 }
 
 func readIndexedGeoJSONFeature(file *os.File, entry geoJSONFeatureIndex, ordinal int, buffer *[]byte) (streamedGeoJSONFeature, error) {
@@ -2265,6 +2482,10 @@ func geoJSONCoordinateBounds(raw []byte, depth int, coordinateCount *int) ([4]fl
 }
 
 func geoJSONCoordinateBoundsWithLimit(raw []byte, depth int, coordinateCount *int, limit int) ([4]float64, bool, error) {
+	if bounds, hasBounds, count, ok := geoJSONCoordinateBoundsFast(raw, depth, limit-*coordinateCount); ok {
+		*coordinateCount += count
+		return bounds, hasBounds, nil
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	token, err := decoder.Token()
@@ -2360,6 +2581,93 @@ func geoJSONCoordinateBoundsWithLimit(raw []byte, depth int, coordinateCount *in
 		return [4]float64{}, false, err
 	}
 	return bounds, hasBounds, nil
+}
+
+// geoJSONCoordinateBoundsFast scans ordinary numeric coordinate arrays without
+// allocating a decoder token for every ordinate. Unusual or invalid input goes
+// through the validating decoder above, preserving its limits and errors.
+func geoJSONCoordinateBoundsFast(raw []byte, depth, remaining int) ([4]float64, bool, int, bool) {
+	if depth < 0 || depth > 3 || remaining < 0 {
+		return [4]float64{}, false, 0, false
+	}
+	index, count := 0, 0
+	var bounds [4]float64
+	hasBounds := false
+	var array func(int) bool
+	array = func(level int) bool {
+		index = skipGeoJSONSpace(raw, index)
+		if index >= len(raw) || raw[index] != '[' {
+			return false
+		}
+		index++
+		index = skipGeoJSONSpace(raw, index)
+		if index < len(raw) && raw[index] == ']' {
+			index++
+			return level > 0
+		}
+		items := 0
+		var x, y float64
+		for {
+			if level == 0 {
+				index = skipGeoJSONSpace(raw, index)
+				start := index
+				for index < len(raw) && (raw[index] == '-' || raw[index] == '+' || raw[index] == '.' ||
+					(raw[index] >= '0' && raw[index] <= '9') || raw[index] == 'e' || raw[index] == 'E') {
+					index++
+				}
+				if start == index {
+					return false
+				}
+				value, err := strconv.ParseFloat(string(raw[start:index]), 64)
+				if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+					return false
+				}
+				if items == 0 {
+					x = value
+				} else if items == 1 {
+					y = value
+				}
+				items++
+				if items > maxGeoJSONPositionOrdinates {
+					return false
+				}
+			} else {
+				if !array(level - 1) {
+					return false
+				}
+				items++
+			}
+			index = skipGeoJSONSpace(raw, index)
+			if index >= len(raw) {
+				return false
+			}
+			if raw[index] == ']' {
+				index++
+				break
+			}
+			if raw[index] != ',' {
+				return false
+			}
+			index++
+		}
+		if level == 0 {
+			if items < 2 || count >= remaining {
+				return false
+			}
+			count++
+			if !hasBounds {
+				bounds, hasBounds = [4]float64{x, y, x, y}, true
+			} else {
+				bounds[0], bounds[1] = math.Min(bounds[0], x), math.Min(bounds[1], y)
+				bounds[2], bounds[3] = math.Max(bounds[2], x), math.Max(bounds[3], y)
+			}
+		}
+		return true
+	}
+	if !array(depth) || skipGeoJSONSpace(raw, index) != len(raw) || !json.Valid(raw) {
+		return [4]float64{}, false, 0, false
+	}
+	return bounds, hasBounds, count, true
 }
 
 // geoJSONPointBoundsFast handles common compact 2D points without allocating

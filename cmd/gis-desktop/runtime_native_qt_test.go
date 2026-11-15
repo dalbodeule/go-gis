@@ -737,9 +737,17 @@ func TestReadOnlyDetailWorkspaceTransparentFillRealSource(t *testing.T) {
 		Center: render.Point{X: view.CenterX, Y: view.CenterY}, Zoom: view.Zoom,
 		ScreenWidth: 1166, ScreenHeight: 726, CanvasWidth: 1166, CanvasHeight: 234,
 	}
-	if lod := readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom),
-		runtime.mapExtent, runtime.mapFitExtent); lod <= 1 {
-		t.Fatalf("workspace viewport semantic LOD=%d, want detail", lod)
+	// Filtered fit bounds can turn the saved zoom into an overview. Move to
+	// the nearest detail zoom while retaining its center for this test.
+	lod := readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom),
+		runtime.mapExtent, runtime.mapFitExtent)
+	for attempt := 0; lod <= 1 && attempt < 12; attempt++ {
+		viewport.Zoom *= 2
+		lod = readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom),
+			runtime.mapExtent, runtime.mapFitExtent)
+	}
+	if lod <= 1 {
+		t.Fatalf("workspace zoom %g semantic LOD=%d, want detail", viewport.Zoom, lod)
 	}
 	planner := runtime.planner
 	planner.ChunkSize = readOnlyWindowChunkSize(readOnlyWindowZoomBucket(viewport.Zoom))
@@ -828,6 +836,14 @@ func TestReadOnlyWorkspacePublishesBeforeReadyRealSource(t *testing.T) {
 	terminal := waitForRenderTerminalDiagnostic(t, start, 120*time.Second)
 	t.Logf("saved workspace first visible batch: %s", first)
 	t.Logf("saved workspace terminal render: %s", terminal)
+	var renderDiagnostics []struct{ Stream, Message string }
+	if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &renderDiagnostics); err == nil {
+		for _, entry := range renderDiagnostics {
+			if entry.Stream == "render" && (strings.Contains(entry.Message, "retry generation=") || strings.Contains(entry.Message, "incomplete generation=")) {
+				t.Logf("saved workspace render fallback: %s", entry.Message)
+			}
+		}
+	}
 	if !strings.Contains(terminal, "ready generation=") ||
 		metricValue(t, first, "elapsed_ms") >= metricValue(t, terminal, "elapsed_ms") {
 		t.Fatalf("saved workspace did not publish visible geometry before completion: first=%s terminal=%s", first, terminal)
@@ -1037,6 +1053,24 @@ func TestReadOnlyOverviewSamplingGetsDenserOnZoomIn(t *testing.T) {
 	}
 }
 
+func TestSampledPointOverviewCollapsesCoincidentSymbols(t *testing.T) {
+	first := core.WKBGeometry{WKB: []byte{1, 1, 0, 0, 0, 0, 0, 0, 0}}
+	second := core.WKBGeometry{WKB: []byte{1, 1, 0, 0, 0, 1, 0, 0, 0}}
+	layer := core.Layer{Features: []core.Feature{
+		{ID: 1, Geometry: first, Properties: map[string]any{"name": "one"}},
+		{ID: 2, Geometry: first, Properties: map[string]any{"name": "two"}},
+		{ID: 3, Geometry: second},
+		{ID: 4},
+	}}
+	got := deduplicateReadOnlyOverviewPoints(layer)
+	if len(got.Features) != 3 || got.Features[0].ID != 1 || got.Features[1].ID != 3 || got.Features[2].ID != 4 {
+		t.Fatalf("overview point symbols = %+v", got.Features)
+	}
+	if layer.Features[3].Geometry != nil || layer.Features[3].Properties != nil {
+		t.Fatal("discarded point retained geometry or properties in the reused backing slice")
+	}
+}
+
 func TestReadOnlyOverviewSimplificationToleranceTracksZoom(t *testing.T) {
 	extent := [4]float64{0, 0, 20_000, 10_000}
 	for _, test := range []struct {
@@ -1057,6 +1091,45 @@ func TestReadOnlyOverviewZoomIsRelativeToPreferredExtent(t *testing.T) {
 	}
 	if got := readOnlyOverviewZoomBucket(6, data, fit); got != 2 {
 		t.Fatalf("fit-scale LOD bucket at raw bucket 6 = %d, want detail bucket 2", got)
+	}
+}
+
+func TestReadOnlyOverviewZoomRejectsSingleAxisOutlierDetail(t *testing.T) {
+	data := [4]float64{0, 0, 10_000, 2}
+	fit := [4]float64{0, 0, 2, 2}
+	if got := readOnlyOverviewZoomBucket(12, data, fit); got != 0 {
+		t.Fatalf("single-axis outlier LOD = %d, want initial overview bucket 0", got)
+	}
+}
+
+func TestRobustFitBoundsFromDistributedSamples(t *testing.T) {
+	samples := make([][4]float64, 0, 256)
+	for i := 0; i < 255; i++ {
+		x := float64(i%16) / 16
+		y := float64(i/16) / 16
+		samples = append(samples, [4]float64{x, y, x, y})
+	}
+	samples = append(samples, [4]float64{10_000, 1, 10_000, 1})
+	fit, ok := robustFitBoundsFromSamples([4]float64{0, 0, 10_000, 2}, samples)
+	if !ok || fit[2] > 2 || fit[3] > 2 {
+		t.Fatalf("outlier expanded sampled fit: %v ok=%t", fit, ok)
+	}
+}
+
+func TestDominantLayerFitKeepsSmallDistantFileOutOfInitialView(t *testing.T) {
+	fit, ok := dominantLayerFitExtent([]layerFitContribution{
+		{bounds: [4]float64{0, 0, 2, 2}, count: 10_000_000},
+		{bounds: [4]float64{10_000, 0, 10_001, 1}, count: 1},
+	})
+	if !ok || fit != [4]float64{0, 0, 2, 2} {
+		t.Fatalf("dominant fit = %v ok=%t", fit, ok)
+	}
+	fit, ok = dominantLayerFitExtent([]layerFitContribution{
+		{bounds: [4]float64{0, 0, 2, 0}, count: 10_000_000},
+		{bounds: [4]float64{10_000, 0, 10_000, 0}, count: 1},
+	})
+	if !ok || fit != [4]float64{0, 0, 2, 0} {
+		t.Fatalf("degenerate-axis dominant fit = %v ok=%t", fit, ok)
 	}
 }
 
@@ -1969,6 +2042,29 @@ func TestWorkspaceReopensOriginalSourcesAndLayerSettings(t *testing.T) {
 	}
 }
 
+func TestWorkspaceWithOnlyMissingSourcesOpensWindowedForRelink(t *testing.T) {
+	directory := t.TempDir()
+	layers := []core.Layer{
+		{Name: "parcels", SourcePath: filepath.Join(directory, "old", "parcels.shp"), SourceLayerName: "parcels", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()},
+		{Name: "buildings", SourcePath: filepath.Join(directory, "old", "buildings.shp"), SourceLayerName: "buildings", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Visible: true, Style: core.DefaultLayerStyle(), Labels: core.DefaultLabelSettings()},
+	}
+	path := filepath.Join(directory, "moved.gogis")
+	if err := workspace.Save(path, workspace.FromProject(core.Project{Name: "moved", CRS: core.CRS{AuthorityCode: "EPSG:5186"}, Layers: layers})); err != nil {
+		t.Fatal(err)
+	}
+	runtime, automaticReadOnly, count, err := loadWorkspaceRuntimeWithLargePolicy(context.Background(), path, false, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.closeAttributeSource != nil {
+		defer runtime.closeAttributeSource()
+	}
+	if !automaticReadOnly || !runtime.readOnly || count != 0 || len(runtime.unavailableSources) != 2 {
+		t.Fatalf("missing workspace mode readOnly=%t runtime=%t count=%d unavailable=%d",
+			automaticReadOnly, runtime.readOnly, count, len(runtime.unavailableSources))
+	}
+}
+
 func TestWorkspaceViewNormalizesPanAndZoom(t *testing.T) {
 	got := workspaceViewFromViewport(native.Viewport{PanX: 120, PanY: -60, Zoom: 2, Width: 800, Height: 400}, "roads")
 	want := workspace.ViewState{CenterX: 0.425, CenterY: 0.425, Zoom: 2, ActiveLayer: "roads"}
@@ -2431,7 +2527,7 @@ func TestReadOnlySHPDisplayRuleAppliesAtOverviewAndDetail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "filtered.shp")
 	features := []core.Feature{
 		{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (200005.1 400005.1)"}, Properties: map[string]any{"keep": "yes"}},
-		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200005.1 400005.1)"}, Properties: map[string]any{"keep": "no"}},
+		{ID: 2, Geometry: core.WKTGeometry{WKT: "POINT (200005.2 400005.2)"}, Properties: map[string]any{"keep": "no"}},
 		{ID: 3, Geometry: core.WKTGeometry{WKT: "POINT (200000 400000)"}, Properties: map[string]any{"keep": "no"}},
 		{ID: 4, Geometry: core.WKTGeometry{WKT: "POINT (200010 400010)"}, Properties: map[string]any{"keep": "no"}},
 	}
@@ -3971,7 +4067,7 @@ func TestReplacedReadOnlyRuntimePublishesWindowLabelsToActiveRuntime(t *testing.
 		t.Fatalf("temporary runtime retained built labels: %+v", loaded.mapLabels)
 	}
 	active.mu.Lock()
-	active.windowFeatureNames[123] = "active parcel"
+	active.windowFeatureNames[windowFeatureNameKey{layer: "parcels", id: 123}] = "active parcel"
 	active.mu.Unlock()
 	feature, err := active.attributeFeatureReader(ctx, "parcels", 123)
 	if err != nil || feature.Properties["name"] != "active parcel" {
@@ -3986,9 +4082,133 @@ func TestSimpleStringFilterForLayerRequiresTextField(t *testing.T) {
 	if !ok || filter.Field != "A3" || filter.Value != "44150" || !filter.Prefix {
 		t.Fatalf("building prefilter = %+v, %t", filter, ok)
 	}
+	layer.DisplayRule = "return gogis.contains(feature.A3, '44150')"
+	filter, ok = simpleStringFilterForLayer(layer)
+	if !ok || !filter.Contains || filter.Prefix || filter.Field != "A3" || filter.Value != "44150" {
+		t.Fatalf("building substring prefilter = %+v, %t", filter, ok)
+	}
 	layer.Fields[0].Type = core.FieldTypeNumber
 	if _, ok := simpleStringFilterForLayer(layer); ok {
 		t.Fatal("numeric field was pushed down as a string comparison")
+	}
+}
+
+func TestReadOnlyFitUsesFilteredPolygonBoundsAcrossSources(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	filteredPath := filepath.Join(dir, "filtered.shp")
+	neighborPath := filepath.Join(dir, "neighbor.shp")
+	filtered := core.Layer{Name: "filtered", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields: []core.Field{{Name: "keep", Type: core.FieldTypeText}},
+		Features: []core.Feature{
+			{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0,1 0,1 1,0 1,0 0))"}, Properties: map[string]any{"keep": "1"}},
+			{ID: 2, Geometry: core.WKTGeometry{WKT: "POLYGON ((10000 10000,10001 10000,10001 10001,10000 10001,10000 10000))"}, Properties: map[string]any{"keep": "0"}},
+		}}
+	neighbor := core.Layer{Name: "neighbor", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POLYGON ((1 1,2 1,2 2,1 2,1 1))"}}}}
+	if err := (gdal.Writer{}).Write(ctx, filteredPath, filtered); err != nil {
+		t.Fatal(err)
+	}
+	if err := (gdal.Writer{}).Write(ctx, neighborPath, neighbor); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{
+		{Path: filteredPath, DisplayRule: "return feature.keep == '1'"},
+		{Path: neighborPath},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.mapExtent[2] < 10001 || runtime.mapExtent[3] < 10001 {
+		t.Fatalf("source extent lost outlier: %v", runtime.mapExtent)
+	}
+	if runtime.mapFitExtent[2] > 3 || runtime.mapFitExtent[3] > 3 {
+		t.Fatalf("filtered outlier expanded preferred fit: %v", runtime.mapFitExtent)
+	}
+	if binding := runtime.readOnlyBindings["filtered"]; binding.acceptedIDs == nil || binding.acceptedIDs.Count() != 1 {
+		t.Fatalf("filtered source index = %+v", binding.acceptedIDs)
+	} else {
+		if !binding.hasRenderBounds || math.Abs(binding.renderBounds[0]) > 1e-8 ||
+			math.Abs(binding.renderBounds[1]) > 1e-8 || math.Abs(binding.renderBounds[2]-1) > 1e-8 ||
+			math.Abs(binding.renderBounds[3]-1) > 1e-8 {
+			t.Fatalf("filtered render bounds = %v available=%v", binding.renderBounds, binding.hasRenderBounds)
+		}
+		if runtime.layerBounds["filtered"][2] < 10001 {
+			t.Fatalf("layer source bounds were replaced by filtered bounds: %v", runtime.layerBounds["filtered"])
+		}
+		planner := render.NewChunkPlanner()
+		planner.ChunkSize = 0.03125
+		planner.Domain, planner.HasDomain = [4]float64{0, 0, 1, 1}, true
+		keys := planner.VisibleKeys(render.Viewport{Center: render.Point{X: 0.5, Y: 0.5}, Zoom: 1}, "filtered")
+		pruned := filterReadOnlyKeysByLayerBounds(keys, runtime.mapExtent, planner.ChunkSize,
+			map[string][4]float64{"filtered": binding.renderBounds})
+		if len(keys) < 1000 || len(pruned) > 4 {
+			t.Fatalf("filtered bounds pruned %d of %d planned tiles", len(pruned), len(keys))
+		}
+	}
+	fit := initialFitWorkspaceView(runtime, native.Viewport{ViewportWidth: 1172, ViewportHeight: 732})
+	if fit == nil {
+		t.Fatal("missing filtered initial fit")
+	}
+	viewport := render.Viewport{Center: render.Point{X: fit.CenterX, Y: fit.CenterY}, Zoom: fit.Zoom,
+		ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 585, CanvasHeight: 732}
+	start := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(ctx, viewport)
+	terminal := waitForRenderTerminalDiagnostic(t, start, 10*time.Second)
+	var generation, chunks int
+	if _, err := fmt.Sscanf(terminal, "ready generation=%d chunks=%d", &generation, &chunks); err != nil || chunks > 16 {
+		t.Fatalf("filtered initial viewport planned too many chunks: %s (%v)", terminal, err)
+	}
+}
+
+func TestReadOnlyFitPrefersDominantPointFileOverDistantSingleton(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.shp")
+	outlierPath := filepath.Join(dir, "outlier.shp")
+	main := core.Layer{Name: "main", CRS: core.CRS{AuthorityCode: "EPSG:4326"}}
+	for i := 0; i < 256; i++ {
+		main.Features = append(main.Features, core.Feature{ID: uint64(i + 1),
+			Geometry: core.WKTGeometry{WKT: fmt.Sprintf("POINT (%g %g)", float64(i%16)/16, float64(i/16)/16)}})
+	}
+	outlier := core.Layer{Name: "outlier", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Features: []core.Feature{{ID: 1, Geometry: core.WKTGeometry{WKT: "POINT (10000 1)"}}}}
+	if err := (gdal.Writer{}).Write(ctx, mainPath, main); err != nil {
+		t.Fatal(err)
+	}
+	if err := (gdal.Writer{}).Write(ctx, outlierPath, outlier); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: mainPath}, {Path: outlierPath}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.mapExtent[2] < 10000 || runtime.mapFitExtent[2] > 2 {
+		t.Fatalf("full extent %v; preferred fit %v", runtime.mapExtent, runtime.mapFitExtent)
+	}
+}
+
+func TestReadOnlyFitSamplesVisibleOutlierWithinOneShapefile(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cluster-with-outlier.shp")
+	layer := core.Layer{Name: "cluster", CRS: core.CRS{AuthorityCode: "EPSG:4326"}}
+	for i := 0; i < 256; i++ {
+		layer.Features = append(layer.Features, core.Feature{ID: uint64(i + 1),
+			Geometry: core.WKTGeometry{WKT: fmt.Sprintf("POINT (%g %g)", float64(i%16)/16, float64(i/16)/16)}})
+	}
+	layer.Features = append(layer.Features, core.Feature{ID: 257, Geometry: core.WKTGeometry{WKT: "POINT (10000 1)"}})
+	if err := (gdal.Writer{}).Write(ctx, path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(ctx, []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.mapExtent[2] < 10000 || runtime.mapFitExtent[2] > 2 {
+		t.Fatalf("full extent %v; preferred fit %v", runtime.mapExtent, runtime.mapFitExtent)
 	}
 }
 
@@ -4338,7 +4558,7 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 		windowPayloadBytes:        map[render.ChunkKey]int64{key: 128},
 		windowVisiblePayloadBytes: 128,
 		windowVisibleKeys:         map[render.ChunkKey]struct{}{key: {}},
-		windowFeatureNames:        map[uint64]string{77: "parcel"},
+		windowFeatureNames:        map[windowFeatureNameKey]string{{layer: "large", id: 77}: "parcel"},
 		windowLabels:              map[render.ChunkKey][]render.LayerLabel{key: {{Text: "parcel"}}},
 		nextWindowFeatureID:       77,
 		readOnlyBaseLayers:        []core.Layer{{Name: "base"}},
@@ -4352,7 +4572,7 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 		mapFitExtent:         [4]float64{-1, -1, 1, 1},
 		viewportReadOnly:     true,
 		windowHits:           map[render.ChunkKey][]render.HitFeature{key: {{FeatureID: 1}}},
-		windowFeatureNames:   map[uint64]string{1: "old"},
+		windowFeatureNames:   map[windowFeatureNameKey]string{{layer: "large", id: 1}: "old"},
 		readOnlyBaseFeatures: []render.HitFeature{{FeatureID: 1}},
 	}
 
@@ -4370,7 +4590,7 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 		current.windowFeatureCounts[key] != 1 || current.windowFeatureIDs[key][0] != 77 ||
 		current.windowVisibleFeatureCount != 1 || current.windowPayloadBytes[key] != 128 ||
 		current.windowVisiblePayloadBytes != 128 || len(current.windowVisibleKeys) != 1 ||
-		current.windowFeatureNames[77] != "parcel" || current.windowLabels[key][0].Text != "parcel" ||
+		current.windowFeatureNames[windowFeatureNameKey{layer: "large", id: 77}] != "parcel" || current.windowLabels[key][0].Text != "parcel" ||
 		current.nextWindowFeatureID != 77 || len(current.readOnlyBaseLayers) != 1 ||
 		current.readOnlyBaseFeatures[0].FeatureID != 8 || current.readOnlyBaseLabels[0].Text != "base" {
 		t.Fatal("loaded viewport feature state was not transferred completely")
@@ -4389,6 +4609,33 @@ func TestLoadedRuntimeReplacementTransfersAndClearsSpatialState(t *testing.T) {
 		len(current.windowLabels) != 0 || current.nextWindowFeatureID != 0 ||
 		len(current.readOnlyBaseLayers) != 0 || len(current.readOnlyBaseFeatures) != 0 || len(current.readOnlyBaseLabels) != 0 {
 		t.Fatal("replacing with a non-windowed runtime retained stale viewport state")
+	}
+}
+
+func TestWindowFeatureNamesStayWithTheirLayerAcrossViewportMoves(t *testing.T) {
+	first := render.ChunkKey{Layer: "buildings", ZoomBucket: 3, X: 1, Y: 1}
+	second := render.ChunkKey{Layer: "survey", ZoomBucket: 3, X: 1, Y: 1}
+	runtime := &demoRuntime{
+		windowVisibleKeys:   map[render.ChunkKey]struct{}{first: {}, second: {}},
+		windowFeatureCounts: map[render.ChunkKey]int{first: 1, second: 1},
+		windowPayloadBytes:  map[render.ChunkKey]int64{first: 32, second: 32},
+		windowFeatureIDs:    map[render.ChunkKey][]uint64{first: {7}, second: {7}},
+		windowFeatureNames: map[windowFeatureNameKey]string{
+			{layer: "buildings", id: 7}: "building 7",
+			{layer: "survey", id: 7}:    "survey 7",
+		},
+		windowVisibleFeatureCount: 2,
+		windowVisiblePayloadBytes: 64,
+	}
+	runtime.mu.Lock()
+	runtime.retainVisibleWindowChunksLocked([]render.ChunkKey{second})
+	runtime.mu.Unlock()
+	if len(runtime.windowFeatureNames) != 1 || runtime.windowFeatureNames[windowFeatureNameKey{layer: "survey", id: 7}] != "survey 7" {
+		t.Fatalf("retained feature names after first layer left viewport = %#v", runtime.windowFeatureNames)
+	}
+	feature, err := runtime.readOnlyAttributeFeature(context.Background(), "survey", 7)
+	if err != nil || feature.Properties["name"] != "survey 7" {
+		t.Fatalf("remaining layer feature name = %#v, %v", feature, err)
 	}
 }
 
@@ -4543,6 +4790,247 @@ func TestWindowedReadOnlyRejectsDenseChunkWithoutCachingPartialData(t *testing.T
 	}
 }
 
+func TestForcedReadOnlyOverviewSamplesDenseShapefilePolygons(t *testing.T) {
+	const featureCount = maxReadOnlyWindowFeatures + 1
+	path := filepath.Join(t.TempDir(), "dense-polygons.shp")
+	layer := core.Layer{Name: "dense-polygons", CRS: core.CRS{AuthorityCode: "EPSG:5186"},
+		Features: make([]core.Feature, featureCount)}
+	for i := range layer.Features {
+		layer.Features[i] = core.Feature{ID: uint64(i + 1),
+			Geometry: core.WKTGeometry{WKT: "POLYGON ((0 0,1 0,1 1,0 1,0 0))"}}
+	}
+	if err := (gdal.Writer{}).Write(context.Background(), path, layer); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(0), name, render.Point{X: 0, Y: 0})
+	key.ZoomBucket = 0
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys[key] = struct{}{}
+	runtime.mu.Unlock()
+	if _, exactErr := runtime.builder(context.Background(), key); exactErr == nil ||
+		!strings.Contains(exactErr.Error(), "sampled overview retry available") {
+		t.Fatalf("dense exact window did not request approximate retry: %v", exactErr)
+	}
+	ctx := context.WithValue(context.Background(), forceReadOnlyOverviewContextKey{}, true)
+	chunk, err := runtime.builder(ctx, key)
+	if err != nil || len(chunk.Vertices) == 0 || len(chunk.Vertices) > render.MaxChunkVertices {
+		t.Fatalf("forced dense overview: vertices=%d err=%v", len(chunk.Vertices), err)
+	}
+	if len(runtime.features) != 0 || len(runtime.windowFeatureNames) != 0 {
+		t.Fatalf("approximate overview retained full source: features=%d names=%d", len(runtime.features), len(runtime.windowFeatureNames))
+	}
+}
+
+func TestForcedReadOnlyOverviewSamplesDenseGeoJSONSequence(t *testing.T) {
+	const featureCount = maxReadOnlyWindowFeatures + 1
+	path := filepath.Join(t.TempDir(), "dense.geojsonl")
+	var data strings.Builder
+	for i := 0; i < featureCount; i++ {
+		data.WriteString(`{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]},"properties":{}}`)
+		data.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(data.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	name := runtime.service.LayerNames()[0]
+	key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(0), name, render.Point{X: 0, Y: 0})
+	key.ZoomBucket = 0
+	runtime.mu.Lock()
+	runtime.windowVisibleKeys[key] = struct{}{}
+	runtime.mu.Unlock()
+	if _, err := runtime.builder(context.Background(), key); err == nil || !strings.Contains(err.Error(), "sampled overview retry available") {
+		t.Fatalf("dense exact window retry = %v", err)
+	}
+	ctx := context.WithValue(context.Background(), forceReadOnlyOverviewContextKey{}, true)
+	chunk, err := runtime.builder(ctx, key)
+	if err != nil || len(chunk.Vertices) == 0 || len(chunk.Vertices) > render.MaxChunkVertices {
+		t.Fatalf("sampled GeoJSONSeq overview vertices=%d err=%v", len(chunk.Vertices), err)
+	}
+	if len(runtime.features) != 0 || len(runtime.windowFeatureNames) != 0 {
+		t.Fatalf("overview retained source features=%d names=%d", len(runtime.features), len(runtime.windowFeatureNames))
+	}
+}
+
+func TestDenseOverlappingPolygonViewportStaysBounded(t *testing.T) {
+	const featureCount = 100_001
+	path := filepath.Join(t.TempDir(), "overlapping-polygons.geojsonl")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriterSize(file, 1<<20)
+	const record = "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[127,37],[127.001,37],[127.001,37.001],[127,37.001],[127,37]]]},\"properties\":{}}\n"
+	for i := 0; i < featureCount; i++ {
+		if _, err := writer.WriteString(record); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := writer.WriteString(`{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[170,80],[170.001,80],[170.001,80.001],[170,80.001],[170,80]]]},"properties":{}}` + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if runtime.mapExtent[2] < 170 || runtime.mapFitExtent[2] > 128 {
+		t.Fatalf("same-file outlier changed source/fit bounds: source=%v fit=%v", runtime.mapExtent, runtime.mapFitExtent)
+	}
+	fit := initialFitWorkspaceView(runtime, native.Viewport{ViewportWidth: 1172, ViewportHeight: 732})
+	for name, binding := range runtime.readOnlyBindings {
+		if !binding.broadOverlap {
+			t.Fatalf("dense overlapping layer %s was not classified", name)
+		}
+	}
+	if fit == nil {
+		t.Fatal("missing initial fit")
+	}
+	viewport := render.Viewport{Center: render.Point{X: fit.CenterX, Y: fit.CenterY}, Zoom: fit.Zoom,
+		ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 585, CanvasHeight: 732}
+	start := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(context.Background(), viewport)
+	result := waitForRenderTerminalDiagnostic(t, start, 30*time.Second)
+	if !strings.Contains(result, "chunks=1 ") || !strings.Contains(result, "vertices=12008 ") {
+		t.Fatalf("overlapping overview was not bounded: %s", result)
+	}
+	t.Logf("dense polygon viewport: %s", result)
+	outlierPath := filepath.Join(t.TempDir(), "distant-point.geojsonl")
+	if err := os.WriteFile(outlierPath, []byte(`{"type":"Feature","geometry":{"type":"Point","coordinates":[140,45]},"properties":{}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	combined, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}, {Path: outlierPath}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer combined.closeAttributeSource()
+	fit = initialFitWorkspaceView(combined, native.Viewport{ViewportWidth: 1172, ViewportHeight: 732})
+	if fit == nil {
+		t.Fatal("missing multi-file fit")
+	}
+	viewport = render.Viewport{Center: render.Point{X: fit.CenterX, Y: fit.CenterY}, Zoom: fit.Zoom,
+		ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 585, CanvasHeight: 732}
+	if lod := readOnlyOverviewZoomBucket(readOnlyWindowZoomBucket(viewport.Zoom), combined.mapExtent, combined.mapFitExtent); lod > 1 {
+		t.Fatalf("distant file forced detail LOD %d at initial fit", lod)
+	}
+	start = diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	combined.refresh(context.Background(), viewport)
+	result = waitForRenderTerminalDiagnostic(t, start, 30*time.Second)
+	if !strings.Contains(result, "chunks=1 ") {
+		t.Fatalf("multi-file outlier multiplied dense polygon tiles: %s", result)
+	}
+}
+
+func TestMedianSampleEnvelopeSpansIgnoresRareBroadFeature(t *testing.T) {
+	samples := make([][4]float64, 256)
+	for i := range samples {
+		x := float64(i)
+		samples[i] = [4]float64{x, x, x + 0.01, x + 0.01}
+	}
+	samples[len(samples)-1] = [4]float64{-1000, -1000, 1000, 1000}
+	x, y, count := medianSampleEnvelopeSpans(samples)
+	if count != len(samples) || math.Abs(x-0.01) > 1e-12 || math.Abs(y-0.01) > 1e-12 {
+		t.Fatalf("sample median spans = %g,%g count=%d", x, y, count)
+	}
+}
+
+func TestShapefileBroadOverlapWithDistantFeatureUsesCoarseOverview(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "overlap.shp")
+	godal.RegisterAll()
+	dataset, err := godal.CreateVector(godal.Shapefile, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spatialRef, err := godal.NewSpatialRef("EPSG:4326")
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	defer spatialRef.Close()
+	layer, err := dataset.CreateLayer("overlap", spatialRef, godal.GTPolygon)
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	write := func(wkt string, count int) {
+		geometry, geometryErr := godal.NewGeometryFromWKT(wkt, spatialRef)
+		if geometryErr != nil {
+			t.Fatal(geometryErr)
+		}
+		defer geometry.Close()
+		for i := 0; i < count; i++ {
+			feature, featureErr := layer.NewFeature(geometry)
+			if featureErr != nil {
+				t.Fatal(featureErr)
+			}
+			if featureErr = layer.UpdateFeature(feature); featureErr != nil {
+				feature.Close()
+				t.Fatal(featureErr)
+			}
+			feature.Close()
+		}
+	}
+	write("POLYGON ((127 37,127.001 37,127.001 37.001,127 37.001,127 37))", 100_000)
+	write("POLYGON ((170 80,170.001 80,170.001 80.001,170 80.001,170 80))", 1)
+	if err := dataset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.closeAttributeSource()
+	if binding := runtime.readOnlyBindings["overlap"]; !binding.broadOverlap || binding.featureCount != 100_001 {
+		t.Fatalf("SHP overlap detection = broad:%v count:%d", binding.broadOverlap, binding.featureCount)
+	}
+	fit := initialFitWorkspaceView(runtime, native.Viewport{ViewportWidth: 1172, ViewportHeight: 732})
+	if fit == nil {
+		t.Fatal("missing SHP fit")
+	}
+	viewport := render.Viewport{Center: render.Point{X: fit.CenterX, Y: fit.CenterY}, Zoom: fit.Zoom,
+		ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 585, CanvasHeight: 732}
+	start := diagnosticEntryCount(t, native.DiagnosticLogJSON())
+	runtime.refresh(context.Background(), viewport)
+	terminal := waitForRenderTerminalDiagnostic(t, start, 30*time.Second)
+	if !strings.Contains(terminal, "chunks=1 ") {
+		t.Fatalf("SHP overlap viewport was not coarse: %s", terminal)
+	}
+}
+
+func TestPostGISDenseWindowCanSubdivideAndRetryOverview(t *testing.T) {
+	for _, message := range []string{
+		`PostGIS window "roads" exceeds the 20000-feature limit; zoom in`,
+		`PostGIS window "roads" exceeds the 32 MiB byte limit; zoom in`,
+	} {
+		if !isReadOnlyWindowSubdivisionError(errors.New(message)) {
+			t.Fatalf("PostGIS window error was not classified for subdivision: %s", message)
+		}
+	}
+	if !isPostGISSampledOverviewSource("postgis://public.roads", "") ||
+		isPostGISSampledOverviewSource("postgis://public.roads", "return false") {
+		t.Fatal("PostGIS sampled overview eligibility ignored the display rule")
+	}
+}
+
 func TestReadOnlyPolygonVertexBudgetPreflightsWKB(t *testing.T) {
 	wkb := make([]byte, 9+4+3*16)
 	wkb[0] = 1
@@ -4604,7 +5092,7 @@ func TestWindowedReadOnlyLargeSourceIntegration(t *testing.T) {
 			runtime.windowFeatureIDs = make(map[render.ChunkKey][]uint64)
 			runtime.windowPayloadBytes = make(map[render.ChunkKey]int64)
 			runtime.windowLabels = make(map[render.ChunkKey][]render.LayerLabel)
-			runtime.windowFeatureNames = make(map[uint64]string)
+			runtime.windowFeatureNames = make(map[windowFeatureNameKey]string)
 			runtime.windowVisibleFeatureCount = 0
 			runtime.windowVisiblePayloadBytes = 0
 			for _, key := range keys {
@@ -5197,7 +5685,8 @@ func waitForRenderTerminalDiagnostic(t *testing.T, start int, timeout time.Durat
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("timed out after %s waiting for initial viewport render diagnostic", timeout)
+	log := native.DiagnosticLogJSON()
+	t.Fatalf("timed out after %s waiting for initial viewport render diagnostic; latest log: %s", timeout, log[max(0, len(log)-3000):])
 	return ""
 }
 

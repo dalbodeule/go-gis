@@ -262,27 +262,12 @@ func (s *Store) ReadWindow(ctx context.Context, bounds [4]float64, includeProper
 		return core.Layer{}, fmt.Errorf("read PostGIS window %q: %w", s.Table, err)
 	}
 	defer rows.Close()
-	layer, err := readPostGISRows(rows, s.Table)
+	layer, err := readPostGISRowsWithWindowBudget(rows, s.Table, maxFeatures+1, maxBytes)
 	if err != nil {
 		return core.Layer{}, err
 	}
 	if len(layer.Features) > maxFeatures {
 		return core.Layer{}, fmt.Errorf("PostGIS window %q exceeds the %d-feature limit; zoom in", s.Table, maxFeatures)
-	}
-	var payloadBytes int64
-	for _, feature := range layer.Features {
-		geometry, geometryErr := core.ToWKT(feature.Geometry)
-		if geometryErr != nil {
-			return core.Layer{}, fmt.Errorf("estimate PostGIS window feature %d: %w", feature.ID, geometryErr)
-		}
-		properties, propertiesErr := json.Marshal(feature.Properties)
-		if propertiesErr != nil {
-			return core.Layer{}, fmt.Errorf("estimate PostGIS window feature %d: %w", feature.ID, propertiesErr)
-		}
-		payloadBytes += int64(len(geometry.WKT) + len(properties) + 128)
-		if payloadBytes > maxBytes {
-			return core.Layer{}, fmt.Errorf("PostGIS window %q exceeds the %d MiB byte limit; zoom in", s.Table, maxBytes>>20)
-		}
 	}
 	return layer, nil
 }
@@ -295,6 +280,33 @@ func (s *Store) OpenWindowWithLimits(ctx context.Context, sourceName string, bou
 		return core.Layer{}, fmt.Errorf("PostGIS source %q does not match table %q", sourceName, s.Table)
 	}
 	return s.ReadWindow(ctx, bounds, includeProperties, maxFeatures, maxBytes)
+}
+
+// OpenOverviewWindowSampled reads a bounded prefix for an explicitly
+// approximate viewport retry. Exact reads and exports still use ReadWindow.
+func (s *Store) OpenOverviewWindowSampled(ctx context.Context, sourceName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	if s == nil || s.DB == nil {
+		return core.Layer{}, fmt.Errorf("PostGIS database is not configured")
+	}
+	if sourceName != "" && sourceName != s.Table {
+		return core.Layer{}, fmt.Errorf("PostGIS source %q does not match table %q", sourceName, s.Table)
+	}
+	if !validTableIdentifier(s.Table) {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS table identifier %q", s.Table)
+	}
+	if err := validatePostGISBounds(bounds); err != nil {
+		return core.Layer{}, err
+	}
+	if maxFeatures <= 0 || maxFeatures > maxPostGISReadFeatures || maxBytes <= 0 || maxBytes > maxPostGISReadBytes {
+		return core.Layer{}, fmt.Errorf("invalid PostGIS overview budgets: features=%d bytes=%d", maxFeatures, maxBytes)
+	}
+	rows, err := s.DB.QueryContext(ctx, readWindowQuery(s.Table, includeProperties),
+		bounds[0], bounds[1], bounds[2], bounds[3], maxFeatures+1)
+	if err != nil {
+		return core.Layer{}, fmt.Errorf("read PostGIS overview %q: %w", s.Table, err)
+	}
+	defer rows.Close()
+	return readPostGISRowsWithLimits(rows, s.Table, maxFeatures, maxBytes, true)
 }
 
 // OpenAttributePage returns one bounded attribute page without loading the
@@ -389,11 +401,25 @@ func expandDegenerateBounds(bounds [4]float64) [4]float64 {
 }
 
 func readPostGISRows(rows *sql.Rows, table string) (core.Layer, error) {
+	return readPostGISRowsWithBudgets(rows, table, maxPostGISReadFeatures, maxPostGISReadBytes, 0, false)
+}
 
+func readPostGISRowsWithLimits(rows *sql.Rows, table string, maxFeatures int, maxBytes int64, sampled bool) (core.Layer, error) {
+	return readPostGISRowsWithBudgets(rows, table, maxFeatures, maxBytes, 0, sampled)
+}
+
+func readPostGISRowsWithWindowBudget(rows *sql.Rows, table string, maxFeatures int, maxBytes int64) (core.Layer, error) {
+	return readPostGISRowsWithBudgets(rows, table, maxFeatures, maxPostGISReadBytes, maxBytes, false)
+}
+
+func readPostGISRowsWithBudgets(rows *sql.Rows, table string, maxFeatures int, maxBytes, windowBudget int64, sampled bool) (core.Layer, error) {
 	layer := core.Layer{Name: tableName(table), Editable: true}
-	var totalPayloadBytes int64
+	var totalPayloadBytes, windowPayloadBytes int64
 	for rows.Next() {
-		if len(layer.Features) >= maxPostGISReadFeatures {
+		if len(layer.Features) >= maxFeatures {
+			if sampled {
+				break
+			}
 			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d-feature in-memory read limit; use a bounded query or viewport reader", table, maxPostGISReadFeatures)
 		}
 		var id int64
@@ -438,8 +464,22 @@ func readPostGISRows(rows *sql.Rows, table string) (core.Layer, error) {
 		if featurePayloadBytes > maxPostGISFeatureBytes {
 			return core.Layer{}, fmt.Errorf("feature %d exceeds the %d MiB decoded PostGIS feature limit", id, maxPostGISFeatureBytes>>20)
 		}
-		if featurePayloadBytes > maxPostGISReadBytes-totalPayloadBytes {
-			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d MiB in-memory read limit", table, maxPostGISReadBytes>>20)
+		if featurePayloadBytes > maxBytes-totalPayloadBytes {
+			if sampled && len(layer.Features) > 0 {
+				break
+			}
+			return core.Layer{}, fmt.Errorf("PostGIS layer %q exceeds the %d MiB in-memory read limit", table, maxBytes>>20)
+		}
+		if windowBudget > 0 {
+			encodedProperties, err := json.Marshal(decoded)
+			if err != nil {
+				return core.Layer{}, fmt.Errorf("estimate PostGIS window feature %d: %w", id, err)
+			}
+			windowFeatureBytes := int64(len(wkt.String) + len(encodedProperties) + 128)
+			if windowFeatureBytes > windowBudget-windowPayloadBytes {
+				return core.Layer{}, fmt.Errorf("PostGIS window %q exceeds the %d MiB byte limit; zoom in", table, windowBudget>>20)
+			}
+			windowPayloadBytes += windowFeatureBytes
 		}
 		totalPayloadBytes += featurePayloadBytes
 		layer.Features = append(layer.Features, core.Feature{

@@ -621,6 +621,10 @@ func openWindowSpatialFilterLimitedWithPredicate(ctx context.Context, dataset *g
 }
 
 func openWindowSpatialFilterLimitedWithPredicateIDs(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return openWindowSpatialFilterLimitedWithPredicateIDsMode(ctx, dataset, layer, layerName, bounds, includeProperties, maxFeatures, maxBytes, accepted, accept, false)
+}
+
+func openWindowSpatialFilterLimitedWithPredicateIDsMode(ctx context.Context, dataset *godal.Dataset, layer godal.Layer, layerName string, bounds [4]float64, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error), truncate bool) (core.Layer, error) {
 	if layerName == "" {
 		layerName = layer.Name()
 	}
@@ -638,7 +642,7 @@ func openWindowSpatialFilterLimitedWithPredicateIDs(ctx context.Context, dataset
 		return core.Layer{Name: layerName, Editable: true}, nil
 	}
 	defer resultSet.Close()
-	result, err := readLayerOptionsLimitedWithPredicateIDs(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes, accepted, accept)
+	result, err := readLayerOptionsLimitedWithPredicateIDsMode(ctx, resultSet.Layer, includeProperties, maxFeatures, maxBytes, accepted, accept, truncate)
 	if err != nil {
 		return core.Layer{}, err
 	}
@@ -858,12 +862,18 @@ func readLayerOptionsLimitedWithPredicate(ctx context.Context, layer godal.Layer
 }
 
 func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	return readLayerOptionsLimitedWithPredicateIDsMode(ctx, layer, includeProperties, maxFeatures, maxBytes, accepted, accept, false)
+}
+
+func readLayerOptionsLimitedWithPredicateIDsMode(ctx context.Context, layer godal.Layer, includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet, accept func(map[string]any) (bool, error), truncate bool) (core.Layer, error) {
 	result := readLayerHeader(layer)
 	// FeatureCount lets the common SHP/GeoPackage drivers reserve the final
 	// feature slice up front. Driver counts are not always trustworthy, however,
 	// and a very large reservation can exhaust memory before the first feature
 	// is read. Bound the eager reservation; append grows the slice as needed.
-	if count, countErr := layer.FeatureCount(); countErr == nil && count > 0 {
+	if truncate {
+		result.Features = make([]core.Feature, 0, min(maxFeatures, 256))
+	} else if count, countErr := layer.FeatureCount(); countErr == nil && count > 0 {
 		capacity := initialFeatureCapacity(count)
 		if maxFeatures > 0 && capacity > maxFeatures {
 			capacity = maxFeatures
@@ -883,6 +893,9 @@ func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.La
 		if err := ctx.Err(); err != nil {
 			return core.Layer{}, err
 		}
+		if truncate && maxFeatures > 0 && len(result.Features) >= maxFeatures {
+			return result, nil
+		}
 		feature := layer.NextFeature()
 		if feature == nil {
 			break
@@ -892,6 +905,7 @@ func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.La
 			return core.Layer{}, fmt.Errorf("feature limit of %d features exceeded", maxFeatures)
 		}
 		var featureErr error
+		stopAtPayload := false
 		func() {
 			defer feature.Close()
 			if accepted != nil && !accepted.MayInclude(feature.FID()) {
@@ -941,6 +955,10 @@ func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.La
 			}
 			featureBytes := estimateFeaturePayloadBytes(loaded)
 			if maxBytes > 0 && featureBytes > maxBytes-payloadBytes {
+				if truncate && len(result.Features) > 0 {
+					stopAtPayload = true
+					return
+				}
 				featureErr = fmt.Errorf("feature payload limit of %d bytes exceeded", maxBytes)
 				return
 			}
@@ -950,6 +968,9 @@ func readLayerOptionsLimitedWithPredicateIDs(ctx context.Context, layer godal.La
 		}()
 		if featureErr != nil {
 			return core.Layer{}, fmt.Errorf("read feature %d: %w", nextID, featureErr)
+		}
+		if stopAtPayload {
+			return result, nil
 		}
 	}
 	return result, nil

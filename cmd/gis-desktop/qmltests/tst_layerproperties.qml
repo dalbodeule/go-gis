@@ -84,6 +84,40 @@ TestCase {
                                          {enabled: true, expression: "${id}"}));
     }
 
+    function test_luaFieldHintsIgnorePreviousLayerAttributePage() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var model = findChild(appWindow, "layerModel");
+        var settings = findChild(appWindow, "layerSettingsDialog");
+        verify(canvas && viewport && model && settings);
+        var originalTree = canvas.layerTreePayload;
+        var originalLayerCount = model.count;
+        try {
+            canvas.layerTreePayload = JSON.stringify([
+                {name: "parcel_fields", labels: {}},
+                {name: "point_fields", labels: {}}
+            ]);
+            canvas.layerTreePayloadGeneration += 1;
+            tryCompare(model, "count", 2);
+            viewport.openLayerPropertiesForCategory("point_fields", "labels");
+            tryCompare(settings, "visible", true);
+            canvas.attributePayload = JSON.stringify({layerName: "parcel_fields", columns: ["PNU"], fields: [{name: "PNU", type: "text"}], rows: []});
+            canvas.attributePayloadGeneration += 1;
+            wait(180);
+            compare(viewport.attributeFieldHints.length, 0);
+            canvas.attributePayload = JSON.stringify({layerName: "point_fields", columns: ["POINT_ID"], fields: [{name: "POINT_ID", type: "number"}], rows: []});
+            canvas.attributePayloadGeneration += 1;
+            wait(180);
+            compare(viewport.attributeFieldHints.length, 1);
+            compare(viewport.attributeFieldHints[0].name, "POINT_ID");
+        } finally {
+            settings.close();
+            canvas.layerTreePayload = originalTree;
+            canvas.layerTreePayloadGeneration += 1;
+            tryCompare(model, "count", originalLayerCount);
+        }
+    }
+
     function test_luaScriptsStayWithTheirLayerAndSaveOnTabChangeAndConfirm() {
         var canvas = findChild(appWindow, "goGisMapCanvas");
         var viewport = findChild(appWindow, "mapViewport");
@@ -615,6 +649,7 @@ TestCase {
         tryCompare(attributeDialog, "visible", true);
         canvas.layerTreePayload = JSON.stringify([{name: "vertex-layer", visible: true}]);
         tryCompare(canvas, "visible", true);
+        tryCompare(viewport, "activeLayer", "vertex-layer");
         appWindow.vertexEditMode = true;
         canvas.attributePayload = "{truncated";
         canvas.layerLabelPayload = "{truncated";
@@ -623,7 +658,7 @@ TestCase {
         canvas.vertexHandleGeneration += 1;
         tryVerify(function() { return attributes.count === 0 && labels.count === 0 && handles.count === 0; });
 
-        canvas.attributePayload = JSON.stringify({columns: ["name"], rows: [{featureId: 1, values: {name: "ok"}}], page: 0, pageSize: 1, total: 1});
+        canvas.attributePayload = JSON.stringify({layerName: canvas.activeLayer, columns: ["name"], rows: [{featureId: 1, values: {name: "ok"}}], page: 0, pageSize: 1, total: 1});
         canvas.layerLabelPayload = JSON.stringify([{text: "ok", x: 0.5, y: 0.5}]);
         canvas.layerLabelGeneration += 1;
         canvas.vertexHandlePayload = JSON.stringify([{vertexIndex: 0, x: 0.5, y: 0.5}]);
@@ -647,13 +682,35 @@ TestCase {
         var columns = [];
         for (var columnIndex = 0; columnIndex < 270; ++columnIndex)
             columns.push("field-" + columnIndex);
-        canvas.attributePayload = JSON.stringify({columns: columns, rows: rows, page: "invalid", pageSize: 9999, total: -4});
+        canvas.attributePayload = JSON.stringify({layerName: canvas.activeLayer, columns: columns, rows: rows, page: "invalid", pageSize: 9999, total: -4});
         tryVerify(function() { return attributes.count === 128; });
         compare(viewport.attributeColumns.length, 256);
         compare(viewport.attributePage, 0);
         compare(viewport.attributePageSize, 128);
         compare(viewport.attributeTotal, 0);
         attributeDialog.close();
+    }
+
+    function test_largeAttributeTableAllowsDirectPageNavigation() {
+        var canvas = findChild(appWindow, "goGisMapCanvas");
+        var viewport = findChild(appWindow, "mapViewport");
+        var dialog = findChild(appWindow, "attributeDialog");
+        var jump = findChild(appWindow, "attributePageJumpSpinBox");
+        verify(canvas !== null && viewport !== null && dialog !== null && jump !== null);
+        dialog.open();
+        canvas.attributePayload = JSON.stringify({layerName: canvas.activeLayer, columns: ["name"], rows: [{featureId: 1, values: {name: "first"}}],
+                                                  page: 0, pageSize: 128, total: 10000001});
+        tryCompare(jump, "to", 78126);
+        compare(jump.value, 1);
+        var priorGeneration = canvas.attributePageGeneration;
+        jump.value = 2;
+        jump.valueModified();
+        compare(canvas.attributePage, 1);
+        compare(canvas.attributePageGeneration, priorGeneration + 1);
+        viewport.requestAttributePage(78125);
+        compare(canvas.attributePage, 78125);
+        compare(canvas.attributePageGeneration, priorGeneration + 2);
+        dialog.close();
     }
 
     function test_zoomToLayerExtentFitsPolygonWithoutChangingProjectBounds() {
@@ -1226,6 +1283,7 @@ TestCase {
         attributeDialog.open();
         tryCompare(attributeDialog, "visible", true);
         canvas.attributePayload = JSON.stringify({
+            layerName: canvas.activeLayer,
             columns: ["NAME"],
             rows: [
                 {featureId: 11, values: {NAME: "one"}},
@@ -1236,7 +1294,7 @@ TestCase {
             total: 2
         });
         tryCompare(attributes, "count", 2);
-        canvas.attributePayload = JSON.stringify({columns: [], rows: [], page: 0, pageSize: 128, total: 0});
+        canvas.attributePayload = JSON.stringify({layerName: canvas.activeLayer, columns: [], rows: [], page: 0, pageSize: 128, total: 0});
         tryCompare(attributes, "count", 0);
         attributeDialog.close();
     }
@@ -1248,6 +1306,7 @@ TestCase {
         var viewport = findChild(appWindow, "mapViewport");
         verify(canvas !== null && dialog !== null && attributes !== null && viewport !== null);
         canvas.attributePayload = JSON.stringify({
+            layerName: canvas.activeLayer,
             columns: ["NAME"],
             rows: [{featureId: 21, values: {NAME: "one"}}],
             page: 0,
@@ -1268,6 +1327,7 @@ TestCase {
         // The real desktop runtime answers the reopen request asynchronously;
         // the QML fixture supplies that response explicitly.
         canvas.attributePayload = JSON.stringify({
+            layerName: canvas.activeLayer,
             columns: ["NAME"],
             rows: [{featureId: 21, values: {NAME: "one"}}],
             page: 0,

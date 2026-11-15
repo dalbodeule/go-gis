@@ -18,6 +18,7 @@ import (
 	"gogis/drivers/gdal"
 	"gogis/internal/core"
 	"gogis/internal/render"
+	"gogis/ui/qt/native"
 
 	"github.com/airbusgeo/godal"
 )
@@ -232,6 +233,156 @@ func BenchmarkDesktopReadOnlyLoadGeoJSONSeq1M(b *testing.B) {
 	benchmarkDesktopReadOnlyMillionPath(b, desktopBenchmarkGeoJSONSeqFixture(b, 1_000_000), 1_000_000, true)
 }
 
+// Run explicitly with -benchtime=1x. This exercises the desktop read-only
+// policy, source inspection, runtime construction, and one viewport chunk
+// above ten million features without checking the generated source into Git.
+func BenchmarkDesktopReadOnlyLoadGeoJSONSeq10MPlusOne(b *testing.B) {
+	const featureCount = 10_000_001
+	benchmarkDesktopReadOnlyMillionPath(b, desktopBenchmarkGeoJSONSeqFixture(b, featureCount), featureCount, true)
+}
+
+// Run explicitly with -benchtime=1x. This probes a dense 10M+ source plus a
+// separate distant file: initial fit, index budget, exact-limit retry, and
+// bounded overview all run through the desktop runtime.
+func BenchmarkDesktopDenseGeoJSONSeq10MWithDistantFile(b *testing.B) {
+	const featureCount = 10_000_001
+	dir := b.TempDir()
+	mainPath := filepath.Join(dir, "dense.geojsonl")
+	file, err := os.Create(mainPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	writer := bufio.NewWriterSize(file, 1<<20)
+	const denseRecord = "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[127,37]},\"properties\":{}}\n"
+	for i := 0; i < featureCount-1; i++ {
+		if _, err := writer.WriteString(denseRecord); err != nil {
+			_ = file.Close()
+			b.Fatal(err)
+		}
+	}
+	if _, err := writer.WriteString("{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[127.001,37.001]},\"properties\":{}}\n"); err != nil {
+		_ = file.Close()
+		b.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		b.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatal(err)
+	}
+	distantPath := filepath.Join(dir, "distant.geojsonl")
+	if err := os.WriteFile(distantPath, []byte("{\"type\":\"Feature\",\"geometry\":{\"type\":\"Point\",\"coordinates\":[170,80]},\"properties\":{}}\n"), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		started := time.Now()
+		runtime, err := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: mainPath}, {Path: distantPath}}, "")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if !runtime.viewportReadOnly || len(runtime.features) != 0 || runtime.mapExtent[2] < 170 || runtime.mapFitExtent[2] > 128 {
+			runtime.closeAttributeSource()
+			b.Fatalf("dense fit full=%v preferred=%v viewport=%t features=%d", runtime.mapExtent, runtime.mapFitExtent, runtime.viewportReadOnly, len(runtime.features))
+		}
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "runtime-load-ms/op")
+		if rss, ok := benchmarkProcessMaxRSSBytes(); ok {
+			b.ReportMetric(float64(rss)/(1<<20), "rss-after-load-MiB")
+		}
+		name := runtime.service.LayerNames()[0]
+		key := chunkKeyForPoint(runtime.mapExtent, readOnlyWindowChunkSize(0), name, render.Point{X: 127, Y: 37})
+		key.ZoomBucket = 0
+		runtime.mu.Lock()
+		runtime.windowVisibleKeys[key] = struct{}{}
+		runtime.mu.Unlock()
+		started = time.Now()
+		if _, err := runtime.builder(context.Background(), key); err == nil || !strings.Contains(err.Error(), "sampled overview retry available") {
+			runtime.closeAttributeSource()
+			b.Fatalf("dense exact window retry = %v", err)
+		}
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "exact-retry-ms/op")
+		if rss, ok := benchmarkProcessMaxRSSBytes(); ok {
+			b.ReportMetric(float64(rss)/(1<<20), "rss-after-exact-MiB")
+		}
+		forced := context.WithValue(context.Background(), forceReadOnlyOverviewContextKey{}, true)
+		started = time.Now()
+		chunk, err := runtime.builder(forced, key)
+		if err != nil || len(chunk.Vertices) == 0 || len(chunk.Vertices) > render.MaxChunkVertices {
+			runtime.closeAttributeSource()
+			b.Fatalf("dense sampled window vertices=%d err=%v", len(chunk.Vertices), err)
+		}
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "sampled-window-ms/op")
+		fit, extent := runtime.mapFitExtent, runtime.mapExtent
+		spanX, spanY := extent[2]-extent[0], extent[3]-extent[1]
+		viewport := render.Viewport{
+			Center: render.Point{X: ((fit[0]+fit[2])/2 - extent[0]) / spanX,
+				Y: ((fit[1]+fit[3])/2 - extent[1]) / spanY},
+			Zoom:        0.9 / max((fit[2]-fit[0])/spanX, (fit[3]-fit[1])/spanY),
+			ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 640, CanvasHeight: 732,
+		}
+		var before []struct{ Stream, Message string }
+		if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &before); err != nil {
+			runtime.closeAttributeSource()
+			b.Fatal(err)
+		}
+		started = time.Now()
+		runtime.refresh(context.Background(), viewport)
+		terminal := ""
+		deadline := time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			var entries []struct{ Stream, Message string }
+			if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &entries); err != nil {
+				runtime.closeAttributeSource()
+				b.Fatal(err)
+			}
+			for _, entry := range entries[min(len(before), len(entries)):] {
+				if entry.Stream == "render" && (strings.Contains(entry.Message, "ready generation=") ||
+					strings.Contains(entry.Message, "incomplete generation=")) {
+					terminal = entry.Message
+				}
+			}
+			if terminal != "" {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !strings.Contains(terminal, "ready generation=") {
+			runtime.closeAttributeSource()
+			b.Fatalf("dense full viewport did not finish: %s", terminal)
+		}
+		metric := func(name string) int {
+			for _, field := range strings.Fields(terminal) {
+				if strings.HasPrefix(field, name+"=") {
+					var value int
+					if _, err := fmt.Sscanf(strings.TrimPrefix(field, name+"="), "%d", &value); err == nil {
+						return value
+					}
+				}
+			}
+			b.Fatalf("missing %s in full-viewport diagnostic: %s", name, terminal)
+			return 0
+		}
+		if metric("nonempty") == 0 || metric("vertices") == 0 {
+			runtime.closeAttributeSource()
+			b.Fatalf("dense full viewport contained no geometry: %s", terminal)
+		}
+		b.ReportMetric(float64(metric("chunks")), "viewport-chunks/op")
+		b.ReportMetric(float64(metric("vertices")), "viewport-vertices/op")
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "full-viewport-ms/op")
+		goruntime.GC()
+		var memory goruntime.MemStats
+		goruntime.ReadMemStats(&memory)
+		b.ReportMetric(float64(memory.HeapAlloc)/(1<<20), "retained-heap-MiB/op")
+		if rss, ok := benchmarkProcessMaxRSSBytes(); ok {
+			b.ReportMetric(float64(rss)/(1<<20), "process-maxrss-MiB")
+		}
+		runtime.closeAttributeSource()
+	}
+	b.ReportMetric(float64(featureCount), "dense-features/op")
+}
+
 // BenchmarkGeoJSONMetadataStages1M measures the raw godal/GDAL GeoJSON driver
 // open, FeatureCount, and Bounds costs. It deliberately bypasses the desktop
 // Reader's bounded JSON stream path and is a diagnostic baseline, not the
@@ -407,6 +558,271 @@ func BenchmarkDesktopReadOnlyLoadShapefile1MNoIndex(b *testing.B) {
 	if rss := benchmarkReadOnlyChildPeakRSSMiB(b, path); rss > 0 {
 		b.ReportMetric(float64(rss), "loader-child-maxrss-MiB")
 	}
+}
+
+// Run explicitly with -benchtime=1x. A streamed 10M+1 SHP and QIX are kept
+// only in b.TempDir; the timed region measures desktop load, a complete
+// initial overview, two detail views, and a final attribute page.
+func BenchmarkDesktopShapefile10MPlusOneOverview(b *testing.B) {
+	const featureCount = 10_000_001
+	path := filepath.Join(b.TempDir(), "ten-million-points.shp")
+	godal.RegisterAll()
+	dataset, err := godal.CreateVector(godal.Shapefile, path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	spatialRef, err := godal.NewSpatialRef("EPSG:4326")
+	if err != nil {
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	defer spatialRef.Close()
+	layer, err := dataset.CreateLayer("ten_million_points", spatialRef, godal.GTPoint)
+	if err != nil {
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			geometry, geometryErr := godal.NewGeometryFromWKT(fmt.Sprintf("POINT (%g %g)", float64(x)/100, float64(y)/100), spatialRef)
+			if geometryErr != nil {
+				_ = dataset.Close()
+				b.Fatal(geometryErr)
+			}
+			for i := 0; i < 1000; i++ {
+				feature, featureErr := layer.NewFeature(geometry)
+				if featureErr != nil {
+					geometry.Close()
+					_ = dataset.Close()
+					b.Fatal(featureErr)
+				}
+				featureErr = layer.UpdateFeature(feature)
+				feature.Close()
+				if featureErr != nil {
+					geometry.Close()
+					_ = dataset.Close()
+					b.Fatal(featureErr)
+				}
+			}
+			geometry.Close()
+		}
+	}
+	extra, err := godal.NewGeometryFromWKT("POINT (0.995 0.995)", spatialRef)
+	if err != nil {
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	feature, err := layer.NewFeature(extra)
+	if err != nil {
+		extra.Close()
+		_ = dataset.Close()
+		b.Fatal(err)
+	}
+	err = layer.UpdateFeature(feature)
+	feature.Close()
+	extra.Close()
+	if closeErr := dataset.Close(); err != nil || closeErr != nil {
+		b.Fatalf("finish SHP fixture: write=%v close=%v", err, closeErr)
+	}
+	if err := gdal.CreateShapefileSpatialIndex(context.Background(), path, ""); err != nil {
+		b.Fatal(err)
+	}
+	benchmarkDesktopTenMillionOverview(b, path, featureCount)
+}
+
+// The GeoJSONSeq input streams through GDAL's translation path; its generated
+// 10M+1 GeoPackage and RTree stay under b.TempDir and are not checked in.
+// GOGIS_BENCH_GPKG_PATH reuses a previously generated synthetic fixture.
+func BenchmarkDesktopGeoPackage10MPlusOneOverview(b *testing.B) {
+	const featureCount = 10_000_001
+	output := os.Getenv("GOGIS_BENCH_GPKG_PATH")
+	godal.RegisterAll()
+	if output == "" {
+		input := desktopBenchmarkGeoJSONSeqFixture(b, featureCount)
+		output = filepath.Join(b.TempDir(), "ten-million-points.gpkg")
+		source, err := godal.Open(input)
+		if err != nil {
+			b.Fatal(err)
+		}
+		converted, err := source.VectorTranslate(output, []string{"-nln", "ten_million_points", "-lco", "SPATIAL_INDEX=YES"}, godal.DriverName("GPKG"))
+		closeErr := source.Close()
+		if err != nil || closeErr != nil {
+			if converted != nil {
+				_ = converted.Close()
+			}
+			b.Fatalf("translate 10M GeoJSONSeq to GPKG: translate=%v close=%v", err, closeErr)
+		}
+		if err := converted.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	dataset, err := godal.Open(output)
+	if err != nil {
+		b.Fatal(err)
+	}
+	rtree, err := dataset.ExecuteSQL("SELECT name FROM sqlite_master WHERE type='table' AND name='rtree_ten_million_points_geom'", godal.SQLiteDialect())
+	if err != nil || rtree == nil {
+		_ = dataset.Close()
+		b.Fatalf("10M GPKG RTree missing: %v", err)
+	}
+	rtreeCount, countErr := rtree.FeatureCount()
+	rtreeCloseErr, datasetCloseErr := rtree.Close(), dataset.Close()
+	if rtreeCount != 1 || countErr != nil || rtreeCloseErr != nil || datasetCloseErr != nil {
+		b.Fatalf("10M GPKG RTree check: count=%d countErr=%v close=%v datasetClose=%v", rtreeCount, countErr, rtreeCloseErr, datasetCloseErr)
+	}
+	stageStart := time.Now()
+	probe, err := gdal.OpenAttributeSession(output)
+	if err != nil {
+		b.Fatal(err)
+	}
+	probeOpenMS := time.Since(stageStart).Milliseconds()
+	stageStart = time.Now()
+	overviews, err := probe.Inspect(context.Background())
+	if err != nil || len(overviews) != 1 || overviews[0].FeatureCount != featureCount {
+		_ = probe.Close()
+		b.Fatalf("10M GPKG overview=%#v err=%v", overviews, err)
+	}
+	probeInspectMS := time.Since(stageStart).Milliseconds()
+	stageStart = time.Now()
+	samples, err := probe.SampleGeometryEnvelopes(context.Background(), overviews[0].Name, featureCount, 256)
+	if err != nil {
+		_ = probe.Close()
+		b.Fatal(err)
+	}
+	probeSampleMS := time.Since(stageStart).Milliseconds()
+	probeSampleCount := len(samples)
+	stageStart = time.Now()
+	if _, _, err := probe.OpenAttributePage(context.Background(), overviews[0].Name, 0, 1); err != nil {
+		_ = probe.Close()
+		b.Fatal(err)
+	}
+	probePageMS := time.Since(stageStart).Milliseconds()
+	if err := probe.Close(); err != nil {
+		b.Fatal(err)
+	}
+	benchmarkDesktopTenMillionOverview(b, output, featureCount)
+	b.StopTimer()
+	b.ReportMetric(float64(probeOpenMS), "probe-open-ms")
+	b.ReportMetric(float64(probeInspectMS), "probe-inspect-ms")
+	b.ReportMetric(float64(probeSampleMS), "probe-sample-ms")
+	b.ReportMetric(float64(probeSampleCount), "probe-samples")
+	b.ReportMetric(float64(probePageMS), "probe-page-ms")
+	if rss := benchmarkReadOnlyChildPeakRSSMiB(b, output); rss > 0 {
+		b.ReportMetric(float64(rss), "loader-child-maxrss-MiB")
+	}
+}
+
+func benchmarkDesktopTenMillionOverview(b *testing.B, path string, featureCount int) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		started := time.Now()
+		runtime, loadErr := loadReadOnlyDataRuntime(context.Background(), []vectorSourceSpec{{Path: path}}, "")
+		if loadErr != nil {
+			b.Fatal(loadErr)
+		}
+		if !runtime.viewportReadOnly || len(runtime.features) != 0 {
+			runtime.closeAttributeSource()
+			b.Fatalf("10M runtime retained %d source features", len(runtime.features))
+		}
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "load-ms/op")
+		fit := initialFitWorkspaceView(runtime, native.Viewport{ViewportWidth: 1172, ViewportHeight: 732})
+		if fit == nil {
+			runtime.closeAttributeSource()
+			b.Fatal("missing 10M initial fit")
+		}
+		viewport := render.Viewport{Center: render.Point{X: fit.CenterX, Y: fit.CenterY}, Zoom: fit.Zoom,
+			ScreenWidth: 1172, ScreenHeight: 732, CanvasWidth: 585, CanvasHeight: 732}
+		var before []struct{ Stream, Message string }
+		if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &before); err != nil {
+			runtime.closeAttributeSource()
+			b.Fatal(err)
+		}
+		started = time.Now()
+		runtime.refresh(context.Background(), viewport)
+		terminal := ""
+		deadline := time.Now().Add(90 * time.Second)
+		for time.Now().Before(deadline) {
+			var entries []struct{ Stream, Message string }
+			if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &entries); err != nil {
+				runtime.closeAttributeSource()
+				b.Fatal(err)
+			}
+			for _, entry := range entries[min(len(before), len(entries)):] {
+				if entry.Stream == "render" && (strings.Contains(entry.Message, "ready generation=") || strings.Contains(entry.Message, "incomplete generation=")) {
+					terminal = entry.Message
+				}
+			}
+			if terminal != "" {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if !strings.Contains(terminal, "ready generation=") ||
+			(strings.EqualFold(filepath.Ext(path), ".shp") && !strings.Contains(terminal, "world_occupied_cells=256/256")) {
+			runtime.closeAttributeSource()
+			b.Fatalf("10M overview incomplete or lost spatial coverage: %s", terminal)
+		}
+		var generation, chunks, nonempty int
+		if _, err := fmt.Sscanf(terminal, "ready generation=%d chunks=%d nonempty=%d", &generation, &chunks, &nonempty); err != nil || chunks == 0 || nonempty == 0 {
+			runtime.closeAttributeSource()
+			b.Fatalf("10M overview has no visible features: %s (%v)", terminal, err)
+		}
+		b.ReportMetric(float64(chunks), "chunks/op")
+		b.ReportMetric(float64(nonempty), "nonempty-chunks/op")
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "overview-ms/op")
+		b.Logf("10M %s overview: %s", filepath.Ext(path), terminal)
+		// Opening the source is only the first part of the desktop workflow.
+		// Exercise exact city-scale detail, a distant pan, and a page at the
+		// end of the attribute table on the same 10M source.
+		for viewIndex, center := range []render.Point{{X: 0.5, Y: 0.5}, {X: 0.75, Y: 0.75}} {
+			viewport.Center, viewport.Zoom = center, 64
+			before = nil
+			if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &before); err != nil {
+				runtime.closeAttributeSource()
+				b.Fatal(err)
+			}
+			started = time.Now()
+			runtime.refresh(context.Background(), viewport)
+			terminal = ""
+			deadline = time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				var entries []struct{ Stream, Message string }
+				if err := json.Unmarshal([]byte(native.DiagnosticLogJSON()), &entries); err != nil {
+					runtime.closeAttributeSource()
+					b.Fatal(err)
+				}
+				for _, entry := range entries[min(len(before), len(entries)):] {
+					if entry.Stream == "render" && (strings.Contains(entry.Message, "ready generation=") || strings.Contains(entry.Message, "incomplete generation=")) {
+						terminal = entry.Message
+					}
+				}
+				if terminal != "" {
+					break
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			if !strings.Contains(terminal, "ready generation=") {
+				runtime.closeAttributeSource()
+				b.Fatalf("10M detail view %d incomplete: %s", viewIndex, terminal)
+			}
+			b.ReportMetric(float64(time.Since(started).Milliseconds()), fmt.Sprintf("detail-%d-ms/op", viewIndex+1))
+			b.Logf("10M %s detail %d: %s", filepath.Ext(path), viewIndex+1, terminal)
+		}
+		started = time.Now()
+		page, total, pageErr := runtime.attributePageReader(context.Background(), runtime.service.LayerNames()[0], featureCount-128, 128)
+		if pageErr != nil || total != featureCount || len(page.Features) != 128 {
+			runtime.closeAttributeSource()
+			b.Fatalf("10M last attribute page: rows=%d total=%d err=%v", len(page.Features), total, pageErr)
+		}
+		b.ReportMetric(float64(time.Since(started).Milliseconds()), "last-page-ms/op")
+		if rss, ok := benchmarkProcessMaxRSSBytes(); ok {
+			b.ReportMetric(float64(rss)/(1<<20), "maxrss-MiB")
+		}
+		runtime.closeAttributeSource()
+	}
+	b.ReportMetric(float64(featureCount), "features/source")
 }
 
 func benchmarkReadOnlyChildPeakRSSMiB(b *testing.B, path string) uint64 {

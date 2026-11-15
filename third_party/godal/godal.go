@@ -3844,6 +3844,27 @@ func (layer Layer) ResetReading() {
 	C.OGR_L_ResetReading(layer.handle())
 }
 
+// FastSetNextByIndex reports whether the driver can position its read cursor
+// without scanning all preceding features. Callers must serialize this with
+// other reads on the same layer.
+func (layer Layer) FastSetNextByIndex() bool {
+	capability := C.CString("FastSetNextByIndex")
+	defer C.free(unsafe.Pointer(capability))
+	return C.OGR_L_TestCapability(layer.handle(), capability) != 0
+}
+
+// SetNextByIndex positions the read cursor at the zero-based feature ordinal.
+// A driver may implement this by scanning unless FastSetNextByIndex is true.
+func (layer Layer) SetNextByIndex(index int) error {
+	if index < 0 {
+		return fmt.Errorf("negative layer feature index %d", index)
+	}
+	if result := C.OGR_L_SetNextByIndex(layer.handle(), C.GIntBig(index)); result != C.OGRERR_NONE {
+		return fmt.Errorf("position layer cursor at feature %d: OGR error %d", index, int(result))
+	}
+	return nil
+}
+
 // NextFeature returns the layer's next feature, or nil if there are no mo features
 func (layer Layer) NextFeature() *Feature {
 	hndl := C.OGR_L_GetNextFeature(layer.handle())

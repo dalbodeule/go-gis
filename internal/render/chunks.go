@@ -17,6 +17,8 @@ type ChunkKey struct {
 	ZoomBucket int
 	X          int
 	Y          int
+	// Coarse selects a whole-domain overview tile for broadly overlapping geometry.
+	Coarse bool
 }
 
 // Vertex is the compact representation consumed by a renderer adapter.

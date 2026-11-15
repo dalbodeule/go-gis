@@ -655,6 +655,29 @@ func TestGeoJSONCoordinateScannerBoundsComplexity(t *testing.T) {
 	}
 }
 
+func TestGeoJSONCoordinateFastScannerMatchesValidatedShapes(t *testing.T) {
+	for _, test := range []struct {
+		raw   string
+		depth int
+		want  [4]float64
+		count int
+	}{
+		{`[[[127,37],[127.001,37],[127.001,37.001],[127,37.001],[127,37]]]`, 2, [4]float64{127, 37, 127.001, 37.001}, 5},
+		{`[[[-1e2, 2, 9], [0, -3, 10]]]`, 2, [4]float64{-100, -3, 0, 2}, 2},
+		{`[1,2]`, 0, [4]float64{1, 2, 1, 2}, 1},
+	} {
+		bounds, has, count, ok := geoJSONCoordinateBoundsFast([]byte(test.raw), test.depth, 100)
+		if !ok || !has || bounds != test.want || count != test.count {
+			t.Fatalf("fast bounds for %s = %v has=%v count=%d ok=%v", test.raw, bounds, has, count, ok)
+		}
+	}
+	for _, raw := range []string{`[[1,2],]`, `[[01,2]]`, `[[1,null]]`} {
+		if _, _, _, ok := geoJSONCoordinateBoundsFast([]byte(raw), 1, 100); ok {
+			t.Fatalf("invalid or unusual coordinate bypassed validation: %s", raw)
+		}
+	}
+}
+
 func TestGeoJSONGeometryCollectionDepthLimit(t *testing.T) {
 	geometry := `{"type":"Point","coordinates":[1,2]}`
 	for range maxGeoJSONGeometryCollectionDepth + 1 {
@@ -1091,6 +1114,32 @@ func TestGeoJSONPartialIndexStillQueriesTailFeatures(t *testing.T) {
 	}
 }
 
+func TestGeoJSONMeanEnvelopeSpansUseFeaturesNotTailBlockUnion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "separated.geojsonl")
+	var records strings.Builder
+	for _, x := range []int{0, 1, 2, 3} {
+		fmt.Fprintf(&records, `{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[%d,0],[%d,0],[%d,0.1],[%d,0.1],[%d,0]]]},"properties":{}}`+"\n", x, x+1, x+1, x, x)
+	}
+	if err := os.WriteFile(path, []byte(records.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if applied, err := session.SetGeoJSONStreamIndexFeatureLimit(0); err != nil || !applied {
+		t.Fatalf("set zero index limit: applied=%t err=%v", applied, err)
+	}
+	if _, err := session.Inspect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	meanX, meanY, count, err := session.MeanGeometryEnvelopeSpans(context.Background(), "separated")
+	if err != nil || count != 4 || meanX != 1 || math.Abs(meanY-0.1) > 1e-12 {
+		t.Fatalf("mean feature spans = %g,%g count=%d err=%v", meanX, meanY, count, err)
+	}
+}
+
 func TestGeoJSONTailBlocksSkipNonIntersectingRecordRanges(t *testing.T) {
 	const featureCount = 2 + 2*geoJSONTailBlockFeatureCount + 1
 	path := filepath.Join(t.TempDir(), "tail-blocks.geojson")
@@ -1129,6 +1178,204 @@ func TestGeoJSONTailBlocksSkipNonIntersectingRecordRanges(t *testing.T) {
 	feature, err := session.OpenFeature(context.Background(), "", uint64(featureCount))
 	if err != nil || feature.ID != uint64(featureCount) || feature.Properties["id"] != float64(featureCount) {
 		t.Fatalf("last-block feature=%#v err=%v", feature, err)
+	}
+	samples, err := session.SampleGeometryEnvelopes(context.Background(), "", featureCount, 256)
+	if err != nil || len(samples) != 4 {
+		t.Fatalf("tail geometry samples=%d err=%v; repeated block envelopes must be deduplicated", len(samples), err)
+	}
+	if samples[0][0] != 1 || samples[len(samples)-1][2] != featureCount {
+		t.Fatalf("tail geometry sample endpoints: first=%v last=%v", samples[0], samples[len(samples)-1])
+	}
+	noPrefix, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer noPrefix.Close()
+	if _, err := noPrefix.SetGeoJSONStreamIndexFeatureLimit(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := noPrefix.Inspect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(noPrefix.streamIndex) != 0 || len(noPrefix.streamTailBlocks) != 3 {
+		t.Fatalf("zero-prefix collection index=%d blocks=%d", len(noPrefix.streamIndex), len(noPrefix.streamTailBlocks))
+	}
+	blockSamples, err := noPrefix.SampleGeometryEnvelopes(context.Background(), "", featureCount, 256)
+	if err != nil || len(blockSamples) != 3 {
+		t.Fatalf("zero-prefix block samples=%d err=%v", len(blockSamples), err)
+	}
+	lastWindow, err := noPrefix.OpenWindow(context.Background(), "", [4]float64{featureCount - 1, -1, featureCount, 1}, false)
+	if err != nil || len(lastWindow.Features) != 2 || lastWindow.Features[0].ID != uint64(featureCount-1) {
+		t.Fatalf("zero-prefix collection window=%#v err=%v", lastWindow.Features, err)
+	}
+}
+
+func TestGeoJSONTailAttributePagesCrossBlockBoundary(t *testing.T) {
+	for _, extension := range []string{".geojson", ".geojsons"} {
+		t.Run(extension, func(t *testing.T) {
+			const count = geoJSONTailBlockFeatureCount + 5
+			path := filepath.Join(t.TempDir(), "tail"+extension)
+			var content strings.Builder
+			if extension == ".geojson" {
+				content.WriteString(`{"type":"FeatureCollection","features":[`)
+			}
+			for ordinal := 1; ordinal <= count; ordinal++ {
+				if extension == ".geojson" && ordinal > 1 {
+					content.WriteByte(',')
+				}
+				fmt.Fprintf(&content, `{"type":"Feature","properties":{"id":%d},"geometry":{"type":"Point","coordinates":[%d,0]}}`, ordinal, ordinal)
+				if extension != ".geojson" {
+					content.WriteByte('\n')
+				}
+			}
+			if extension == ".geojson" {
+				content.WriteString(`]}`)
+			}
+			if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			session, err := OpenAttributeSession(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			if _, err := session.SetGeoJSONStreamIndexFeatureLimit(1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.Inspect(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for _, request := range []struct{ offset, limit, want int }{
+				{0, 3, 3},
+				{geoJSONTailBlockFeatureCount - 2, 10, 7},
+				{count - 1, 128, 1},
+				{count, 128, 0},
+			} {
+				page, total, err := session.OpenAttributePage(context.Background(), "", request.offset, request.limit)
+				if err != nil || total != count || len(page.Features) != request.want {
+					t.Fatalf("page offset=%d: total=%d rows=%d err=%v", request.offset, total, len(page.Features), err)
+				}
+				for i, feature := range page.Features {
+					wantID := request.offset + i + 1
+					if feature.ID != uint64(wantID) || feature.Properties["id"] != float64(wantID) || feature.Geometry != nil {
+						t.Fatalf("page offset=%d row=%d: %#v", request.offset, i, feature)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestShapefileAttributeSessionPositionsRandomPageByOrdinal(t *testing.T) {
+	const count = 1_024
+	path := filepath.Join(t.TempDir(), "pages.shp")
+	layer := core.Layer{Name: "pages", CRS: core.CRS{AuthorityCode: "EPSG:4326"},
+		Fields: []core.Field{{Name: "ordinal", Type: core.FieldTypeText}}}
+	for ordinal := 1; ordinal <= count; ordinal++ {
+		layer.Features = append(layer.Features, core.Feature{ID: uint64(ordinal),
+			Geometry:   core.WKTGeometry{WKT: fmt.Sprintf("POINT (%d 0)", ordinal)},
+			Properties: map[string]any{"ordinal": fmt.Sprint(ordinal)}})
+	}
+	if err := (Writer{}).Write(context.Background(), path, layer); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	ogrLayer, _, err := session.layerForName("")
+	if err != nil || !ogrLayer.FastSetNextByIndex() {
+		t.Fatalf("SHP fast cursor positioning unavailable: %v", err)
+	}
+	for _, offset := range []int{900, 903, 0, 1, 1000, 900} {
+		page, total, err := session.OpenAttributePage(context.Background(), "", offset, 3)
+		if err != nil || total != count || len(page.Features) != 3 {
+			t.Fatalf("offset %d: total=%d rows=%d err=%v", offset, total, len(page.Features), err)
+		}
+		for i, feature := range page.Features {
+			want := offset + i + 1
+			if feature.ID != uint64(want) || feature.Properties["ordinal"] != fmt.Sprint(want) {
+				t.Fatalf("offset %d row %d: %#v", offset, i, feature)
+			}
+		}
+	}
+	window, err := session.OpenOverviewWindowSampled(context.Background(), "", [4]float64{0, -1, count + 1, 1},
+		true, 10, 1<<20, nil, nil)
+	if err != nil || len(window.Features) != 10 || window.Features[9].Properties["ordinal"] != "10" {
+		t.Fatalf("sampled SHP overview = %d features, err=%v", len(window.Features), err)
+	}
+}
+
+func TestSampledGeoJSONWindowStopsAtIndexAndTailBudgets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dense.geojsonl")
+	var records strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&records, `{"type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{"name":"feature-%d"}}`+"\n", i)
+	}
+	if err := os.WriteFile(path, []byte(records.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if entries, ready := session.GeoJSONStreamIndexState(); ready || entries != 0 {
+		t.Fatalf("fresh GeoJSON session index entries=%d ready=%t", entries, ready)
+	}
+	if _, err := session.SetGeoJSONStreamIndexFeatureLimit(5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.OpenWindowWithLimits(context.Background(), "", [4]float64{-1, -1, 1, 1}, true, 10, 1<<20); err == nil {
+		t.Fatal("exact window silently truncated")
+	}
+	if entries, ready := session.GeoJSONStreamIndexState(); !ready || entries != 5 {
+		t.Fatalf("inspected GeoJSON session index entries=%d ready=%t", entries, ready)
+	}
+	for _, budget := range []struct {
+		features int
+		bytes    int64
+	}{{3, 1 << 20}, {8, 1 << 20}, {30, 550}} {
+		got, err := session.OpenOverviewWindowSampled(context.Background(), "", [4]float64{-1, -1, 1, 1},
+			true, budget.features, budget.bytes, nil, nil)
+		if err != nil || len(got.Features) == 0 || len(got.Features) > budget.features {
+			t.Fatalf("sampled window budget=%+v features=%d err=%v", budget, len(got.Features), err)
+		}
+		if budget.features == 8 && got.Features[7].ID != 8 {
+			t.Fatalf("sampled tail ordinal = %d, want 8", got.Features[7].ID)
+		}
+	}
+	noPrefix, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer noPrefix.Close()
+	if _, err := noPrefix.SetGeoJSONStreamIndexFeatureLimit(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := noPrefix.Inspect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(noPrefix.streamIndex) != 0 || len(noPrefix.streamTailBlocks) == 0 {
+		t.Fatalf("zero-budget index: features=%d blocks=%d", len(noPrefix.streamIndex), len(noPrefix.streamTailBlocks))
+	}
+	last, err := noPrefix.OpenWindowWithLimits(context.Background(), "", [4]float64{-1, -1, 1, 1}, false, 30, 1<<20)
+	if err != nil || len(last.Features) != 30 || last.Features[29].ID != 30 {
+		t.Fatalf("zero-budget exact window features=%d err=%v", len(last.Features), err)
+	}
+	approximate, err := noPrefix.OpenOverviewWindowSampled(context.Background(), "", [4]float64{-1, -1, 1, 1},
+		false, 4, 1<<20, nil, nil)
+	if err != nil || len(approximate.Features) != 4 || approximate.Features[3].ID != 4 {
+		t.Fatalf("zero-budget sampled window features=%d err=%v", len(approximate.Features), err)
+	}
+	page, total, err := noPrefix.OpenAttributePage(context.Background(), "", 28, 2)
+	if err != nil || total != 30 || len(page.Features) != 2 || page.Features[1].ID != 30 {
+		t.Fatalf("zero-budget last page total=%d features=%#v err=%v", total, page.Features, err)
+	}
+	feature, err := noPrefix.OpenFeature(context.Background(), "", 30)
+	if err != nil || feature.ID != 30 || feature.Properties["name"] != "feature-29" {
+		t.Fatalf("zero-budget last feature=%#v err=%v", feature, err)
 	}
 }
 
@@ -1517,6 +1764,73 @@ func TestAttributeSessionStringPrefilterPreservesVisibleShapefileFeatures(t *tes
 	if err != nil || len(exact.Features) != 1 || exact.Features[0].Properties["A3"] != "44150001" {
 		t.Fatalf("exact string prefilter = %+v, %v", exact.Features, err)
 	}
+	containsIDs, err := session.BuildStringFilterIDSet(ctx, "", 4, StringAttributeFilter{Field: "A3", Value: "1500", Contains: true})
+	if err != nil || containsIDs.Count() != 2 || !containsIDs.MayInclude(0) || containsIDs.MayInclude(1) || !containsIDs.MayInclude(2) {
+		t.Fatalf("substring FID set = %+v, %v", containsIDs, err)
+	}
+	containsPredicate := func(properties map[string]any) (bool, error) {
+		return strings.Contains(fmt.Sprint(properties["A3"]), "1500"), nil
+	}
+	ordinaryContains, err := session.OpenShapefileWindowWithLimitsFiltered(ctx, "", [4]float64{0, 0, 4, 4}, 2, 1024, containsPredicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexedContains, err := session.OpenShapefileWindowWithLimitsFilteredIDs(ctx, "", [4]float64{0, 0, 4, 4}, 2, 1024, containsIDs, containsPredicate)
+	if err != nil || len(indexedContains.Features) != len(ordinaryContains.Features) || len(indexedContains.Features) != 2 {
+		t.Fatalf("substring indexed window=%+v ordinary=%+v err=%v", indexedContains.Features, ordinaryContains.Features, err)
+	}
+	if validStringAttributeFilter(StringAttributeFilter{Field: "A3", Value: "44", Prefix: true, Contains: true}) {
+		t.Fatal("ambiguous string filter mode was accepted")
+	}
+}
+
+func TestAttributeSessionStringPrefilterKeepsNullGeometryConservative(t *testing.T) {
+	registerDrivers()
+	path := filepath.Join(t.TempDir(), "null-point.shp")
+	dataset, err := godal.CreateVector(godal.Shapefile, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := dataset.CreateLayer("null-point", nil, godal.GTPoint,
+		godal.NewFieldDefinition("code", godal.FTString))
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	empty, err := godal.NewGeometryFromWKT("POINT EMPTY", nil)
+	if err != nil {
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	feature, err := layer.NewFeature(empty)
+	if err != nil {
+		empty.Close()
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	if err := feature.SetFieldValue(feature.Fields()["code"], "44150"); err != nil {
+		feature.Close()
+		empty.Close()
+		_ = dataset.Close()
+		t.Fatal(err)
+	}
+	writeErr := layer.UpdateFeature(feature)
+	feature.Close()
+	empty.Close()
+	closeErr := dataset.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("write null point: write=%v close=%v", writeErr, closeErr)
+	}
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	accepted, err := session.BuildStringFilterIDSet(context.Background(), "", 1,
+		StringAttributeFilter{Field: "code", Value: "44150"})
+	if err != nil || accepted.Count() != 1 || !accepted.MayIntersect([4]float64{1, 1, 2, 2}) {
+		t.Fatalf("null geometry filter index = %+v, err=%v", accepted, err)
+	}
 }
 
 func TestReaderOpenGeometryOnlySkipsProperties(t *testing.T) {
@@ -1804,6 +2118,24 @@ func TestWindowRejectsOversizedGPKGAttributeBeforeCopy(t *testing.T) {
 	_, err = session.OpenWindowWithLimits(context.Background(), "features", [4]float64{0, 0, 2, 2}, true, 10, 16<<20)
 	if err == nil || !strings.Contains(err.Error(), "field") || !strings.Contains(err.Error(), "limit") {
 		t.Fatalf("oversized GPKG attribute error = %v", err)
+	}
+}
+
+func TestGeoPackageGeometrySamplesUseSelectedLayerRTree(t *testing.T) {
+	path := multiLayerGeoPackage(t, 9)
+	session, err := OpenAttributeSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	samples, err := session.SampleGeometryEnvelopes(context.Background(), "selected", 9, 5)
+	if err != nil || len(samples) != 5 {
+		t.Fatalf("selected layer samples=%v err=%v", samples, err)
+	}
+	for index, expected := range []float64{0, 2, 4, 6, 8} {
+		if samples[index] != [4]float64{expected, expected, expected, expected} {
+			t.Fatalf("sample %d = %v; want point %g", index, samples[index], expected)
+		}
 	}
 }
 

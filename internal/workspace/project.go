@@ -9,10 +9,13 @@ import (
 	"io"
 	"math"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gogis/internal/core"
+	"golang.org/x/text/unicode/norm"
 )
 
 const CurrentVersion = 1
@@ -103,6 +106,12 @@ func Save(path string, doc Document) error {
 	}
 	for index := range doc.Layers {
 		source := doc.Layers[index].SourcePath
+		if isSourceURI(source) {
+			continue
+		}
+		if isForeignAbsolutePath(source, strings.ReplaceAll(source, "\\", "/")) {
+			continue
+		}
 		if filepath.IsAbs(source) {
 			if relative, relErr := filepath.Rel(workspaceDirectory, source); relErr == nil {
 				doc.Layers[index].SourcePath = filepath.ToSlash(relative)
@@ -190,26 +199,116 @@ func Load(path string) (Document, error) {
 	if err != nil {
 		return Document{}, err
 	}
+	var nearby map[string][]string
+	var nearbyComplete bool
+	nearbyScanned := false
 	for index := range doc.Layers {
 		source := doc.Layers[index].SourcePath
+		if isSourceURI(source) {
+			continue
+		}
 		// A Windows absolute path is not meaningful to filepath.IsAbs on
 		// POSIX. Preserve it for display/relinking instead of incorrectly
 		// treating it as relative to the workspace directory.
-		if isWindowsAbsolutePath(source) && !filepath.IsAbs(source) {
+		portable := strings.ReplaceAll(source, "\\", "/")
+		if isForeignAbsolutePath(source, portable) {
+			doc.Layers[index].SourcePath = source
+		} else if local := filepath.FromSlash(portable); filepath.IsAbs(local) {
+			doc.Layers[index].SourcePath = filepath.Clean(local)
+		} else {
+			doc.Layers[index].SourcePath = filepath.Clean(filepath.Join(workspaceDirectory, local))
+		}
+		if info, statErr := os.Stat(doc.Layers[index].SourcePath); statErr == nil && info.Mode().IsRegular() {
+			continue
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			continue
 		}
-		source = strings.ReplaceAll(source, "\\", "/")
-		source = filepath.FromSlash(source)
-		if filepath.IsAbs(source) {
-			doc.Layers[index].SourcePath = filepath.Clean(source)
-		} else {
-			doc.Layers[index].SourcePath = filepath.Clean(filepath.Join(workspaceDirectory, source))
+		if !nearbyScanned {
+			nearby, nearbyComplete = nearbyWorkspaceSources(workspaceDirectory)
+			nearbyScanned = true
+		}
+		if nearbyComplete {
+			if candidates := nearby[portableSourceKey(pathpkg.Base(portable))]; len(candidates) == 1 {
+				doc.Layers[index].SourcePath = candidates[0]
+			}
 		}
 	}
 	if _, err := doc.Project(); err != nil {
 		return Document{}, err
 	}
 	return doc, nil
+}
+
+func isSourceURI(source string) bool {
+	return strings.Contains(source, "://") && !isWindowsAbsolutePath(source)
+}
+
+func isForeignAbsolutePath(source, portable string) bool {
+	return runtime.GOOS != "windows" && isWindowsAbsolutePath(source) ||
+		runtime.GOOS == "windows" && strings.HasPrefix(portable, "/") && !strings.HasPrefix(portable, "//")
+}
+
+func portableSourceKey(name string) string {
+	return strings.ToLower(norm.NFC.String(name))
+}
+
+// Search only the workspace folder and two nested levels. A unique filename
+// can recover a moved project tree; duplicate names stay unavailable so the
+// application never silently chooses a different dataset. A capped scan
+// fails closed if a very large folder cannot be examined completely.
+func nearbyWorkspaceSources(root string) (map[string][]string, bool) {
+	const maxEntries = 20_000
+	const maxDepth = 2
+	type directory struct {
+		path  string
+		depth int
+	}
+	queue := []directory{{path: root}}
+	result := make(map[string][]string)
+	seenEntries := 0
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		folder, err := os.Open(current.path)
+		if err != nil {
+			return nil, false
+		}
+		for {
+			entries, readErr := folder.ReadDir(256)
+			for _, entry := range entries {
+				seenEntries++
+				if seenEntries > maxEntries {
+					_ = folder.Close()
+					return nil, false
+				}
+				if strings.HasPrefix(entry.Name(), ".") || entry.Type()&os.ModeSymlink != 0 {
+					continue
+				}
+				candidate := filepath.Join(current.path, entry.Name())
+				if entry.IsDir() {
+					if current.depth < maxDepth {
+						queue = append(queue, directory{path: candidate, depth: current.depth + 1})
+					}
+					continue
+				}
+				if entry.Type().IsRegular() {
+					key := portableSourceKey(entry.Name())
+					result[key] = append(result[key], candidate)
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				_ = folder.Close()
+				return nil, false
+			}
+		}
+		if err := folder.Close(); err != nil {
+			return nil, false
+		}
+	}
+	return result, true
 }
 
 func isWindowsAbsolutePath(path string) bool {

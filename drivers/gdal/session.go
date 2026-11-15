@@ -5,6 +5,9 @@ package gdal
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +15,202 @@ import (
 
 	"github.com/airbusgeo/godal"
 )
+
+// MeanGeometryEnvelopeSpans reports the mean per-feature envelope size from
+// the bounded GeoJSON index. Tail blocks retain sums, not union envelopes.
+func (s *AttributeSession) MeanGeometryEnvelopeSpans(ctx context.Context, layerName string) (float64, float64, int, error) {
+	if err := s.lockContext(ctx); err != nil {
+		return 0, 0, 0, err
+	}
+	defer s.mu.Unlock()
+	if !s.streamGeoJSON || !s.streamIndexReady || len(s.streamOverview) != 1 {
+		return 0, 0, 0, nil
+	}
+	if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+		return 0, 0, 0, err
+	}
+	if layerName != "" && layerName != s.streamOverview[0].Name {
+		return 0, 0, 0, fmt.Errorf("layer %q not found in %q", layerName, s.source)
+	}
+	var sumX, sumY float64
+	count := 0
+	for _, entry := range s.streamIndex {
+		if !entry.valid {
+			continue
+		}
+		x, y := entry.bounds[2]-entry.bounds[0], entry.bounds[3]-entry.bounds[1]
+		if x < 0 || y < 0 || math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+			continue
+		}
+		sumX += x
+		sumY += y
+		count++
+	}
+	for _, block := range s.streamTailBlocks {
+		sumX += block.spanXSum
+		sumY += block.spanYSum
+		count += block.boundedCount
+	}
+	if count == 0 {
+		return 0, 0, 0, nil
+	}
+	return sumX / float64(count), sumY / float64(count), count, nil
+}
+
+// SampleGeometryEnvelopes returns a bounded, evenly spaced set of source
+// geometry envelopes for optional viewport fitting. It never retains feature
+// handles or WKB. Drivers without fast random positioning return no samples.
+func (s *AttributeSession) SampleGeometryEnvelopes(ctx context.Context, layerName string, featureCount, maxSamples int) ([][4]float64, error) {
+	if featureCount <= 0 || maxSamples <= 0 {
+		return nil, nil
+	}
+	if err := s.lockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer s.mu.Unlock()
+	count := min(featureCount, maxSamples)
+	if s.streamGeoJSON {
+		if !s.streamIndexReady || len(s.streamOverview) != 1 {
+			return nil, nil
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return nil, err
+		}
+		if layerName != "" && layerName != s.streamOverview[0].Name {
+			return nil, fmt.Errorf("layer %q not found in %q", layerName, s.source)
+		}
+		samples := make([][4]float64, 0, count)
+		lastBlockIndex := -1
+		for i := 0; i < count; i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ordinal := 1 + i*(featureCount-1)/max(1, count-1)
+			if ordinal <= len(s.streamIndex) {
+				entry := s.streamIndex[ordinal-1]
+				if entry.valid && validFilterEnvelope(entry.bounds) {
+					samples = append(samples, entry.bounds)
+				}
+				continue
+			}
+			blockIndex := sort.Search(len(s.streamTailBlocks), func(j int) bool {
+				return s.streamTailBlocks[j].firstOrdinal+s.streamTailBlocks[j].featureCount > ordinal
+			})
+			// A block envelope is one observation, even if many sampled
+			// ordinals land in it. Repeating an outlier-containing block would
+			// make the robust fit incorrectly treat it as many outliers.
+			if blockIndex == lastBlockIndex {
+				continue
+			}
+			lastBlockIndex = blockIndex
+			if blockIndex < len(s.streamTailBlocks) {
+				block := s.streamTailBlocks[blockIndex]
+				if block.firstOrdinal <= ordinal && block.hasBounds && validFilterEnvelope(block.bounds) {
+					samples = append(samples, block.bounds)
+				}
+			}
+		}
+		return samples, nil
+	}
+	if s.dataset == nil {
+		return nil, fmt.Errorf("attribute session for %q is closed", s.source)
+	}
+	layer, _, err := s.layerForName(layerName)
+	if err != nil {
+		return nil, err
+	}
+	if s.dataset.Driver().ShortName() == "GPKG" {
+		// GeoPackage reports fast random positioning, but SetNextByIndex
+		// walks millions of records for late ordinals. Indexed RTree/FID
+		// probes avoid a multi-second schema load on large packages.
+		return s.sampleGeoPackageEnvelopes(ctx, layer.Name(), count)
+	}
+	if !layer.FastSetNextByIndex() {
+		return nil, nil
+	}
+	s.featureCursorReady, s.attributeCursorReady = false, false
+	samples := make([][4]float64, 0, count)
+	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ordinal := i * (featureCount - 1) / max(1, count-1)
+		if err := layer.SetNextByIndex(ordinal); err != nil {
+			return nil, err
+		}
+		feature := layer.NextFeature()
+		if feature == nil {
+			continue
+		}
+		geometry := feature.Geometry()
+		if geometry != nil && !geometry.IsNull() && !geometry.Empty() {
+			if bounds, err := geometry.Bounds(); err == nil && validFilterEnvelope(bounds) {
+				samples = append(samples, bounds)
+			}
+		}
+		if geometry != nil {
+			geometry.Close()
+		}
+		feature.Close()
+	}
+	return samples, nil
+}
+
+func (s *AttributeSession) sampleGeoPackageEnvelopes(ctx context.Context, layerName string, count int) ([][4]float64, error) {
+	queryRow := func(query string) (map[string]godal.Field, bool) {
+		result, err := s.dataset.ExecuteSQL(query, godal.SQLiteDialect())
+		if err != nil || result == nil {
+			return nil, false
+		}
+		defer result.Close()
+		feature := result.NextFeature()
+		if feature == nil {
+			return nil, false
+		}
+		defer feature.Close()
+		return feature.Fields(), true
+	}
+	geometry, ok := queryRow("SELECT column_name AS geometry_column FROM gpkg_geometry_columns WHERE table_name = '" + strings.ReplaceAll(layerName, "'", "''") + "'")
+	if !ok || !geometry["geometry_column"].IsSet() {
+		return nil, nil
+	}
+	rtree := quoteSQLIdentifier("rtree_" + layerName + "_" + geometry["geometry_column"].String())
+	if _, ok := queryRow("SELECT id FROM " + rtree + " LIMIT 1"); !ok {
+		return nil, nil
+	}
+	primaryKey, ok := queryRow("SELECT name AS pk_name FROM pragma_table_info('" + strings.ReplaceAll(layerName, "'", "''") + "') WHERE pk > 0 ORDER BY pk LIMIT 1")
+	if !ok || !primaryKey["pk_name"].IsSet() {
+		return nil, nil
+	}
+	key := quoteSQLIdentifier(primaryKey["pk_name"].String())
+	table := quoteSQLIdentifier(layerName)
+	limits, ok := queryRow("SELECT MIN(" + key + ") AS min_id, MAX(" + key + ") AS max_id FROM " + table)
+	if !ok || !limits["min_id"].IsSet() || !limits["max_id"].IsSet() {
+		return nil, nil
+	}
+	minimum, maximum := limits["min_id"].Int(), limits["max_id"].Int()
+	if maximum < minimum {
+		return nil, nil
+	}
+	samples := make([][4]float64, 0, count)
+	var lastID int64 = -1
+	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		target := minimum + int64(float64(maximum-minimum)*float64(i)/float64(max(1, count-1)))
+		fields, found := queryRow(fmt.Sprintf("SELECT id, minx, miny, maxx, maxy FROM %s WHERE id = (SELECT %s FROM %s WHERE %s >= %d ORDER BY %s LIMIT 1)", rtree, key, table, key, target, key))
+		if !found || !fields["id"].IsSet() || fields["id"].Int() == lastID {
+			continue
+		}
+		lastID = fields["id"].Int()
+		bounds := [4]float64{fields["minx"].Float(), fields["miny"].Float(), fields["maxx"].Float(), fields["maxy"].Float()}
+		if validFilterEnvelope(bounds) {
+			samples = append(samples, bounds)
+		}
+	}
+	return samples, nil
+}
 
 // AttributeSession keeps one GDAL dataset open for repeated attribute-page
 // requests. Calls are serialized because OGR layer reading state is mutable;
@@ -102,6 +301,18 @@ func OpenAttributeSession(source string, encoding ...string) (*AttributeSession,
 		attributeTotals:  make(map[string]int),
 		attributeSchemas: make(map[string][]core.Field),
 	}, nil
+}
+
+// GeoJSONStreamIndexState reports retained entries after inspection. A desktop
+// preview may have initialized the stream before the multi-file budget is
+// assigned; the loader must debit those entries rather than reconfigure it.
+func (s *AttributeSession) GeoJSONStreamIndexState() (entries int, initialized bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.streamGeoJSON || !s.streamIndexReady {
+		return 0, false
+	}
+	return len(s.streamIndex), true
 }
 
 // SetGeoJSONStreamIndexFeatureLimit bounds the number of per-feature entries
@@ -248,7 +459,7 @@ func (s *AttributeSession) OpenWindowWithLimits(ctx context.Context, layerName s
 		if len(s.streamOverview) == 0 || (layerName != "" && layerName != s.streamOverview[0].Name) {
 			return core.Layer{}, fmt.Errorf("layer %q not found in %q", layerName, s.source)
 		}
-		if s.streamIndex == nil {
+		if s.streamIndex == nil && len(s.streamTailBlocks) == 0 {
 			layer, err := readGeoJSONSourceWindow(ctx, s.source, layerName, bounds, includeProperties, maxFeatures, maxBytes)
 			if err != nil {
 				return core.Layer{}, err
@@ -296,13 +507,14 @@ func (s *AttributeSession) OpenShapefileWindowWithLimitsFiltered(ctx context.Con
 // StringAttributeFilter describes a one-time source FID scan. The caller
 // still evaluates its original predicate on every retained feature.
 type StringAttributeFilter struct {
-	Field  string
-	Value  string
-	Prefix bool
+	Field    string
+	Value    string
+	Prefix   bool
+	Contains bool
 }
 
 func validStringAttributeFilter(filter StringAttributeFilter) bool {
-	if filter.Field == "" || filter.Value == "" {
+	if filter.Field == "" || filter.Value == "" || filter.Prefix && filter.Contains {
 		return false
 	}
 	for index, character := range filter.Field {
@@ -358,6 +570,68 @@ func (s *AttributeSession) openShapefileWindowWithLimitsFiltered(ctx context.Con
 	return openWindowSpatialFilterLimitedWithPredicateIDs(ctx, s.dataset, layer, resolvedLayerName, bounds, true, maxFeatures, maxBytes, accepted, accept)
 }
 
+// OpenOverviewWindowSampled reads a bounded prefix of a spatial result for an
+// explicitly approximate viewport retry. It never substitutes
+// for an exact window request or an export.
+func (s *AttributeSession) OpenOverviewWindowSampled(ctx context.Context, layerName string, bounds [4]float64,
+	includeProperties bool, maxFeatures int, maxBytes int64, accepted *FeatureIDSet,
+	accept func(map[string]any) (bool, error)) (core.Layer, error) {
+	if err := validateSpatialWindow(bounds); err != nil {
+		return core.Layer{}, err
+	}
+	if maxFeatures <= 0 || maxBytes <= 0 || (accept != nil && !includeProperties) {
+		return core.Layer{}, fmt.Errorf("sampled overview requires positive budgets and predicate attributes")
+	}
+	if accepted != nil && !accepted.MayIntersect(bounds) {
+		return core.Layer{Name: layerName, Editable: true}, nil
+	}
+	if err := s.lockContext(ctx); err != nil {
+		return core.Layer{}, err
+	}
+	defer s.mu.Unlock()
+	if s.streamGeoJSON {
+		if accept != nil {
+			return core.Layer{}, fmt.Errorf("sampled GeoJSON overview with a display rule is unavailable")
+		}
+		if !s.streamIndexReady {
+			overviews, index, tailBlocks, stamp, err := inspectGeoJSONSourceWithIndexLimitAndTailBlocks(ctx, s.source, s.streamIndexLimit)
+			if err != nil {
+				return core.Layer{}, err
+			}
+			s.streamOverview, s.streamIndex, s.streamTailBlocks, s.streamIndexStamp = overviews, index, tailBlocks, stamp
+			s.streamOverviewReady, s.streamIndexReady = true, true
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return core.Layer{}, err
+		}
+		if len(s.streamOverview) == 0 || (layerName != "" && layerName != s.streamOverview[0].Name) {
+			return core.Layer{}, fmt.Errorf("layer %q not found in %q", layerName, s.source)
+		}
+		if len(s.streamIndex) == 0 && len(s.streamTailBlocks) == 0 && s.streamOverview[0].FeatureCount > 0 {
+			return core.Layer{}, fmt.Errorf("sampled GeoJSON overview requires a feature or block index")
+		}
+		result, err := readGeoJSONIndexedWindowMode(ctx, s.source, s.streamOverview[0], s.streamIndex,
+			s.streamTailBlocks, nil, bounds, includeProperties, maxFeatures, maxBytes, true)
+		if err != nil {
+			return core.Layer{}, err
+		}
+		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
+			return core.Layer{}, err
+		}
+		return result, nil
+	}
+	if s.dataset == nil {
+		return core.Layer{}, fmt.Errorf("sampled OGR overview source is unavailable")
+	}
+	s.featureCursorReady, s.attributeCursorReady = false, false
+	layer, resolvedName, err := s.layerForName(layerName)
+	if err != nil {
+		return core.Layer{}, err
+	}
+	return openWindowSpatialFilterLimitedWithPredicateIDsMode(ctx, s.dataset, layer, resolvedName,
+		bounds, includeProperties, maxFeatures, maxBytes, accepted, accept, true)
+}
+
 // OpenAttributePage reads one property page using the retained dataset.
 func (s *AttributeSession) OpenAttributePage(ctx context.Context, layerName string, offset, limit int) (core.Layer, int, error) {
 	if err := validateAttributePage(offset, limit); err != nil {
@@ -382,7 +656,7 @@ func (s *AttributeSession) OpenAttributePage(ctx context.Context, layerName stri
 		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
 			return core.Layer{}, 0, err
 		}
-		if s.streamIndex == nil {
+		if len(s.streamIndex) == 0 && len(s.streamTailBlocks) == 0 {
 			page, total, err := readGeoJSONSourceAttributePage(ctx, s.source, layerName, offset, limit)
 			if err != nil {
 				return core.Layer{}, 0, err
@@ -392,7 +666,8 @@ func (s *AttributeSession) OpenAttributePage(ctx context.Context, layerName stri
 			}
 			return page, total, nil
 		}
-		page, total, err := readGeoJSONIndexedAttributePage(ctx, s.source, layerName, offset, limit, s.streamIndex, s.streamOverview[0])
+		page, total, err := readGeoJSONIndexedAttributePageWithTailBlocks(ctx, s.source, layerName, offset, limit,
+			s.streamIndex, s.streamTailBlocks, s.streamOverview[0])
 		if err != nil {
 			return core.Layer{}, 0, err
 		}
@@ -422,7 +697,8 @@ func (s *AttributeSession) openAttributePageCursor(ctx context.Context, layerNam
 	layerName = resolvedLayerName
 	sequential := s.attributeCursorReady && s.attributeCursorLayer == layerName &&
 		uint64(offset)+1 == s.attributeNextID
-	if !sequential && (s.attributeCursorReady || offset != 0) {
+	fastRandom := !sequential && offset != 0 && isShapefilePath(s.source) && layer.FastSetNextByIndex()
+	if !sequential && !fastRandom && (s.attributeCursorReady || offset != 0) {
 		// OGRSQL is faster for random page jumps on indexed formats such as
 		// GeoPackage. Keep the cursor for the next request only after a page
 		// zero or an actually adjacent page has been read.
@@ -442,7 +718,14 @@ func (s *AttributeSession) openAttributePageCursor(ctx context.Context, layerNam
 	}
 	reset := !sequential
 	startID := s.attributeNextID
-	if reset {
+	if fastRandom {
+		if err := layer.SetNextByIndex(offset); err != nil {
+			s.attributeCursorReady = false
+			return openAttributePageDataset(ctx, s.dataset, s.source, layerName, offset, limit)
+		}
+		reset = false
+		startID = uint64(offset) + 1
+	} else if reset {
 		startID = 1
 	}
 	schema := s.attributeSchemas[layerName]
@@ -488,7 +771,7 @@ func (s *AttributeSession) OpenFeature(ctx context.Context, layerName string, fe
 		if err := validateGeoJSONSourceStamp(s.source, s.streamIndexStamp); err != nil {
 			return core.Feature{}, err
 		}
-		if s.streamIndex == nil {
+		if len(s.streamIndex) == 0 && len(s.streamTailBlocks) == 0 {
 			feature, err := openGeoJSONSourceFeature(ctx, s.source, layerName, featureID)
 			if err != nil {
 				return core.Feature{}, err

@@ -1,0 +1,19 @@
+# Coarse overview for broadly overlapping geometry
+
+## Context
+
+The read-only viewport planned 1,024 overview tiles for 100,001 identical polygons. Every tile intersected the same source geometry, repeated the source query, and expanded the Qt scene graph. GeoJSONSeq indexing was also slow because each coordinate ordinate was decoded as a separate JSON token. Multiple layers and distant coordinate outliers make a single global tile size inappropriate.
+
+## Decision
+
+Keep the normal fine tile size for each layer. For streamed GeoJSON layers with at least 100,000 features, compute the mean **per-feature** envelope span from the bounded prefix index and tail-block sums. For OGR sources that support fast random feature positioning, use the median envelope span from at most 256 existing fit samples; this resists one broad sampled outlier. When both spans cover at least half of that layer's representative source fit, use one whole-domain tile at overview zoom. The representative fit omits isolated coordinate outliers in the same file; an attribute-filtered SHP layer retains the original source extent because its sampled spans are unfiltered. Store the tile scale in the renderer-independent chunk key so query bounds, scheduling, and cache identity agree. A source with small distributed polygons retains normal tiles even if a tail block's union envelope covers the whole source. The detection uses each layer's own source coordinates, independent of the combined map extent or distant features in other files. Detailed zooms retain the existing tile plan.
+
+Scan ordinary numeric coordinate arrays directly during GeoJSON index construction, followed by JSON validity checking. Unusual input falls back to the existing bounded decoder, preserving validation and safety limits. The approximation and per-window budgets remain unchanged.
+
+## Verification
+
+A 100,001-feature identical-polygon GeoJSON Qt runtime test changed from 1,024 tiles and a 30-second timeout to one tile, 12,008 source vertices, and about 8 ms for the render after load. The regression also includes a distant polygon in the same source and a distant point in another file; the preferred fit remains local and the polygon overview remains one tile. A separate 100,001-feature SHP fixture with a distant polygon also renders as one overview tile. In an offscreen Qt launch with 10,000,001 identical GeoJSON polygons, first scene-graph publication changed from about 108 seconds, 205 nodes, and 12.29 million expanded vertices to about 18.2 seconds, one node, and 12,024 expanded vertices on the same machine. The latter is software rendering, not a GPU frame. The source scan remains O(feature count), so 10-million-feature cold load still takes seconds. Unit tests check tail-block mean spans separately from block union, median sample resistance to broad outliers, and fast coordinate-scanner validation.
+
+An explicit desktop runtime benchmark generated a temporary 10,000,001-point SHP on a 100-by-100 distributed grid and built its QIX before timing. On Apple M3, the read-only runtime loaded in 17 ms and its full initial viewport completed 1,024 nonempty chunks with 475,392 source vertices in 7.12 s; peak process RSS was 328 MiB. Fixture and index generation took about a minute outside the timed region. This benchmark covers the scheduler and chunk builder, not a native Qt scene-graph frame or an unindexed SHP.
+
+The same distributed 10,000,001-point SHP was also launched in the actual desktop application with Qt's offscreen software backend. A progressive scene-graph frame appeared at about 0.74 s with 5,136 expanded vertices. The complete frame appeared at about 7.59-7.82 s with 1,426,176 expanded vertices across 24 scene-graph nodes; peak child-process RSS was 421 MiB. The generated SHP, QIX, application binary, and measurement scripts were removed after the run. Hardware GPU, Windows, and an unindexed 10M SHP remain separate validation cases.
